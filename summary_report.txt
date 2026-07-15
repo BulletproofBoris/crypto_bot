@@ -1,0 +1,273 @@
+Current time: 2026-06-10 10:27:27. Total running time: 0s
+Current time: 2026-06-10 10:27:57. Total running time: 30s
+Current best trial: d53e9_00000 with env_runners/episode_return_mean=-3.5797808548790115
+Current time: 2026-06-10 10:28:27. Total running time: 1min 0s
+Current best trial: d53e9_00000 with env_runners/episode_return_mean=-8.422644069505033
+Current time: 2026-06-10 10:28:57. Total running time: 1min 30s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=-5.749692218292422
+Current time: 2026-06-10 10:29:28. Total running time: 2min 0s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=-0.3731363227583108
+Current time: 2026-06-10 10:29:58. Total running time: 2min 30s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=6.390337277873967
+Current time: 2026-06-10 10:30:28. Total running time: 3min 0s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=3.6301991770086715
+Current time: 2026-06-10 10:30:58. Total running time: 3min 30s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=7.008145703553364
+Current time: 2026-06-10 10:31:28. Total running time: 4min 0s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=13.146238513075346
+Current time: 2026-06-10 10:31:58. Total running time: 4min 30s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=4.612891459908988
+Current time: 2026-06-10 10:32:28. Total running time: 5min 0s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=10.356807439126335
+Current time: 2026-06-10 10:32:58. Total running time: 5min 30s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=12.222532259600461
+Current time: 2026-06-10 10:33:28. Total running time: 6min 0s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=7.132920431267905
+Current time: 2026-06-10 10:33:58. Total running time: 6min 30s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=9.000955585694662
+Current time: 2026-06-10 10:34:28. Total running time: 7min 0s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=8.01634618614018
+Current time: 2026-06-10 10:34:58. Total running time: 7min 30s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=8.717115777239215
+Current time: 2026-06-10 10:35:28. Total running time: 8min 0s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=6.717373810076278
+Current time: 2026-06-10 10:35:58. Total running time: 8min 30s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=10.05545326811838
+Current time: 2026-06-10 10:36:28. Total running time: 9min 0s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=12.703261484771879
+Current time: 2026-06-10 10:36:58. Total running time: 9min 31s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=12.838995792950351
+Current time: 2026-06-10 10:37:28. Total running time: 10min 1s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=14.787894044828336
+Current time: 2026-06-10 10:37:58. Total running time: 10min 31s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=14.400157561899592
+Current time: 2026-06-10 10:38:28. Total running time: 11min 1s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=15.959516338423905
+Current time: 2026-06-10 10:38:58. Total running time: 11min 31s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=28.171970729483856
+Current time: 2026-06-10 10:39:28. Total running time: 12min 1s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=22.88459516770838
+Current time: 2026-06-10 10:39:58. Total running time: 12min 31s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=15.872404948684649
+Current time: 2026-06-10 10:40:28. Total running time: 13min 1s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=13.915181055630145
+Current time: 2026-06-10 10:40:58. Total running time: 13min 31s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=19.1450361946166
+Current time: 2026-06-10 10:41:29. Total running time: 14min 1s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=20.919940849514006
+Current time: 2026-06-10 10:41:59. Total running time: 14min 31s
+Current best trial: d53e9_00000 with env_runners/episode_return_mean=17.04798413685019
+Current time: 2026-06-10 10:42:29. Total running time: 15min 1s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=26.152587428852474
+Current time: 2026-06-10 10:42:59. Total running time: 15min 31s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=26.751799868374274
+Current time: 2026-06-10 10:43:29. Total running time: 16min 1s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=28.085515494267945
+Current time: 2026-06-10 10:43:59. Total running time: 16min 31s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=20.816326560292893
+Current time: 2026-06-10 10:44:29. Total running time: 17min 1s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=18.727325306261825
+Current time: 2026-06-10 10:44:59. Total running time: 17min 31s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=18.921859005173285
+Current time: 2026-06-10 10:45:29. Total running time: 18min 1s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=15.108971627038464
+Current time: 2026-06-10 10:45:59. Total running time: 18min 31s
+Current best trial: d53e9_00000 with env_runners/episode_return_mean=17.312821989602142
+Current time: 2026-06-10 10:46:29. Total running time: 19min 1s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=20.74959235015258
+Current time: 2026-06-10 10:46:59. Total running time: 19min 32s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=23.249835238894722
+Current time: 2026-06-10 10:47:29. Total running time: 20min 2s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=27.281429241526038
+Current time: 2026-06-10 10:47:59. Total running time: 20min 32s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=22.0527905722727
+Current time: 2026-06-10 10:48:29. Total running time: 21min 2s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=23.31254749410209
+Current time: 2026-06-10 10:48:59. Total running time: 21min 32s
+Current best trial: d53e9_00000 with env_runners/episode_return_mean=20.816326560292893
+Current time: 2026-06-10 10:49:29. Total running time: 22min 2s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=27.6852255969203
+Current time: 2026-06-10 10:49:59. Total running time: 22min 32s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=24.856437438572666
+Current time: 2026-06-10 10:50:29. Total running time: 23min 2s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=26.354703632593864
+Current time: 2026-06-10 10:51:00. Total running time: 23min 32s
+Current best trial: d53e9_00000 with env_runners/episode_return_mean=25.0156928858892
+Current time: 2026-06-10 10:51:30. Total running time: 24min 2s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=25.172817382345876
+Current time: 2026-06-10 10:52:00. Total running time: 24min 32s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=25.810297044776288
+Current time: 2026-06-10 10:52:30. Total running time: 25min 2s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=21.5064242291857
+Current time: 2026-06-10 10:53:00. Total running time: 25min 32s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=25.05863002325603
+Current time: 2026-06-10 10:53:30. Total running time: 26min 2s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=26.56486184905012
+Current time: 2026-06-10 10:54:00. Total running time: 26min 32s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=26.56486184905012
+Current time: 2026-06-10 10:54:30. Total running time: 27min 2s
+Current best trial: d53e9_00005 with env_runners/episode_return_mean=27.02583284245759
+Current time: 2026-06-10 10:55:00. Total running time: 27min 32s
+Current best trial: d53e9_00005 with env_runners/episode_return_mean=30.411272106510786
+Current time: 2026-06-10 10:55:30. Total running time: 28min 2s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=26.56486184905012
+Current time: 2026-06-10 10:56:00. Total running time: 28min 32s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=26.56486184905012
+Current time: 2026-06-10 10:56:30. Total running time: 29min 2s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=26.56486184905012
+Current time: 2026-06-10 10:57:00. Total running time: 29min 32s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=28.586545940489287
+Current time: 2026-06-10 10:57:30. Total running time: 30min 2s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=26.56486184905012
+Current time: 2026-06-10 10:58:00. Total running time: 30min 33s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=26.56486184905012
+Current time: 2026-06-10 10:58:30. Total running time: 31min 3s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=26.56486184905012
+Current time: 2026-06-10 10:59:00. Total running time: 31min 33s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=23.9113075804322
+Current time: 2026-06-10 10:59:30. Total running time: 32min 3s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=23.94015645469501
+Current time: 2026-06-10 11:00:00. Total running time: 32min 33s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=34.45452275232185
+Current time: 2026-06-10 11:00:30. Total running time: 33min 3s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=32.69931681970941
+Current time: 2026-06-10 11:01:00. Total running time: 33min 33s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=28.162458723605578
+Current time: 2026-06-10 11:01:30. Total running time: 34min 3s
+Current best trial: d53e9_00005 with env_runners/episode_return_mean=32.34208119404522
+Current time: 2026-06-10 11:02:00. Total running time: 34min 33s
+Current best trial: d53e9_00003 with env_runners/episode_return_mean=32.261413741574124
+Current time: 2026-06-10 11:02:30. Total running time: 35min 3s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=25.851938542905536
+Current time: 2026-06-10 11:03:00. Total running time: 35min 33s
+Current best trial: d53e9_00000 with env_runners/episode_return_mean=25.890657090171572
+Current time: 2026-06-10 11:03:31. Total running time: 36min 3s
+Current best trial: d53e9_00000 with env_runners/episode_return_mean=27.053751697913086
+Current time: 2026-06-10 11:04:01. Total running time: 36min 33s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=44.136727660871315
+Current time: 2026-06-10 11:04:31. Total running time: 37min 3s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=37.30633508783898
+Current time: 2026-06-10 11:05:01. Total running time: 37min 33s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=33.56680128800223
+Current time: 2026-06-10 11:05:31. Total running time: 38min 3s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=33.645201967099766
+Current time: 2026-06-10 11:06:01. Total running time: 38min 33s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=30.524404192668936
+Current time: 2026-06-10 11:06:31. Total running time: 39min 3s
+Current best trial: d53e9_00005 with env_runners/episode_return_mean=30.911150684884834
+Current time: 2026-06-10 11:07:01. Total running time: 39min 33s
+Current best trial: d53e9_00000 with env_runners/episode_return_mean=30.060397230064826
+Current time: 2026-06-10 11:07:31. Total running time: 40min 4s
+Current best trial: d53e9_00000 with env_runners/episode_return_mean=31.391786541994716
+Current time: 2026-06-10 11:08:01. Total running time: 40min 34s
+Current best trial: d53e9_00000 with env_runners/episode_return_mean=27.146259322360038
+Current time: 2026-06-10 11:08:31. Total running time: 41min 4s
+Current best trial: d53e9_00005 with env_runners/episode_return_mean=30.094954551161518
+Current time: 2026-06-10 11:09:01. Total running time: 41min 34s
+Current best trial: d53e9_00000 with env_runners/episode_return_mean=32.31188008512474
+Current time: 2026-06-10 11:09:31. Total running time: 42min 4s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=44.34373450366331
+Current time: 2026-06-10 11:10:01. Total running time: 42min 34s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=32.95887350604228
+Current time: 2026-06-10 11:10:31. Total running time: 43min 4s
+Current best trial: d53e9_00003 with env_runners/episode_return_mean=26.9309323854508
+Current time: 2026-06-10 11:11:01. Total running time: 43min 34s
+Current best trial: d53e9_00003 with env_runners/episode_return_mean=29.59583891825974
+Current time: 2026-06-10 11:11:31. Total running time: 44min 4s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=29.618027671813888
+Current time: 2026-06-10 11:12:01. Total running time: 44min 34s
+Current best trial: d53e9_00005 with env_runners/episode_return_mean=30.525469149005275
+Current time: 2026-06-10 11:12:32. Total running time: 45min 4s
+Current best trial: d53e9_00003 with env_runners/episode_return_mean=33.1352500014119
+Current time: 2026-06-10 11:13:02. Total running time: 45min 34s
+Current best trial: d53e9_00003 with env_runners/episode_return_mean=29.417239840517485
+Current time: 2026-06-10 11:13:32. Total running time: 46min 4s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=30.36713921793793
+Current time: 2026-06-10 11:14:02. Total running time: 46min 34s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=33.73331203016392
+Current time: 2026-06-10 11:14:32. Total running time: 47min 4s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=32.00249017362503
+Current time: 2026-06-10 11:15:02. Total running time: 47min 34s
+Current best trial: d53e9_00002 with env_runners/episode_return_mean=30.430777045525264
+Current time: 2026-06-10 11:15:32. Total running time: 48min 4s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=33.257954537878554
+Current time: 2026-06-10 11:16:02. Total running time: 48min 34s
+Current best trial: d53e9_00003 with env_runners/episode_return_mean=37.68654028224603
+Current time: 2026-06-10 11:16:32. Total running time: 49min 4s
+Current best trial: d53e9_00003 with env_runners/episode_return_mean=34.38000447255492
+Current time: 2026-06-10 11:17:02. Total running time: 49min 34s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=30.977842019725557
+Current time: 2026-06-10 11:17:32. Total running time: 50min 5s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=36.150944281187165
+Current time: 2026-06-10 11:18:02. Total running time: 50min 35s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=36.604726019251885
+Current time: 2026-06-10 11:18:32. Total running time: 51min 5s
+Current best trial: d53e9_00003 with env_runners/episode_return_mean=32.817660013961046
+Current time: 2026-06-10 11:19:02. Total running time: 51min 35s
+Current best trial: d53e9_00003 with env_runners/episode_return_mean=30.927922517016615
+Current time: 2026-06-10 11:19:32. Total running time: 52min 5s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=29.634987909750834
+Current time: 2026-06-10 11:20:02. Total running time: 52min 35s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=32.41233931130146
+Current time: 2026-06-10 11:20:32. Total running time: 53min 5s
+Current best trial: d53e9_00000 with env_runners/episode_return_mean=44.07737445627811
+Current time: 2026-06-10 11:21:02. Total running time: 53min 35s
+Current best trial: d53e9_00000 with env_runners/episode_return_mean=42.16202777647561
+Current time: 2026-06-10 11:21:33. Total running time: 54min 5s
+Current best trial: d53e9_00000 with env_runners/episode_return_mean=39.558303193174254
+Current time: 2026-06-10 11:22:03. Total running time: 54min 35s
+Current best trial: d53e9_00000 with env_runners/episode_return_mean=31.408009842231586
+Current time: 2026-06-10 11:22:33. Total running time: 55min 5s
+Current best trial: d53e9_00003 with env_runners/episode_return_mean=35.222512053573176
+Current time: 2026-06-10 11:23:03. Total running time: 55min 35s
+Current best trial: d53e9_00003 with env_runners/episode_return_mean=38.1058011251232
+Current time: 2026-06-10 11:23:33. Total running time: 56min 5s
+Current best trial: d53e9_00003 with env_runners/episode_return_mean=36.406468512609045
+Current time: 2026-06-10 11:24:03. Total running time: 56min 35s
+Current best trial: d53e9_00003 with env_runners/episode_return_mean=37.34229397256704
+Current time: 2026-06-10 11:24:33. Total running time: 57min 5s
+Current best trial: d53e9_00003 with env_runners/episode_return_mean=39.63716043658396
+Current time: 2026-06-10 11:25:03. Total running time: 57min 35s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=37.97031155724841
+Current time: 2026-06-10 11:25:33. Total running time: 58min 5s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=40.183818768337574
+Current time: 2026-06-10 11:26:03. Total running time: 58min 35s
+Current best trial: d53e9_00000 with env_runners/episode_return_mean=34.50103273948415
+Current time: 2026-06-10 11:26:33. Total running time: 59min 5s
+Current best trial: d53e9_00003 with env_runners/episode_return_mean=33.66250374023677
+Current time: 2026-06-10 11:27:03. Total running time: 59min 36s
+Current best trial: d53e9_00003 with env_runners/episode_return_mean=33.66250374023677
+Current time: 2026-06-10 11:27:33. Total running time: 1hr 0min 6s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=35.25130752673276
+Current time: 2026-06-10 11:28:03. Total running time: 1hr 0min 36s
+Current best trial: d53e9_00003 with env_runners/episode_return_mean=33.66250374023677
+Current time: 2026-06-10 11:28:33. Total running time: 1hr 1min 6s
+Current best trial: d53e9_00003 with env_runners/episode_return_mean=33.66250374023677
+Current time: 2026-06-10 11:29:03. Total running time: 1hr 1min 36s
+Current best trial: d53e9_00005 with env_runners/episode_return_mean=36.07948575654291
+Current time: 2026-06-10 11:29:33. Total running time: 1hr 2min 6s
+Current best trial: d53e9_00003 with env_runners/episode_return_mean=33.66250374023677
+Current time: 2026-06-10 11:30:04. Total running time: 1hr 2min 36s
+Current best trial: d53e9_00003 with env_runners/episode_return_mean=33.66250374023677
+Current time: 2026-06-10 11:30:34. Total running time: 1hr 3min 6s
+Current best trial: d53e9_00003 with env_runners/episode_return_mean=35.018194135091335
+Current time: 2026-06-10 11:31:04. Total running time: 1hr 3min 36s
+Current best trial: d53e9_00004 with env_runners/episode_return_mean=38.80784145459404
+Current time: 2026-06-10 11:31:34. Total running time: 1hr 4min 6s
+Current best trial: d53e9_00003 with env_runners/episode_return_mean=35.30278223346182
+Current time: 2026-06-10 11:32:04. Total running time: 1hr 4min 36s
+Current best trial: d53e9_00005 with env_runners/episode_return_mean=31.14523467102108
+Current time: 2026-06-10 11:32:34. Total running time: 1hr 5min 6s
+Current best trial: d53e9_00000 with env_runners/episode_return_mean=35.47965444748048
+Current time: 2026-06-10 11:33:04. Total running time: 1hr 5min 36s
+Current best trial: d53e9_00003 with env_runners/episode_return_mean=36.67805903254796
+Current time: 2026-06-10 11:33:34. Total running time: 1hr 6min 6s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=34.15210962245566
+Current time: 2026-06-10 11:34:04. Total running time: 1hr 6min 36s
+Current best trial: d53e9_00001 with env_runners/episode_return_mean=37.126807345193214
+Current time: 2026-06-10 11:34:34. Total running time: 1hr 7min 6s
+Current best trial: d53e9_00005 with env_runners/episode_return_mean=40.92417932274677
+Current time: 2026-06-10 11:35:04. Total running time: 1hr 7min 36s
+Current best trial: d53e9_00005 with env_runners/episode_return_mean=35.44145898547422
+Current time: 2026-06-10 11:35:30. Total running time: 1hr 8min 2s
+Current best trial: d53e9_00005 with env_runners/episode_return_mean=35.57341501145003

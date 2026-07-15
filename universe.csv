@@ -1,0 +1,64 @@
+Ticker,Name,Sector
+SBER@MISX,Sberbank,Financials
+GAZP@MISX,Gazprom,Energy
+LKOH@MISX,Lukoil,Energy
+ROSN@MISX,Rosneft,Energy
+NVTK@MISX,Novatek,Energy
+GMKN@MISX,Norilsk Nickel,Materials
+YDEX@MISX,Yandex,IT
+SNGS@MISX,Surgutneftegas,Energy
+SNGSP@MISX,Surgutneftegas (Pref),Energy
+MGNT@MISX,Magnit,Consumer Staples
+TATN@MISX,Tatneft,Energy
+MTSS@MISX,MTS,Telecom
+ALRS@MISX,Alrosa,Materials
+CHMF@MISX,Severstal,Materials
+NLMK@MISX,NLMK,Materials
+MOEX@MISX,Moscow Exchange,Financials
+IRAO@MISX,Inter RAO,Utilities
+PLZL@MISX,Polyus,Materials
+VTBR@MISX,VTB Bank,Financials
+SIBN@MISX,Gazprom Neft,Energy
+SMLT@MISX,Samolet,Real Estate
+PIKK@MISX,PIK Group,Real Estate
+PHOR@MISX,PhosAgro,Materials
+AFKS@MISX,Sistema,Industrials
+RTKM@MISX,Rostelecom,Telecom
+HYDR@MISX,RusHydro,Utilities
+RUAL@MISX,Rusal,Materials
+T@MISX,T-Bank,Financials
+VKCO@MISX,VK,IT
+OZON@MISX,Ozon,Consumer Discretionary
+CBOM@MISX,Credit Bank of Moscow,Financials
+FLOT@MISX,Sovcomflot,Industrials
+BANE@MISX,Bashneft,Energy
+BANEP@MISX,Bashneft (Pref),Energy
+POSI@MISX,Positive Technologies,IT
+ENPG@MISX,EN+ Group,Utilities
+FESH@MISX,FESCO,Industrials
+MSNG@MISX,Mosenergo,Utilities
+UPRO@MISX,Unipro,Utilities
+GLTR@MISX,Globaltrans,Industrials
+BSPB@MISX,Bank St. Petersburg,Financials
+MVID@MISX,M.Video,Consumer Discretionary
+TRMK@MISX,TMK,Materials
+AFLT@MISX,Aeroflot,Industrials
+LENT@MISX,Lenta,Consumer Staples
+LSNGP@MISX,Lenenergo (Pref),Utilities
+NMTP@MISX,NMTP,Industrials
+RASP@MISX,Raspadskaya,Materials
+SELG@MISX,Seligdar,Materials
+TRNFP@MISX,Transneft (Pref),Energy
+MAGN@MISX,MMK,Materials
+AGRO@MISX,Ros Agro,Consumer Staples
+BELU@MISX,Novabev Group,Consumer Staples
+MTLR@MISX,Mechel,Materials
+SGZH@MISX,Segezha Group,Materials
+FEES@MISX,Federal Grid Company,Utilities
+RENI@MISX,Renaissance Insurance,Financials
+SVCB@MISX,Sovcombank,Financials
+ASTR@MISX,Astra Group,IT
+WUSH@MISX,Whoosh,Industrials
+MDMG@MISX,MD Medical,Health Care
+UGLD@MISX,Yuzhuralzoloto,Materials
+LEAS@MISX,Europlan,Financials
