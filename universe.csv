@@ -1,64 +1,32 @@
-Ticker,Name,Sector
-SBER@MISX,Sberbank,Financials
-GAZP@MISX,Gazprom,Energy
-LKOH@MISX,Lukoil,Energy
-ROSN@MISX,Rosneft,Energy
-NVTK@MISX,Novatek,Energy
-GMKN@MISX,Norilsk Nickel,Materials
-YDEX@MISX,Yandex,IT
-SNGS@MISX,Surgutneftegas,Energy
-SNGSP@MISX,Surgutneftegas (Pref),Energy
-MGNT@MISX,Magnit,Consumer Staples
-TATN@MISX,Tatneft,Energy
-MTSS@MISX,MTS,Telecom
-ALRS@MISX,Alrosa,Materials
-CHMF@MISX,Severstal,Materials
-NLMK@MISX,NLMK,Materials
-MOEX@MISX,Moscow Exchange,Financials
-IRAO@MISX,Inter RAO,Utilities
-PLZL@MISX,Polyus,Materials
-VTBR@MISX,VTB Bank,Financials
-SIBN@MISX,Gazprom Neft,Energy
-SMLT@MISX,Samolet,Real Estate
-PIKK@MISX,PIK Group,Real Estate
-PHOR@MISX,PhosAgro,Materials
-AFKS@MISX,Sistema,Industrials
-RTKM@MISX,Rostelecom,Telecom
-HYDR@MISX,RusHydro,Utilities
-RUAL@MISX,Rusal,Materials
-T@MISX,T-Bank,Financials
-VKCO@MISX,VK,IT
-OZON@MISX,Ozon,Consumer Discretionary
-CBOM@MISX,Credit Bank of Moscow,Financials
-FLOT@MISX,Sovcomflot,Industrials
-BANE@MISX,Bashneft,Energy
-BANEP@MISX,Bashneft (Pref),Energy
-POSI@MISX,Positive Technologies,IT
-ENPG@MISX,EN+ Group,Utilities
-FESH@MISX,FESCO,Industrials
-MSNG@MISX,Mosenergo,Utilities
-UPRO@MISX,Unipro,Utilities
-GLTR@MISX,Globaltrans,Industrials
-BSPB@MISX,Bank St. Petersburg,Financials
-MVID@MISX,M.Video,Consumer Discretionary
-TRMK@MISX,TMK,Materials
-AFLT@MISX,Aeroflot,Industrials
-LENT@MISX,Lenta,Consumer Staples
-LSNGP@MISX,Lenenergo (Pref),Utilities
-NMTP@MISX,NMTP,Industrials
-RASP@MISX,Raspadskaya,Materials
-SELG@MISX,Seligdar,Materials
-TRNFP@MISX,Transneft (Pref),Energy
-MAGN@MISX,MMK,Materials
-AGRO@MISX,Ros Agro,Consumer Staples
-BELU@MISX,Novabev Group,Consumer Staples
-MTLR@MISX,Mechel,Materials
-SGZH@MISX,Segezha Group,Materials
-FEES@MISX,Federal Grid Company,Utilities
-RENI@MISX,Renaissance Insurance,Financials
-SVCB@MISX,Sovcombank,Financials
-ASTR@MISX,Astra Group,IT
-WUSH@MISX,Whoosh,Industrials
-MDMG@MISX,MD Medical,Health Care
-UGLD@MISX,Yuzhuralzoloto,Materials
-LEAS@MISX,Europlan,Financials
+Ticker,Name,Sector,Exchange
+BTC/USDT,Bitcoin,Layer 1,binance
+ETH/USDT,Ethereum,Layer 1,binance
+BNB/USDT,Binance Coin,Exchange Token,binance
+SOL/USDT,Solana,Layer 1,binance
+XRP/USDT,Ripple,Payments,binance
+ADA/USDT,Cardano,Layer 1,binance
+DOGE/USDT,Dogecoin,Meme,binance
+TRX/USDT,Tron,Layer 1,binance
+TON/USDT,Toncoin,Layer 1,binance
+LINK/USDT,Chainlink,Oracle,binance
+MATIC/USDT,Polygon,Layer 2,binance
+DOT/USDT,Polkadot,Layer 0,binance
+LTC/USDT,Litecoin,Payments,binance
+BCH/USDT,Bitcoin Cash,Payments,binance
+SHIB/USDT,Shiba Inu,Meme,binance
+AVAX/USDT,Avalanche,Layer 1,binance
+XLM/USDT,Stellar,Payments,binance
+ATOM/USDT,Cosmos,Layer 0,binance
+UNI/USDT,Uniswap,DeFi,binance
+XMR/USDT,Monero,Privacy,binance
+ETC/USDT,Ethereum Classic,Layer 1,binance
+FIL/USDT,Filecoin,Storage,binance
+LDO/USDT,Lido DAO,DeFi,binance
+ICP/USDT,Internet Computer,Layer 1,binance
+APT/USDT,Aptos,Layer 1,binance
+NEAR/USDT,NEAR Protocol,Layer 1,binance
+ARB/USDT,Arbitrum,Layer 2,binance
+OP/USDT,Optimism,Layer 2,binance
+INJ/USDT,Injective,DeFi,binance
+RNDR/USDT,Render Token,AI/Compute,binance
+PRL/USDT,Pearl,Layer 1,coinex

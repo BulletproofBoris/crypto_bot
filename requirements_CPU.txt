@@ -12,10 +12,7 @@ gymnasium
 # torch (Устанавливается отдельно: pip install torch --index-url https://download.pytorch.org/whl/cpu)
 
 # --- Торговля и Брокеры ---
-finam-export
-finam-trade-api
-FinamPy @ git+https://github.com/cia76/FinamPy.git@57d44c64b893ad2c955337d7f838e67b96b635ab
-investpy
+ccxt
 yfinance
 
 # --- ML, Индикаторы и Математика ---

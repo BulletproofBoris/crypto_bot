@@ -1,8 +1,4 @@
 import os
-
-# ОТКЛЮЧАЕМ системное хранилище паролей, чтобы потоки не блокировали друг друга
-os.environ["PYTHON_KEYRING_BACKEND"] = "keyring.backends.null.Keyring"
-
 import asyncio
 import random
 import json
@@ -10,31 +6,39 @@ import pandas as pd
 from typing import Optional, List
 from pathlib import Path
 from datetime import datetime, timezone
-from google.protobuf.json_format import ParseDict
+import ccxt.async_support as ccxt
+from tqdm.auto import tqdm
 
-# --- Импорты Финама ---
-from FinamPy import FinamPy
-from FinamPy.grpc.marketdata_service_pb2 import BarsRequest
-
-# --- Настройки проекта ---
 import sys
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(BASE_DIR))
 
-from config import FINAM_TOKEN, RAW_DIR  
+from config import RAW_DIR  
 
 DATE_CANDIDATES: List[str] = ["datetime", "date", "TRADEDATE", "DATE", "Datetime"]
 
-# Карта перевода наших MLOps-таймфреймов в формат Finam API
+# Карта перевода наших MLOps-таймфреймов в формат ccxt
 TIMEFRAME_MAPPING = {
-    "1m": "TIME_FRAME_M1",
-    "5m": "TIME_FRAME_M5",
-    "15m": "TIME_FRAME_M15",
-    "30m": "TIME_FRAME_M30",
-    "1h": "TIME_FRAME_H1",
-    "4h": "TIME_FRAME_H4",
-    "1d": "TIME_FRAME_D",
-    "1w": "TIME_FRAME_W",
+    "1m": "1m",
+    "5m": "5m",
+    "15m": "15m",
+    "30m": "30m",
+    "1h": "1h",
+    "4h": "4h",
+    "1d": "1d",
+    "1w": "1w",
+}
+
+# Длительность одной свечи в миллисекундах (для расчёта прогресс-бара)
+TF_MS = {
+    "1m":  60_000,
+    "5m":  300_000,
+    "15m": 900_000,
+    "30m": 1_800_000,
+    "1h":  3_600_000,
+    "4h":  14_400_000,
+    "1d":  86_400_000,
+    "1w":  604_800_000,
 }
 
 # =====================================================================
@@ -46,7 +50,7 @@ def _resolve_path(ticker_or_path: str) -> Optional[str]:
         return ticker_or_path
         
     ticker = str(ticker_or_path).upper().strip()
-    safe_symbol = ticker.replace('@', '_')
+    safe_symbol = ticker.replace('/', '_').replace('@', '_')
     
     # Ищем файл в новых папках таймфреймов (начиная с 1d)
     for tf in ['1d', '1h', '30m', '15m', '5m', '1m']:
@@ -103,29 +107,19 @@ def load_data(ticker_or_path: str) -> Optional[pd.DataFrame]:
     return df
 
 # =====================================================================
-# ЧАСТЬ 2: СКАЧИВАНИЕ ДАННЫХ ИЗ FINAM (gRPC клиент)
+# ЧАСТЬ 2: СКАЧИВАНИЕ ДАННЫХ ИЗ CCXT (Криптобиржи)
 # =====================================================================
 
-class FinamClient:
-    def __init__(self, token: str = FINAM_TOKEN):
-        self.token = token
-        self.fp = None
+class CryptoClient:
+    def __init__(self, exchange_id='binance'):
+        self.exchange_id = exchange_id
+        exchange_class = getattr(ccxt, exchange_id)
+        self.exchange = exchange_class({
+            'enableRateLimit': True,
+        })
 
-    def connect(self):
-        if not self.fp:
-            self.fp = FinamPy(self.token)
-
-    def disconnect(self):
-        if self.fp:
-            self.fp.close_channel()
-            self.fp = None
-
-    def _parse_price(self, decimal_obj) -> float:
-        if hasattr(decimal_obj, 'value'):
-            return float(decimal_obj.value)
-        elif hasattr(decimal_obj, 'num'):
-            return decimal_obj.num * (10 ** -decimal_obj.scale)
-        return float(decimal_obj)
+    async def disconnect(self):
+        await self.exchange.close()
 
     def _update_meta(self, df: pd.DataFrame, meta_file: Path):
         if df is not None and not df.empty:
@@ -135,30 +129,26 @@ class FinamClient:
             with open(meta_file, 'w', encoding='utf-8') as f:
                 json.dump({"first_trade_date": first_date_str, "last_downloaded_date": last_date_str}, f, indent=4)
 
-    async def fetch_history(self, symbol: str, start_year: int = 2010, timeframe: str = "1d"):
+    async def fetch_history(self, symbol: str, start_year: int = 2017, timeframe: str = "1d"):
         """
-        Умное инкрементальное выкачивание.
-        timeframe: короткий формат (1d, 1h, 30m)
+        Умное инкрементальное выкачивание с криптобиржи.
         """
-        self.connect()
         current_time = datetime.now(timezone.utc)
-        current_year = current_time.year
         today = current_time.date()
         all_data = []
 
-        # Конвертируем MLOps-таймфрейм в формат Finam
-        finam_tf_enum = TIMEFRAME_MAPPING.get(timeframe.lower(), "TIME_FRAME_D")
+        ccxt_tf = TIMEFRAME_MAPPING.get(timeframe.lower(), "1d")
         
-        # Динамически определяем целевую папку
         target_dir = RAW_DIR / timeframe.lower()
         target_dir.mkdir(parents=True, exist_ok=True)
 
-        safe_symbol = symbol.replace('@', '_')
+        safe_symbol = symbol.replace('/', '_').replace('@', '_')
         file_path = target_dir / f"{safe_symbol}_{timeframe.upper()}_MAX.csv"
         meta_file = target_dir / f"{safe_symbol}_{timeframe.upper()}_meta.json"
         
         existing_df = pd.DataFrame()
-        years_to_fetch = list(range(start_year, current_year + 1))
+        
+        start_ts = int(datetime(start_year, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
         
         # --- 1. ЧТЕНИЕ МЕТАДАННЫХ ---
         if meta_file.exists() and file_path.exists():
@@ -167,97 +157,102 @@ class FinamClient:
                     meta = json.load(f)
                 last_date = pd.to_datetime(meta["last_downloaded_date"]).date()
                 if last_date >= today:
-                    years_to_fetch = []
+                    print(f"  ✅ {symbol} | Актуально на {today}. Обновление не требуется.")
+                    try:
+                        existing_df = pd.read_csv(file_path)
+                    except:
+                        pass
+                    return existing_df
                 else:
-                    years_to_fetch = list(range(last_date.year, current_year + 1))
+                    # Начинаем качать с последней скачанной даты
+                    start_ts = int(pd.to_datetime(meta["last_downloaded_date"]).timestamp() * 1000)
                 existing_df = pd.read_csv(file_path)
             except Exception as e:
                 print(f"  ⚠️ Ошибка чтения метафайла {symbol}: {e}")
         elif file_path.exists():
             try:
                 existing_df = pd.read_csv(file_path)
-                dates = pd.to_datetime(existing_df['Date']).dt.date
-                min_y, max_y = min(dates).year, max(dates).year
+                dates = pd.to_datetime(existing_df['Date'])
                 last_date = max(dates)
-                missing_early = [y for y in range(start_year, min_y)]
-                missing_late = [] if last_date >= today else [y for y in range(max_y, current_year + 1)]
-                years_to_fetch = sorted(list(set(missing_early + missing_late)))
+                if last_date.date() >= today:
+                    print(f"  ✅ {symbol} | Актуально на {today}. Обновление не требуется.")
+                    return existing_df
+                start_ts = int(last_date.timestamp() * 1000)
             except:
                 pass
 
-        if not years_to_fetch:
-            print(f"  ✅ {symbol} | Актуально на {today}. Обновление не требуется.")
-            self._update_meta(existing_df, meta_file)
-            return existing_df
+        now_ts = int(current_time.timestamp() * 1000)
+        tf_ms = TF_MS.get(timeframe.lower(), 3_600_000)
+        estimated_total = max(1, (now_ts - start_ts) // tf_ms)
+        start_date_str = datetime.fromtimestamp(start_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d')
 
-        print(f"🚀 {symbol} ({timeframe}) | Докачиваем года: {years_to_fetch}")
+        # --- 2. ЗАГРУЗКА ДАННЫХ ЧЕРЕЗ CCXT ---
+        limit = 1000
+        current_ts = start_ts
+        retries = 0
 
-        try:
-            # --- 2. ЗАГРУЗКА НЕДОСТАЮЩИХ ЛЕТ ---
-            for year in years_to_fetch:
-                year_start = datetime(year, 1, 1, tzinfo=timezone.utc)
-                year_end = datetime(year, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
-                if year_end > current_time:
-                    year_end = current_time
+        with tqdm(
+            total=estimated_total,
+            desc=f"📥 {symbol} ({timeframe}) c {start_date_str}",
+            unit=" св",
+            dynamic_ncols=True,
+            colour="cyan",
+            leave=True,
+        ) as pbar:
+            while True:
+                try:
+                    ohlcv = await self.exchange.fetch_ohlcv(symbol, ccxt_tf, since=current_ts, limit=limit)
+                    if not ohlcv:
+                        break
 
-                request_data = {
-                    "symbol": symbol,
-                    "timeframe": finam_tf_enum, # <-- ПЕРЕДАЕМ ПРАВИЛЬНЫЙ ENUM ФИНАМА!
-                    "interval": {
-                        "startTime": year_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        "endTime": year_end.strftime("%Y-%m-%dT%H:%M:%SZ")
-                    }
-                }
-                
-                request = BarsRequest()
-                ParseDict(request_data, request)
+                    for b in ohlcv:
+                        dt = datetime.fromtimestamp(b[0] / 1000.0, tz=timezone.utc)
+                        all_data.append({
+                            'Date': dt.date() if timeframe.lower() == '1d' else dt,
+                            'Open': float(b[1]),
+                            'High': float(b[2]),
+                            'Low': float(b[3]),
+                            'Close': float(b[4]),
+                            'Volume': float(b[5])
+                        })
 
-                max_retries = 6  
-                success = False
-                
-                for attempt in range(max_retries):
-                    response = self.fp.call_function(self.fp.marketdata_stub.Bars, request)
-                    
-                    if response is not None:
-                        if response.bars and len(response.bars) > 0:
-                            print(f"  ✅ {symbol} | {year} год: Получено свечей - {len(response.bars)}")
-                            for b in response.bars:
-                                dt = datetime.fromtimestamp(b.timestamp.seconds, tz=timezone.utc)
-                                all_data.append({
-                                    'Date': dt.date() if timeframe.lower() == '1d' else dt, # Если часы, сохраняем и время
-                                    'Open': self._parse_price(b.open),
-                                    'High': self._parse_price(b.high),
-                                    'Low': self._parse_price(b.low),
-                                    'Close': self._parse_price(b.close),
-                                    'Volume': self._parse_price(b.volume)
-                                })
-                        else:
-                            print(f"  ℹ️ {symbol} | {year} год: Данных нет")
-                        success = True
-                        break  
-                    else:
-                        delay = (2 ** attempt) + random.uniform(0, 1.5)  
-                        print(f"  ⏳ {symbol} | {year}: Сбой API. Ждем {delay:.1f} сек...")
-                        await asyncio.sleep(delay)
-                
-                if not success:
-                    print(f"  ❌ {symbol} | {year}: Пропущен")
+                    batch_size = len(ohlcv)
+                    last_ts = ohlcv[-1][0]
+                    last_date_str = datetime.fromtimestamp(last_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d')
+                    pbar.set_postfix_str(f"по {last_date_str}", refresh=False)
+                    pbar.update(batch_size)
 
-                await asyncio.sleep(1.0) 
 
-            # --- 3. СЛИЯНИЕ ДАННЫХ И ОБНОВЛЕНИЕ МЕТАФАЙЛА ---
-            if all_data:
-                new_df = pd.DataFrame(all_data)
-                df = pd.concat([existing_df, new_df], ignore_index=True) if not existing_df.empty else new_df
-                
-                df['Date'] = pd.to_datetime(df['Date'])
-                df = df.drop_duplicates(subset=['Date'], keep='last').sort_values('Date').reset_index(drop=True)
-                df.to_csv(file_path, index=False)
-            else:
-                df = existing_df if not existing_df.empty else None
+                    if last_ts <= current_ts:
+                        break
 
-            self._update_meta(df, meta_file)
-            return df
+                    current_ts = last_ts + 1
+                    retries = 0  # Сбрасываем счётчик после успешного запроса
 
-        finally:
-            self.disconnect()
+                    if batch_size < limit:
+                        break  # Достигли конца доступных данных
+
+                except Exception as e:
+                    retries += 1
+                    tqdm.write(f"  ⏳ {symbol} | Ошибка CCXT: {e}. Попытка {retries}/3...")
+                    if retries >= 3:
+                        tqdm.write(f"  ❌ {symbol} | Превышено число попыток. Прерываем загрузку.")
+                        break
+                    await asyncio.sleep(5)
+
+        if all_data:
+            tqdm.write(f"  ✅ {symbol} | Получено новых свечей: {len(all_data)}")
+
+        # --- 3. СЛИЯНИЕ ДАННЫХ И ОБНОВЛЕНИЕ МЕТАФАЙЛА ---
+        if all_data:
+            new_df = pd.DataFrame(all_data)
+            df = pd.concat([existing_df, new_df], ignore_index=True) if not existing_df.empty else new_df
+            
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df.drop_duplicates(subset=['Date'], keep='last').sort_values('Date').reset_index(drop=True)
+            df.to_csv(file_path, index=False)
+        else:
+            df = existing_df if not existing_df.empty else None
+
+        self._update_meta(df, meta_file)
+        return df

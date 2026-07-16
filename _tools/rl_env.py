@@ -21,7 +21,7 @@ class PortfolioTradingEnv(gym.Env):
         self.prob_cols = [c for c in all_cols if c.endswith('_p0') or c.endswith('_p1') or c.endswith('_p2')]
         
         # Выцепляем глобальный макро-контекст (если он есть в данных)
-        potential_macro = ['usdrub_close', 'brent_close', 'sp500_close', 'imoex_close', 'vix_close']
+        potential_macro = ['btc_close', 'eth_close', 'dxy_close', 'sp500_close', 'vix_close']
         self.macro_cols = [c for c in potential_macro if c in all_cols]
         
         # Безопасный выбор базовых колонок
@@ -105,10 +105,10 @@ class PortfolioTradingEnv(gym.Env):
             self.commission = 0.0
             self.max_episode_steps = min(60, max(1, len(self.unique_dates) - 2))
         elif self.task_phase == 2:
-            self.commission = 0.00015
+            self.commission = 0.0005  # Пониженная крипто-комиссия для обучения
             self.max_episode_steps = min(126, max(1, len(self.unique_dates) - 2))
         else:
-            self.commission = env_config.get("commission", 0.0003)
+            self.commission = env_config.get("commission", 0.001)  # Стандартная крипто-комиссия (0.1%)
             self.max_episode_steps = min(env_config.get("max_episode_steps", 252), max(1, len(self.unique_dates) - 2))
         
         self.current_step = 0
