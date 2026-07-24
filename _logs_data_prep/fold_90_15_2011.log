@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File [35m"<frozen runpy>"[0m, line [35m198[0m, in [35m_run_module_as_main[0m
+  File [35m"<frozen runpy>"[0m, line [35m88[0m, in [35m_run_code[0m
+  File [35m"/home/restorator/crypto_bot/_tools/init_dataset.py"[0m, line [35m177[0m, in [35m<module>[0m
+    [31mmain[0m[1;31m()[0m
+    [31m~~~~[0m[1;31m^^[0m
+  File [35m"/home/restorator/crypto_bot/_tools/init_dataset.py"[0m, line [35m70[0m, in [35mmain[0m
+    csv_files = [f for f in [31mos.listdir[0m[1;31m(RAW_DIR)[0m if f.endswith('.csv') and not f.endswith('_meta.csv')]
+                            [31m~~~~~~~~~~[0m[1;31m^^^^^^^^^[0m
+[1;35mFileNotFoundError[0m: [35m[Errno 2] No such file or directory: '/home/restorator/crypto_bot/data/raw/1d'[0m

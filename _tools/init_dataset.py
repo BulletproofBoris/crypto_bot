@@ -81,6 +81,10 @@ def main():
                 df_temp['ticker'] = raw_name.replace("_", "@", 1) if ("MACRO" not in raw_name and "_" in raw_name) else raw_name
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 if col not in df_temp.columns: df_temp[col] = df_temp['close'] if 'close' in df_temp.columns else 0.0
+            
+            # Нормализуем объем (переводим базовую валюту в USDT/доллары)
+            df_temp['volume'] = df_temp['volume'] * df_temp['close']
+            
             df_list.append(df_temp[['datetime', 'ticker', 'open', 'high', 'low', 'close', 'volume']])
         except: continue
 
