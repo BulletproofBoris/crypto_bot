@@ -89,7 +89,7 @@ def main():
         except: continue
 
     df_combined = pd.concat(df_list, ignore_index=True)
-    df_combined['datetime'] = pd.to_datetime(df_combined['datetime'])
+    df_combined['datetime'] = pd.to_datetime(df_combined['datetime'], format='mixed', utc=True)
     df_combined = clean_and_adjust_data(df_combined.sort_values(['datetime', 'ticker']))
 
     dataset_name = f"{df_combined['datetime'].min().year}_{df_combined['datetime'].max().year}_{args.timeframe}_{args.lookback}_{args.horizon}"
@@ -112,7 +112,7 @@ def main():
 
     # --- ЦИКЛ ПО ФОЛДАМ (WALK-FORWARD) ---
     while current_split <= endpoint:
-        fold_name = f"fold_{current_split.year}"
+        fold_name = f"fold_{current_split.strftime('%Y_%m')}"
         FOLD_DIR = DATASET_DIR / fold_name
         ARTIFACTS_DIR = FOLD_DIR / "artifacts"
         
@@ -122,7 +122,7 @@ def main():
         # 🛡️ ЭМБАРГО: Отодвигаем конец трейна назад, чтобы таргеты не заглядывали в валидацию
         train_end = (current_split - pd.Timedelta(days=args.horizon + 1)).strftime('%Y-%m-%d')
         val_start = current_split.strftime('%Y-%m-%d')
-        val_end = (current_split + relativedelta(years=args.val_interval) - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+        val_end = (current_split + relativedelta(months=args.val_interval) - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
 
         for phase, p_start, p_end in [("train", min_date.strftime('%Y-%m-%d'), train_end), ("val", val_start, val_end)]:
             PHASE_DIR = FOLD_DIR / "data" / phase
@@ -169,7 +169,7 @@ def main():
                 "--lookback", str(args.lookback)
             ], f"{fold_name}/{phase} - TFRecords", expected_output=out_tfrecord, force=args.force)
 
-        current_split += relativedelta(years=args.split_interval)
+        current_split += relativedelta(months=args.split_interval)
         
     print("\n✅ ПАЙПЛАЙН ПОЛНОСТЬЮ ЗАВЕРШЕН!")
 
