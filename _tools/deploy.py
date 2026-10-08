@@ -37,6 +37,7 @@ import os
 sftp = client.open_sftp()
 files = [
     "collect_safetrade_realtime.py", 
+    "collect_bigone_realtime.py",
     "upload_to_gdrive.py", 
     "rotate_data.py", 
     "token.json"
@@ -51,8 +52,8 @@ sftp.close()
 print("4.5 Setting up cron for automatic rotation...")
 run("echo '0 * * * * root /opt/crypto_bot/venv/bin/python /opt/crypto_bot/_tools/rotate_data.py >> /var/log/crypto_rotate.log 2>&1' > /etc/cron.d/crypto_rotate")
 
-print("5. Creating systemd service...")
-service_file = """[Unit]
+print("5. Creating systemd services...")
+service_file_safetrade = """[Unit]
 Description=SafeTrade Realtime Collector
 After=network.target
 
@@ -67,15 +68,33 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 """
-run(f"cat << 'EOF' > /etc/systemd/system/safetrade-collector.service\n{service_file}EOF")
+run(f"cat << 'EOF' > /etc/systemd/system/safetrade-collector.service\n{service_file_safetrade}EOF")
 
-print("6. Starting service...")
+service_file_bigone = """[Unit]
+Description=BigONE Realtime Collector
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/crypto_bot
+ExecStart=/opt/crypto_bot/venv/bin/python /opt/crypto_bot/_tools/collect_bigone_realtime.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"""
+run(f"cat << 'EOF' > /etc/systemd/system/bigone-collector.service\n{service_file_bigone}EOF")
+
+print("6. Starting services...")
 run("systemctl daemon-reload")
-run("systemctl enable safetrade-collector")
-run("systemctl restart safetrade-collector")
+run("systemctl enable safetrade-collector bigone-collector")
+run("systemctl restart safetrade-collector bigone-collector")
 
 time.sleep(2)
 print("Deployment complete! Checking status...")
 run("systemctl status safetrade-collector --no-pager")
+run("systemctl status bigone-collector --no-pager")
 
 client.close()
