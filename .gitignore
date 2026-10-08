@@ -1,1 +1,11 @@
 venv/
+
+# Secrets
+_tools/*.json
+
+# Data
+data/
+*remote.csv
+*.log
+test.txt
+__pycache__/
