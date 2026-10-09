@@ -1,0 +1,4 @@
+VPS_HOST = "81.19.137.18"
+VPS_PORT = 2222
+VPS_USER = "root"
+VPS_PASS = "cbqeoR6392Lr"

@@ -3,9 +3,12 @@ import time
 import sys
 from datetime import datetime
 
-HOST = "81.19.137.18"
-USER = "root"
-PASS = "cbqeoR6392Lr"
+import vps_config
+
+HOST = vps_config.VPS_HOST
+PORT = vps_config.VPS_PORT
+USER = vps_config.VPS_USER
+PASS = vps_config.VPS_PASS
 
 # Thresholds for warnings
 MEM_WARNING_PERCENT = 85.0
@@ -62,7 +65,7 @@ def monitor():
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     
     try:
-        ssh.connect(HOST, username=USER, password=PASS, timeout=10)
+        ssh.connect(HOST, port=PORT, username=USER, password=PASS, timeout=10)
         print("✅ Соединение установлено. Нажмите Ctrl+C для выхода.\n")
         
         while True:

@@ -2,9 +2,12 @@ import paramiko
 import os
 import sys
 
-HOST = "81.19.137.18"
-USER = "root"
-PASS = "cbqeoR6392Lr"
+import vps_config
+
+HOST = vps_config.VPS_HOST
+PORT = vps_config.VPS_PORT
+USER = vps_config.VPS_USER
+PASS = vps_config.VPS_PASS
 
 REMOTE_DIR = "/opt/crypto_bot/data/realtime/prlusdt"
 LOCAL_DIR = "/home/restorator/crypto_bot/data/realtime/prlusdt"
@@ -17,7 +20,7 @@ def sync_data():
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     
     try:
-        ssh.connect(HOST, username=USER, password=PASS, timeout=10)
+        ssh.connect(HOST, port=PORT, username=USER, password=PASS, timeout=10)
         sftp = ssh.open_sftp()
         
         os.makedirs(LOCAL_DIR, exist_ok=True)

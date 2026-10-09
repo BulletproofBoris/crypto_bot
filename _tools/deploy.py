@@ -1,14 +1,17 @@
 import paramiko
 import time
 
-host = '81.19.137.18'
-user = 'root'
-secret = 'cbqeoR6392Lr'
+import vps_config
 
-print(f"Connecting to {host} as {user}...")
+host = vps_config.VPS_HOST
+port = vps_config.VPS_PORT
+user = vps_config.VPS_USER
+secret = vps_config.VPS_PASS
+
+print(f"Connecting to {host}:{port} as {user}...")
 client = paramiko.SSHClient()
 client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-client.connect(hostname=host, username=user, password=secret)
+client.connect(hostname=host, port=port, username=user, password=secret)
 
 def run(cmd):
     print(f"Running: {cmd}")
