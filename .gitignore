@@ -7,5 +7,4 @@ _tools/*.json
 data/
 *remote.csv
 *.log
-test.txt
 __pycache__/

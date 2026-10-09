@@ -1,6 +1,9 @@
 import paramiko
 import time
 
+import sys
+import os
+sys.path.append(os.path.dirname(__file__))
 import vps_config
 
 host = vps_config.VPS_HOST

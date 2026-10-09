@@ -3,6 +3,9 @@ import time
 import sys
 from datetime import datetime
 
+import sys
+import os
+sys.path.append(os.path.dirname(__file__))
 import vps_config
 
 HOST = vps_config.VPS_HOST
@@ -52,10 +55,16 @@ def get_server_stats(ssh):
     load_avg = uptime_line.split("load average:")[1].strip() if "load average:" in uptime_line else "N/A"
     stats['load'] = load_avg
     
-    # Check if collector is running
+    # Check collectors status
     stdin, stdout, stderr = ssh.exec_command("systemctl is-active safetrade-collector")
-    collector_status = stdout.read().decode().strip()
-    stats['collector_status'] = collector_status
+    stats['st_status'] = stdout.read().decode().strip()
+
+    stdin, stdout, stderr = ssh.exec_command("systemctl is-active bigone-collector")
+    stats['bo_status'] = stdout.read().decode().strip()
+
+    # Check hot files sizes
+    stdin, stdout, stderr = ssh.exec_command("ls -lh /opt/crypto_bot/data/realtime/prlusdt/depth.csv /opt/crypto_bot/data/realtime/prlusdt_bigone/depth_bigone.csv 2>/dev/null | awk '{print $9, $5}'")
+    stats['hot_files'] = stdout.read().decode().strip()
     
     return stats
 
@@ -91,9 +100,10 @@ def monitor():
                 
             out.append(f"Загрузка CPU: {stats.get('load', 'N/A')}")
             
-            collector = stats.get('collector_status', 'unknown')
-            collector_str = f"Статус сборщика (safetrade-collector): {'🟢 ACTIVE' if collector == 'active' else '🔴 ' + collector.upper()}"
-            out.append(collector_str)
+            st_col = stats.get('st_status', 'unknown')
+            bo_col = stats.get('bo_status', 'unknown')
+            out.append(f"Сборщик SafeTrade: {'🟢 ACTIVE' if st_col == 'active' else '🔴 ' + st_col.upper()}")
+            out.append(f"Сборщик BigONE:    {'🟢 ACTIVE' if bo_col == 'active' else '🔴 ' + bo_col.upper()}")
             
             print("\n".join(out))
             print("-" * 40)
