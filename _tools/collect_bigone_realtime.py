@@ -30,10 +30,7 @@ logging.basicConfig(
 )
 
 # Прокси (если нужен, берем из окружения или хардкод)
-PROXIES = {
-    "http": "http://edtilhmt:iblj7uuixqce@185.199.229.156:7492",
-    "https": "http://edtilhmt:iblj7uuixqce@185.199.229.156:7492"
-}
+PROXIES = None
 
 def init_csv_files():
     # Инициализация файла стакана
