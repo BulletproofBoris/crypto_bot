@@ -35,6 +35,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CACHE_GDRIVE_DIR = os.path.join(BASE_DIR, "data", "cache_gdrive")
 HOT_VPS_DIR = os.path.join(BASE_DIR, "data", "vps_hot")
 PROCESSED_DIR = os.path.join(BASE_DIR, "data", "processed")
+METADATA_DIR = os.path.join(BASE_DIR, "data", "metadata")
 
 # Google Drive настройки
 FOLDER_ID = '1-qWy2q2nYoZtSCiMDZ1DiKZ5roBqXx-c'
@@ -49,56 +50,224 @@ except ImportError:
     from vps_config import VPS_HOST, VPS_PORT, VPS_USER, VPS_PASS
 
 REMOTE_FILES = [
+    # PRL/USDT
     {
         "remote": "/opt/crypto_bot/data/realtime/prlusdt/depth.csv",
         "local": os.path.join(HOT_VPS_DIR, "safetrade_depth_hot.csv"),
-        "name": "SafeTrade Depth Hot"
+        "name": "SafeTrade Depth Hot (PRL)"
     },
     {
         "remote": "/opt/crypto_bot/data/realtime/prlusdt/trades.csv",
         "local": os.path.join(HOT_VPS_DIR, "safetrade_trades_hot.csv"),
-        "name": "SafeTrade Trades Hot"
+        "name": "SafeTrade Trades Hot (PRL)"
     },
     {
         "remote": "/opt/crypto_bot/data/realtime/prlusdt_bigone/depth_bigone.csv",
         "local": os.path.join(HOT_VPS_DIR, "bigone_depth_hot.csv"),
-        "name": "BigONE Depth Hot"
+        "name": "BigONE Depth Hot (PRL)"
     },
     {
         "remote": "/opt/crypto_bot/data/realtime/prlusdt_bigone/trades_bigone.csv",
         "local": os.path.join(HOT_VPS_DIR, "bigone_trades_hot.csv"),
-        "name": "BigONE Trades Hot"
+        "name": "BigONE Trades Hot (PRL)"
+    },
+    # QUANTUS / QTC
+    {
+        "remote": "/opt/crypto_bot/data/realtime/quantususdt/depth.csv",
+        "local": os.path.join(HOT_VPS_DIR, "safetrade_quantus_depth_hot.csv"),
+        "name": "SafeTrade Depth Hot (Quantus)"
+    },
+    {
+        "remote": "/opt/crypto_bot/data/realtime/quantususdt/trades.csv",
+        "local": os.path.join(HOT_VPS_DIR, "safetrade_quantus_trades_hot.csv"),
+        "name": "SafeTrade Trades Hot (Quantus)"
+    },
+    {
+        "remote": "/opt/crypto_bot/data/realtime/quantus_bigone/depth_bigone.csv",
+        "local": os.path.join(HOT_VPS_DIR, "bigone_quantus_depth_hot.csv"),
+        "name": "BigONE Depth Hot (Quantus)"
+    },
+    {
+        "remote": "/opt/crypto_bot/data/realtime/quantus_bigone/trades_bigone.csv",
+        "local": os.path.join(HOT_VPS_DIR, "bigone_quantus_trades_hot.csv"),
+        "name": "BigONE Trades Hot (Quantus)"
+    },
+    {
+        "remote": "/opt/crypto_bot/data/realtime/quantus_rhea/price_rhea.csv",
+        "local": os.path.join(HOT_VPS_DIR, "rhea_quantus_price_hot.csv"),
+        "name": "Rhea Finance Price Hot (Quantus)"
+    },
+    # TSC/USDT (SafeTrade)
+    {
+        "remote": "/opt/crypto_bot/data/realtime/tscusdt/depth.csv",
+        "local": os.path.join(HOT_VPS_DIR, "safetrade_tsc_depth_hot.csv"),
+        "name": "SafeTrade Depth Hot (TSC)"
+    },
+    {
+        "remote": "/opt/crypto_bot/data/realtime/tscusdt/trades.csv",
+        "local": os.path.join(HOT_VPS_DIR, "safetrade_tsc_trades_hot.csv"),
+        "name": "SafeTrade Trades Hot (TSC)"
+    },
+    # Binance Macro Leading Indicators (BTC + NEAR)
+    {
+        "remote": "/opt/crypto_bot/data/realtime/macro_binance/binance_macro.csv",
+        "local": os.path.join(HOT_VPS_DIR, "binance_macro_hot.csv"),
+        "name": "Binance Macro Hot (BTC + NEAR)"
+    },
+    # On-chain Data
+    {
+        "remote": "/opt/crypto_bot/data/realtime/onchain/prl_onchain.csv",
+        "local": os.path.join(HOT_VPS_DIR, "prl_onchain_hot.csv"),
+        "name": "Pearl On-chain Hot (PRL)"
+    },
+    {
+        "remote": "/opt/crypto_bot/data/realtime/onchain/quantus_onchain.csv",
+        "local": os.path.join(HOT_VPS_DIR, "quantus_onchain_hot.csv"),
+        "name": "Quantus On-chain Hot (QTC)"
+    },
+    # Metadata & Rules
+    {
+        "remote": "/opt/crypto_bot/data/metadata/exchange_rules.json",
+        "local": os.path.join(METADATA_DIR, "exchange_rules.json"),
+        "name": "Exchange Rules JSON"
+    },
+    {
+        "remote": "/opt/crypto_bot/data/metadata/exchange_rules_history.csv",
+        "local": os.path.join(METADATA_DIR, "exchange_rules_history.csv"),
+        "name": "Exchange Rules History CSV"
     },
 ]
 
 DATASET_CONFIGS = [
+    # PRL Datasets
     {
         "key": "safetrade_depth",
+        "coin": "prl",
         "cache_pattern": "safetrade_depth_*.csv.gz",
         "hot_file": os.path.join(HOT_VPS_DIR, "safetrade_depth_hot.csv"),
         "parquet_file": os.path.join(PROCESSED_DIR, "safetrade_depth.parquet"),
+        "hierarchical_file": os.path.join(PROCESSED_DIR, "prl", "safetrade_depth.parquet"),
         "dedup_key": "timestamp",
     },
     {
         "key": "safetrade_trades",
+        "coin": "prl",
         "cache_pattern": "safetrade_trades_*.csv.gz",
         "hot_file": os.path.join(HOT_VPS_DIR, "safetrade_trades_hot.csv"),
         "parquet_file": os.path.join(PROCESSED_DIR, "safetrade_trades.parquet"),
+        "hierarchical_file": os.path.join(PROCESSED_DIR, "prl", "safetrade_trades.parquet"),
         "dedup_key": "id",
     },
     {
         "key": "bigone_depth",
+        "coin": "prl",
         "cache_pattern": "bigone_depth_*.csv.gz",
         "hot_file": os.path.join(HOT_VPS_DIR, "bigone_depth_hot.csv"),
         "parquet_file": os.path.join(PROCESSED_DIR, "bigone_depth.parquet"),
+        "hierarchical_file": os.path.join(PROCESSED_DIR, "prl", "bigone_depth.parquet"),
         "dedup_key": "timestamp",
     },
     {
         "key": "bigone_trades",
+        "coin": "prl",
         "cache_pattern": "bigone_trades_*.csv.gz",
         "hot_file": os.path.join(HOT_VPS_DIR, "bigone_trades_hot.csv"),
         "parquet_file": os.path.join(PROCESSED_DIR, "bigone_trades.parquet"),
+        "hierarchical_file": os.path.join(PROCESSED_DIR, "prl", "bigone_trades.parquet"),
         "dedup_key": "id",
+    },
+    {
+        "key": "prl_onchain",
+        "coin": "prl",
+        "cache_pattern": "prl_onchain_*.csv.gz",
+        "hot_file": os.path.join(HOT_VPS_DIR, "prl_onchain_hot.csv"),
+        "parquet_file": os.path.join(PROCESSED_DIR, "prl_onchain.parquet"),
+        "hierarchical_file": os.path.join(PROCESSED_DIR, "prl", "onchain.parquet"),
+        "dedup_key": "timestamp",
+    },
+    # Quantus Datasets
+    {
+        "key": "safetrade_quantus_depth",
+        "coin": "quantus",
+        "cache_pattern": "safetrade_quantus_depth_*.csv.gz",
+        "hot_file": os.path.join(HOT_VPS_DIR, "safetrade_quantus_depth_hot.csv"),
+        "parquet_file": os.path.join(PROCESSED_DIR, "safetrade_quantus_depth.parquet"),
+        "hierarchical_file": os.path.join(PROCESSED_DIR, "quantus", "safetrade_depth.parquet"),
+        "dedup_key": "timestamp",
+    },
+    {
+        "key": "safetrade_quantus_trades",
+        "coin": "quantus",
+        "cache_pattern": "safetrade_quantus_trades_*.csv.gz",
+        "hot_file": os.path.join(HOT_VPS_DIR, "safetrade_quantus_trades_hot.csv"),
+        "parquet_file": os.path.join(PROCESSED_DIR, "safetrade_quantus_trades.parquet"),
+        "hierarchical_file": os.path.join(PROCESSED_DIR, "quantus", "safetrade_trades.parquet"),
+        "dedup_key": "id",
+    },
+    {
+        "key": "bigone_quantus_depth",
+        "coin": "quantus",
+        "cache_pattern": "bigone_quantus_depth_*.csv.gz",
+        "hot_file": os.path.join(HOT_VPS_DIR, "bigone_quantus_depth_hot.csv"),
+        "parquet_file": os.path.join(PROCESSED_DIR, "bigone_quantus_depth.parquet"),
+        "hierarchical_file": os.path.join(PROCESSED_DIR, "quantus", "bigone_depth.parquet"),
+        "dedup_key": "timestamp",
+    },
+    {
+        "key": "bigone_quantus_trades",
+        "coin": "quantus",
+        "cache_pattern": "bigone_quantus_trades_*.csv.gz",
+        "hot_file": os.path.join(HOT_VPS_DIR, "bigone_quantus_trades_hot.csv"),
+        "parquet_file": os.path.join(PROCESSED_DIR, "bigone_quantus_trades.parquet"),
+        "hierarchical_file": os.path.join(PROCESSED_DIR, "quantus", "bigone_trades.parquet"),
+        "dedup_key": "id",
+    },
+    {
+        "key": "rhea_quantus_price",
+        "coin": "quantus",
+        "cache_pattern": "rhea_quantus_price_*.csv.gz",
+        "hot_file": os.path.join(HOT_VPS_DIR, "rhea_quantus_price_hot.csv"),
+        "parquet_file": os.path.join(PROCESSED_DIR, "rhea_quantus_price.parquet"),
+        "hierarchical_file": os.path.join(PROCESSED_DIR, "quantus", "rhea_price.parquet"),
+        "dedup_key": "timestamp",
+    },
+    {
+        "key": "quantus_onchain",
+        "coin": "quantus",
+        "cache_pattern": "quantus_onchain_*.csv.gz",
+        "hot_file": os.path.join(HOT_VPS_DIR, "quantus_onchain_hot.csv"),
+        "parquet_file": os.path.join(PROCESSED_DIR, "quantus_onchain.parquet"),
+        "hierarchical_file": os.path.join(PROCESSED_DIR, "quantus", "onchain.parquet"),
+        "dedup_key": "timestamp",
+    },
+    # TSC Datasets
+    {
+        "key": "safetrade_tsc_depth",
+        "coin": "tsc",
+        "cache_pattern": "safetrade_tsc_depth_*.csv.gz",
+        "hot_file": os.path.join(HOT_VPS_DIR, "safetrade_tsc_depth_hot.csv"),
+        "parquet_file": os.path.join(PROCESSED_DIR, "safetrade_tsc_depth.parquet"),
+        "hierarchical_file": os.path.join(PROCESSED_DIR, "tsc", "safetrade_depth.parquet"),
+        "dedup_key": "timestamp",
+    },
+    {
+        "key": "safetrade_tsc_trades",
+        "coin": "tsc",
+        "cache_pattern": "safetrade_tsc_trades_*.csv.gz",
+        "hot_file": os.path.join(HOT_VPS_DIR, "safetrade_tsc_trades_hot.csv"),
+        "parquet_file": os.path.join(PROCESSED_DIR, "safetrade_tsc_trades.parquet"),
+        "hierarchical_file": os.path.join(PROCESSED_DIR, "tsc", "safetrade_trades.parquet"),
+        "dedup_key": "id",
+    },
+    # Binance Macro Dataset
+    {
+        "key": "binance_macro",
+        "coin": "macro",
+        "cache_pattern": "binance_macro_*.csv.gz",
+        "hot_file": os.path.join(HOT_VPS_DIR, "binance_macro_hot.csv"),
+        "parquet_file": os.path.join(PROCESSED_DIR, "binance_macro.parquet"),
+        "hierarchical_file": os.path.join(PROCESSED_DIR, "macro", "binance_bbo.parquet"),
+        "dedup_key": "timestamp",
     },
 ]
 
@@ -106,6 +275,9 @@ def ensure_directories():
     os.makedirs(CACHE_GDRIVE_DIR, exist_ok=True)
     os.makedirs(HOT_VPS_DIR, exist_ok=True)
     os.makedirs(PROCESSED_DIR, exist_ok=True)
+    os.makedirs(METADATA_DIR, exist_ok=True)
+    for c in ["prl", "quantus", "tsc", "macro"]:
+        os.makedirs(os.path.join(PROCESSED_DIR, c), exist_ok=True)
 
 # ==============================================================================
 # 1. СИНХРОНИЗАЦИЯ С GOOGLE DRIVE
@@ -285,6 +457,12 @@ def build_dataset_for_config(cfg, include_vps=True):
     full_df.to_parquet(parquet_path, index=False)
     file_size_mb = os.path.getsize(parquet_path) / (1024 * 1024)
 
+    # Сохраняем в структурированную иерархическую папку (data/processed/{coin}/...)
+    if "hierarchical_file" in cfg:
+        h_path = cfg["hierarchical_file"]
+        os.makedirs(os.path.dirname(h_path), exist_ok=True)
+        full_df.to_parquet(h_path, index=False)
+
     logger.info(f"📊 {key}: {len(full_df):,} записей сохранены в {os.path.basename(parquet_path)} ({file_size_mb:.2f} MB)")
     if 'timestamp' in full_df.columns and not full_df.empty:
         t_min = full_df['timestamp'].min()
@@ -325,15 +503,40 @@ def sync_and_process_all(include_vps=True):
 # ПУБЛИЧНЫЙ API ДЛЯ JUPYTER НОУТБУКА
 # ==============================================================================
 
+def load_dataset(key):
+    """
+    Быстрая загрузка любого датасета по ключу из data/processed/{key}.parquet.
+    Ключи:
+      - 'safetrade_depth', 'safetrade_trades' (PRL)
+      - 'bigone_depth', 'bigone_trades' (PRL)
+      - 'safetrade_quantus_depth', 'safetrade_quantus_trades' (Quantus)
+      - 'bigone_quantus_depth', 'bigone_quantus_trades' (Quantus / QTC)
+      - 'rhea_quantus_price' (Quantus on Rhea Finance / Near Intents)
+      - 'safetrade_tsc_depth', 'safetrade_tsc_trades' (TSC)
+      - 'binance_macro' (BTC/USDT + NEAR/USDT 1s snapshots)
+    """
+    path = os.path.join(PROCESSED_DIR, f"{key}.parquet")
+    if os.path.exists(path):
+        return pd.read_parquet(path)
+    logger.warning(f"Датасет {key} не найден по пути {path}")
+    return pd.DataFrame()
+
+def get_all_market_data():
+    """Возвращает словарь всех доступных DataFrames из Parquet кэша."""
+    out = {}
+    for cfg in DATASET_CONFIGS:
+        out[cfg["key"]] = load_dataset(cfg["key"])
+    return out
+
 def get_market_data(force_sync=True, include_vps=True):
     """
-    Основная функция для ноутбука.
+    Основная функция для ноутбука (PRL).
     Возвращает 4 чистых DataFrame:
     (depth_safetrade, trades_safetrade, depth_bigone, trades_bigone)
     
     Если force_sync=False и parquet файлы уже существуют, быстро загружает их из кэша.
     """
-    parquet_files = [cfg["parquet_file"] for cfg in DATASET_CONFIGS]
+    parquet_files = [cfg["parquet_file"] for cfg in DATASET_CONFIGS[:4]]
     all_exist = all(os.path.exists(p) for p in parquet_files)
 
     if not force_sync and all_exist:

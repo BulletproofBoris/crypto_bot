@@ -1,4 +1,5 @@
-venv/
+.env
+.venv/
 
 # Secrets
 _tools/*.json
@@ -8,3 +9,4 @@ data/
 *remote.csv
 *.log
 __pycache__/
+.vscode/

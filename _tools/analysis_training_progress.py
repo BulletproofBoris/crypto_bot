@@ -1,7 +1,10 @@
 import csv
 import sys
+import os
 
-path = r"C:/Users/Restorator/Documents/trader_test/trader_test/data/processed/2000_2026_1d/rl_env/training_progress.csv"
+# Путь относительно корня проекта
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+path = os.path.join(PROJECT_ROOT, "data", "processed", "2000_2026_1d", "rl_env", "training_progress.csv")
 
 rows = []
 with open(path, newline='') as csvfile:

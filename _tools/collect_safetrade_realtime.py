@@ -14,24 +14,42 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MARKET = "prlusdt"
-REST_URL = f"https://safe.trade/api/v2/trade/public/markets/{MARKET}/depth"
-WS_URL = "wss://safe.trade/api/v2/websocket/public"
-DATA_DIR = f"/opt/crypto_bot/data/realtime/{MARKET}"
+MARKETS = [
+    {
+        "id": "prlusdt",
+        "data_dir": "/opt/crypto_bot/data/realtime/prlusdt"
+    },
+    {
+        "id": "quantususdt",
+        "data_dir": "/opt/crypto_bot/data/realtime/quantususdt"
+    },
+    {
+        "id": "tscusdt",
+        "data_dir": "/opt/crypto_bot/data/realtime/tscusdt"
+    }
+]
 
+WS_URL = "wss://safe.trade/api/v2/websocket/public"
 PROXY = "http://edtilhmt:iblj7uuixsmy@31.59.20.176:6754"
 
-os.makedirs(DATA_DIR, exist_ok=True)
+# Создаем директории
+for m in MARKETS:
+    os.makedirs(m["data_dir"], exist_ok=True)
 
-orderbook = {"bids": {}, "asks": {}}
+orderbooks = {m["id"]: {"bids": {}, "asks": {}} for m in MARKETS}
 
-def write_depth(timestamp):
-    sorted_bids = sorted(orderbook["bids"].items(), key=lambda x: float(x[0]), reverse=True)[:50]
-    sorted_asks = sorted(orderbook["asks"].items(), key=lambda x: float(x[0]))[:50]
-    
-    file_path = os.path.join(DATA_DIR, "depth.csv")
+def write_depth(market_id, timestamp):
+    m_info = next((m for m in MARKETS if m["id"] == market_id), None)
+    if not m_info:
+        return
+
+    ob = orderbooks[market_id]
+    sorted_bids = sorted(ob["bids"].items(), key=lambda x: float(x[0]), reverse=True)[:50]
+    sorted_asks = sorted(ob["asks"].items(), key=lambda x: float(x[0]))[:50]
+
+    file_path = os.path.join(m_info["data_dir"], "depth.csv")
     file_exists = os.path.exists(file_path)
-    
+
     with open(file_path, "a", newline="") as f:
         writer = csv.writer(f)
         if not file_exists:
@@ -39,14 +57,14 @@ def write_depth(timestamp):
             for i in range(1, 51): headers.extend([f"bid_{i}_price", f"bid_{i}_qty"])
             for i in range(1, 51): headers.extend([f"ask_{i}_price", f"ask_{i}_qty"])
             writer.writerow(headers)
-            
+
         row = [timestamp]
         for i in range(50):
             if i < len(sorted_bids):
                 row.extend([sorted_bids[i][0], sorted_bids[i][1]])
             else:
                 row.extend(["", ""])
-                
+
         for i in range(50):
             if i < len(sorted_asks):
                 row.extend([sorted_asks[i][0], sorted_asks[i][1]])
@@ -54,80 +72,95 @@ def write_depth(timestamp):
                 row.extend(["", ""])
         writer.writerow(row)
 
-async def fetch_snapshot(session):
-    logger.info("📥 Скачиваем начальный снимок стакана...")
+async def fetch_snapshot(session, market_id):
+    logger.info(f"📥 [{market_id}] Скачиваем начальный снимок стакана...")
+    rest_url = f"https://safe.trade/api/v2/trade/public/markets/{market_id}/depth"
     try:
         proxies = {"http": PROXY, "https": PROXY}
-        r = await session.get(REST_URL, proxies=proxies, timeout=15)
+        r = await session.get(rest_url, proxies=proxies, timeout=15)
         if r.status_code != 200:
-            logger.error(f"Snapshot HTTP {r.status_code}: {r.text[:100]}")
+            logger.error(f"[{market_id}] Snapshot HTTP {r.status_code}: {r.text[:100]}")
             return False
-            
+
         data = r.json()
-        orderbook["bids"] = {price: qty for price, qty in data.get("bids", [])}
-        orderbook["asks"] = {price: qty for price, qty in data.get("asks", [])}
-        logger.info(f"✅ Снимок загружен: {len(orderbook['bids'])} bids, {len(orderbook['asks'])} asks.")
+        orderbooks[market_id]["bids"] = {price: qty for price, qty in data.get("bids", [])}
+        orderbooks[market_id]["asks"] = {price: qty for price, qty in data.get("asks", [])}
+        logger.info(f"✅ [{market_id}] Снимок загружен: {len(orderbooks[market_id]['bids'])} bids, {len(orderbooks[market_id]['asks'])} asks.")
         return True
     except Exception as e:
-        logger.error(f"⚠️ Ошибка при скачивании снимка: {e}")
+        logger.error(f"⚠️ [{market_id}] Ошибка при скачивании снимка: {e}")
         return False
 
-def update_orderbook(updates):
+def update_orderbook(market_id, updates):
+    ob = orderbooks[market_id]
     for price, qty in updates.get("bids", []):
         if float(qty) == 0:
-            orderbook["bids"].pop(price, None)
+            ob["bids"].pop(price, None)
         else:
-            orderbook["bids"][price] = qty
+            ob["bids"][price] = qty
 
     for price, qty in updates.get("asks", []):
         if float(qty) == 0:
-            orderbook["asks"].pop(price, None)
+            ob["asks"].pop(price, None)
         else:
-            orderbook["asks"][price] = qty
+            ob["asks"][price] = qty
 
 async def main():
+    market_ids = [m["id"] for m in MARKETS]
     while True:
         try:
             async with AsyncSession(impersonate="chrome110") as session:
-                success = await fetch_snapshot(session)
-                if not success:
-                    logger.warning("⚠️ Не удалось получить снимок стакана! Собираем с нуля.")
-                
-                logger.info(f"🚀 Запуск WebSocket сбора данных для {MARKET.upper()} с {WS_URL} (через прокси)")
-                
-                # curl_cffi doesn't directly take `proxies` dict in ws_connect like it does in get(), wait, let's verify. 
-                # According to curl_cffi docs, ws_connect takes `proxies={"http": ...}` just like get, or we can just pass `proxy`.
+                for mid in market_ids:
+                    success = await fetch_snapshot(session, mid)
+                    if not success:
+                        logger.warning(f"⚠️ [{mid}] Не удалось получить снимок стакана! Собираем с нуля.")
+
+                logger.info(f"🚀 Запуск WebSocket сбора данных для {market_ids} с {WS_URL} (через прокси)")
+
                 ws_proxies = {"http": PROXY, "https": PROXY}
-                
+                streams = []
+                for mid in market_ids:
+                    streams.extend([f"{mid}.depth", f"{mid}.trades"])
+
                 async with session.ws_connect(WS_URL, proxies=ws_proxies) as ws:
                     subscribe_msg = {
                         "event": "subscribe",
-                        "streams": [f"{MARKET}.depth", f"{MARKET}.trades"]
+                        "streams": streams
                     }
                     await ws.send(json.dumps(subscribe_msg).encode())
-                    
+
                     while True:
                         msg, *_ = await ws.recv()
                         data = json.loads(msg)
-                        
+
                         if data.get("event") == "ping":
-                            # No standard ping in curl_cffi WS yet, but server might send string ping
-                            pass 
-                            
+                            pass
+
                         for k, stream_data in data.items():
-                            if k == f"{MARKET}.depth":
-                                update_orderbook(stream_data)
-                                write_depth(int(time.time() * 1000))
-                            elif k == f"{MARKET}.trades":
-                                file_path = os.path.join(DATA_DIR, "trades.csv")
-                                file_exists = os.path.exists(file_path)
-                                with open(file_path, "a", newline="") as f:
-                                    writer = csv.writer(f)
-                                    if not file_exists:
-                                        writer.writerow(["id", "price", "amount", "type", "timestamp"])
-                                    for trade in stream_data:
-                                        writer.writerow([trade.get("id", ""), trade.get("price", ""), trade.get("amount", ""), trade.get("type", trade.get("taker_type", "")), trade.get("date", trade.get("created_at", ""))])
-                                        
+                            if k.endswith(".depth"):
+                                mid = k.split(".")[0]
+                                if mid in orderbooks:
+                                    update_orderbook(mid, stream_data)
+                                    write_depth(mid, int(time.time() * 1000))
+                            elif k.endswith(".trades"):
+                                mid = k.split(".")[0]
+                                m_info = next((m for m in MARKETS if m["id"] == mid), None)
+                                if m_info:
+                                    file_path = os.path.join(m_info["data_dir"], "trades.csv")
+                                    file_exists = os.path.exists(file_path)
+                                    with open(file_path, "a", newline="") as f:
+                                        writer = csv.writer(f)
+                                        if not file_exists:
+                                            writer.writerow(["id", "price", "amount", "type", "timestamp"])
+                                        for trade in stream_data:
+                                            writer.writerow([
+                                                trade.get("id", ""),
+                                                trade.get("price", ""),
+                                                trade.get("amount", ""),
+                                                trade.get("type", trade.get("taker_type", "")),
+                                                trade.get("date", trade.get("created_at", ""))
+                                            ])
+
         except Exception as e:
             logger.error(f"Неожиданная ошибка: {e}. Переподключение через 5 секунд...")
             await asyncio.sleep(5)

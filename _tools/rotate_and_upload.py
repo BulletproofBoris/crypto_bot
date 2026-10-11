@@ -48,12 +48,56 @@ FILES_TO_ROTATE = [
         "path": "/opt/crypto_bot/data/realtime/prlusdt/trades.csv",
     },
     {
+        "prefix": "safetrade_quantus_depth",
+        "path": "/opt/crypto_bot/data/realtime/quantususdt/depth.csv",
+    },
+    {
+        "prefix": "safetrade_quantus_trades",
+        "path": "/opt/crypto_bot/data/realtime/quantususdt/trades.csv",
+    },
+    {
         "prefix": "bigone_depth",
         "path": "/opt/crypto_bot/data/realtime/prlusdt_bigone/depth_bigone.csv",
     },
     {
         "prefix": "bigone_trades",
         "path": "/opt/crypto_bot/data/realtime/prlusdt_bigone/trades_bigone.csv",
+    },
+    {
+        "prefix": "bigone_quantus_depth",
+        "path": "/opt/crypto_bot/data/realtime/quantus_bigone/depth_bigone.csv",
+    },
+    {
+        "prefix": "bigone_quantus_trades",
+        "path": "/opt/crypto_bot/data/realtime/quantus_bigone/trades_bigone.csv",
+    },
+    {
+        "prefix": "rhea_quantus_price",
+        "path": "/opt/crypto_bot/data/realtime/quantus_rhea/price_rhea.csv",
+    },
+    {
+        "prefix": "safetrade_tsc_depth",
+        "path": "/opt/crypto_bot/data/realtime/tscusdt/depth.csv",
+    },
+    {
+        "prefix": "safetrade_tsc_trades",
+        "path": "/opt/crypto_bot/data/realtime/tscusdt/trades.csv",
+    },
+    {
+        "prefix": "binance_macro",
+        "path": "/opt/crypto_bot/data/realtime/macro_binance/binance_macro.csv",
+    },
+    {
+        "prefix": "prl_onchain",
+        "path": "/opt/crypto_bot/data/realtime/onchain/prl_onchain.csv",
+    },
+    {
+        "prefix": "quantus_onchain",
+        "path": "/opt/crypto_bot/data/realtime/onchain/quantus_onchain.csv",
+    },
+    {
+        "prefix": "exchange_rules_history",
+        "path": "/opt/crypto_bot/data/metadata/exchange_rules_history.csv",
     },
 ]
 
@@ -199,8 +243,12 @@ def process_single_file(service, folder_id, file_info, date_str, timestamp_suffi
                 f_dst.write(line)
                 lines_preserved += 1
 
-        # Атомарная замена файла
-        os.replace(tmp_hot_path, file_path)
+        # In-place перезапись файла (сохраняет inode и открытые файловые дескрипторы)
+        with open(tmp_hot_path, "r", encoding="utf-8") as f_src, \
+             open(file_path, "w", encoding="utf-8") as f_dst:
+            shutil.copyfileobj(f_src, f_dst)
+        if os.path.exists(tmp_hot_path):
+            os.remove(tmp_hot_path)
         logger.info(f"✂️ Файл {file_path} успешно обрезан: удалено {skipped_count} заархивированных строк, сохранено {lines_preserved} новых строк.")
     except Exception as e:
         logger.error(f"❌ Ошибка при обрезке файла {file_path}: {e}")
@@ -245,6 +293,16 @@ def rotate_all(force=False, check_disk=False):
 
     after_free_gb = get_free_disk_gb("/")
     logger.info(f"🎉 Ротация завершена. Успешно обработано: {success_count}/{len(FILES_TO_ROTATE)} файлов. Свободно на диске: {after_free_gb:.2f} GB (освобождено {after_free_gb - free_gb:+.2f} GB).")
+
+    # Плановый перезапуск сборщиков после ротации
+    if success_count > 0:
+        logger.info("🔄 Перезапуск служб сборщиков после ротации для обновления дескрипторов и снимков стакана...")
+        try:
+            import subprocess
+            subprocess.run(["systemctl", "restart", "safetrade-collector", "bigone-collector", "rhea-collector", "binance-collector", "onchain-collector"], check=True, timeout=30)
+            logger.info("✅ Службы сборщиков успешно перезапущены.")
+        except Exception as e:
+            logger.error(f"⚠️ Ошибка при перезапуске служб сборщиков: {e}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Суточная и аварийная ротация данных криптовалютного бота.")
