@@ -338,6 +338,16 @@ def sync_gdrive():
                 status, done = downloader.next_chunk()
         downloaded_count += 1
 
+    # Проверяем и подтягиваем legacy zip-бэкапы (PRL за 10-11 октября)
+    try:
+        try:
+            from _tools.extract_legacy_backups import process_legacy_backups
+        except ImportError:
+            from extract_legacy_backups import process_legacy_backups
+        process_legacy_backups()
+    except Exception as e:
+        logger.warning(f"Ошибка при обработке legacy бэкапов: {e}")
+
     logger.info(f"✅ Синхронизация Google Drive завершена (скачано новых архивов: {downloaded_count}).")
 
 # ==============================================================================

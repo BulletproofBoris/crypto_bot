@@ -65,6 +65,11 @@ def visualize_coin(coin_name):
         print(f"Арбитраж (Купить ST -> Продать BO): средний = {arb1.mean():+.5f} USDT | Окон с прибылью > 0: {pos1:,} сек ({pos1/len(df)*100:.1f}%)")
         print(f"Арбитраж (Купить BO -> Продать ST): средний = {arb2.mean():+.5f} USDT | Окон с прибылью > 0: {pos2:,} сек ({pos2/len(df)*100:.1f}%)")
 
+    if 'q_prl_accum_gain_100usd' in df.columns:
+        gain = df['q_prl_accum_gain_100usd']
+        pos_gain = (gain > 0).sum()
+        print(f"Прирост монет PRL на $100 (с учетом стакана и комиссий): средний = {gain.mean():+.2f} PRL | Окон с приростом > 0: {pos_gain:,} сек ({pos_gain/len(df)*100:.1f}%) | Макс за окно: {gain.max():+.2f} PRL")
+
     if 'arb_rhea_diff_st' in df.columns:
         diff_rhea = df['arb_rhea_diff_st']
         print(f"Разница Rhea DEX vs SafeTrade: средняя = {diff_rhea.mean():+.4f} USDT (max = {diff_rhea.max():+.4f})")
@@ -88,11 +93,12 @@ def visualize_coin(coin_name):
 
     # 2. Арбитражный спред
     ax2 = axes[1]
-    if 'arb_st_buy_bo_sell' in df.columns:
-        ax2.plot(df.index, df['arb_st_buy_bo_sell'], label='Купить ST -> Продать BO', color='green', alpha=0.7, lw=1)
-        ax2.plot(df.index, df['arb_bo_buy_st_sell'], label='Купить BO -> Продать ST', color='crimson', alpha=0.7, lw=1)
+    if 'arb_bo_buy_st_sell' in df.columns:
+        ax2.plot(df.index, df['arb_bo_buy_st_sell'], label='BBO Спред (Купить BO -> Продать ST)', color='crimson', alpha=0.6, lw=1)
+        if 'arb_eff_100_bo_buy_st_sell' in df.columns:
+            ax2.plot(df.index, df['arb_eff_100_bo_buy_st_sell'], label='Эффективный спред на $100 (с учетом стакана)', color='darkgreen', alpha=0.8, lw=1.2)
         ax2.axhline(0, color='black', linestyle='--', alpha=0.5)
-        ax2.set_title(f"2. Межбиржевой арбитражный спред (Arbitrage Spread)")
+        ax2.set_title(f"2. Межбиржевой арбитражный спред и глубина (SafeTrade vs BigONE)")
         ax2.set_ylabel("Спред (USDT)")
         ax2.legend(loc='upper left')
     elif 'ST_spread' in df.columns:
@@ -102,20 +108,28 @@ def visualize_coin(coin_name):
         ax2.legend(loc='upper left')
     ax2.grid(True, alpha=0.3)
 
-    # 3. Объемы сделок или ончейн
+    # 3. CVD и поток сделок
     ax3 = axes[2]
-    vol_cols = [c for c in df.columns if 'trade_vol' in c]
-    if vol_cols:
-        for vc in vol_cols:
-            ax3.plot(df.index, df[vc], label=vc, alpha=0.6, lw=1)
-        ax3.set_title("3. Секундные объемы сделок (Trade Volume 1s)")
-        ax3.set_ylabel("Объем")
+    if 'BO_cvd_total' in df.columns and 'ST_cvd_total' in df.columns:
+        ax3.plot(df.index, df['BO_cvd_total'], label='BigONE CVD (Кумулятивная дельта)', color='royalblue', lw=1.2)
+        ax3.plot(df.index, df['ST_cvd_total'], label='SafeTrade CVD (Кумулятивная дельта)', color='darkorange', lw=1.2)
+        ax3.axhline(0, color='black', linestyle='--', alpha=0.3)
+        ax3.set_title("3. Кумулятивная дельта объемов торгов (CVD: Buyer vs Seller Flow)")
+        ax3.set_ylabel("CVD (монет)")
         ax3.legend(loc='upper left')
-    elif 'onchain_mempool_size' in df.columns:
-        ax3.plot(df.index, df['onchain_mempool_size'], label='Pearl Mempool Size', color='brown', lw=1)
-        ax3.set_title("3. Размер ончейн-мемпула (Mempool Transactions)")
-        ax3.set_ylabel("Транзакций")
-        ax3.legend(loc='upper left')
+    else:
+        vol_cols = [c for c in df.columns if 'trade_vol' in c]
+        if vol_cols:
+            for vc in vol_cols:
+                ax3.plot(df.index, df[vc], label=vc, alpha=0.6, lw=1)
+            ax3.set_title("3. Секундные объемы сделок (Trade Volume 1s)")
+            ax3.set_ylabel("Объем")
+            ax3.legend(loc='upper left')
+        elif 'onchain_mempool_size' in df.columns:
+            ax3.plot(df.index, df['onchain_mempool_size'], label='Pearl Mempool Size', color='brown', lw=1)
+            ax3.set_title("3. Размер ончейн-мемпула (Mempool Transactions)")
+            ax3.set_ylabel("Транзакций")
+            ax3.legend(loc='upper left')
     ax3.grid(True, alpha=0.3)
 
     # 4. Макро-поводыри

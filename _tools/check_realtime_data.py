@@ -89,7 +89,7 @@ def check_coin(coin_name):
     ts_dict = {}
     for key in sorted(cdata.keys()):
         df = cdata[key]
-        is_tr = 'trade' in key
+        is_tr = 'trades' in key
         max_gap = 60.0 if 'onchain' in key else 5.0
         label = f"{coin_name.upper()} {key}"
         ts = analyze_dataset(df, label, is_trades=is_tr, max_gap_sec=max_gap)

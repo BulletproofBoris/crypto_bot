@@ -45,13 +45,9 @@ else:
     NUM_GPUS = 1  
     print("🎮 РЕЖИМ GPU: Использование видеокарты разрешено.")
 
-<<<<<<< HEAD
-=======
 os.environ["RAY_DEDUP_LOGS"] = "0"
 os.environ["TUNE_DISABLE_AUTO_CALLBACK_LOGGERS"] = "0"
 warnings.filterwarnings("ignore")
-
->>>>>>> 05fafbd63bd96d6993470e37f67dbd76d7f4b212
 import ray
 from ray import tune
 from ray.tune.schedulers import PopulationBasedTraining
@@ -125,10 +121,7 @@ class TradingStatsCallback(tune.Callback):
                 writer = csv.writer(f)
                 writer.writerows(csv_data_to_append)
 
-<<<<<<< HEAD
 # --- КАЛБЭК: Отслеживание метрик и Curriculum Learning ---
-=======
->>>>>>> 05fafbd63bd96d6993470e37f67dbd76d7f4b212
 class CustomMetricsCallback(DefaultCallbacks):
     def __init__(self):
         super().__init__()
@@ -169,17 +162,7 @@ class CustomMetricsCallback(DefaultCallbacks):
     def on_train_result(self, *, algorithm, result, **kwargs):
         iteration = result["training_iteration"]
         
-<<<<<<< HEAD
-        # Определяем фазу (Curriculum Learning)
-        phase = 1
-        if iteration > TOTAL_ITERATIONS / 5:
-            phase = 2
-        if iteration > TOTAL_ITERATIONS / 2:
-            phase = 3
-            
-        # Безопасная рассылка новой фазы
-=======
-        # 🌟 НОВОЕ: Логика принудительной фазы
+        # Определение фазы (Curriculum Learning) с поддержкой start_phase
         if args.start_phase > 0:
             phase = args.start_phase
         else:
@@ -188,8 +171,6 @@ class CustomMetricsCallback(DefaultCallbacks):
                 phase = 2
             if iteration >= args.iterations * args.phase3_ratio:
                 phase = 3
-            
->>>>>>> 05fafbd63bd96d6993470e37f67dbd76d7f4b212
         env_group = getattr(algorithm, "env_runner_group", getattr(algorithm, "workers", None))
         if callable(env_group):
             env_group = env_group() 

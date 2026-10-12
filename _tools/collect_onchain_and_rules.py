@@ -52,7 +52,20 @@ RULES_HISTORY_CSV = os.path.join(METADATA_DIR, "exchange_rules_history.csv")
 def init_csv_files():
     if not os.path.exists(PRL_ONCHAIN_CSV):
         with open(PRL_ONCHAIN_CSV, "w", newline="") as f:
-            csv.writer(f).writerow(["timestamp", "block_height", "mempool_size", "indexer_lag"])
+            csv.writer(f).writerow(["timestamp", "block_height", "mempool_size", "indexer_lag", "difficulty", "reward_grains", "tx_count", "miner_pool"])
+    else:
+        # Обновляем заголовок, если он был старого формата
+        try:
+            with open(PRL_ONCHAIN_CSV, "r") as f:
+                first_line = f.readline().strip()
+            if first_line and "difficulty" not in first_line:
+                with open(PRL_ONCHAIN_CSV, "r") as f:
+                    lines = f.readlines()
+                new_header = "timestamp,block_height,mempool_size,indexer_lag,difficulty,reward_grains,tx_count,miner_pool\n"
+                with open(PRL_ONCHAIN_CSV, "w") as f:
+                    f.write(new_header + "".join(lines[1:]))
+        except Exception as e:
+            logger.warning(f"Не удалось обновить заголовок {PRL_ONCHAIN_CSV}: {e}")
             
     if not os.path.exists(QUANTUS_ONCHAIN_CSV):
         with open(QUANTUS_ONCHAIN_CSV, "w", newline="") as f:
@@ -192,7 +205,7 @@ def update_exchange_rules():
         logger.error(f"Ошибка обновления правил бирж: {e}")
 
 def collect_prl_onchain():
-    """Опрашивает статус сети Pearl (PRL) через api.prlscan.com."""
+    """Опрашивает статус сети Pearl (PRL) через api.prlscan.com: высота, мемпул, сложность, награда."""
     try:
         r = requests.get("https://api.prlscan.com/v1/status", timeout=8)
         if r.status_code == 200:
@@ -202,10 +215,27 @@ def collect_prl_onchain():
             mempool = d.get("mempool_size")
             lag = d.get("indexer_lag")
 
+            difficulty = None
+            reward_grains = None
+            tx_count = None
+            miner_pool = None
+            try:
+                rb = requests.get("https://api.prlscan.com/v1/blocks?limit=1", timeout=8)
+                if rb.status_code == 200:
+                    bdata = rb.json().get("items", [])
+                    if bdata:
+                        blk = bdata[0]
+                        difficulty = blk.get("difficulty")
+                        reward_grains = blk.get("reward_grains")
+                        tx_count = blk.get("tx_count")
+                        miner_pool = blk.get("miner_label")
+            except Exception as eb:
+                logger.debug(f"Не удалось получить детали последнего блока Pearl: {eb}")
+
             if height is not None:
                 with open(PRL_ONCHAIN_CSV, "a", newline="") as f:
-                    csv.writer(f).writerow([ts, height, mempool, lag])
-                logger.debug(f"Pearl onchain: height={height}, mempool={mempool}")
+                    csv.writer(f).writerow([ts, height, mempool, lag, difficulty, reward_grains, tx_count, miner_pool])
+                logger.debug(f"Pearl onchain: height={height}, diff={difficulty}, mempool={mempool}")
                 return True
     except Exception as e:
         logger.error(f"Ошибка запроса Pearl onchain: {e}")
