@@ -99,7 +99,7 @@ def main():
         print(f"📊 {coin.upper()}: Всего = {total_rows:,} с | Train (80%) = {train_80:,} с | L_max (N={N_TARGET}) = {L_max} с")
 
     print("\n" + "="*80)
-    print("ЗАПУСК ПЕРЕБОРА СЕТКИ (H = 5:Max_L/K:5 для K = 3, 4, 5)")
+    print("ЗАПУСК ПЕРЕБОРА СЕТКИ (H = 5:Max_L/K:5 для K = 3, 4, 5, 6)")
     print("="*80)
 
     for coin in coins:
@@ -110,14 +110,14 @@ def main():
         df = tbl.to_pandas()
         total_rows, train_80, L_max = coin_lmax[coin]
         
-        for K in [3, 4, 5]:
+        for K in [3, 4, 5, 6]:
             H_max = L_max // K
             # Сетка горизонтов: от 5 с шагом 5 до H_max
             H_values = list(range(5, H_max + 1, 5))
             if not H_values and H_max >= 5:
                 H_values = [5]
             elif not H_values and H_max < 5:
-                H_values = [H_max] # если H_max меньше 5
+                H_values = [max(1, H_max)]
                 
             for H in H_values:
                 print(f"\nТест: Монета={coin.upper()}, K={K}, H={H}с (L={K*H}с, L_max={L_max}с)...")
