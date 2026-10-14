@@ -286,21 +286,35 @@ def ensure_directories():
 def get_drive_service():
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
+    import socket
+    socket.setdefaulttimeout(30.0)
     if not os.path.exists(TOKEN_PATH):
         raise FileNotFoundError(f"Файл токена не найден: {TOKEN_PATH}. Запустите auth_gdrive.py.")
     creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-    return build('drive', 'v3', credentials=creds)
+    return build('drive', 'v3', credentials=creds, cache_discovery=False)
 
 def sync_gdrive():
-    """Скачивает все недостающие архивы .csv.gz из Google Drive в локальный кэш."""
+    """Скачивает все недостающие архивы .csv.gz из Google Drive в локальный кэш с повторными попытками."""
     from googleapiclient.http import MediaIoBaseDownload
+    import socket
+    socket.setdefaulttimeout(30.0)
     logger.info("☁️ Проверка обновлений на Google Drive...")
     ensure_directories()
-    service = get_drive_service()
-
-    # Ищем все подпапки (например 2026-10-09) и файлы внутри корневой папки
-    query = f"'{FOLDER_ID}' in parents and trashed = false"
-    items = service.files().list(q=query, fields='files(id, name, mimeType, size)').execute().get('files', [])
+    
+    service = None
+    items = []
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            service = get_drive_service()
+            query = f"'{FOLDER_ID}' in parents and trashed = false"
+            items = service.files().list(q=query, fields='files(id, name, mimeType, size)').execute().get('files', [])
+            break
+        except Exception as e:
+            if attempt == max_retries:
+                raise
+            logger.warning(f"Попытка {attempt}/{max_retries} подключения к Google Drive завершилась с ошибкой: {e}. Повтор через 3с...")
+            time.sleep(3)
 
     files_to_download = []
 
@@ -308,10 +322,13 @@ def sync_gdrive():
         if item['mimeType'] == 'application/vnd.google-apps.folder':
             # Сканируем содержимое папки даты
             sub_query = f"'{item['id']}' in parents and trashed = false"
-            sub_files = service.files().list(q=sub_query, fields='files(id, name, mimeType, size)').execute().get('files', [])
-            for sf in sub_files:
-                if sf['name'].endswith('.csv.gz'):
-                    files_to_download.append(sf)
+            try:
+                sub_files = service.files().list(q=sub_query, fields='files(id, name, mimeType, size)').execute().get('files', [])
+                for sf in sub_files:
+                    if sf['name'].endswith('.csv.gz'):
+                        files_to_download.append(sf)
+            except Exception as e:
+                logger.warning(f"Ошибка при чтении папки {item.get('name')}: {e}")
         elif item['name'].endswith('.csv.gz'):
             files_to_download.append(item)
 
@@ -330,13 +347,23 @@ def sync_gdrive():
                 continue
 
         logger.info(f"📥 Скачивание архива: {fname} ({remote_size / 1024:.1f} KB)...")
-        request = service.files().get_media(fileId=f['id'])
-        with io.FileIO(local_path, 'wb') as fh:
-            downloader = MediaIoBaseDownload(fh, request)
-            done = False
-            while not done:
-                status, done = downloader.next_chunk()
-        downloaded_count += 1
+        success = False
+        for dl_attempt in range(1, 4):
+            try:
+                request = service.files().get_media(fileId=f['id'])
+                with io.FileIO(local_path, 'wb') as fh:
+                    downloader = MediaIoBaseDownload(fh, request)
+                    done = False
+                    while not done:
+                        status, done = downloader.next_chunk()
+                success = True
+                downloaded_count += 1
+                break
+            except Exception as e:
+                logger.warning(f"Ошибка при скачивании {fname} (попытка {dl_attempt}/3): {e}")
+                time.sleep(2)
+        if not success:
+            logger.error(f"Не удалось скачать {fname} после 3 попыток.")
 
     # Проверяем и подтягиваем legacy zip-бэкапы (PRL за 10-11 октября)
     try:
@@ -364,12 +391,23 @@ def print_progress(transferred, total):
         sys.stdout.flush()
 
 def sync_vps_hot():
-    """Скачивает текущие горячие файлы с сервера VPS через SFTP."""
+    """Скачивает текущие горячие файлы с сервера VPS через SFTP с таймаутом."""
     import paramiko
+    import socket
     logger.info(f"⚡ Подключение к VPS ({VPS_HOST}:{VPS_PORT}) для выгрузки горячего хвоста...")
     ensure_directories()
 
-    transport = paramiko.Transport((VPS_HOST, VPS_PORT))
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(10.0)
+    try:
+        sock.connect((VPS_HOST, VPS_PORT))
+    except Exception as e:
+        logger.warning(f"Не удалось подключиться к VPS {VPS_HOST}:{VPS_PORT} (таймаут/сеть): {e}")
+        sock.close()
+        return
+
+    transport = paramiko.Transport(sock)
+    transport.banner_timeout = 10.0
     try:
         transport.connect(username=VPS_USER, password=VPS_PASS)
         sftp = paramiko.SFTPClient.from_transport(transport)
@@ -389,6 +427,8 @@ def sync_vps_hot():
                 logger.warning(f"Не удалось получить {remote_path} с VPS: {e}")
 
         sftp.close()
+    except Exception as e:
+        logger.warning(f"Ошибка во время передачи данных с VPS: {e}")
     finally:
         transport.close()
 

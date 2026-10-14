@@ -112,7 +112,7 @@ def get_drive_service():
     if not os.path.exists(TOKEN_PATH):
         raise FileNotFoundError(f"Файл токена авторизации не найден: {TOKEN_PATH}. Запустите auth_gdrive.py.")
     creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-    return build('drive', 'v3', credentials=creds)
+    return build('drive', 'v3', credentials=creds, cache_discovery=False)
 
 def get_or_create_date_folder(service, parent_id, date_str):
     """Находит или создает подпапку с датой (YYYY-MM-DD) в указанной папке Google Drive."""
