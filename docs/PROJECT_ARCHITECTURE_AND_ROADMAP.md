@@ -76,7 +76,7 @@
 - **[_tools/visualize_data.py](file:///home/restorator/crypto_bot/_tools/visualize_data.py):** Визуализатор динамики стакана, спредов, арбитражных окон и профиля ликвидности.
 
 ### Этап 3: Физическая разметка и квантование таргетов
-- **[_tools/data_labeler.py](file:///home/restorator/crypto_bot/_tools/data_labeler.py):** Производственный конвейер разметки. Реализует двойное квантование, кинематику волны и 7 асимметричных классов на квантильных плато. Поддерживает PRL, QUAN и TSC. Сохраняет выборки в `data/labeled/`.
+- **[_tools/data_labeler.py](file:///home/restorator/crypto_bot/_tools/data_labeler.py):** Производственный конвейер разметки. Реализует двойное квантование, кинематику волны, 7 асимметричных классов на квантильных плато и изоляцию выборок от утечки данных (Purging $H$ секунд и опциональный Embargo gap). Поддерживает PRL, QUAN и TSC. Сохраняет выборки в `data/labeled/`.
 - **[_tools/run_grid_validation.py](file:///home/restorator/crypto_bot/_tools/run_grid_validation.py):** Автоматизированная валидация сетки H = 5:Max_L/K:5 для K in [3, 4, 5] при целевом N.
 
 ### Этап 4: Отбор признаков (Feature Selection)
