@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Production Data Labeling Engine for PRL/USDT, QUANTUS, TSC
-==========================================================
+Production Data Labeling Engine for PRL/USDT and QUANTUS
+========================================================
 Поддерживает:
 1. Двойное квантование цены и ликвидности.
 2. Асимметричную эластичность стакана и кинематику волны.
@@ -27,8 +27,7 @@ import pyarrow.parquet as pq
 # Микроструктурные параметры монет (SafeTrade)
 COIN_CONFIG = {
     'prl': {'tick_size': 0.005, 'typical_trade': 17.3, 'min_vol': 50.0},
-    'quantus': {'tick_size': 0.001, 'typical_trade': 2.2, 'min_vol': 2.0},
-    'tsc': {'tick_size': 0.0001, 'typical_trade': 10.0, 'min_vol': 10.0},
+    'quantus': {'tick_size': 0.05, 'typical_trade': 2.2, 'min_vol': 2.0},
 }
 
 # Пороги квантильных плато
@@ -140,7 +139,8 @@ def compute_single_horizon_labels(df, coin, H, K, min_vol, tick_size):
     z[dt_ticks_full > 0] = (dt_ticks_full[dt_ticks_full > 0] / M_up[dt_ticks_full > 0]).astype(np.float32)
     z[dt_ticks_full < 0] = (dt_ticks_full[dt_ticks_full < 0] / M_dn[dt_ticks_full < 0]).astype(np.float32)
     
-    # 8. Проверка сделок в будущем интервале движения
+    # 8. Флаг фантомных котировок (Zero-Volume Liquidity Void):
+    # Сумма сделок вперед за горизонт (t, t+H]
     trade_cumsum = np.pad(np.cumsum(trade_vol), (1, 0))
     trade_vol_future_H = np.zeros(n, dtype=np.float32)
     trade_vol_future_H[:-H] = trade_cumsum[1 + H : n + 1] - trade_cumsum[1 : n - H + 1]
@@ -222,6 +222,9 @@ def compute_labels(df, coin="prl", horizon_sec=5, window_ratio=4, split_ratio=0.
     out_df['sample_split'] = sample_split
     out_df['is_valid_sample'] = (sample_split == 'train') | (sample_split == 'val')
     
+    if isinstance(out_df.index, pd.DatetimeIndex) or out_df.index.name == 'timestamp':
+        out_df = out_df.reset_index()
+
     tr_df = out_df.iloc[L:train_end].copy().reset_index(drop=True)
     va_df = out_df.iloc[val_start:n - H].copy().reset_index(drop=True)
     valid_df = pd.concat([tr_df, va_df], ignore_index=True)
@@ -254,6 +257,8 @@ def process_coin_labeling(
     
     tbl = pq.read_table(in_file)
     df = tbl.to_pandas()
+    if isinstance(df.index, pd.DatetimeIndex) or df.index.name == 'timestamp':
+        df = df.reset_index()
     total_rows = len(df)
     train_80 = int(total_rows * split_ratio)
     L_max = max(10, train_80 // n_target)
@@ -409,7 +414,7 @@ def process_coin_labeling(
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-Asset Dynamic Dataset Labeling Engine")
-    parser.add_argument("--coin", type=str, default="all", choices=["prl", "quantus", "tsc", "all"], help="Монета для разметки (по умолчанию all)")
+    parser.add_argument("--coin", type=str, default="all", choices=["prl", "quantus", "all"], help="Монета для разметки (по умолчанию all)")
     parser.add_argument("--horizon", type=str, default="5", help="Горизонт H или интервал (например: 5, '5,10,15', '5:Lmax:5', '5:30:5')")
     parser.add_argument("--ratio", type=str, default="4", help="Соотношение K=L/H или интервал (например: 4, '[3,4,5,6]', '3,4,5', '3:6')")
     parser.add_argument("--outdir", type=str, default="data/labeled", help="Выходная директория")
@@ -420,10 +425,9 @@ def main():
     parser.add_argument("--no-legacy-splits", action="store_true", help="Не сохранять отдельные train/val файлы")
     args = parser.parse_args()
     
-    coins = ["prl", "quantus", "tsc"] if args.coin == "all" else [args.coin]
+    coins = ["prl", "quantus"] if args.coin == "all" else [args.coin]
     all_coin_dfs = []
     all_records = []
-    
     for c in coins:
         cdf, recs = process_coin_labeling(
             coin=c,

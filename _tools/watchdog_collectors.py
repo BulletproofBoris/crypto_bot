@@ -44,11 +44,6 @@ TARGETS = [
         "name": "SafeTrade Quantus"
     },
     {
-        "service": "safetrade-collector",
-        "file": "/opt/crypto_bot/data/realtime/tscusdt/depth.csv",
-        "name": "SafeTrade TSC"
-    },
-    {
         "service": "bigone-collector",
         "file": "/opt/crypto_bot/data/realtime/prlusdt_bigone/depth_bigone.csv",
         "name": "BigONE PRL"
@@ -71,12 +66,14 @@ TARGETS = [
     {
         "service": "onchain-collector",
         "file": "/opt/crypto_bot/data/realtime/onchain/prl_onchain.csv",
-        "name": "Pearl On-chain"
+        "name": "Pearl On-chain",
+        "max_stale": 180
     },
     {
         "service": "onchain-collector",
         "file": "/opt/crypto_bot/data/realtime/onchain/quantus_onchain.csv",
-        "name": "Quantus On-chain"
+        "name": "Quantus On-chain",
+        "max_stale": 180
     }
 ]
 
@@ -153,8 +150,9 @@ def check_target(target, state, verbose=False):
         if verbose:
             logger.info(f"ℹ️ {name}: служба активна, файл {fpath} ({file_size_kb:.1f} KB), возраст данных: {age_sec:.1f} сек.")
 
-        if age_sec > MAX_STALE_SECONDS:
-            logger.warning(f"⚠️ {name}: данные зависли! Файл не обновлялся {age_sec:.1f} сек (порог: {MAX_STALE_SECONDS} сек).")
+        max_stale = target.get("max_stale", MAX_STALE_SECONDS)
+        if age_sec > max_stale:
+            logger.warning(f"⚠️ {name}: данные зависли! Файл не обновлялся {age_sec:.1f} сек (порог: {max_stale} сек).")
             if can_restart(service, state):
                 if restart_service(service):
                     record_restart(service, state)

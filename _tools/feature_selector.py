@@ -28,32 +28,30 @@ def reduce_multicollinearity(df, feature_cols, threshold=0.85):
     print(f"  ✅ Осталось признаков: {len(retained)} из {len(feature_cols)}")
     return retained
 
-def get_dynamic_feature_importance(df, feature_cols, target_col='label', cumulative_threshold=0.95):
+def get_dynamic_feature_importance(df, feature_cols, target_col='target_class_7', cumulative_threshold=0.95):
     print(f"🧠 LightGBM оценивает важность {len(feature_cols)} признаков...")
     sample_df = df.sample(n=min(len(df), 100000), random_state=42)
     
-    # 🚀 УСКОРЕНИЕ ПАМЯТИ: Снижаем точность до float32. 
-    # Это разгружает шину памяти и ускоряет градиентный бустинг.
+    if target_col not in sample_df.columns:
+        target_col = 'label' if 'label' in sample_df.columns else 'target_class_5'
+
     X = sample_df[feature_cols].astype(np.float32)
-    y = (sample_df[target_col] + 1).astype(int)
+    y = pd.Categorical(sample_df[target_col]).codes
     
     n_estimators = 100
     
-    # Агрессивные параметры для скорости (n_jobs=-1 задействует все ядра CPU)
     model = lgb.LGBMClassifier(
         n_estimators=n_estimators,
         learning_rate=0.1,
         max_depth=7,
         num_leaves=64,
-        max_bin=255,       # Оптимизация построения гистограмм для скорости
+        max_bin=255,
         random_state=42, 
-        n_jobs=4,         #-1 Включаем все доступные потоки
+        n_jobs=4,
         verbose=-1
     )
     
-    # Обертка tqdm для визуализации процесса обучения (100 деревьев)
     with tqdm(total=n_estimators, desc="  🌲 Построение деревьев", unit=" итер", ncols=100, mininterval=1.0) as pbar:
-        # Передаем callback, который будет обновлять полосу после каждого дерева
         model.fit(X, y, callbacks=[lambda env: pbar.update(1)])
     
     importance = model.feature_importances_
@@ -84,8 +82,16 @@ def main(args):
     print(f"🚀 Динамический отбор признаков...")
     df = pd.read_parquet(train_path)
     
-    exclude_cols = {'datetime', 'ticker', 'target_tp', 'target_sl', 'target_return', 'label', 'open', 'high', 'low', 'close', 'volume'}
-    feature_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c not in exclude_cols]
+    exclude_cols = {
+        'datetime', 'timestamp', 'ticker', 'target_tp', 'target_sl', 'target_return', 'label',
+        'open', 'high', 'low', 'close', 'volume',
+        'target_class_7', 'target_class_5', 'target_velocity_z', 'target_dt_ticks', 'target_ret_pct',
+        'dynamic_scale_up', 'dynamic_scale_dn', 'is_liquidity_void', 'is_valid_sample'
+    }
+    feature_cols = [
+        c for c in df.columns
+        if pd.api.types.is_numeric_dtype(df[c]) and c not in exclude_cols and not c.startswith('target_')
+    ]
     
     if not args.skip_corr:
         feature_cols = reduce_multicollinearity(df, feature_cols, threshold=args.corr_threshold)

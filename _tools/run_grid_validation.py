@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Скрипт валидации сетки параметров (H, K = L/H) для всех монет (PRL, QUAN, TSC) при N = 4000.
+Скрипт валидации сетки параметров (H, K = L/H) для всех монет (PRL, QUAN) при N = 4000.
 Рассчитывает L_max для каждой монеты:
 L_max = train_dataset (80%) // 4000.
 Тестирует H = 5:Max_L/K:5 для K in [3, 4, 5] и оценивает сходимость меток Train vs Val.
@@ -78,7 +78,7 @@ def evaluate_run(df, coin, H, K):
 
 def main():
     N_TARGET = 4000
-    coins = ['prl', 'quantus', 'tsc']
+    coins = ['prl', 'quantus']
     results = []
     
     print("================================================================================")

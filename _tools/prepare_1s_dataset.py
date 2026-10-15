@@ -26,7 +26,7 @@ from _tools.data_loader import load_coin, load_macro, sync_data
 
 init(autoreset=True)
 
-def calc_effective_vwap(df, side='ask', target_usd=100.0, max_levels=10):
+def calc_effective_vwap(df, side='ask', target_usd=100.0, max_levels=50):
     """
     Рассчитывает средневзвешенную цену исполнения (VWAP) для заданного объема в USD.
     side='ask' -> покупка монет (по аскам снизу вверх)
@@ -41,19 +41,30 @@ def calc_effective_vwap(df, side='ask', target_usd=100.0, max_levels=10):
     n_rows = len(df)
     filled_usd = np.zeros(n_rows, dtype=float)
     filled_qty = np.zeros(n_rows, dtype=float)
+    last_valid_price = prices[0].copy()
 
     for p, q in zip(prices, qtys):
-        level_usd = p * q
-        needed_usd = target_usd - filled_usd
-        take_usd = np.clip(needed_usd, 0.0, level_usd)
+        valid_mask = np.isfinite(p) & (p > 0) & np.isfinite(q) & (q > 0)
+        last_valid_price = np.where(valid_mask, p, last_valid_price)
+        p_clean = np.where(valid_mask, p, 0.0)
+        q_clean = np.where(valid_mask, q, 0.0)
+
+        level_usd = p_clean * q_clean
+        needed_usd = np.maximum(0.0, target_usd - filled_usd)
+        take_usd = np.minimum(needed_usd, level_usd)
         with np.errstate(divide='ignore', invalid='ignore'):
-            take_qty = np.where(p > 0, take_usd / p, 0.0)
+            take_qty = np.where(p_clean > 0, take_usd / p_clean, 0.0)
 
         filled_usd += take_usd
         filled_qty += take_qty
 
+    rem_usd = np.maximum(0.0, target_usd - filled_usd)
+    penalty_mult = 1.005 if side == 'ask' else 0.995
+    worst_p = last_valid_price * penalty_mult
     with np.errstate(divide='ignore', invalid='ignore'):
-        vwap = np.where(filled_qty > 0, target_usd / filled_qty, np.nan)
+        rem_qty = np.where(worst_p > 0, rem_usd / worst_p, 0.0)
+        total_qty = filled_qty + rem_qty
+        vwap = np.where(total_qty > 0, target_usd / total_qty, np.nan)
     return vwap
 
 def process_exchange_l2(depth_df, trades_df, prefix):
@@ -97,6 +108,56 @@ def process_exchange_l2(depth_df, trades_df, prefix):
     total_vol_top10 = bids_vol_top10 + asks_vol_top10
     ob_imbalance_top10 = (bids_vol_top10 - asks_vol_top10) / total_vol_top10.replace(0, np.nan)
 
+    # Глубокий стакан (уровни 11..50 и топ-50)
+    bids_vol_11_50 = sum(depth_1s[f'bid_{i}_qty'].astype(float).fillna(0) for i in range(11, 51) if f'bid_{i}_qty' in depth_1s.columns)
+    asks_vol_11_50 = sum(depth_1s[f'ask_{i}_qty'].astype(float).fillna(0) for i in range(11, 51) if f'ask_{i}_qty' in depth_1s.columns)
+    bids_vol_top50 = bids_vol_top10.fillna(0) + bids_vol_11_50
+    asks_vol_top50 = asks_vol_top10.fillna(0) + asks_vol_11_50
+    ob_imbalance_11_50 = (bids_vol_11_50 - asks_vol_11_50) / (bids_vol_11_50 + asks_vol_11_50).replace(0, np.nan)
+    ob_imbalance_top50 = (bids_vol_top50 - asks_vol_top50) / (bids_vol_top50 + asks_vol_top50).replace(0, np.nan)
+
+    # Поиск крупнейшей лимитной стены (Whale Wall) в стакане
+    bid_p_cols = [f'bid_{i}_price' for i in range(1, 51) if f'bid_{i}_price' in depth_1s.columns]
+    bid_q_cols = [f'bid_{i}_qty' for i in range(1, 51) if f'bid_{i}_qty' in depth_1s.columns]
+    ask_p_cols = [f'ask_{i}_price' for i in range(1, 51) if f'ask_{i}_price' in depth_1s.columns]
+    ask_q_cols = [f'ask_{i}_qty' for i in range(1, 51) if f'ask_{i}_qty' in depth_1s.columns]
+
+    if bid_q_cols and ask_q_cols:
+        bq_mat = np.nan_to_num(depth_1s[bid_q_cols].to_numpy(dtype=float), nan=0.0)
+        bp_mat = np.nan_to_num(depth_1s[bid_p_cols].to_numpy(dtype=float), nan=0.0)
+        aq_mat = np.nan_to_num(depth_1s[ask_q_cols].to_numpy(dtype=float), nan=0.0)
+        ap_mat = np.nan_to_num(depth_1s[ask_p_cols].to_numpy(dtype=float), nan=0.0)
+        b_idx = np.argmax(bq_mat, axis=1)
+        a_idx = np.argmax(aq_mat, axis=1)
+        rows_idx = np.arange(len(depth_1s))
+        calc_bid_wall_q = bq_mat[rows_idx, b_idx]
+        calc_bid_wall_p = bp_mat[rows_idx, b_idx]
+        calc_ask_wall_q = aq_mat[rows_idx, a_idx]
+        calc_ask_wall_p = ap_mat[rows_idx, a_idx]
+    else:
+        calc_bid_wall_q = np.zeros(len(depth_1s))
+        calc_bid_wall_p = best_bid.to_numpy()
+        calc_ask_wall_q = np.zeros(len(depth_1s))
+        calc_ask_wall_p = best_ask.to_numpy()
+
+    if 'max_bid_wall_qty' in depth_1s.columns:
+        depth_1s['max_bid_wall_qty'] = pd.to_numeric(depth_1s['max_bid_wall_qty'], errors='coerce').fillna(pd.Series(calc_bid_wall_q, index=depth_1s.index))
+        depth_1s['max_bid_wall_price'] = pd.to_numeric(depth_1s['max_bid_wall_price'], errors='coerce').fillna(pd.Series(calc_bid_wall_p, index=depth_1s.index))
+        depth_1s['max_ask_wall_qty'] = pd.to_numeric(depth_1s['max_ask_wall_qty'], errors='coerce').fillna(pd.Series(calc_ask_wall_q, index=depth_1s.index))
+        depth_1s['max_ask_wall_price'] = pd.to_numeric(depth_1s['max_ask_wall_price'], errors='coerce').fillna(pd.Series(calc_ask_wall_p, index=depth_1s.index))
+    else:
+        depth_1s['max_bid_wall_qty'] = calc_bid_wall_q
+        depth_1s['max_bid_wall_price'] = calc_bid_wall_p
+        depth_1s['max_ask_wall_qty'] = calc_ask_wall_q
+        depth_1s['max_ask_wall_price'] = calc_ask_wall_p
+
+    if 'deep_bid_vol' in depth_1s.columns:
+        depth_1s['deep_bid_vol'] = pd.to_numeric(depth_1s['deep_bid_vol'], errors='coerce').fillna(0.0)
+        depth_1s['deep_ask_vol'] = pd.to_numeric(depth_1s['deep_ask_vol'], errors='coerce').fillna(0.0)
+    else:
+        depth_1s['deep_bid_vol'] = 0.0
+        depth_1s['deep_ask_vol'] = 0.0
+
     # Объемы в USD на топ-5
     bids_usd_top5 = sum(depth_1s[f'bid_{i}_price'].astype(float) * depth_1s[f'bid_{i}_qty'].astype(float) for i in range(1, 6) if f'bid_{i}_qty' in depth_1s.columns)
     asks_usd_top5 = sum(depth_1s[f'ask_{i}_price'].astype(float) * depth_1s[f'ask_{i}_qty'].astype(float) for i in range(1, 6) if f'ask_{i}_qty' in depth_1s.columns)
@@ -110,6 +171,14 @@ def process_exchange_l2(depth_df, trades_df, prefix):
     depth_1s['asks_usd_top5'] = asks_usd_top5
     depth_1s['imbalance_top5'] = ob_imbalance_top5.fillna(0)
     depth_1s['imbalance_top10'] = ob_imbalance_top10.fillna(0)
+    depth_1s['bids_vol_11_50'] = bids_vol_11_50
+    depth_1s['asks_vol_11_50'] = asks_vol_11_50
+    depth_1s['imbalance_11_50'] = ob_imbalance_11_50.fillna(0)
+    depth_1s['imbalance_top50'] = ob_imbalance_top50.fillna(0)
+    depth_1s['bid_wall_dist_bps'] = ((mid_price - depth_1s['max_bid_wall_price']) / mid_price.replace(0, np.nan) * 1e4).clip(0, 5000).fillna(0)
+    depth_1s['ask_wall_dist_bps'] = ((depth_1s['max_ask_wall_price'] - mid_price) / mid_price.replace(0, np.nan) * 1e4).clip(0, 5000).fillna(0)
+    wall_tot = (depth_1s['max_bid_wall_qty'] + depth_1s['max_ask_wall_qty']).replace(0, np.nan)
+    depth_1s['wall_vol_imbalance'] = ((depth_1s['max_bid_wall_qty'] - depth_1s['max_ask_wall_qty']) / wall_tot).fillna(0)
 
     # Эффективная цена исполнения и проскальзывание (на $100 и $300)
     depth_1s['eff_buy_vwap_100'] = calc_effective_vwap(depth_1s, 'ask', 100.0)
@@ -132,9 +201,15 @@ def process_exchange_l2(depth_df, trades_df, prefix):
         df_t['amount'] = df_t['amount'].astype(float)
         side_col = 'side' if 'side' in df_t.columns else ('type' if 'type' in df_t.columns else None)
         if side_col:
-            df_t['side_clean'] = df_t[side_col].astype(str).str.upper()
-            df_t['buy_vol'] = np.where(df_t['side_clean'].isin(['ASK', 'BUY']), df_t['amount'], 0.0)
-            df_t['sell_vol'] = np.where(df_t['side_clean'].isin(['BID', 'SELL']), df_t['amount'], 0.0)
+            df_t['side_clean'] = df_t[side_col].astype(str).str.strip().str.upper()
+            if prefix == 'BO':
+                buy_tokens = ['BID', 'BUY']
+                sell_tokens = ['ASK', 'SELL']
+            else:
+                buy_tokens = ['BUY', 'ASK']
+                sell_tokens = ['SELL', 'BID']
+            df_t['buy_vol'] = np.where(df_t['side_clean'].isin(buy_tokens), df_t['amount'], 0.0)
+            df_t['sell_vol'] = np.where(df_t['side_clean'].isin(sell_tokens), df_t['amount'], 0.0)
         else:
             df_t['buy_vol'] = 0.0
             df_t['sell_vol'] = 0.0
@@ -204,8 +279,19 @@ def build_features_for_coin(coin_name, macro_df=None):
         else:
             df_rh['timestamp'] = df_rh['timestamp'].dt.tz_convert('Europe/Moscow')
         df_rh = df_rh.sort_values('timestamp').drop_duplicates('timestamp').set_index('timestamp')
-        rhea_cols = [c for c in ['price_usd', 'price_native', 'liquidity_usd', 'volume_5m'] if c in df_rh.columns]
+        rhea_cols = [c for c in [
+            'price_usd', 'price_native', 'liquidity_usd', 'base_reserve', 'quote_reserve',
+            'volume_5m', 'buys_5m', 'sells_5m', 'volume_1h', 'volume_24h',
+            'buys_1h', 'sells_1h', 'buys_24h', 'sells_24h',
+            'price_change_5m', 'price_change_1h', 'price_change_24h'
+        ] if c in df_rh.columns]
         rhea_1s = df_rh[rhea_cols].apply(pd.to_numeric, errors='coerce').resample('1s').ffill()
+        if 'buys_5m' in rhea_1s.columns and 'sells_5m' in rhea_1s.columns:
+            tot_tx5 = (rhea_1s['buys_5m'] + rhea_1s['sells_5m']).replace(0, np.nan)
+            rhea_1s['tx_imbalance_5m'] = ((rhea_1s['buys_5m'] - rhea_1s['sells_5m']) / tot_tx5).fillna(0)
+        if 'base_reserve' in rhea_1s.columns:
+            rhea_1s['reserve_flow_60s_bps'] = (-rhea_1s['base_reserve'].pct_change(60) * 1e4).fillna(0)
+            rhea_1s['reserve_flow_300s_bps'] = (-rhea_1s['base_reserve'].pct_change(300) * 1e4).fillna(0)
         rhea_1s.columns = [f"RHEA_{c}" for c in rhea_1s.columns]
         parts.append(('RHEA', rhea_1s))
 
@@ -257,27 +343,42 @@ def build_features_for_coin(coin_name, macro_df=None):
         else:
             df_on['timestamp'] = df_on['timestamp'].dt.tz_convert('Europe/Moscow')
         df_on = df_on.sort_values('timestamp').drop_duplicates('timestamp').set_index('timestamp')
-        
-        # Индикаторы майнинг-пулов
+
         if 'miner_pool' in df_on.columns:
             df_on['pool_kryptex'] = (df_on['miner_pool'].astype(str).str.lower() == 'kryptex').astype(int)
             df_on['pool_pearlhash'] = (df_on['miner_pool'].astype(str).str.lower() == 'pearlhash').astype(int)
             df_on['pool_pearlfortune'] = (df_on['miner_pool'].astype(str).str.lower().str.contains('fortune')).astype(int)
             df_on['pool_luckypool'] = (df_on['miner_pool'].astype(str).str.lower().str.contains('lucky')).astype(int)
-        
-        onchain_cols = [c for c in df_on.columns if c not in ['timestamp', 'miner_pool', 'miner_label', 'miner_address']]
+
+        # По-блочные 1-часовые суммы китов (до 1s ffill, чтобы 1 блок не умножался в 3600 раз)
+        if 'block_height' in df_on.columns:
+            blocks = df_on[~df_on['block_height'].duplicated(keep='first')].copy()
+            for w_col, out_col in [
+                ('transfer_volume_prl', 'transfer_vol_sum_1h'),
+                ('whale_volume_5k', 'whale_vol_sum_1h'),
+                ('whale_tx_count_5k', 'whale_tx_sum_1h'),
+                ('whale_volume_25k', 'whale_vol_25k_sum_1h'),
+            ]:
+                if w_col in blocks.columns:
+                    b_sum = pd.to_numeric(blocks[w_col], errors='coerce').fillna(0).rolling('1h').sum()
+                    df_on[out_col] = df_on['block_height'].map(dict(zip(blocks['block_height'], b_sum)))
+
+        drop_on = {
+            'timestamp', 'date', 'miner_pool', 'miner_label', 'miner_address', 'block_hash', 'status',
+            'circulating_supply', 'total_supply', 'active_validators', 'era_reward',
+            'daily_txs', 'daily_Active_Accounts', 'block_reward', 'accounts_count'
+        }
+        onchain_cols = [c for c in df_on.columns if c not in drop_on]
         on_1s = df_on[onchain_cols].apply(pd.to_numeric, errors='coerce').resample('1s').ffill()
         on_1s.columns = [f"onchain_{c}" for c in on_1s.columns]
-        
-        # Динамика сложности и объемы китов
+
         if 'onchain_difficulty' in on_1s.columns:
             on_1s['onchain_diff_pct_change_1h'] = on_1s['onchain_difficulty'].pct_change(3600).fillna(0)
-        if 'onchain_whale_volume_5k' in on_1s.columns:
-            on_1s['onchain_whale_vol_sum_1h'] = on_1s['onchain_whale_volume_5k'].rolling(3600, min_periods=1).sum().fillna(0)
-            on_1s['onchain_whale_tx_sum_1h'] = on_1s.get('onchain_whale_tx_count_5k', pd.Series(0, index=on_1s.index)).rolling(3600, min_periods=1).sum().fillna(0)
-            
+        if 'onchain_mempool_size' in on_1s.columns:
+            on_1s['onchain_mempool_delta_5m'] = on_1s['onchain_mempool_size'].diff(300).fillna(0)
+
         merged = pd.merge(merged, on_1s, left_index=True, right_index=True, how='left')
-        merged[[c for c in on_1s.columns]] = merged[[c for c in on_1s.columns]].ffill().bfill().fillna(0)
+        merged[[c for c in on_1s.columns]] = merged[[c for c in on_1s.columns]].ffill().fillna(0)
 
     # 5. Макро-поводыри Binance
     if macro_df is not None and not macro_df.empty:
@@ -288,25 +389,51 @@ def build_features_for_coin(coin_name, macro_df=None):
         else:
             df_m['timestamp'] = df_m['timestamp'].dt.tz_convert('Europe/Moscow')
         df_m = df_m.sort_values('timestamp').drop_duplicates('timestamp').set_index('timestamp')
-        
-        m_cols = ['btc_mid', 'btc_last', 'near_mid', 'near_last']
+
+        m_cols = [
+            'btc_bid', 'btc_ask', 'btc_mid', 'btc_last',
+            'near_bid', 'near_ask', 'near_mid', 'near_last',
+            'btc_bid_qty', 'btc_ask_qty', 'btc_buy_vol', 'btc_sell_vol',
+            'near_bid_qty', 'near_ask_qty', 'near_buy_vol', 'near_sell_vol'
+        ]
         avail_m_cols = [c for c in m_cols if c in df_m.columns]
-        m_1s = df_m[avail_m_cols].astype(float).resample('1s').ffill()
+        m_1s = df_m[avail_m_cols].apply(pd.to_numeric, errors='coerce').resample('1s').ffill()
         m_1s.columns = [f"macro_{c}" for c in m_1s.columns]
-        
-        # Доходность за 1с
+
         if 'macro_btc_mid' in m_1s.columns:
             m_1s['macro_btc_ret_1s'] = m_1s['macro_btc_mid'].pct_change().fillna(0)
         if 'macro_near_mid' in m_1s.columns:
             m_1s['macro_near_ret_1s'] = m_1s['macro_near_mid'].pct_change().fillna(0)
+        if 'macro_btc_bid_qty' in m_1s.columns and 'macro_btc_ask_qty' in m_1s.columns:
+            bt_tot = (m_1s['macro_btc_bid_qty'] + m_1s['macro_btc_ask_qty']).replace(0, np.nan)
+            m_1s['macro_btc_bbo_imb'] = ((m_1s['macro_btc_bid_qty'] - m_1s['macro_btc_ask_qty']) / bt_tot).fillna(0)
+        if 'macro_near_bid_qty' in m_1s.columns and 'macro_near_ask_qty' in m_1s.columns:
+            nr_tot = (m_1s['macro_near_bid_qty'] + m_1s['macro_near_ask_qty']).replace(0, np.nan)
+            m_1s['macro_near_bbo_imb'] = ((m_1s['macro_near_bid_qty'] - m_1s['macro_near_ask_qty']) / nr_tot).fillna(0)
 
         merged = pd.merge(merged, m_1s, left_index=True, right_index=True, how='left')
         for c in m_1s.columns:
-            merged[c] = merged[c].ffill().bfill().fillna(0)
+            merged[c] = merged[c].ffill().fillna(0)
 
-    # Очистка: удаляем только строки, где нет mid_price ключевой биржи, а пустые глубокие уровни стакана заполняем нулями
-    key_cols = [c for c in merged.columns if 'mid_price' in c or 'bid_1_price' in c]
+    # Очистка: удаляем строки без ключевых BBO/mid_price и приводим сетку к строгому шагу 1 секунда без дыр
+    key_cols = [c for c in merged.columns if 'mid_price' in c or 'bid_1_price' in c or 'ask_1_price' in c]
     merged = merged.dropna(subset=key_cols)
+    orig_idx = merged.index
+    merged = merged.resample('1s').ffill()
+    gap_mask = ~merged.index.isin(orig_idx)
+    if gap_mask.any():
+        flow_cols = [c for c in merged.columns if any(k in c for k in ['trade_vol', 'buy_vol', 'sell_vol', 'trade_count', 'delta_vol'])]
+        merged.loc[gap_mask, flow_cols] = 0.0
+    merged = merged.fillna(0)
+
+    # 6. Многочастотный стационарный банк фильтров W = [5, 20, 60, 300]с и полосовые разности (Band-Pass)
+    print("  Расчет стационарного банка фильтров W=[5, 20, 60, 300]с (OFI, Lead-Lag, Band-Pass)...")
+    from _tools.microstructure_features import add_exchange_filter_bank, add_cross_exchange_and_macro_filters
+    if 'ST_mid_price' in merged.columns:
+        merged = add_exchange_filter_bank(merged, 'ST', coin=coin)
+    if 'BO_mid_price' in merged.columns:
+        merged = add_exchange_filter_bank(merged, 'BO', coin=coin)
+    merged = add_cross_exchange_and_macro_filters(merged, coin=coin)
     merged = merged.fillna(0)
 
     # Сохранение в data/features/{coin}_1s_features.parquet
@@ -328,8 +455,8 @@ def build_features_for_coin(coin_name, macro_df=None):
     return merged
 
 def main():
-    parser = argparse.ArgumentParser(description="Синхронизация и построение 1-секундного базового датасета (PRL, QUANTUS, TSC).")
-    parser.add_argument("--coin", type=str, default="all", choices=["prl", "quantus", "tsc", "all"], help="Монета для генерации (по умолчанию all).")
+    parser = argparse.ArgumentParser(description="Синхронизация и построение 1-секундного базового датасета (PRL, QUANTUS).")
+    parser.add_argument("--coin", type=str, default="all", choices=["prl", "quantus", "all"], help="Монета для генерации (по умолчанию all).")
     parser.add_argument("--sync", action="store_true", help="Сначала выполнить синхронизацию с Google Drive и VPS.")
     args = parser.parse_args()
 
@@ -342,7 +469,7 @@ def main():
     print(f"{Fore.CYAN}==================================================={Style.RESET_ALL}")
 
     macro_df = load_macro()
-    coins = ["prl", "quantus", "tsc"] if args.coin == "all" else [args.coin]
+    coins = ["prl", "quantus"] if args.coin == "all" else [args.coin]
 
     for c in coins:
         build_features_for_coin(c, macro_df=macro_df)

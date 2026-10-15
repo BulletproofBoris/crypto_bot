@@ -76,14 +76,6 @@ FILES_TO_ROTATE = [
         "path": "/opt/crypto_bot/data/realtime/quantus_rhea/price_rhea.csv",
     },
     {
-        "prefix": "safetrade_tsc_depth",
-        "path": "/opt/crypto_bot/data/realtime/tscusdt/depth.csv",
-    },
-    {
-        "prefix": "safetrade_tsc_trades",
-        "path": "/opt/crypto_bot/data/realtime/tscusdt/trades.csv",
-    },
-    {
         "prefix": "binance_macro",
         "path": "/opt/crypto_bot/data/realtime/macro_binance/binance_macro.csv",
     },
@@ -146,14 +138,25 @@ def upload_file_to_drive(service, file_path, folder_id, file_name):
     logger.info(f"✅ Файл успешно загружен на Диск: {file_name} (ID: {file_id})")
     return file_id
 
+PENDING_ARCHIVE_DIR = "/opt/crypto_bot/data/archive_pending"
+
 def get_unique_archive_name(service, folder_id, prefix, date_str, timestamp_suffix=""):
-    """Определяет уникальное имя для архива на Google Диске, добавляя _part2, _part3 при наличии дубликатов."""
+    """Определяет уникальное имя для архива на Google Диске и в локальном буфере, добавляя _part2, _part3."""
     if timestamp_suffix:
         return f"{prefix}_{date_str}_{timestamp_suffix}.csv.gz"
 
-    query = f"'{folder_id}' in parents and trashed = false"
-    resp = service.files().list(q=query, spaces='drive', fields='files(name)').execute()
-    existing_names = {f['name'] for f in resp.get('files', [])}
+    existing_names = set()
+    if service and folder_id:
+        try:
+            query = f"'{folder_id}' in parents and trashed = false"
+            resp = service.files().list(q=query, spaces='drive', fields='files(name)').execute()
+            existing_names.update(f['name'] for f in resp.get('files', []))
+        except Exception:
+            pass
+
+    pending_date_dir = os.path.join(PENDING_ARCHIVE_DIR, date_str)
+    if os.path.exists(pending_date_dir):
+        existing_names.update(os.listdir(pending_date_dir))
 
     base_name = f"{prefix}_{date_str}"
     candidate = f"{base_name}.csv.gz"
@@ -169,7 +172,7 @@ def process_single_file(service, folder_id, file_info, date_str, timestamp_suffi
     """
     Выполняет безопасную ротацию для одного файла:
     1. Читает и архивирует строки до текущего момента.
-    2. Загружает архив на Google Drive.
+    2. Загружает архив на Google Drive (или сохраняет в локальный буфер archive_pending при сбое сети).
     3. Атомарно перезаписывает горячий файл (заголовок + строки, поступившие во время загрузки).
     """
     file_path = file_info["path"]
@@ -184,7 +187,6 @@ def process_single_file(service, folder_id, file_info, date_str, timestamp_suffi
 
     total_lines = 0
     header_line = None
-    last_archived_line = None
 
     # Шаг 1. Читаем файл потоково и пишем в gzip архив
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f_in, \
@@ -192,7 +194,6 @@ def process_single_file(service, folder_id, file_info, date_str, timestamp_suffi
         for idx, line in enumerate(f_in):
             if idx == 0:
                 header_line = line
-            last_archived_line = line
             f_out.write(line)
             total_lines += 1
 
@@ -207,17 +208,22 @@ def process_single_file(service, folder_id, file_info, date_str, timestamp_suffi
     orig_size_mb = os.path.getsize(file_path) / (1024 * 1024)
     logger.info(f"Архивировано {total_lines} строк из {file_path} ({orig_size_mb:.2f} MB -> {archive_size_mb:.2f} MB сжато).")
 
-    # Шаг 2. Выгрузка на Google Drive
-    try:
-        drive_file_id = upload_file_to_drive(service, tmp_archive_path, folder_id, archive_name)
-        if not drive_file_id:
-            raise RuntimeError(f"Не удалось получить ID загруженного файла {archive_name}")
-    except Exception as e:
-        logger.error(f"❌ Ошибка выгрузки {archive_name} на Google Drive: {e}")
-        logger.error("Горячий файл НЕ будет обрезан во избежание потери данных!")
-        if os.path.exists(tmp_archive_path):
-            os.remove(tmp_archive_path)
-        return False
+    # Шаг 2. Выгрузка на Google Drive или сохранение в локальный буфер archive_pending
+    uploaded = False
+    if service and folder_id:
+        try:
+            drive_file_id = upload_file_to_drive(service, tmp_archive_path, folder_id, archive_name)
+            if drive_file_id:
+                uploaded = True
+        except Exception as e:
+            logger.error(f"❌ Ошибка выгрузки {archive_name} на Google Drive: {e}")
+
+    if not uploaded:
+        pending_date_dir = os.path.join(PENDING_ARCHIVE_DIR, date_str)
+        os.makedirs(pending_date_dir, exist_ok=True)
+        pending_target = os.path.join(pending_date_dir, archive_name)
+        shutil.move(tmp_archive_path, pending_target)
+        logger.warning(f"📦 Архив сохранён в локальный резервный буфер: {pending_target}")
 
     # Шаг 3. Атомарная обрезка горячего файла
     tmp_hot_path = file_path + ".tmp"
@@ -262,6 +268,27 @@ def process_single_file(service, folder_id, file_info, date_str, timestamp_suffi
 
     return True
 
+def flush_pending_archives(service):
+    """Докачивает ранее сохранённые в локальном буфере архивы на Google Drive."""
+    if not service or not os.path.exists(PENDING_ARCHIVE_DIR):
+        return
+    for d_name in sorted(os.listdir(PENDING_ARCHIVE_DIR)):
+        d_path = os.path.join(PENDING_ARCHIVE_DIR, d_name)
+        if not os.path.isdir(d_path):
+            continue
+        files = sorted(f for f in os.listdir(d_path) if f.endswith(".csv.gz"))
+        if not files:
+            continue
+        try:
+            f_id = get_or_create_date_folder(service, FOLDER_ID, d_name)
+            for fname in files:
+                fpath = os.path.join(d_path, fname)
+                if upload_file_to_drive(service, fpath, f_id, fname):
+                    os.remove(fpath)
+                    logger.info(f"☁️ Докачан отложенный архив из буфера: {d_name}/{fname}")
+        except Exception as e:
+            logger.warning(f"Не удалось докачать отложенные архивы за {d_name}: {e}")
+
 def rotate_all(force=False, check_disk=False):
     """Основная процедура ротации всех файлов."""
     free_gb = get_free_disk_gb("/")
@@ -278,12 +305,14 @@ def rotate_all(force=False, check_disk=False):
 
     logger.info(f"🚀 Запуск ротации данных для даты {date_str}...")
 
+    service = None
+    folder_id = None
     try:
         service = get_drive_service()
+        flush_pending_archives(service)
         folder_id = get_or_create_date_folder(service, FOLDER_ID, date_str)
     except Exception as e:
-        logger.error(f"❌ Критическая ошибка подключения к Google Drive: {e}")
-        return
+        logger.warning(f"⚠️ Google Drive временно недоступен ({e}). Ротация выполнится в локальный буфер {PENDING_ARCHIVE_DIR}!")
 
     success_count = 0
     for file_info in FILES_TO_ROTATE:

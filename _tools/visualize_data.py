@@ -163,10 +163,10 @@ def visualize_coin(coin_name):
 
 def main():
     parser = argparse.ArgumentParser(description="Визуализация и аудит 1-секундных признаков.")
-    parser.add_argument("--coin", type=str, default="prl", choices=["prl", "quantus", "tsc", "all"], help="Монета для визуализации (по умолчанию prl).")
+    parser.add_argument("--coin", type=str, default="all", choices=["prl", "quantus", "all"], help="Монета для визуализации (по умолчанию all).")
     args = parser.parse_args()
 
-    coins = ["prl", "quantus", "tsc"] if args.coin == "all" else [args.coin]
+    coins = ["prl", "quantus"] if args.coin == "all" else [args.coin]
     for c in coins:
         visualize_coin(c)
 
