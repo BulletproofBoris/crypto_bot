@@ -1,18 +1,11 @@
 """
-Модуль генерации стационарных микроструктурных признаков и многомасштабного банка фильтров.
-Использует геометрическую сетку окон W = [5, 20, 60, 300] секунд (шаг 3x-5x между полосами частот),
-обеспечивающую статистическую достаточность (N_eff >= 4000 на микроструктурных окнах <= 60с)
-и ортогональность полосовых фильтров (Band-Pass).
+Модуль генерации стационарных микроструктурных признаков и многомасштабного банка фильтров (6 блоков).
+Окна банка фильтров: W = [3, 8, 20, 60, 300] секунд (синхронизированы с тактическими горизонтами H = 3, 8, 25с).
 """
 import numpy as np
 import pandas as pd
 
-# Геометрическая сетка частотных полос (в секундах):
-# 5s  = Горизонт исполнения H (Impulse band)
-# 20s = Окно микроструктурной волны L = 4*H и время блока (Wave band)
-# 60s = Локальное равновесие потока ордеров (Equilibrium band, N_eff ~ 4000..5500)
-# 300s = Медленный контекст режима и волатильности для Z-нормировки (Regime band)
-FILTER_WINDOWS = (5, 20, 60, 300)
+FILTER_WINDOWS = (3, 8, 20, 60, 300)
 
 TICK_SIZES = {
     "prl": 0.005,
@@ -22,164 +15,93 @@ TICK_SIZES = {
 
 def compute_ofi_1s(df_1s, prefix):
     """
-    Рассчитывает 1-секундный Order Flow Imbalance (Cont-Kukanov-Stoikov OFI) на лучших уровнях BBO.
-    Учитывает как сделки, так и подстановку/снятие лимитных заявок.
+    Рассчитывает 1-секундный Order Flow Imbalance (Cont-Kukanov-Stoikov OFI):
+    - ofi_bbo: по 1-му уровню (bid_1, ask_1)
+    - ofi_deep5: взвешенный по уровням 1..5 с весами exp(-0.5*(k-1))
     """
-    b_p = df_1s[f"{prefix}_bid_1_price"].astype(float)
-    b_q = df_1s[f"{prefix}_bid_1_qty"].astype(float)
-    a_p = df_1s[f"{prefix}_ask_1_price"].astype(float)
-    a_q = df_1s[f"{prefix}_ask_1_qty"].astype(float)
+    weights = [1.0, 0.6065, 0.3679, 0.2231, 0.1353]
+    ofi_bbo = None
+    ofi_deep = np.zeros(len(df_1s), dtype=np.float32)
 
-    b_p_prev = b_p.shift(1)
-    b_q_prev = b_q.shift(1)
-    a_p_prev = a_p.shift(1)
-    a_q_prev = a_q.shift(1)
+    for k in range(1, 6):
+        bp_col, bq_col = f"{prefix}_bid_{k}_price", f"{prefix}_bid_{k}_qty"
+        ap_col, aq_col = f"{prefix}_ask_{k}_price", f"{prefix}_ask_{k}_qty"
+        if bp_col not in df_1s.columns or ap_col not in df_1s.columns:
+            continue
 
-    e_bid = np.where(b_p >= b_p_prev, b_q, 0.0) - np.where(b_p <= b_p_prev, b_q_prev, 0.0)
-    e_ask = np.where(a_p <= a_p_prev, a_q, 0.0) - np.where(a_p >= a_p_prev, a_q_prev, 0.0)
+        b_p = df_1s[bp_col].to_numpy(dtype=np.float32)
+        b_q = np.nan_to_num(df_1s[bq_col].to_numpy(dtype=np.float32), nan=0.0)
+        a_p = df_1s[ap_col].to_numpy(dtype=np.float32)
+        a_q = np.nan_to_num(df_1s[aq_col].to_numpy(dtype=np.float32), nan=0.0)
 
-    ofi_raw = pd.Series(e_bid - e_ask, index=df_1s.index).fillna(0.0)
-    return ofi_raw
+        b_p_prev = np.roll(b_p, 1); b_p_prev[0] = b_p[0]
+        b_q_prev = np.roll(b_q, 1); b_q_prev[0] = b_q[0]
+        a_p_prev = np.roll(a_p, 1); a_p_prev[0] = a_p[0]
+        a_q_prev = np.roll(a_q, 1); a_q_prev[0] = a_q[0]
+
+        e_bid = np.where(b_p >= b_p_prev, b_q, 0.0) - np.where(b_p <= b_p_prev, b_q_prev, 0.0)
+        e_ask = np.where(a_p <= a_p_prev, a_q, 0.0) - np.where(a_p >= a_p_prev, a_q_prev, 0.0)
+        ofi_k = (e_bid - e_ask).astype(np.float32)
+
+        if k == 1:
+            ofi_bbo = pd.Series(ofi_k, index=df_1s.index)
+        ofi_deep += weights[k - 1] * ofi_k
+
+    if ofi_bbo is None:
+        ofi_bbo = pd.Series(0.0, index=df_1s.index, dtype=np.float32)
+    return ofi_bbo, pd.Series(ofi_deep, index=df_1s.index)
 
 
-def add_exchange_filter_bank(df_1s, prefix, coin="prl"):
+def compute_price_bucket_depth(df_1s, prefix, tick):
     """
-    Добавляет стационарные признаки геометрии стакана и многочастотный банк фильтров
-    W = [5, 20, 60, 300] с полосовыми разностями (Band-Pass) для биржи (ST или BO).
+    Блок 1: Плотность ликвидности в фиксированных ценовых коридорах (2, 5, 15, 50 тиков от mid_price)
+    и центр масс топ-10 уровней стакана.
     """
-    tick = TICK_SIZES.get(coin.lower(), 0.005)
-    new_cols = {}
+    mid = df_1s[f"{prefix}_mid_price"].to_numpy(dtype=np.float32)[:, None]
+    max_lvl = 20
+    bp_cols = [f"{prefix}_bid_{i}_price" for i in range(1, max_lvl + 1) if f"{prefix}_bid_{i}_price" in df_1s.columns]
+    bq_cols = [f"{prefix}_bid_{i}_qty" for i in range(1, max_lvl + 1) if f"{prefix}_bid_{i}_qty" in df_1s.columns]
+    ap_cols = [f"{prefix}_ask_{i}_price" for i in range(1, max_lvl + 1) if f"{prefix}_ask_{i}_price" in df_1s.columns]
+    aq_cols = [f"{prefix}_ask_{i}_qty" for i in range(1, max_lvl + 1) if f"{prefix}_ask_{i}_qty" in df_1s.columns]
 
-    mid = df_1s[f"{prefix}_mid_price"].astype(float)
-    b1_p = df_1s[f"{prefix}_bid_1_price"].astype(float)
-    a1_p = df_1s[f"{prefix}_ask_1_price"].astype(float)
-    b1_q = df_1s[f"{prefix}_bid_1_qty"].astype(float)
-    a1_q = df_1s[f"{prefix}_ask_1_qty"].astype(float)
-    b5_q = df_1s[f"{prefix}_bids_vol_top5"].astype(float)
-    a5_q = df_1s[f"{prefix}_asks_vol_top5"].astype(float)
+    out = {}
+    if not bp_cols or not ap_cols:
+        return out
 
-    # 1. Стационарная геометрия стакана (в тиках и долях)
-    tot_q1 = (b1_q + a1_q).replace(0, np.nan)
-    microprice = (b1_p * a1_q + a1_p * b1_q) / tot_q1
-    new_cols[f"{prefix}_microprice_offset_ticks"] = ((microprice - mid) / tick).fillna(0.0)
-    new_cols[f"{prefix}_spread_ticks"] = ((a1_p - b1_p) / tick).fillna(0.0)
-    new_cols[f"{prefix}_bbo_imbalance"] = ((b1_q - a1_q) / tot_q1).fillna(0.0)
-    new_cols[f"{prefix}_bid1_dominance"] = (b1_q / b5_q.replace(0, np.nan)).fillna(0.0)
-    new_cols[f"{prefix}_ask1_dominance"] = (a1_q / a5_q.replace(0, np.nan)).fillna(0.0)
-    new_cols[f"{prefix}_log_book_pressure_top5"] = np.log((df_1s[f"{prefix}_bids_usd_top5"] + 1.0) / (df_1s[f"{prefix}_asks_usd_top5"] + 1.0))
+    bp = np.nan_to_num(df_1s[bp_cols].to_numpy(dtype=np.float32), nan=0.0)
+    bq = np.nan_to_num(df_1s[bq_cols].to_numpy(dtype=np.float32), nan=0.0)
+    ap = np.nan_to_num(df_1s[ap_cols].to_numpy(dtype=np.float32), nan=0.0)
+    aq = np.nan_to_num(df_1s[aq_cols].to_numpy(dtype=np.float32), nan=0.0)
 
-    # Относительные расстояния уровней 2..5 от mid_price (в тиках) и их наклон (book slope)
-    for k in range(2, 6):
-        if f"{prefix}_bid_{k}_price" in df_1s.columns:
-            bp_k = df_1s[f"{prefix}_bid_{k}_price"].astype(float)
-            new_cols[f"{prefix}_bid_{k}_dist_ticks"] = np.where(bp_k > 0, (mid - bp_k) / tick, np.nan)
-        if f"{prefix}_ask_{k}_price" in df_1s.columns:
-            ap_k = df_1s[f"{prefix}_ask_{k}_price"].astype(float)
-            new_cols[f"{prefix}_ask_{k}_dist_ticks"] = np.where(ap_k > 0, (ap_k - mid) / tick, np.nan)
+    bid_dist_ticks = np.where(bp > 0, (mid - bp) / tick, 9999.0)
+    ask_dist_ticks = np.where(ap > 0, (ap - mid) / tick, 9999.0)
 
-    # 2. Многомасштабный банк фильтров по W = [5, 20, 60, 300]
-    ofi_1s = compute_ofi_1s(df_1s, prefix)
-    delta_vol = df_1s[f"{prefix}_delta_vol"].astype(float)
-    trade_vol = df_1s[f"{prefix}_trade_vol"].astype(float)
-    depth_scale = (b5_q + a5_q).rolling(60, min_periods=1).median().replace(0, np.nan).ffill().fillna(1.0)
-    ret_1s_ticks = mid.diff().fillna(0.0) / tick
+    b5 = df_1s[f"{prefix}_bids_vol_top5"].astype(np.float32)
+    a5 = df_1s[f"{prefix}_asks_vol_top5"].astype(np.float32)
+    norm_scale = (b5 + a5).rolling(60, min_periods=1).median().replace(0, np.nan).ffill().fillna(1.0).to_numpy(dtype=np.float32)
 
-    for w in FILTER_WINDOWS:
-        # Нормированная скорость изменения цены (тиков в секунду за окно W) и импульс в тиках
-        new_cols[f"{prefix}_ret_{w}s_ticks"] = (mid - mid.shift(w)).fillna(0.0) / tick
-        new_cols[f"{prefix}_vol_{w}s_ticks"] = ret_1s_ticks.rolling(w, min_periods=1).std().fillna(0.0)
-        # Нормированный поток ордеров OFI и CVD (в долях глубины стакана в секунду)
-        new_cols[f"{prefix}_ofi_norm_{w}s"] = (ofi_1s.rolling(w, min_periods=1).mean() / depth_scale).fillna(0.0)
-        new_cols[f"{prefix}_cvd_norm_{w}s"] = (delta_vol.rolling(w, min_periods=1).mean() / depth_scale).fillna(0.0)
-        new_cols[f"{prefix}_vol_intensity_{w}s"] = (trade_vol.rolling(w, min_periods=1).mean() / depth_scale).fillna(0.0)
-        new_cols[f"{prefix}_imbalance_ema_{w}s"] = df_1s[f"{prefix}_imbalance_top5"].ewm(span=w, adjust=False).mean()
+    for rad in (2, 5, 15, 50):
+        b_vol = np.where(bid_dist_ticks <= rad, bq, 0.0).sum(axis=1)
+        a_vol = np.where(ask_dist_ticks <= rad, aq, 0.0).sum(axis=1)
+        tot = b_vol + a_vol
+        out[f"{prefix}_bucket_bid_norm_{rad}t"] = b_vol / norm_scale
+        out[f"{prefix}_bucket_ask_norm_{rad}t"] = a_vol / norm_scale
+        out[f"{prefix}_bucket_imb_{rad}t"] = np.where(tot > 0, (b_vol - a_vol) / tot, 0.0)
 
-    # 3. Ортогональные полосовые фильтры (Band-Pass разности между соседними частотами)
-    new_cols[f"{prefix}_ofi_band_5_20"] = new_cols[f"{prefix}_ofi_norm_5s"] - new_cols[f"{prefix}_ofi_norm_20s"]
-    new_cols[f"{prefix}_ofi_band_20_60"] = new_cols[f"{prefix}_ofi_norm_20s"] - new_cols[f"{prefix}_ofi_norm_60s"]
-    new_cols[f"{prefix}_ofi_band_60_300"] = new_cols[f"{prefix}_ofi_norm_60s"] - new_cols[f"{prefix}_ofi_norm_300s"]
+    # Центр масс топ-10 уровней (в тиках от mid) и наклон книги (Book Slope)
+    k10 = min(10, bp.shape[1])
+    b10_sum = np.maximum(bq[:, :k10].sum(axis=1), 1e-6)
+    a10_sum = np.maximum(aq[:, :k10].sum(axis=1), 1e-6)
+    com_bid = (np.clip(bid_dist_ticks[:, :k10], 0, 500) * bq[:, :k10]).sum(axis=1) / b10_sum
+    com_ask = (np.clip(ask_dist_ticks[:, :k10], 0, 500) * aq[:, :k10]).sum(axis=1) / a10_sum
 
-    new_cols[f"{prefix}_imb_band_5_20"] = new_cols[f"{prefix}_imbalance_ema_5s"] - new_cols[f"{prefix}_imbalance_ema_20s"]
-    new_cols[f"{prefix}_imb_band_20_60"] = new_cols[f"{prefix}_imbalance_ema_20s"] - new_cols[f"{prefix}_imbalance_ema_60s"]
-    new_cols[f"{prefix}_vol_ratio_5_60"] = new_cols[f"{prefix}_vol_5s_ticks"] / (new_cols[f"{prefix}_vol_60s_ticks"] + 0.05)
-    new_cols[f"{prefix}_vol_ratio_20_300"] = new_cols[f"{prefix}_vol_20s_ticks"] / (new_cols[f"{prefix}_vol_300s_ticks"] + 0.05)
+    out[f"{prefix}_com_bid_top10_ticks"] = com_bid
+    out[f"{prefix}_com_ask_top10_ticks"] = com_ask
+    out[f"{prefix}_com_asymmetry_ticks"] = com_ask - com_bid
 
-    ext_df = pd.DataFrame(new_cols, index=df_1s.index).ffill().fillna(0.0)
-    return pd.concat([df_1s, ext_df], axis=1)
-
-
-def add_cross_exchange_and_macro_filters(merged, coin="prl"):
-    """
-    Добавляет кросс-биржевые опережающие фильтры (Lead-Lag BigONE/Rhea -> SafeTrade),
-    адаптивные Z-score межбиржевого спреда и многомасштабные доходности поводырей BTC/NEAR.
-    Удаляет нестационарные накопительные счётчики.
-    """
-    tick = TICK_SIZES.get(coin.lower(), 0.005)
-    new_cols = {}
-
-    if "BO_mid_price" in merged.columns and "ST_mid_price" in merged.columns:
-        diff_ticks = (merged["BO_mid_price"] - merged["ST_mid_price"]) / tick
-        new_cols["arb_mid_diff_ticks"] = diff_ticks
-
-        for w in (20, 60, 300):
-            ema_w = diff_ticks.ewm(span=w, adjust=False).mean()
-            std_w = diff_ticks.rolling(w, min_periods=5).std().fillna(0.0)
-            new_cols[f"arb_spread_zscore_{w}s"] = (diff_ticks - ema_w) / (std_w + 0.25)
-
-        for w in (5, 20, 60):
-            if f"BO_ret_{w}s_ticks" in merged.columns and f"ST_ret_{w}s_ticks" in merged.columns:
-                new_cols[f"leadlag_bo_minus_st_{w}s_ticks"] = (
-                    merged[f"BO_ret_{w}s_ticks"] - merged[f"ST_ret_{w}s_ticks"]
-                )
-            if f"BO_ofi_norm_{w}s" in merged.columns and f"ST_ofi_norm_{w}s" in merged.columns:
-                new_cols[f"leadlag_bo_minus_st_ofi_{w}s"] = (
-                    merged[f"BO_ofi_norm_{w}s"] - merged[f"ST_ofi_norm_{w}s"]
-                )
-
-    if "RHEA_price_usd" in merged.columns and "ST_mid_price" in merged.columns:
-        rhea_diff_ticks = (merged["RHEA_price_usd"] - merged["ST_mid_price"]) / tick
-        new_cols["arb_rhea_diff_ticks"] = rhea_diff_ticks
-        for w in (5, 20, 60, 300):
-            new_cols[f"RHEA_ret_{w}s_ticks"] = (
-                merged["RHEA_price_usd"] - merged["RHEA_price_usd"].shift(w)
-            ).fillna(0.0) / tick
-        for w in (60, 300):
-            ema_r = rhea_diff_ticks.ewm(span=w, adjust=False).mean()
-            std_r = rhea_diff_ticks.rolling(w, min_periods=5).std().fillna(0.0)
-            new_cols[f"arb_rhea_zscore_{w}s"] = (rhea_diff_ticks - ema_r) / (std_r + 0.25)
-
-    # Многомасштабные доходности макро-поводырей (в базисных пунктах bps = 1e4 * pct)
-    for m_asset in ("btc", "near"):
-        col = f"macro_{m_asset}_mid"
-        if col in merged.columns:
-            p_m = merged[col].astype(float).replace(0, np.nan)
-            for w in FILTER_WINDOWS:
-                new_cols[f"macro_{m_asset}_ret_{w}s_bps"] = ((p_m / p_m.shift(w) - 1.0) * 10000.0).fillna(0.0)
-            new_cols[f"macro_{m_asset}_band_5_20_bps"] = (
-                new_cols[f"macro_{m_asset}_ret_5s_bps"] - new_cols[f"macro_{m_asset}_ret_20s_bps"] / 4.0
-            )
-
-    # Стационарные ончейн-признаки: время с момента последнего блока (в секундах)
-    if "onchain_block_height" in merged.columns:
-        bh = merged["onchain_block_height"]
-        block_changed = (bh != bh.shift(1)).cumsum()
-        new_cols["onchain_seconds_since_block"] = merged.groupby(block_changed).cumcount().astype(float)
-
-    if "onchain_mempool_pending_count" in merged.columns:
-        mp = merged["onchain_mempool_pending_count"].astype(float)
-        new_cols["onchain_mempool_delta_20s"] = (mp - mp.shift(20)).fillna(0.0)
-        new_cols["onchain_mempool_delta_60s"] = (mp - mp.shift(60)).fillna(0.0)
-
-    ext_df = pd.DataFrame(new_cols, index=merged.index).ffill().fillna(0.0)
-    out = pd.concat([merged, ext_df], axis=1)
-
-    # Удаляем нестационарные монотонно растущие счётчики
-    non_stationary = [
-        c for c in ["ST_cvd_total", "BO_cvd_total", "onchain_total_accounts", "onchain_total_transactions"]
-        if c in out.columns
-    ]
-    if non_stationary:
-        out = out.drop(columns=non_stationary)
-
+    slope_bid = b10_sum / np.maximum(com_bid, 0.5) / norm_scale
+    slope_ask = a10_sum / np.maximum(com_ask, 0.5) / norm_scale
+    out[f"{prefix}_book_slope_bid"] = slope_bid
+    out[f"{prefix}_book_slope_ask"] = slope_ask
+    out[f"{prefix}_book_slope_imb"] = (slope_bid - slope_ask) / np.maximum(slope_bid + slope_ask, 1e-6)
     return out
-
