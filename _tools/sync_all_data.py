@@ -423,23 +423,31 @@ def sync_vps_hot():
 
 def standardize_timestamps(df):
     """Приводит колонку timestamp к единому объекту UTC datetime."""
-    if 'timestamp' not in df.columns:
+    if 'timestamp' not in df.columns or df.empty:
         return df
 
-    if df['timestamp'].dtype in [np.float64, np.int64]:
-        # Миллисекунды SafeTrade
-        if df['timestamp'].max() > 20000000000:
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+    ts_col = df['timestamp']
+    if pd.api.types.is_datetime64_any_dtype(ts_col):
+        if ts_col.dt.tz is None:
+            df['timestamp'] = ts_col.dt.tz_localize('UTC')
         else:
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s', utc=True)
+            df['timestamp'] = ts_col.dt.tz_convert('UTC')
+        return df
+
+    numeric_ts = pd.to_numeric(ts_col, errors='coerce')
+    if numeric_ts.notna().mean() > 0.8:
+        max_val = numeric_ts.dropna().max()
+        if max_val > 20000000000:
+            df['timestamp'] = pd.to_datetime(numeric_ts, unit='ms', utc=True)
+        else:
+            df['timestamp'] = pd.to_datetime(numeric_ts, unit='s', utc=True)
     else:
-        # Строковые метки (ISO8601)
-        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True, format='mixed')
+        df['timestamp'] = pd.to_datetime(ts_col, utc=True, format='mixed', errors='coerce')
 
     return df
 
 def build_dataset_for_config(cfg, include_vps=True):
-    """Объединяет все архивы из кэша и горячий файл VPS в единый датасет."""
+    """Объединяет все архивы из кэша и горячий файл VPS в единый датасет с инкрементальным Parquet-кэшем."""
     try:
         from _tools.data_sanitizer import read_csv_flexible, sanitize_dataset
     except ImportError:
@@ -449,22 +457,45 @@ def build_dataset_for_config(cfg, include_vps=True):
     pattern = os.path.join(CACHE_GDRIVE_DIR, cfg["cache_pattern"])
     archive_files = sorted(glob.glob(pattern))
 
+    parquet_cache_dir = os.path.join(CACHE_GDRIVE_DIR, ".parquet_cache")
+    os.makedirs(parquet_cache_dir, exist_ok=True)
+
     dfs = []
 
-    # 1. Читаем все архивы из кэша
+    # 1. Читаем архивы (с использованием ускоренного бинарного Parquet-кэша)
     for arch_file in archive_files:
-        try:
-            df_part = read_csv_flexible(arch_file, key)
-            if not df_part.empty:
-                dfs.append(df_part)
-        except Exception as e:
-            logger.warning(f"Ошибка чтения архива {arch_file}: {e}")
+        arch_name = os.path.basename(arch_file)
+        cached_pq = os.path.join(parquet_cache_dir, f"{arch_name}.parquet")
+        df_part = None
+
+        if os.path.exists(cached_pq) and os.path.getmtime(cached_pq) >= os.path.getmtime(arch_file):
+            try:
+                df_part = pd.read_parquet(cached_pq)
+            except Exception:
+                df_part = None
+
+        if df_part is None:
+            try:
+                df_part = read_csv_flexible(arch_file, key)
+                if not df_part.empty:
+                    df_part = standardize_timestamps(df_part)
+                    try:
+                        df_part.to_parquet(cached_pq, index=False)
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.warning(f"Ошибка чтения архива {arch_file}: {e}")
+                df_part = None
+
+        if df_part is not None and not df_part.empty:
+            dfs.append(df_part)
 
     # 2. Читаем горячий файл с VPS
     if include_vps and os.path.exists(cfg["hot_file"]):
         try:
             df_hot = read_csv_flexible(cfg["hot_file"], key)
             if not df_hot.empty:
+                df_hot = standardize_timestamps(df_hot)
                 dfs.append(df_hot)
         except Exception as e:
             logger.warning(f"Ошибка чтения горячего файла {cfg['hot_file']}: {e}")
@@ -476,7 +507,7 @@ def build_dataset_for_config(cfg, include_vps=True):
     # 3. Конкатенация
     full_df = pd.concat(dfs, ignore_index=True)
 
-    # 4. Приведение временных меток
+    # 4. Повторная гарантия единого UTC типа
     full_df = standardize_timestamps(full_df)
 
     # 5. Дедупликация

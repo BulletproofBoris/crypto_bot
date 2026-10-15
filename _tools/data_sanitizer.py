@@ -116,7 +116,11 @@ def clean_orderbook_df(df, key):
 
     crossed_mask = df["ask_1_price"] <= df["bid_1_price"]
     if crossed_mask.any():
-        max_lvl = 20 if "ask_20_price" in df.columns else 50
+        ask_lvl_indices = [
+            int(c.split("_")[1]) for c in df.columns
+            if c.startswith("ask_") and c.endswith("_price") and c.split("_")[1].isdigit()
+        ]
+        max_lvl = max(ask_lvl_indices) if ask_lvl_indices else 50
         ask_p_cols = [f"ask_{i}_price" for i in range(1, max_lvl + 1) if f"ask_{i}_price" in df.columns]
         ask_q_cols = [f"ask_{i}_qty" for i in range(1, max_lvl + 1) if f"ask_{i}_qty" in df.columns]
 

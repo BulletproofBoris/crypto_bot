@@ -165,17 +165,31 @@ def add_cross_exchange_and_macro_filters(merged, coin="prl"):
         block_changed = (bh != bh.shift(1)).cumsum()
         new_cols["onchain_seconds_since_block"] = merged.groupby(block_changed).cumcount().astype(float)
 
-    if "onchain_mempool_pending_count" in merged.columns:
-        mp = merged["onchain_mempool_pending_count"].astype(float)
+    mp_col = "onchain_mempool_size" if "onchain_mempool_size" in merged.columns else (
+        "onchain_mempool_pending_count" if "onchain_mempool_pending_count" in merged.columns else None
+    )
+    if mp_col:
+        mp = merged[mp_col].astype(float)
         new_cols["onchain_mempool_delta_20s"] = (mp - mp.shift(20)).fillna(0.0)
         new_cols["onchain_mempool_delta_60s"] = (mp - mp.shift(60)).fillna(0.0)
+
+    if "onchain_total_transfers" in merged.columns:
+        tt = merged["onchain_total_transfers"].astype(float)
+        new_cols["onchain_transfers_delta_300s"] = (tt - tt.shift(300)).fillna(0.0)
+
+    if "onchain_total_miners" in merged.columns:
+        tm = merged["onchain_total_miners"].astype(float)
+        new_cols["onchain_miners_delta_300s"] = (tm - tm.shift(300)).fillna(0.0)
 
     ext_df = pd.DataFrame(new_cols, index=merged.index).ffill().fillna(0.0)
     out = pd.concat([merged, ext_df], axis=1)
 
-    # Удаляем нестационарные монотонно растущие счётчики
+    # Удаляем нестационарные монотонно растущие счётчики (защита от переобучения на номера блоков и даты)
     non_stationary = [
-        c for c in ["ST_cvd_total", "BO_cvd_total", "onchain_total_accounts", "onchain_total_transactions"]
+        c for c in [
+            "ST_cvd_total", "BO_cvd_total", "onchain_total_accounts", "onchain_total_transactions",
+            "onchain_total_transfers", "onchain_block_height", "onchain_total_miners"
+        ]
         if c in out.columns
     ]
     if non_stationary:

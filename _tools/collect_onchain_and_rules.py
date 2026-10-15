@@ -43,7 +43,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("onchain_collector")
 
-SAFETRADE_PROXY = "http://edtilhmt:iblj7uuixsmy@31.59.20.176:6754"
+try:
+    from _tools.vps_config import SAFETRADE_PROXY
+except ImportError:
+    try:
+        from vps_config import SAFETRADE_PROXY
+    except ImportError:
+        SAFETRADE_PROXY = os.environ.get("SAFETRADE_PROXY", "")
 
 PRL_ONCHAIN_CSV = os.path.join(ONCHAIN_DIR, "prl_onchain.csv")
 QUANTUS_ONCHAIN_CSV = os.path.join(ONCHAIN_DIR, "quantus_onchain.csv")

@@ -27,7 +27,13 @@ MARKETS = [
 ]
 
 WS_URL = "wss://safe.trade/api/v2/websocket/public"
-FALLBACK_PROXY = "http://edtilhmt:iblj7uuixsmy@31.59.20.176:6754"
+try:
+    from _tools.vps_config import FALLBACK_PROXY
+except ImportError:
+    try:
+        from vps_config import FALLBACK_PROXY
+    except ImportError:
+        FALLBACK_PROXY = os.environ.get("SAFETRADE_PROXY", "")
 
 # Периодичность фоновой ре-синхронизации стакана через REST (сек) и heartbeat-записи (сек)
 SNAPSHOT_RESYNC_INTERVAL = 900.0
