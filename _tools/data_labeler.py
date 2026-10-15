@@ -295,6 +295,21 @@ def process_coin_labeling(
     sample_split[train_end:val_start] = 'purged' if embargo_steps == 0 else 'purged_embargo'
     sample_split[val_start:total_rows - max_H] = 'val'
     sample_split[total_rows - max_H:] = 'tail'
+
+    if 'is_data_gap' in df.columns:
+        raw_gap = (df['is_data_gap'].values > 0)
+        if np.any(raw_gap):
+            post_gap_warmup = min(int(max_L), 300)
+            pre_gap_purge = int(max_H)
+            # Расширяем маску разрыва назад на pre_gap_purge и вперед на post_gap_warmup
+            gap_series = pd.Series(raw_gap.astype(np.int32))
+            fwd_mask = gap_series.rolling(post_gap_warmup + 1, min_periods=1).max().values > 0
+            bwd_mask = gap_series.iloc[::-1].rolling(pre_gap_purge + 1, min_periods=1).max().iloc[::-1].values > 0
+            full_gap_mask = (raw_gap | fwd_mask | bwd_mask) & ((sample_split == 'train') | (sample_split == 'val'))
+            n_gap_purged = int(np.sum(full_gap_mask))
+            if n_gap_purged > 0:
+                sample_split[full_gap_mask] = 'purged_gap'
+                print(f"   🧹 Исключено технических разрывов связи (is_data_gap + буфер): {n_gap_purged:,} строк")
     
     out_df = df.copy()
     out_df['coin'] = coin.upper()

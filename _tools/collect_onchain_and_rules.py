@@ -12,6 +12,7 @@ import time
 import json
 import csv
 import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 
 # Для обхода Cloudflare на SafeTrade используем curl_cffi если доступно, иначе requests
@@ -36,7 +37,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
-        logging.FileHandler(os.path.join(LOG_DIR, "onchain_and_rules.log")),
+        RotatingFileHandler(os.path.join(LOG_DIR, "onchain_and_rules.log"), maxBytes=10 * 1024 * 1024, backupCount=2),
         logging.StreamHandler()
     ]
 )

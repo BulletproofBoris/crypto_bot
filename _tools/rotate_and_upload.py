@@ -17,6 +17,7 @@ import shutil
 import logging
 import argparse
 from datetime import datetime, timezone
+from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -100,10 +101,19 @@ def get_free_disk_gb(path="/"):
     return free_bytes / (1024 ** 3)
 
 def get_drive_service():
-    """Инициализирует и возвращает сервис Google Drive API."""
+    """Инициализирует и возвращает сервис Google Drive API с автосохранением обновленного токена."""
     if not os.path.exists(TOKEN_PATH):
         raise FileNotFoundError(f"Файл токена авторизации не найден: {TOKEN_PATH}. Запустите auth_gdrive.py.")
     creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            tmp_token = TOKEN_PATH + ".tmp"
+            with open(tmp_token, "w", encoding="utf-8") as f:
+                f.write(creds.to_json())
+            os.replace(tmp_token, TOKEN_PATH)
+        except Exception as e:
+            logger.warning(f"Не удалось предварительно обновить токен: {e}")
     return build('drive', 'v3', credentials=creds, cache_discovery=False)
 
 def get_or_create_date_folder(service, parent_id, date_str):
@@ -249,13 +259,9 @@ def process_single_file(service, folder_id, file_info, date_str, timestamp_suffi
                 f_dst.write(line)
                 lines_preserved += 1
 
-        # In-place перезапись файла (сохраняет inode и открытые файловые дескрипторы)
-        with open(tmp_hot_path, "r", encoding="utf-8") as f_src, \
-             open(file_path, "w", encoding="utf-8") as f_dst:
-            shutil.copyfileobj(f_src, f_dst)
-        if os.path.exists(tmp_hot_path):
-            os.remove(tmp_hot_path)
-        logger.info(f"✂️ Файл {file_path} успешно обрезан: удалено {skipped_count} заархивированных строк, сохранено {lines_preserved} новых строк.")
+        # Атомарная POSIX-замена файла (исключает состояние гонки при параллельной записи коллектором)
+        os.replace(tmp_hot_path, file_path)
+        logger.info(f"✂️ Файл {file_path} атомарно обрезан: удалено {skipped_count} заархивированных строк, сохранено {lines_preserved} новых строк.")
     except Exception as e:
         logger.error(f"❌ Ошибка при обрезке файла {file_path}: {e}")
         if os.path.exists(tmp_hot_path):

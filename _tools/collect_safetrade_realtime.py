@@ -1,4 +1,6 @@
 import asyncio
+from collections import OrderedDict
+from datetime import datetime
 import json
 import csv
 import logging
@@ -39,7 +41,8 @@ orderbooks = {m["id"]: {"bids": {}, "asks": {}} for m in MARKETS}
 snapshot_ready = {m["id"]: False for m in MARKETS}
 last_write_time = {m["id"]: 0.0 for m in MARKETS}
 last_sequence = {m["id"]: None for m in MARKETS}
-seen_trade_ids = {m["id"]: set() for m in MARKETS}
+seen_trade_ids = {m["id"]: OrderedDict() for m in MARKETS}
+last_ws_msg_time = 0.0
 
 
 DEPTH_TAIL_COLS = [
@@ -82,6 +85,14 @@ def upgrade_csv_header_if_needed(file_path, expected_headers):
         logger.warning(f"Не удалось обновить заголовок {file_path}: {e}")
 
 
+def remember_trade_id(mid, tid):
+    if not tid:
+        return
+    seen_trade_ids[mid][tid] = None
+    while len(seen_trade_ids[mid]) > 2000:
+        seen_trade_ids[mid].popitem(last=False)
+
+
 def init_seen_trades():
     for m in MARKETS:
         mid = m["id"]
@@ -95,7 +106,7 @@ def init_seen_trades():
                 for line in lines[1:]:
                     parts = line.strip().split(",")
                     if parts and parts[0]:
-                        seen_trade_ids[mid].add(str(parts[0]))
+                        remember_trade_id(mid, str(parts[0]))
             except Exception as e:
                 logger.warning(f"[{mid}] Не удалось считать историю сделок: {e}")
 
@@ -274,28 +285,92 @@ def infer_trade_side(market_id, price_str, raw_side):
     return ""
 
 
-async def periodic_maintenance(session, market_ids):
-    """Фоновая задача: heartbeat-запись при тишине в стакане и периодическая ре-синхронизация REST-снимка."""
+def append_trades_to_csv(mid, trade_list):
+    m_info = next((m for m in MARKETS if m["id"] == mid), None)
+    if not m_info or not trade_list:
+        return
+    file_path = os.path.join(m_info["data_dir"], "trades.csv")
+    file_exists = os.path.exists(file_path)
+    with open(file_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["id", "price", "amount", "type", "timestamp"])
+        for trade in trade_list:
+            tid = str(trade.get("id", ""))
+            if tid and tid in seen_trade_ids[mid]:
+                continue
+            remember_trade_id(mid, tid)
+            raw_side = (
+                trade.get("side")
+                or trade.get("type")
+                or trade.get("taker_type")
+                or ""
+            )
+            clean_side = infer_trade_side(mid, trade.get("price"), raw_side)
+            raw_ts = trade.get("date", trade.get("created_at", ""))
+            if isinstance(raw_ts, str) and "T" in raw_ts:
+                try:
+                    raw_ts = int(datetime.fromisoformat(raw_ts.replace("Z", "+00:00")).timestamp())
+                except Exception:
+                    pass
+            writer.writerow([
+                tid,
+                trade.get("price", ""),
+                trade.get("amount", ""),
+                clean_side,
+                raw_ts
+            ])
+
+
+async def fetch_recent_trades(session, market_id):
+    rest_url = f"https://safe.trade/api/v2/trade/public/markets/{market_id}/trades?limit=50"
+    for attempt_name, proxies in [("DIRECT", None), ("PROXY", {"http": FALLBACK_PROXY, "https": FALLBACK_PROXY})]:
+        try:
+            r = await session.get(rest_url, proxies=proxies, timeout=8)
+            if r.status_code == 200:
+                trades = r.json()
+                if isinstance(trades, list) and trades:
+                    trades_sorted = sorted(trades, key=lambda x: int(x.get("id", 0) or 0))
+                    append_trades_to_csv(market_id, trades_sorted)
+                return True
+        except Exception as e:
+            logger.debug(f"[{market_id}] Ошибка догрузки REST сделок ({attempt_name}): {e}")
+    return False
+
+
+async def periodic_maintenance(session, ws, market_ids, subscribe_msg):
+    """Фоновая задача: проверка живости WS, heartbeat-запись и периодическая ре-синхронизация REST-снимка."""
     last_resync = time.time()
     while True:
         await asyncio.sleep(2.0)
         now = time.time()
+        ws_silence = now - last_ws_msg_time
 
-        # 1. Heartbeat для поддержания свежести файлов и плотной сетки
-        for mid in market_ids:
-            if not snapshot_ready.get(mid, False):
-                await fetch_snapshot(session, mid)
-            elif now - last_write_time.get(mid, 0.0) >= HEARTBEAT_WRITE_INTERVAL:
-                write_depth(mid, int(now * 1000))
+        # Проактивный пинг подпиской при тишине в сокете > 20 сек (Ranger отвечает JSON-кадром)
+        if ws_silence >= 20.0:
+            try:
+                await ws.send(json.dumps(subscribe_msg).encode())
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка отправки WS-проверки: {e}")
 
-        # 2. Периодическая сверка полного снимка стакана
+        # 1. Heartbeat пишем ТОЛЬКО если WebSocket-соединение подтверждённо живо (ws_silence <= 45с)
+        if ws_silence <= 45.0:
+            for mid in market_ids:
+                if not snapshot_ready.get(mid, False):
+                    await fetch_snapshot(session, mid)
+                elif now - last_write_time.get(mid, 0.0) >= HEARTBEAT_WRITE_INTERVAL:
+                    write_depth(mid, int(now * 1000))
+
+        # 2. Периодическая сверка полного снимка стакана и сделок
         if now - last_resync >= SNAPSHOT_RESYNC_INTERVAL:
             for mid in market_ids:
                 await fetch_snapshot(session, mid)
+                await fetch_recent_trades(session, mid)
             last_resync = time.time()
 
 
 async def main():
+    global last_ws_msg_time
     init_seen_trades()
     market_ids = [m["id"] for m in MARKETS]
     while True:
@@ -306,6 +381,7 @@ async def main():
                     snapshot_ready[mid] = False
                     last_sequence[mid] = None
                     await fetch_snapshot(session, mid)
+                    await fetch_recent_trades(session, mid)
 
                 logger.info(f"🚀 Запуск WebSocket сбора данных для {market_ids} с {WS_URL}")
 
@@ -314,20 +390,23 @@ async def main():
                     streams.extend([f"{mid}.depth", f"{mid}.trades"])
 
                 async with session.ws_connect(WS_URL) as ws:
+                    last_ws_msg_time = time.time()
                     subscribe_msg = {
                         "event": "subscribe",
                         "streams": streams
                     }
                     await ws.send(json.dumps(subscribe_msg).encode())
 
-                    # Повторная быстрая синхронизация снимка сразу после подписки на WS (закрывает окно гонки)
+                    # Повторная быстрая синхронизация снимка и сделок сразу после подписки на WS (закрывает окно гонки)
                     for mid in market_ids:
                         await fetch_snapshot(session, mid)
+                        await fetch_recent_trades(session, mid)
 
-                    maint_task = asyncio.create_task(periodic_maintenance(session, market_ids))
+                    maint_task = asyncio.create_task(periodic_maintenance(session, ws, market_ids, subscribe_msg))
 
                     while True:
-                        msg, *_ = await ws.recv()
+                        msg, *_ = await asyncio.wait_for(ws.recv(), timeout=45.0)
+                        last_ws_msg_time = time.time()
                         data = json.loads(msg)
 
                         for k, stream_data in data.items():
@@ -349,36 +428,7 @@ async def main():
 
                             elif k.endswith(".trades") and isinstance(stream_data, list):
                                 mid = k.split(".")[0]
-                                m_info = next((m for m in MARKETS if m["id"] == mid), None)
-                                if m_info:
-                                    file_path = os.path.join(m_info["data_dir"], "trades.csv")
-                                    file_exists = os.path.exists(file_path)
-                                    with open(file_path, "a", newline="") as f:
-                                        writer = csv.writer(f)
-                                        if not file_exists:
-                                            writer.writerow(["id", "price", "amount", "type", "timestamp"])
-                                        for trade in stream_data:
-                                            tid = str(trade.get("id", ""))
-                                            if tid and tid in seen_trade_ids[mid]:
-                                                continue
-                                            if tid:
-                                                seen_trade_ids[mid].add(tid)
-                                                if len(seen_trade_ids[mid]) > 2000:
-                                                    seen_trade_ids[mid] = set(list(seen_trade_ids[mid])[-1000:])
-                                            raw_side = (
-                                                trade.get("side")
-                                                or trade.get("type")
-                                                or trade.get("taker_type")
-                                                or ""
-                                            )
-                                            clean_side = infer_trade_side(mid, trade.get("price"), raw_side)
-                                            writer.writerow([
-                                                tid,
-                                                trade.get("price", ""),
-                                                trade.get("amount", ""),
-                                                clean_side,
-                                                trade.get("date", trade.get("created_at", ""))
-                                            ])
+                                append_trades_to_csv(mid, stream_data)
 
         except Exception as e:
             logger.error(f"Неожиданная ошибка: {e}. Переподключение через 5 секунд...")

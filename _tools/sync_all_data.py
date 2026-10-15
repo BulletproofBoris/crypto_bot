@@ -257,6 +257,7 @@ def ensure_directories():
 # ==============================================================================
 
 def get_drive_service():
+    from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
     import socket
@@ -264,6 +265,15 @@ def get_drive_service():
     if not os.path.exists(TOKEN_PATH):
         raise FileNotFoundError(f"Файл токена не найден: {TOKEN_PATH}. Запустите auth_gdrive.py.")
     creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            tmp_token = TOKEN_PATH + ".tmp"
+            with open(tmp_token, "w", encoding="utf-8") as f:
+                f.write(creds.to_json())
+            os.replace(tmp_token, TOKEN_PATH)
+        except Exception as e:
+            logger.warning(f"Не удалось предварительно обновить токен: {e}")
     return build('drive', 'v3', credentials=creds, cache_discovery=False)
 
 def sync_gdrive():

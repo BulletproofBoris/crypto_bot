@@ -13,6 +13,7 @@ import asyncio
 import json
 import csv
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import time
 from datetime import datetime
@@ -27,7 +28,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(LOG_FILE),
+        RotatingFileHandler(LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=2),
         logging.StreamHandler()
     ]
 )
@@ -44,6 +45,7 @@ MACRO_HEADERS = [
 ]
 
 state = {
+    "last_ws_ts": 0.0,
     "btc": {"bid": None, "ask": None, "bid_qty": 0.0, "ask_qty": 0.0, "last": None, "buy_vol": 0.0, "sell_vol": 0.0},
     "near": {"bid": None, "ask": None, "bid_qty": 0.0, "ask_qty": 0.0, "last": None, "buy_vol": 0.0, "sell_vol": 0.0}
 }
@@ -80,8 +82,9 @@ async def writer_loop():
 
             btc = state["btc"]
             near = state["near"]
+            ws_age = time.time() - state.get("last_ws_ts", 0.0)
 
-            if btc["bid"] is not None and near["bid"] is not None:
+            if ws_age <= 30.0 and btc["bid"] is not None and near["bid"] is not None:
                 btc_mid = (btc["bid"] + btc["ask"]) / 2.0 if btc["bid"] and btc["ask"] else ""
                 near_mid = (near["bid"] + near["ask"]) / 2.0 if near["bid"] and near["ask"] else ""
 
@@ -128,7 +131,8 @@ async def ws_loop():
                     logger.info("✅ Подключено к Binance WebSocket (BTCUSDT + NEARUSDT)!")
 
                     while True:
-                        msg, *_ = await ws.recv()
+                        msg, *_ = await asyncio.wait_for(ws.recv(), timeout=30.0)
+                        state["last_ws_ts"] = time.time()
                         payload = json.loads(msg)
                         stream = payload.get("stream", "")
                         data = payload.get("data", {})

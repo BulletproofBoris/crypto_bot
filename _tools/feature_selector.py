@@ -81,6 +81,12 @@ def main(args):
 
     print(f"🚀 Динамический отбор признаков...")
     df = pd.read_parquet(train_path)
+    if 'sample_split' in df.columns:
+        n_before = len(df)
+        df = df[df['sample_split'] == 'train'].copy()
+        print(f"🔒 Фильтрация sample_split == 'train': оставлено {len(df):,} из {n_before:,} строк (защита от утечки Val/Purged)")
+    elif 'is_valid_sample' in df.columns:
+        df = df[df['is_valid_sample'] == 1].copy()
     
     exclude_cols = {
         'datetime', 'timestamp', 'ticker', 'coin', 'sample_split',
@@ -88,7 +94,7 @@ def main(args):
         'open', 'high', 'low', 'close', 'volume',
         'target_class_7', 'target_class_5', 'target_velocity_z', 'target_dt_ticks', 'target_ret_pct',
         'dynamic_scale_up', 'dynamic_scale_dn', 'future_trade_vol_H', 'is_liquidity_void', 'is_valid_sample',
-        'kinematic_v_wave', 'kinematic_micro_offset'
+        'is_data_gap', 'kinematic_v_wave', 'kinematic_micro_offset'
     }
     exclude_prefixes = (
         'target_', 'future_', 'is_liquidity_void', 'dynamic_scale_', 'kinematic_v_wave_'

@@ -86,9 +86,11 @@ def process_exchange_l2(depth_df, trades_df, prefix):
     df_d = df_d.sort_values('timestamp').drop_duplicates(subset=['timestamp'])
     df_d.set_index('timestamp', inplace=True)
 
-    # 2. Ресемплинг стакана (1s, ffill)
+    # 2. Ресемплинг стакана (1s, ffill) и время с последнего реального тика
     depth_cols = [c for c in df_d.columns if 'bid' in c or 'ask' in c]
+    raw_tick_ts = pd.Series(df_d.index, index=df_d.index).resample('1s').ffill()
     depth_1s = df_d[depth_cols].resample('1s').ffill()
+    depth_1s['sec_since_tick'] = (depth_1s.index - raw_tick_ts).dt.total_seconds().fillna(0.0)
 
     # 3. Базовые фичи стакана
     best_bid = depth_1s['bid_1_price'].astype(float)
@@ -424,6 +426,11 @@ def build_features_for_coin(coin_name, macro_df=None):
     if gap_mask.any():
         flow_cols = [c for c in merged.columns if any(k in c for k in ['trade_vol', 'buy_vol', 'sell_vol', 'trade_count', 'delta_vol'])]
         merged.loc[gap_mask, flow_cols] = 0.0
+
+    # Флаг технического разрыва связи (когда одновременно все биржи молчат > 180 сек)
+    st_silent = merged['ST_sec_since_tick'] > 180.0 if 'ST_sec_since_tick' in merged.columns else pd.Series(False, index=merged.index)
+    bo_silent = merged['BO_sec_since_tick'] > 180.0 if 'BO_sec_since_tick' in merged.columns else pd.Series(True, index=merged.index)
+    merged['is_data_gap'] = (st_silent & bo_silent).astype(np.int8)
     merged = merged.fillna(0)
 
     # 6. Многочастотный стационарный банк фильтров W = [5, 20, 60, 300]с и полосовые разности (Band-Pass)
@@ -435,6 +442,20 @@ def build_features_for_coin(coin_name, macro_df=None):
         merged = add_exchange_filter_bank(merged, 'BO', coin=coin)
     merged = add_cross_exchange_and_macro_filters(merged, coin=coin)
     merged = merged.fillna(0)
+
+    # Оптимизация RAM: конвертируем производные признаки в float32, сохраняя float64 для опорных цен
+    keep_f64 = {
+        'ST_mid_price', 'ST_micro_price', 'ST_spread', 'ST_bid_1_price', 'ST_ask_1_price',
+        'BO_mid_price', 'BO_micro_price', 'BO_spread', 'BO_bid_1_price', 'BO_ask_1_price',
+        'RHEA_price_usd', 'RHEA_price_native', 'macro_btc_mid', 'macro_near_mid',
+        'ONCHAIN_block_height'
+    }
+    f64_to_f32 = [
+        c for c in merged.columns
+        if merged[c].dtype == np.float64 and c not in keep_f64
+    ]
+    if f64_to_f32:
+        merged[f64_to_f32] = merged[f64_to_f32].astype(np.float32)
 
     # Сохранение в data/features/{coin}_1s_features.parquet
     out_dir = os.path.join(BASE_DIR, 'data', 'features')
