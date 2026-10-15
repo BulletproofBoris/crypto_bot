@@ -4,7 +4,6 @@
 Поддерживает новую иерархическую структуру данных и любые монеты:
 - PRL (SafeTrade, BigONE, On-chain Pearl)
 - QUANTUS (SafeTrade, BigONE, Rhea DEX, On-chain Quantus)
-- TSC (SafeTrade)
 - Macro (Binance BTC & NEAR)
 - Правила и статусы бирж (SafeTrade, BigONE)
 """
@@ -47,16 +46,25 @@ def analyze_dataset(df, name, is_trades=False, max_gap_sec=5.0):
 
     print(f"  {Fore.CYAN}• {name:<30}{Style.RESET_ALL} {total_records:>8,} строк | {t_min} -> {t_max}", end="")
 
-    # Анализ разрывов (для стаканов и макро)
     if not is_trades:
         deltas = ts_msk.diff().dt.total_seconds()
         gaps = deltas[deltas > max_gap_sec]
+        extra = ""
+        if "bid_1_price" in df.columns and "ask_1_price" in df.columns:
+            crossed = int((df["ask_1_price"] <= df["bid_1_price"]).sum())
+            bbo_nan = int(df["bid_1_price"].isna().sum() + df["ask_1_price"].isna().sum())
+            extra = f" | Crossed: {crossed}, BBO NaN: {bbo_nan}"
         if len(gaps) > 0:
-            print(f" | Разрывов >{max_gap_sec:.0f}с: {Fore.YELLOW}{len(gaps)}{Style.RESET_ALL} (макс {gaps.max():.1f}с)")
+            print(f" | Разрывов >{max_gap_sec:.0f}с: {Fore.YELLOW}{len(gaps)}{Style.RESET_ALL} (макс {gaps.max():.1f}с){extra}")
         else:
-            print(f" | {Fore.GREEN}Разрывов нет (непрерывно){Style.RESET_ALL}")
+            print(f" | {Fore.GREEN}Разрывов нет (непрерывно){Style.RESET_ALL}{extra}")
     else:
-        print(f" | {Fore.GREEN}Тики сделок{Style.RESET_ALL}")
+        side_col = "type" if "type" in df.columns else ("side" if "side" in df.columns else None)
+        side_info = ""
+        if side_col:
+            valid_sides = df[side_col].astype(str).str.lower().isin(["buy", "sell", "bid", "ask"]).mean() * 100
+            side_info = f" (side заполнен: {valid_sides:.1f}%)"
+        print(f" | {Fore.GREEN}Тики сделок{side_info}{Style.RESET_ALL}")
 
     return ts_msk
 
@@ -118,7 +126,7 @@ def check_macro():
 
 def main():
     parser = argparse.ArgumentParser(description="Анализ качества и плотности собранных рыночных данных.")
-    parser.add_argument("--coin", type=str, default="all", choices=["prl", "quantus", "tsc", "all"], help="Монета для анализа (по умолчанию all).")
+    parser.add_argument("--coin", type=str, default="all", choices=["prl", "quantus", "all"], help="Монета для анализа (по умолчанию all).")
     parser.add_argument("--sync", action="store_true", help="Сначала выполнить синхронизацию с Google Drive и VPS.")
     args = parser.parse_args()
 
@@ -126,7 +134,7 @@ def main():
         print(f"{Fore.CYAN}🔄 Выполняется синхронизация данных...{Style.RESET_ALL}")
         sync_data()
 
-    coins_to_check = ["prl", "quantus", "tsc"] if args.coin == "all" else [args.coin]
+    coins_to_check = ["prl", "quantus"] if args.coin == "all" else [args.coin]
 
     all_ts = {}
     for c in coins_to_check:

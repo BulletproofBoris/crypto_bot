@@ -36,8 +36,7 @@ import pyarrow.parquet as pq
 # Microstructure Parameters by Coin (SafeTrade)
 COIN_CONFIG = {
     'prl': {'tick_size': 0.005, 'typical_trade': 17.3, 'min_vol': 50.0},
-    'quantus': {'tick_size': 0.001, 'typical_trade': 2.2, 'min_vol': 2.0},
-    'tsc': {'tick_size': 0.0001, 'typical_trade': 10.0, 'min_vol': 10.0},
+    'quantus': {'tick_size': 0.05, 'typical_trade': 2.2, 'min_vol': 2.0},
 }
 
 # Robust Asymmetric Thresholds (Anchored on empirical plateaus)
@@ -124,8 +123,8 @@ def compute_labels(df, coin="prl", horizon_sec=5, window_ratio=4, split_ratio=0.
     z[dt_ticks_full < 0] = (dt_ticks_full[dt_ticks_full < 0] / M_dn[dt_ticks_full < 0]).astype(np.float32)
     
     # 8. Флаг фантомных котировок (Zero-Volume Liquidity Void):
-    # Скользящая сумма сделок за горизонт H
-    trade_vol_H = pd.Series(trade_vol).rolling(H, min_periods=1).sum().values
+    # Скользящая сумма сделок вперед за горизонт (t, t+H]
+    trade_vol_H = pd.Series(trade_vol).rolling(H, min_periods=1).sum().shift(-H).fillna(0).values
     is_void = (np.abs(dt_ticks_full) >= 5) & (trade_vol_H == 0)
     
     print(f"[3/4] Формирование меток классов на устойчивых плато...")
@@ -164,8 +163,12 @@ def compute_labels(df, coin="prl", horizon_sec=5, window_ratio=4, split_ratio=0.
     out_df['is_liquidity_void'] = is_void
     out_df['is_valid_sample'] = valid_mask
     
-    # Срезаем только валидные строки
-    valid_df = out_df.iloc[L : n - H].copy().reset_index(drop=True)
+    # Срезаем только валидные строки с сохранением колонки timestamp
+    valid_df = out_df.iloc[L : n - H].copy()
+    if isinstance(valid_df.index, pd.DatetimeIndex) or valid_df.index.name == 'timestamp':
+        valid_df = valid_df.reset_index()
+    else:
+        valid_df = valid_df.reset_index(drop=True)
     
     # Расчет сходимости Train vs Val
     split_valid = split_idx - L
@@ -254,13 +257,13 @@ def process_coin_labeling(coin, horizon, ratio, base_outdir):
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-Asset Dataset Labeling Engine")
-    parser.add_argument("--coin", type=str, default="all", choices=["prl", "quantus", "tsc", "all"], help="Монета для разметки (по умолчанию all)")
+    parser.add_argument("--coin", type=str, default="all", choices=["prl", "quantus", "all"], help="Монета для разметки (по умолчанию all)")
     parser.add_argument("--horizon", type=int, default=5, help="Prediction horizon in seconds (default: 5)")
     parser.add_argument("--ratio", type=int, default=4, help="Ratio of L/H (default: 4)")
     parser.add_argument("--outdir", type=str, default="data/labeled", help="Output directory")
     args = parser.parse_args()
     
-    coins = ["prl", "quantus", "tsc"] if args.coin == "all" else [args.coin]
+    coins = ["prl", "quantus"] if args.coin == "all" else [args.coin]
     for c in coins:
         process_coin_labeling(c, args.horizon, args.ratio, args.outdir)
         

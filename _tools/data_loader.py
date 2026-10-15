@@ -69,7 +69,7 @@ class CoinData:
 def load_coin(coin: str) -> CoinData:
     """
     Загружает все датасеты по монете из структурированной папки data/processed/{coin}/.
-    Поддерживаемые монеты: 'prl', 'quantus', 'tsc'.
+    Поддерживаемые монеты: 'prl', 'quantus'.
     """
     coin = coin.lower()
     coin_dir = os.path.join(PROCESSED_DIR, coin)
@@ -105,7 +105,7 @@ def load_macro() -> pd.DataFrame:
 def load_rules(coin: Optional[str] = None) -> Dict[str, Any]:
     """
     Загружает актуальные торговые правила и статусы бирж из data/metadata/exchange_rules.json.
-    Если указан coin ('prl', 'quantus', 'tsc'), фильтрует правила для этой монеты.
+    Если указан coin ('prl', 'quantus'), фильтрует правила для этой монеты.
     """
     rules_file = os.path.join(METADATA_DIR, "exchange_rules.json")
     if not os.path.exists(rules_file):

@@ -15,8 +15,11 @@
 
 import os
 import io
+import csv
 import sys
+import time
 import glob
+import gzip
 import logging
 import argparse
 import numpy as np
@@ -96,17 +99,6 @@ REMOTE_FILES = [
         "remote": "/opt/crypto_bot/data/realtime/quantus_rhea/price_rhea.csv",
         "local": os.path.join(HOT_VPS_DIR, "rhea_quantus_price_hot.csv"),
         "name": "Rhea Finance Price Hot (Quantus)"
-    },
-    # TSC/USDT (SafeTrade)
-    {
-        "remote": "/opt/crypto_bot/data/realtime/tscusdt/depth.csv",
-        "local": os.path.join(HOT_VPS_DIR, "safetrade_tsc_depth_hot.csv"),
-        "name": "SafeTrade Depth Hot (TSC)"
-    },
-    {
-        "remote": "/opt/crypto_bot/data/realtime/tscusdt/trades.csv",
-        "local": os.path.join(HOT_VPS_DIR, "safetrade_tsc_trades_hot.csv"),
-        "name": "SafeTrade Trades Hot (TSC)"
     },
     # Binance Macro Leading Indicators (BTC + NEAR)
     {
@@ -240,25 +232,6 @@ DATASET_CONFIGS = [
         "hierarchical_file": os.path.join(PROCESSED_DIR, "quantus", "onchain.parquet"),
         "dedup_key": "timestamp",
     },
-    # TSC Datasets
-    {
-        "key": "safetrade_tsc_depth",
-        "coin": "tsc",
-        "cache_pattern": "safetrade_tsc_depth_*.csv.gz",
-        "hot_file": os.path.join(HOT_VPS_DIR, "safetrade_tsc_depth_hot.csv"),
-        "parquet_file": os.path.join(PROCESSED_DIR, "safetrade_tsc_depth.parquet"),
-        "hierarchical_file": os.path.join(PROCESSED_DIR, "tsc", "safetrade_depth.parquet"),
-        "dedup_key": "timestamp",
-    },
-    {
-        "key": "safetrade_tsc_trades",
-        "coin": "tsc",
-        "cache_pattern": "safetrade_tsc_trades_*.csv.gz",
-        "hot_file": os.path.join(HOT_VPS_DIR, "safetrade_tsc_trades_hot.csv"),
-        "parquet_file": os.path.join(PROCESSED_DIR, "safetrade_tsc_trades.parquet"),
-        "hierarchical_file": os.path.join(PROCESSED_DIR, "tsc", "safetrade_trades.parquet"),
-        "dedup_key": "id",
-    },
     # Binance Macro Dataset
     {
         "key": "binance_macro",
@@ -276,7 +249,7 @@ def ensure_directories():
     os.makedirs(HOT_VPS_DIR, exist_ok=True)
     os.makedirs(PROCESSED_DIR, exist_ok=True)
     os.makedirs(METADATA_DIR, exist_ok=True)
-    for c in ["prl", "quantus", "tsc", "macro"]:
+    for c in ["prl", "quantus", "macro"]:
         os.makedirs(os.path.join(PROCESSED_DIR, c), exist_ok=True)
 
 # ==============================================================================
@@ -457,6 +430,11 @@ def standardize_timestamps(df):
 
 def build_dataset_for_config(cfg, include_vps=True):
     """Объединяет все архивы из кэша и горячий файл VPS в единый датасет."""
+    try:
+        from _tools.data_sanitizer import read_csv_flexible, sanitize_dataset
+    except ImportError:
+        from data_sanitizer import read_csv_flexible, sanitize_dataset
+
     key = cfg["key"]
     pattern = os.path.join(CACHE_GDRIVE_DIR, cfg["cache_pattern"])
     archive_files = sorted(glob.glob(pattern))
@@ -466,7 +444,7 @@ def build_dataset_for_config(cfg, include_vps=True):
     # 1. Читаем все архивы из кэша
     for arch_file in archive_files:
         try:
-            df_part = pd.read_csv(arch_file)
+            df_part = read_csv_flexible(arch_file, key)
             if not df_part.empty:
                 dfs.append(df_part)
         except Exception as e:
@@ -475,7 +453,7 @@ def build_dataset_for_config(cfg, include_vps=True):
     # 2. Читаем горячий файл с VPS
     if include_vps and os.path.exists(cfg["hot_file"]):
         try:
-            df_hot = pd.read_csv(cfg["hot_file"])
+            df_hot = read_csv_flexible(cfg["hot_file"], key)
             if not df_hot.empty:
                 dfs.append(df_hot)
         except Exception as e:
@@ -501,6 +479,9 @@ def build_dataset_for_config(cfg, include_vps=True):
     # 6. Хронологическая сортировка
     if 'timestamp' in full_df.columns:
         full_df = full_df.sort_values('timestamp').reset_index(drop=True)
+
+    # 6.5. Санация и нормализация данных
+    full_df = sanitize_dataset(full_df, key, PROCESSED_DIR)
 
     # 7. Сохранение в Parquet
     parquet_path = cfg["parquet_file"]
@@ -562,7 +543,6 @@ def load_dataset(key):
       - 'safetrade_quantus_depth', 'safetrade_quantus_trades' (Quantus)
       - 'bigone_quantus_depth', 'bigone_quantus_trades' (Quantus / QTC)
       - 'rhea_quantus_price' (Quantus on Rhea Finance / Near Intents)
-      - 'safetrade_tsc_depth', 'safetrade_tsc_trades' (TSC)
       - 'binance_macro' (BTC/USDT + NEAR/USDT 1s snapshots)
     """
     path = os.path.join(PROCESSED_DIR, f"{key}.parquet")

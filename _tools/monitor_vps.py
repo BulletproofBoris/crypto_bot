@@ -25,7 +25,7 @@ MEM_WARNING_PERCENT = 85.0
 DISK_WARNING_PERCENT = 90.0
 
 SERVICES = [
-    ("safetrade-collector", "SafeTrade (PRL, Quantus, TSC)"),
+    ("safetrade-collector", "SafeTrade (PRL, Quantus)"),
     ("bigone-collector", "BigONE (PRL, QTC)"),
     ("rhea-collector", "Rhea Finance / Near Intents"),
     ("binance-collector", "Binance Macro (BTC + NEAR)"),
@@ -80,7 +80,6 @@ def get_server_stats(ssh):
         "/opt/crypto_bot/data/realtime/prlusdt_bigone/depth_bigone.csv "
         "/opt/crypto_bot/data/realtime/quantususdt/depth.csv "
         "/opt/crypto_bot/data/realtime/quantus_bigone/depth_bigone.csv "
-        "/opt/crypto_bot/data/realtime/tscusdt/depth.csv "
         "/opt/crypto_bot/data/realtime/macro_binance/binance_macro.csv "
         "/opt/crypto_bot/data/realtime/onchain/prl_onchain.csv "
         "/opt/crypto_bot/data/realtime/onchain/quantus_onchain.csv "
