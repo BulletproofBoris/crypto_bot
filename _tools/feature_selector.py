@@ -83,14 +83,21 @@ def main(args):
     df = pd.read_parquet(train_path)
     
     exclude_cols = {
-        'datetime', 'timestamp', 'ticker', 'target_tp', 'target_sl', 'target_return', 'label',
+        'datetime', 'timestamp', 'ticker', 'coin', 'sample_split',
+        'target_tp', 'target_sl', 'target_return', 'label',
         'open', 'high', 'low', 'close', 'volume',
         'target_class_7', 'target_class_5', 'target_velocity_z', 'target_dt_ticks', 'target_ret_pct',
-        'dynamic_scale_up', 'dynamic_scale_dn', 'is_liquidity_void', 'is_valid_sample'
+        'dynamic_scale_up', 'dynamic_scale_dn', 'future_trade_vol_H', 'is_liquidity_void', 'is_valid_sample',
+        'kinematic_v_wave', 'kinematic_micro_offset'
     }
+    exclude_prefixes = (
+        'target_', 'future_', 'is_liquidity_void', 'dynamic_scale_', 'kinematic_v_wave_'
+    )
     feature_cols = [
         c for c in df.columns
-        if pd.api.types.is_numeric_dtype(df[c]) and c not in exclude_cols and not c.startswith('target_')
+        if pd.api.types.is_numeric_dtype(df[c])
+        and c not in exclude_cols
+        and not c.startswith(exclude_prefixes)
     ]
     
     if not args.skip_corr:

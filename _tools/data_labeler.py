@@ -306,6 +306,7 @@ def process_coin_labeling(
     
     tr_mask = (sample_split == 'train')
     va_mask = (sample_split == 'val')
+    extra_cols = {}
     
     for H, K in pairs:
         L = H * K
@@ -313,29 +314,29 @@ def process_coin_labeling(
         
         # Добавляем таргеты с суффиксами в общий датасет
         suffix = f"_h{H}_k{K}"
-        out_df[f'target_class_7{suffix}'] = res['class_7']
-        out_df[f'target_class_5{suffix}'] = res['class_5']
-        out_df[f'target_velocity_z{suffix}'] = res['z']
-        out_df[f'target_dt_ticks{suffix}'] = res['dt_ticks']
-        out_df[f'target_ret_pct{suffix}'] = res['ret_pct']
-        out_df[f'kinematic_v_wave{suffix}'] = res['v_wave']
-        out_df[f'dynamic_scale_up{suffix}'] = res['M_up']
-        out_df[f'dynamic_scale_dn{suffix}'] = res['M_dn']
-        out_df[f'is_liquidity_void_h{H}'] = res['is_void']
+        extra_cols[f'target_class_7{suffix}'] = res['class_7']
+        extra_cols[f'target_class_5{suffix}'] = res['class_5']
+        extra_cols[f'target_velocity_z{suffix}'] = res['z']
+        extra_cols[f'target_dt_ticks{suffix}'] = res['dt_ticks']
+        extra_cols[f'target_ret_pct{suffix}'] = res['ret_pct']
+        extra_cols[f'kinematic_v_wave{suffix}'] = res['v_wave']
+        extra_cols[f'dynamic_scale_up{suffix}'] = res['M_up']
+        extra_cols[f'dynamic_scale_dn{suffix}'] = res['M_dn']
+        extra_cols[f'is_liquidity_void_h{H}'] = res['is_void']
         
         # Для базовой пары устанавливаем стандартные имена без суффиксов
         if (H, K) == primary_pair:
-            out_df['target_class_7'] = res['class_7']
-            out_df['target_class_5'] = res['class_5']
-            out_df['target_velocity_z'] = res['z']
-            out_df['target_dt_ticks'] = res['dt_ticks']
-            out_df['target_ret_pct'] = res['ret_pct']
-            out_df['kinematic_v_wave'] = res['v_wave']
-            out_df['kinematic_micro_offset'] = res['micro_offset']
-            out_df['dynamic_scale_up'] = res['M_up']
-            out_df['dynamic_scale_dn'] = res['M_dn']
-            out_df['future_trade_vol_H'] = res['future_trade_vol_H']
-            out_df['is_liquidity_void'] = res['is_void']
+            extra_cols['target_class_7'] = res['class_7']
+            extra_cols['target_class_5'] = res['class_5']
+            extra_cols['target_velocity_z'] = res['z']
+            extra_cols['target_dt_ticks'] = res['dt_ticks']
+            extra_cols['target_ret_pct'] = res['ret_pct']
+            extra_cols['kinematic_v_wave'] = res['v_wave']
+            extra_cols['kinematic_micro_offset'] = res['micro_offset']
+            extra_cols['dynamic_scale_up'] = res['M_up']
+            extra_cols['dynamic_scale_dn'] = res['M_dn']
+            extra_cols['future_trade_vol_H'] = res['future_trade_vol_H']
+            extra_cols['is_liquidity_void'] = res['is_void']
             
         # Метрики сходимости
         z_col = res['z']
@@ -368,6 +369,8 @@ def process_coin_labeling(
             'err_z_m2': err_z_m2,
             'pct_flat': (c7_col[tr_mask] == 0).mean() * 100.0
         })
+
+    out_df = pd.concat([out_df, pd.DataFrame(extra_cols, index=out_df.index)], axis=1)
 
     # Вывод результатов
     print(f"\n📊 СХОДИМОСТЬ СЕТКИ ДЛЯ {coin.upper()}:")
