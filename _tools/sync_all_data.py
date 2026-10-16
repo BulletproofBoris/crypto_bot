@@ -25,6 +25,14 @@ import argparse
 import numpy as np
 import pandas as pd
 
+# Нормализуем прокси до любых сетевых обращений
+for _var in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']:
+    _val = os.environ.get(_var, '')
+    if 'http://127.0.0.1:2080' in _val:
+        os.environ[_var] = 'socks5h://127.0.0.1:2080'
+if not os.environ.get('ALL_PROXY'):
+    os.environ['ALL_PROXY'] = 'socks5h://127.0.0.1:2080'
+
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
@@ -282,7 +290,11 @@ def get_drive_service():
         except Exception as e:
             logger.warning(f"Не удалось предварительно обновить токен: {e}")
             raise RuntimeError(f"Токен Google Drive недействителен: {e}")
-    return build('drive', 'v3', credentials=creds, cache_discovery=False)
+    import httplib2
+    import google_auth_httplib2
+    http_transport = httplib2.Http(proxy_info=httplib2.proxy_info_from_environment, timeout=30)
+    auth_http = google_auth_httplib2.AuthorizedHttp(creds, http=http_transport)
+    return build('drive', 'v3', http=auth_http, cache_discovery=False)
 
 def sync_gdrive():
     """Скачивает все недостающие архивы .csv.gz из Google Drive в локальный кэш с повторными попытками."""

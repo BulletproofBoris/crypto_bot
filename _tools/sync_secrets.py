@@ -8,8 +8,16 @@
 import os
 import json
 import logging
-from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 import io
+
+for _var in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']:
+    _val = os.environ.get(_var, '')
+    if 'http://127.0.0.1:2080' in _val:
+        os.environ[_var] = 'socks5h://127.0.0.1:2080'
+if not os.environ.get('ALL_PROXY'):
+    os.environ['ALL_PROXY'] = 'socks5h://127.0.0.1:2080'
+
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 try:
     from _tools.sync_all_data import get_drive_service, FOLDER_ID
