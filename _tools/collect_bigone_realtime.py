@@ -3,10 +3,25 @@ import csv
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+import socket
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 import traceback
 from curl_cffi import requests
+
+def notify_systemd(state="WATCHDOG=1"):
+    """Отправляет сигнал сторожевому таймеру systemd (WatchdogSec)."""
+    sock_path = os.environ.get("NOTIFY_SOCKET")
+    if not sock_path:
+        return
+    try:
+        if sock_path.startswith("@"):
+            sock_path = "\0" + sock_path[1:]
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.connect(sock_path)
+            sock.sendall(state.encode())
+    except Exception:
+        pass
 
 PAIRS = [
     {
@@ -127,13 +142,17 @@ async def fetch_pair(session, pair_info):
         )
 
         # 1. Process Depth
-        if not isinstance(depth_resp, Exception) and depth_resp.status_code == 200:
+        if isinstance(depth_resp, Exception):
+            logger.warning(f"[{symbol}] Ошибка запроса стакана: {depth_resp}")
+        elif depth_resp.status_code != 200:
+            logger.warning(f"[{symbol}] HTTP {depth_resp.status_code} при запросе стакана: {depth_resp.text[:100]}")
+        else:
             depth_data = depth_resp.json().get('data', {})
             bids = depth_data.get('bids', [])
             asks = depth_data.get('asks', [])
 
             if bids and asks:
-                ts = datetime.utcnow().isoformat() + "Z"
+                ts = datetime.now(timezone.utc).isoformat()
                 row = [ts]
                 for i in range(DEPTH_LEVELS):
                     if i < len(bids):
@@ -162,9 +181,10 @@ async def fetch_pair(session, pair_info):
                 with open(depth_file, "a", newline="") as f:
                     csv.writer(f).writerow(row)
 
-
         # 2. Process Trades
-        if not isinstance(trades_resp, Exception) and trades_resp.status_code == 200:
+        if isinstance(trades_resp, Exception):
+            logger.debug(f"[{symbol}] Ошибка запроса сделок: {trades_resp}")
+        elif trades_resp.status_code == 200:
             trades_data = trades_resp.json().get('data', [])
             if trades_data:
                 trades_data.sort(key=lambda x: int(x['id']))
@@ -190,10 +210,17 @@ async def fetch_pair(session, pair_info):
 async def poll_data():
     session = requests.AsyncSession(impersonate="chrome120", proxies=PROXIES)
     logger.info(f"Запуск параллельного HTTP/2 BigONE polling для пар: {[p['symbol'] for p in PAIRS]}...")
+    notify_systemd("READY=1")
+    last_watchdog_ping = 0.0
 
     while True:
         start_time = time.time()
         await asyncio.gather(*(fetch_pair(session, p) for p in PAIRS), return_exceptions=True)
+
+        now = time.time()
+        if now - last_watchdog_ping >= 5.0:
+            notify_systemd("WATCHDOG=1")
+            last_watchdog_ping = now
 
         elapsed = time.time() - start_time
         sleep_time = max(0.05, POLL_INTERVAL - elapsed)

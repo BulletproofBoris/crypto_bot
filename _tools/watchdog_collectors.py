@@ -111,12 +111,31 @@ def is_service_active(service):
 
 def restart_service(service):
     logger.warning(f"🚨 ПРИНУДИТЕЛЬНЫЙ ПЕРЕЗАПУСК СЛУЖБЫ: {service}...")
-    res = subprocess.run(["systemctl", "restart", service], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if res.returncode == 0:
-        logger.info(f"✅ Служба {service} успешно перезапущена.")
-        return True
-    else:
-        logger.error(f"❌ Ошибка перезапуска {service}: {res.stderr.strip()}")
+    try:
+        res = subprocess.run(["systemctl", "restart", service], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=25)
+        if res.returncode == 0:
+            time.sleep(2)
+            if is_service_active(service):
+                logger.info(f"✅ Служба {service} успешно перезапущена и активна.")
+                return True
+            else:
+                logger.error(f"❌ Служба {service} после перезапуска не перешла в active!")
+                return False
+        else:
+            logger.error(f"❌ Ошибка перезапуска {service}: {res.stderr.strip()}")
+            logger.warning(f"⚠️ Пробуем аварийный SIGKILL и запуск для {service}...")
+            subprocess.run(["systemctl", "kill", "-s", "SIGKILL", service], timeout=10)
+            time.sleep(1)
+            res_start = subprocess.run(["systemctl", "start", service], timeout=15)
+            return res_start.returncode == 0
+    except subprocess.TimeoutExpired:
+        logger.error(f"❌ Таймаут команды systemctl restart {service}! Принудительный SIGKILL...")
+        subprocess.run(["systemctl", "kill", "-s", "SIGKILL", service], timeout=10)
+        time.sleep(1)
+        subprocess.run(["systemctl", "start", service], timeout=15)
+        return False
+    except Exception as e:
+        logger.error(f"❌ Исключение при перезапуске {service}: {e}")
         return False
 
 def check_target(target, state, verbose=False):
@@ -132,7 +151,9 @@ def check_target(target, state, verbose=False):
             if restart_service(service):
                 record_restart(service, state)
         else:
-            logger.error(f"🛑 {name}: превышен лимит перезапусков ({MAX_RESTARTS} за 15 мин). Cooldown.")
+            history = state.get(service, [])
+            rem_cd = int(WINDOW_SECONDS - (now - min(history))) if history else WINDOW_SECONDS
+            logger.error(f"🛑 {name}: превышен лимит перезапусков ({MAX_RESTARTS} за 15 мин). Cooldown еще {rem_cd}с.")
         return False
 
     if not os.path.exists(fpath):
@@ -140,6 +161,10 @@ def check_target(target, state, verbose=False):
         if can_restart(service, state):
             if restart_service(service):
                 record_restart(service, state)
+        else:
+            history = state.get(service, [])
+            rem_cd = int(WINDOW_SECONDS - (now - min(history))) if history else WINDOW_SECONDS
+            logger.error(f"🛑 {name}: превышен лимит перезапусков ({MAX_RESTARTS} за 15 мин). Cooldown еще {rem_cd}с.")
         return False
 
     try:
@@ -157,7 +182,9 @@ def check_target(target, state, verbose=False):
                 if restart_service(service):
                     record_restart(service, state)
             else:
-                logger.error(f"🛑 {name}: превышен лимит перезапусков ({MAX_RESTARTS} за 15 мин). Cooldown.")
+                history = state.get(service, [])
+                rem_cd = int(WINDOW_SECONDS - (now - min(history))) if history else WINDOW_SECONDS
+                logger.error(f"🛑 {name}: превышен лимит перезапусков ({MAX_RESTARTS} за 15 мин). Cooldown еще {rem_cd}с.")
             return False
 
         return True

@@ -5,6 +5,7 @@ import json
 import csv
 import logging
 import os
+import socket
 import time
 from curl_cffi.requests import AsyncSession
 
@@ -14,6 +15,20 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+def notify_systemd(state="WATCHDOG=1"):
+    """Отправляет сигнал сторожевому таймеру systemd (WatchdogSec)."""
+    sock_path = os.environ.get("NOTIFY_SOCKET")
+    if not sock_path:
+        return
+    try:
+        if sock_path.startswith("@"):
+            sock_path = "\0" + sock_path[1:]
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.connect(sock_path)
+            sock.sendall(state.encode())
+    except Exception:
+        pass
 
 MARKETS = [
     {
@@ -49,6 +64,7 @@ last_write_time = {m["id"]: 0.0 for m in MARKETS}
 last_sequence = {m["id"]: None for m in MARKETS}
 seen_trade_ids = {m["id"]: OrderedDict() for m in MARKETS}
 last_ws_msg_time = 0.0
+last_market_depth_time = {m["id"]: 0.0 for m in MARKETS}
 
 
 DEPTH_TAIL_COLS = [
@@ -224,6 +240,7 @@ async def fetch_snapshot(session, market_id):
                     orderbooks[market_id]["bids"] = new_bids
                     orderbooks[market_id]["asks"] = new_asks
                     snapshot_ready[market_id] = True
+                    last_market_depth_time[market_id] = time.time()
                     logger.info(
                         f"✅ [{market_id}] Снимок загружен ({attempt_name}): "
                         f"{len(new_bids)} bids, {len(new_asks)} asks."
@@ -345,29 +362,57 @@ async def fetch_recent_trades(session, market_id):
 
 
 async def periodic_maintenance(session, ws, market_ids, subscribe_msg):
-    """Фоновая задача: проверка живости WS, heartbeat-запись и периодическая ре-синхронизация REST-снимка."""
+    """Фоновая задача: проверка живости WS, watchdog-пинг, heartbeat-запись и ре-синхронизация."""
     last_resync = time.time()
+    last_watchdog_ping = 0.0
+
     while True:
         await asyncio.sleep(2.0)
         now = time.time()
         ws_silence = now - last_ws_msg_time
 
+        # 1. Пинг сторожевого таймера systemd (WatchdogSec) каждые 5-10 сек
+        if now - last_watchdog_ping >= 5.0:
+            notify_systemd("WATCHDOG=1")
+            last_watchdog_ping = now
+
+        # 2. Если WebSocket молчит дольше 45 секунд во всех потоках — принудительно разрываем соединение
+        if ws_silence >= 45.0:
+            logger.warning(f"⚠️ WebSocket молчит {ws_silence:.1f} сек (порог: 45с). Инициируем переподключение...")
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            return
+
         # Проактивный пинг подпиской при тишине в сокете > 20 сек (Ranger отвечает JSON-кадром)
-        if ws_silence >= 20.0:
+        elif ws_silence >= 20.0:
             try:
                 await ws.send(json.dumps(subscribe_msg).encode())
             except Exception as e:
                 logger.warning(f"⚠️ Ошибка отправки WS-проверки: {e}")
 
-        # 1. Heartbeat пишем ТОЛЬКО если WebSocket-соединение подтверждённо живо (ws_silence <= 45с)
-        if ws_silence <= 45.0:
-            for mid in market_ids:
+        # 3. Порыночный контроль свежести стакана и Heartbeat-запись
+        for mid in market_ids:
+            time_since_last_depth = now - last_market_depth_time.get(mid, 0.0)
+            time_since_last_write = now - last_write_time.get(mid, 0.0)
+
+            # Если для конкретного рынка не поступало обновлений стакана > 60 сек
+            # (затишье в тонком стакане или подвисший поток), принудительно обновляем через REST
+            if time_since_last_depth >= 60.0 and time_since_last_write >= HEARTBEAT_WRITE_INTERVAL:
+                logger.info(f"ℹ️ [{mid}] Стакан не обновлялся {time_since_last_depth:.1f} сек. Синхронизируем через REST...")
+                fetch_ok = await fetch_snapshot(session, mid)
+                if fetch_ok:
+                    last_market_depth_time[mid] = now
+
+            # Heartbeat пишем, если прошло HEARTBEAT_WRITE_INTERVAL с последней записи и сокет живой
+            elif time_since_last_write >= HEARTBEAT_WRITE_INTERVAL and ws_silence <= 45.0:
                 if not snapshot_ready.get(mid, False):
                     await fetch_snapshot(session, mid)
-                elif now - last_write_time.get(mid, 0.0) >= HEARTBEAT_WRITE_INTERVAL:
+                else:
                     write_depth(mid, int(now * 1000))
 
-        # 2. Периодическая сверка полного снимка стакана и сделок
+        # 4. Периодическая сверка полного снимка стакана и сделок каждые 15 минут
         if now - last_resync >= SNAPSHOT_RESYNC_INTERVAL:
             for mid in market_ids:
                 await fetch_snapshot(session, mid)
@@ -378,6 +423,7 @@ async def periodic_maintenance(session, ws, market_ids, subscribe_msg):
 async def main():
     global last_ws_msg_time
     init_seen_trades()
+    notify_systemd("READY=1")
     market_ids = [m["id"] for m in MARKETS]
     while True:
         maint_task = None
@@ -411,14 +457,22 @@ async def main():
                     maint_task = asyncio.create_task(periodic_maintenance(session, ws, market_ids, subscribe_msg))
 
                     while True:
+                        if maint_task.done():
+                            exc = maint_task.exception()
+                            if exc:
+                                raise exc
+                            break
+
                         msg, *_ = await asyncio.wait_for(ws.recv(), timeout=45.0)
                         last_ws_msg_time = time.time()
+                        notify_systemd("WATCHDOG=1")
                         data = json.loads(msg)
 
                         for k, stream_data in data.items():
                             if k.endswith(".depth") and isinstance(stream_data, dict):
                                 mid = k.split(".")[0]
                                 if mid in orderbooks:
+                                    last_market_depth_time[mid] = time.time()
                                     seq = stream_data.get("sequence")
                                     prev_seq = last_sequence.get(mid)
                                     if seq is not None and prev_seq is not None and seq > prev_seq + 1:
@@ -438,7 +492,9 @@ async def main():
 
         except Exception as e:
             logger.error(f"Неожиданная ошибка: {e}. Переподключение через 5 секунд...")
-            await asyncio.sleep(5)
+            for _ in range(5):
+                notify_systemd("WATCHDOG=1")
+                await asyncio.sleep(1)
         finally:
             if maint_task:
                 maint_task.cancel()
