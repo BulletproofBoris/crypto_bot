@@ -113,14 +113,14 @@ def compute_single_horizon_labels(df, coin, H, K, min_vol, tick_size):
     # 2. Локальная волатильность за окно L (в тиках)
     step_1s_ticks = np.zeros(n)
     step_1s_ticks[1:] = (mid[1:] - mid[:-1]) / tick_size
-    vol_L = pd.Series(step_1s_ticks).rolling(L, min_periods=L).std().values
+    vol_L = pd.Series(step_1s_ticks).rolling(L, min_periods=max(2, L // 2)).std().fillna(0.0).values
     vol_L = np.nan_to_num(vol_L)
     
     # 3. Скользящие объемы стакана
-    asks_L = pd.Series(a5).rolling(L, min_periods=L).mean().values
-    bids_L = pd.Series(b5).rolling(L, min_periods=L).mean().values
-    a1_L = pd.Series(a1_q).rolling(L, min_periods=L).median().values
-    b1_L = pd.Series(b1_q).rolling(L, min_periods=L).median().values
+    asks_L = pd.Series(a5).rolling(L, min_periods=max(2, L // 2)).mean().fillna(min_vol).values
+    bids_L = pd.Series(b5).rolling(L, min_periods=max(2, L // 2)).mean().fillna(min_vol).values
+    a1_L = pd.Series(a1_q).rolling(L, min_periods=max(2, L // 2)).median().fillna(1.0).values
+    b1_L = pd.Series(b1_q).rolling(L, min_periods=max(2, L // 2)).median().fillna(1.0).values
     
     # 4. Кинематика микроцены
     total_q1 = b1_q + a1_q
@@ -139,13 +139,16 @@ def compute_single_horizon_labels(df, coin, H, K, min_vol, tick_size):
     M_up_base = (spread_ticks + vol_L * np.sqrt(H)) * (np.clip(asks_L / np.maximum(a5, min_vol), 0.2, 5.0) ** 0.25) * q1_factor_up
     M_dn_base = (spread_ticks + vol_L * np.sqrt(H)) * (np.clip(bids_L / np.maximum(b5, min_vol), 0.2, 5.0) ** 0.25) * q1_factor_dn
     
-    M_up = np.maximum(0.5, M_up_base * (1.0 + np.maximum(0, v_wave)) * (1.0 + np.maximum(0, d_vol)))
-    M_dn = np.maximum(0.5, M_dn_base * (1.0 + np.maximum(0, -v_wave)) * (1.0 + np.maximum(0, d_vol)))
+    M_up = np.maximum(0.5, np.nan_to_num(M_up_base * (1.0 + np.maximum(0, v_wave)) * (1.0 + np.maximum(0, d_vol)), nan=1.0))
+    M_dn = np.maximum(0.5, np.nan_to_num(M_dn_base * (1.0 + np.maximum(0, -v_wave)) * (1.0 + np.maximum(0, d_vol)), nan=1.0))
     
     # 7. Нормированный импульс z
     z = np.zeros(n, dtype=np.float32)
-    z[dt_ticks_full > 0] = (dt_ticks_full[dt_ticks_full > 0] / M_up[dt_ticks_full > 0]).astype(np.float32)
-    z[dt_ticks_full < 0] = (dt_ticks_full[dt_ticks_full < 0] / M_dn[dt_ticks_full < 0]).astype(np.float32)
+    pos_mask = dt_ticks_full > 0
+    neg_mask = dt_ticks_full < 0
+    z[pos_mask] = (dt_ticks_full[pos_mask] / M_up[pos_mask]).astype(np.float32)
+    z[neg_mask] = (dt_ticks_full[neg_mask] / M_dn[neg_mask]).astype(np.float32)
+    z = np.nan_to_num(z, nan=0.0)
     
     # 8. Флаг фантомных котировок (Zero-Volume Liquidity Void):
     # Сумма сделок вперед за горизонт (t, t+H]
