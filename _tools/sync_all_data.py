@@ -274,6 +274,7 @@ def get_drive_service():
             os.replace(tmp_token, TOKEN_PATH)
         except Exception as e:
             logger.warning(f"Не удалось предварительно обновить токен: {e}")
+            raise RuntimeError(f"Токен Google Drive недействителен: {e}")
     return build('drive', 'v3', credentials=creds, cache_discovery=False)
 
 def sync_gdrive():
@@ -294,6 +295,9 @@ def sync_gdrive():
             items = service.files().list(q=query, fields='files(id, name, mimeType, size)').execute().get('files', [])
             break
         except Exception as e:
+            if "invalid_grant" in str(e) or "недействителен" in str(e):
+                logger.warning(f"⚠️ Авторизация Google Drive просрочена/недействительна ({e}). Пропускаем Google Drive.")
+                return
             if attempt == max_retries:
                 raise
             logger.warning(f"Попытка {attempt}/{max_retries} подключения к Google Drive завершилась с ошибкой: {e}. Повтор через 3с...")
@@ -394,6 +398,23 @@ def sync_vps_hot():
     try:
         transport.connect(username=VPS_USER, password=VPS_PASS)
         sftp = paramiko.SFTPClient.from_transport(transport)
+
+        # Выгрузка архивных срезов из archive_pending на VPS (если ротация произошла, но выгрузка на GDrive задержана)
+        try:
+            pending_root = "/opt/crypto_bot/data/archive_pending"
+            for date_entry in sftp.listdir_attr(pending_root):
+                date_dir = f"{pending_root}/{date_entry.filename}"
+                try:
+                    for arch in sftp.listdir_attr(date_dir):
+                        if arch.filename.endswith(".csv.gz"):
+                            local_arch = os.path.join(CACHE_GDRIVE_DIR, arch.filename)
+                            if not os.path.exists(local_arch) or os.path.getsize(local_arch) != arch.st_size:
+                                logger.info(f"📥 Выгрузка архива из archive_pending VPS: {arch.filename} ({arch.st_size / 1024:.1f} KB)")
+                                sftp.get(f"{date_dir}/{arch.filename}", local_arch)
+                except Exception as e:
+                    logger.debug(f"Ошибка при чтении каталога {date_dir}: {e}")
+        except Exception as e:
+            logger.debug(f"archive_pending на VPS отсутствует: {e}")
 
         for item in REMOTE_FILES:
             remote_path = item["remote"]
