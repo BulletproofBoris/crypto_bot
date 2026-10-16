@@ -34,8 +34,8 @@ def _worker_label_pair(args):
 
 # Микроструктурные параметры монет (SafeTrade)
 COIN_CONFIG = {
-    'prl': {'tick_size': 0.005, 'typical_trade': 17.3, 'min_vol': 50.0},
-    'quantus': {'tick_size': 0.05, 'typical_trade': 2.2, 'min_vol': 2.0},
+    'prl': {'tick_size': 0.005, 'typical_trade': 17.3, 'min_vol': 50.0, 'spread_factor': 0.10},
+    'quantus': {'tick_size': 0.05, 'typical_trade': 2.2, 'min_vol': 2.0, 'spread_factor': 0.20},
 }
 
 # Пороги квантильных плато
@@ -91,15 +91,21 @@ def parse_horizon_spec(horizon_input, L_max, K):
     return [int(s)]
 
 def compute_single_horizon_labels(df, coin, H, K, min_vol, tick_size):
-    """Рассчитывает микроструктурные метрики и таргеты для пары (H, K)."""
+    """
+    Рассчитывает микроструктурные метрики и таргеты для пары (H, K)
+    с использованием горизонтно-адаптивного трехслойного динамического сопротивления M(H)
+    и статистического пола волатильности (L_vol >= 45s).
+    """
     n = len(df)
-    L = int(H * K)
+    L = int(round(H * K))
     mid = df['ST_mid_price'].values
     spread_ticks = df['ST_spread'].values / tick_size
     b1_p = df['ST_bid_1_price'].values
     a1_p = df['ST_ask_1_price'].values
     b1_q = df['ST_bid_1_qty'].values
     a1_q = df['ST_ask_1_qty'].values
+    b2_q = df['ST_bid_2_qty'].values if 'ST_bid_2_qty' in df.columns else b1_q
+    a2_q = df['ST_ask_2_qty'].values if 'ST_ask_2_qty' in df.columns else a1_q
     b5 = df['ST_bids_vol_top5'].values
     a5 = df['ST_asks_vol_top5'].values
     trade_vol = df['ST_trade_vol'].values
@@ -110,39 +116,66 @@ def compute_single_horizon_labels(df, coin, H, K, min_vol, tick_size):
     ret_pct_full = np.zeros(n, dtype=np.float32)
     ret_pct_full[:-H] = ((mid[H:] - mid[:-H]) / np.maximum(mid[:-H], 0.001) * 100.0).astype(np.float32)
     
-    # 2. Локальная волатильность за окно L (в тиках)
+    # 2. Локальная волатильность со статистическим полом L_vol >= 45s (SE <= 10.5%)
+    L_vol = max(45, L)
     step_1s_ticks = np.zeros(n)
     step_1s_ticks[1:] = (mid[1:] - mid[:-1]) / tick_size
-    vol_L = pd.Series(step_1s_ticks).rolling(L, min_periods=max(2, L // 2)).std().fillna(0.0).values
+    vol_L = pd.Series(step_1s_ticks).rolling(L_vol, min_periods=max(5, L_vol // 2)).std().fillna(0.0).values
     vol_L = np.nan_to_num(vol_L)
     
     # 3. Скользящие объемы стакана
-    asks_L = pd.Series(a5).rolling(L, min_periods=max(2, L // 2)).mean().fillna(min_vol).values
-    bids_L = pd.Series(b5).rolling(L, min_periods=max(2, L // 2)).mean().fillna(min_vol).values
-    a1_L = pd.Series(a1_q).rolling(L, min_periods=max(2, L // 2)).median().fillna(1.0).values
-    b1_L = pd.Series(b1_q).rolling(L, min_periods=max(2, L // 2)).median().fillna(1.0).values
+    q12_ask = a1_q + a2_q
+    q12_bid = b1_q + b2_q
+    eps_q = max(1e-4, min_vol * 0.01)
     
-    # 4. Кинематика микроцены
+    a12_L = pd.Series(q12_ask).rolling(L_vol, min_periods=max(5, L_vol // 2)).median().fillna(1.0).values
+    b12_L = pd.Series(q12_bid).rolling(L_vol, min_periods=max(5, L_vol // 2)).median().fillna(1.0).values
+    asks_L = pd.Series(a5).rolling(L_vol, min_periods=max(5, L_vol // 2)).mean().fillna(min_vol).values
+    bids_L = pd.Series(b5).rolling(L_vol, min_periods=max(5, L_vol // 2)).mean().fillna(min_vol).values
+    
+    # 4. Робастная кинематика микроцены (устойчива при total_q < 1.0)
     total_q1 = b1_q + a1_q
-    microprice = np.where(total_q1 > 0, (b1_p * a1_q + a1_p * b1_q) / np.maximum(total_q1, 1.0), mid)
-    micro_offset = (microprice - mid) / tick_size
+    microprice = np.where(total_q1 > 1e-6, (b1_p * a1_q + a1_p * b1_q) / total_q1, mid)
+    micro_offset = np.clip((microprice - mid) / tick_size, -5.0, 5.0)
     
     t_wave = max(3, H // 3)
     v_wave = (pd.Series(micro_offset) - pd.Series(micro_offset).shift(t_wave)).fillna(0).values / t_wave
+    v_wave = np.clip(v_wave, -2.0, 2.0)
     d_vol = (pd.Series(vol_L) - pd.Series(vol_L).shift(t_wave)).fillna(0).values / t_wave
+    d_vol = np.clip(d_vol, -2.0, 2.0)
     
-    # 5. Факторы лотов 1-го уровня
-    q1_factor_up = np.clip(a1_L / np.maximum(a1_q, 1.0), 0.2, 5.0) ** 0.15
-    q1_factor_dn = np.clip(b1_L / np.maximum(b1_q, 1.0), 0.2, 5.0) ** 0.15
+    cfg = COIN_CONFIG.get(coin.lower(), COIN_CONFIG['prl'])
+    spread_factor = cfg.get('spread_factor', 0.10)
     
-    # 6. Динамическое сопротивление M
-    M_up_base = (spread_ticks + vol_L * np.sqrt(H)) * (np.clip(asks_L / np.maximum(a5, min_vol), 0.2, 5.0) ** 0.25) * q1_factor_up
-    M_dn_base = (spread_ticks + vol_L * np.sqrt(H)) * (np.clip(bids_L / np.maximum(b5, min_vol), 0.2, 5.0) ** 0.25) * q1_factor_dn
+    # 5. Горизонтно-адаптивное многослойное сопротивление M(H)
+    if H <= 5:
+        # Микро-масштаб (H <= 5s): трейды поглощают только 1-2 уровни
+        sp_w = spread_factor * 1.0
+        depth_up = np.clip(a12_L / np.maximum(q12_ask, eps_q), 0.4, 2.5) ** 0.08
+        depth_dn = np.clip(b12_L / np.maximum(q12_bid, eps_q), 0.4, 2.5) ** 0.08
+        kin_up = 1.0 + 0.10 * np.tanh(np.maximum(0, v_wave))
+        kin_dn = 1.0 + 0.10 * np.tanh(np.maximum(0, -v_wave))
+    elif H <= 20:
+        # Волновой масштаб (5 < H <= 20s): плотность top-5 + плотность очередей top-2
+        sp_w = spread_factor * 0.8
+        depth_up = (np.clip(asks_L / np.maximum(a5, min_vol), 0.4, 2.5) ** 0.08) * (np.clip(a12_L / np.maximum(q12_ask, eps_q), 0.5, 2.0) ** 0.04)
+        depth_dn = (np.clip(bids_L / np.maximum(b5, min_vol), 0.4, 2.5) ** 0.08) * (np.clip(b12_L / np.maximum(q12_bid, eps_q), 0.5, 2.0) ** 0.04)
+        kin_up = 1.0 + 0.12 * np.tanh(np.maximum(0, v_wave))
+        kin_dn = 1.0 + 0.12 * np.tanh(np.maximum(0, -v_wave))
+    else:
+        # Макро-масштаб (H > 20s): сопротивление глубины top-5
+        sp_w = spread_factor * 0.5
+        depth_up = np.clip(asks_L / np.maximum(a5, min_vol), 0.4, 2.5) ** 0.10
+        depth_dn = np.clip(bids_L / np.maximum(b5, min_vol), 0.4, 2.5) ** 0.10
+        kin_up = 1.0 + 0.15 * np.tanh(np.maximum(0, v_wave))
+        kin_dn = 1.0 + 0.15 * np.tanh(np.maximum(0, -v_wave))
+        
+    M_up_base = (spread_ticks * sp_w + vol_L * np.sqrt(H)) * depth_up * kin_up
+    M_dn_base = (spread_ticks * sp_w + vol_L * np.sqrt(H)) * depth_dn * kin_dn
+    M_up = np.maximum(0.5, np.nan_to_num(M_up_base, nan=1.0))
+    M_dn = np.maximum(0.5, np.nan_to_num(M_dn_base, nan=1.0))
     
-    M_up = np.maximum(0.5, np.nan_to_num(M_up_base * (1.0 + np.maximum(0, v_wave)) * (1.0 + np.maximum(0, d_vol)), nan=1.0))
-    M_dn = np.maximum(0.5, np.nan_to_num(M_dn_base * (1.0 + np.maximum(0, -v_wave)) * (1.0 + np.maximum(0, d_vol)), nan=1.0))
-    
-    # 7. Нормированный импульс z
+    # 6. Нормированный импульс z
     z = np.zeros(n, dtype=np.float32)
     pos_mask = dt_ticks_full > 0
     neg_mask = dt_ticks_full < 0
@@ -335,7 +368,8 @@ def process_coin_labeling(
     extra_cols = {}
     req_cols = [
         'ST_mid_price', 'ST_spread', 'ST_bid_1_price', 'ST_ask_1_price',
-        'ST_bid_1_qty', 'ST_ask_1_qty', 'ST_bids_vol_top5', 'ST_asks_vol_top5', 'ST_trade_vol'
+        'ST_bid_1_qty', 'ST_ask_1_qty', 'ST_bid_2_qty', 'ST_ask_2_qty',
+        'ST_bids_vol_top5', 'ST_asks_vol_top5', 'ST_trade_vol'
     ]
     df_mini = df[[c for c in req_cols if c in df.columns]].copy()
 

@@ -110,7 +110,8 @@ def run_full_research(coin="prl", h_min=2, h_max=60, h_step=1):
 
     req_cols = [
         'ST_mid_price', 'ST_spread', 'ST_bid_1_price', 'ST_ask_1_price',
-        'ST_bid_1_qty', 'ST_ask_1_qty', 'ST_bids_vol_top5', 'ST_asks_vol_top5', 'ST_trade_vol'
+        'ST_bid_1_qty', 'ST_ask_1_qty', 'ST_bid_2_qty', 'ST_ask_2_qty',
+        'ST_bids_vol_top5', 'ST_asks_vol_top5', 'ST_trade_vol'
     ]
     df_mini = df[[c for c in req_cols if c in df.columns]].copy()
 
