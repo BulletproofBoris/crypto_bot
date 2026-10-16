@@ -439,7 +439,7 @@ def main():
     parser.add_argument("--split-ratio", type=float, default=0.8, help="Доля обучающей выборки Train (по умолчанию 0.8)")
     parser.add_argument("--n-target", type=int, default=5000, help="Минимум независимых отсчетов N для расчета L_max = T_train // N (по умолчанию 5000)")
     parser.add_argument("--purge-sec", type=int, default=None, help="Зазор Purging в секундах (по умолчанию равен max H)")
-    parser.add_argument("--embargo-sec", type=int, default=0, help="Зазор Embargo в секундах (по умолчанию 0)")
+    parser.add_argument("--embargo-sec", type=int, default=360, help="Зазор Embargo в секундах (по умолчанию 360с для защиты от памяти фильтр-банка)")
     parser.add_argument("--no-legacy-splits", action="store_true", help="Не сохранять отдельные train/val файлы")
     args = parser.parse_args()
     
