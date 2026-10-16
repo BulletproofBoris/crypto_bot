@@ -31,6 +31,7 @@ if BASE_DIR not in sys.path:
 
 from _tools.data_labeler import compute_single_horizon_labels, COIN_CONFIG
 from _tools.experiment_hk_selection import get_stationary_feature_cols
+from _tools.system_resources import SAFE_WORKERS
 
 
 def run_walkforward_for_coin(
@@ -143,7 +144,7 @@ def run_walkforward_for_coin(
                 max_depth=5,
                 subsample_for_bin=25000,
                 random_state=42,
-                n_jobs=4,
+                n_jobs=SAFE_WORKERS,
                 verbose=-1,
             )
             model.fit(X_all[tr_idx], np.clip(z_tr, -2.5, 2.5))

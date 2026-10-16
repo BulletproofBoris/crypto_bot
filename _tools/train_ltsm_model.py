@@ -35,10 +35,13 @@ import tensorflow as tf
 # 1. Включаем кэширование компиляции XLA на диск
 #os.environ['TF_XLA_FLAGS'] = "--tf_xla_persistent_cache_directory=./xla_cache"
 
-# 2. Жестко ограничиваем потоки для каждого воркера!
-num_cores = multiprocessing.cpu_count()
-workers_count = 16 # Твой MAX_WORKERS из bash-скрипта
-threads_per_worker = max(2, num_cores // workers_count)
+try:
+    from _tools.system_resources import get_safe_cpu_count
+    num_cores = get_safe_cpu_count()
+except Exception:
+    num_cores = max(1, int((multiprocessing.cpu_count() or 4) * 0.8))
+workers_count = num_cores
+threads_per_worker = max(2, num_cores // max(1, workers_count))
 
 tf.config.threading.set_inter_op_parallelism_threads(threads_per_worker)
 tf.config.threading.set_intra_op_parallelism_threads(threads_per_worker)

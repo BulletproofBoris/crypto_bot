@@ -41,8 +41,12 @@ def main():
     parser.add_argument('--tp', type=float, default=5.0)
     parser.add_argument('--sl', type=float, default=3.0)
     parser.add_argument('--auto', action='store_true')
-    parser.add_argument('--percentile', type=int, default=75)
-    parser.add_argument('--workers', type=int, default=os.cpu_count())
+    try:
+        from _tools.system_resources import get_safe_cpu_count
+        default_workers = get_safe_cpu_count()
+    except Exception:
+        default_workers = max(1, int((os.cpu_count() or 4) * 0.8))
+    parser.add_argument('--workers', type=int, default=default_workers)
     
     # Feature Selection параметры
     parser.add_argument('--cum_threshold', type=float, default=0.99)

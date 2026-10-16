@@ -23,6 +23,14 @@ import argparse
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+from concurrent.futures import ProcessPoolExecutor
+from _tools.system_resources import SAFE_WORKERS
+
+def _worker_label_pair(args):
+    """Изолированный воркер для параллельного расчета таргетов пары (H, K)."""
+    df_mini, coin, H, K, min_vol, tick_size = args
+    res = compute_single_horizon_labels(df_mini, coin, H, K, min_vol, tick_size)
+    return (H, K, res)
 
 # Микроструктурные параметры монет (SafeTrade)
 COIN_CONFIG = {
@@ -322,10 +330,26 @@ def process_coin_labeling(
     tr_mask = (sample_split == 'train')
     va_mask = (sample_split == 'val')
     extra_cols = {}
-    
-    for H, K in pairs:
+    req_cols = [
+        'ST_mid_price', 'ST_spread', 'ST_bid_1_price', 'ST_ask_1_price',
+        'ST_bid_1_qty', 'ST_ask_1_qty', 'ST_bids_vol_top5', 'ST_asks_vol_top5', 'ST_trade_vol'
+    ]
+    df_mini = df[[c for c in req_cols if c in df.columns]].copy()
+
+    workers = min(len(pairs), SAFE_WORKERS)
+    if workers > 1:
+        tasks = [(df_mini, coin, H, K, min_vol, tick_size) for H, K in pairs]
+        print(f"  ⚡ Параллельный расчет {len(pairs)} комбинаций (H, K) на {workers} процессах CPU (лимит 80%)...")
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            pair_results = list(executor.map(_worker_label_pair, tasks))
+    else:
+        pair_results = [
+            (H, K, compute_single_horizon_labels(df_mini, coin, H, K, min_vol, tick_size))
+            for H, K in pairs
+        ]
+
+    for H, K, res in pair_results:
         L = H * K
-        res = compute_single_horizon_labels(df, coin, H, K, min_vol, tick_size)
         
         # Добавляем таргеты с суффиксами в общий датасет
         suffix = f"_h{H}_k{K}"

@@ -21,9 +21,10 @@ import time
 import glob
 import gzip
 import logging
-import argparse
 import numpy as np
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
+from _tools.system_resources import SAFE_WORKERS
 
 # Нормализуем прокси до любых сетевых обращений
 for _var in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']:
@@ -609,11 +610,21 @@ def sync_and_process_all(include_vps=True):
         except Exception as e:
             logger.error(f"Ошибка при скачивании данных с VPS: {e}")
 
-    # 3. Склеиваем и создаем Parquet-датасеты
-    logger.info("⚙️ Сборка и стандартизация датасетов...")
+    # 3. Склеиваем и создаем Parquet-датасеты (параллельно)
+    logger.info(f"⚙️ Сборка и стандартизация датасетов ({len(DATASET_CONFIGS)} датасетов параллельно)...")
+    workers = min(4, SAFE_WORKERS)
     results = {}
-    for cfg in DATASET_CONFIGS:
-        results[cfg["key"]] = build_dataset_for_config(cfg, include_vps=include_vps)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_cfg = {
+            executor.submit(build_dataset_for_config, cfg, include_vps): cfg["key"]
+            for cfg in DATASET_CONFIGS
+        }
+        for future in future_to_cfg:
+            key = future_to_cfg[future]
+            try:
+                results[key] = future.result()
+            except Exception as e:
+                logger.error(f"Ошибка при сборке датасета {key}: {e}")
 
     return (
         results.get("safetrade_depth", pd.DataFrame()),

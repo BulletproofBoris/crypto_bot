@@ -23,6 +23,7 @@ if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 from _tools.data_loader import load_coin, load_macro, sync_data
+from _tools.system_resources import SAFE_WORKERS
 
 init(autoreset=True)
 
@@ -504,8 +505,17 @@ def main():
     macro_df = load_macro()
     coins = ["prl", "quantus"] if args.coin == "all" else [args.coin]
 
-    for c in coins:
-        build_features_for_coin(c, macro_df=macro_df)
+    from concurrent.futures import ProcessPoolExecutor
+    workers = min(len(coins), SAFE_WORKERS)
+    if workers > 1:
+        print(f"⚡ Мультипроцессорная сборка датасетов: {workers} параллельных процессов (лимит CPU <= 80%, {os.cpu_count() - SAFE_WORKERS} ядер свободно для ОС)")
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(build_features_for_coin, c, macro_df) for c in coins]
+            for f in futures:
+                f.result()
+    else:
+        for c in coins:
+            build_features_for_coin(c, macro_df=macro_df)
 
     print(f"\n{Fore.GREEN}🎉 Построение 1-секундных датасетов успешно завершено!{Style.RESET_ALL}\n")
 

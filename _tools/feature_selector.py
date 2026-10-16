@@ -9,6 +9,7 @@ import numpy as np
 import lightgbm as lgb
 import matplotlib.pyplot as plt
 import seaborn as sns
+from _tools.system_resources import SAFE_WORKERS
 
 def reduce_multicollinearity(df, feature_cols, threshold=0.85):
     print(f"📉 Удаление мультиколлинеарности (порог {threshold})...")
@@ -47,7 +48,7 @@ def get_dynamic_feature_importance(df, feature_cols, target_col='target_class_7'
         num_leaves=64,
         max_bin=255,
         random_state=42, 
-        n_jobs=4,
+        n_jobs=SAFE_WORKERS,
         verbose=-1
     )
     
