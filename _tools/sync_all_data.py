@@ -257,6 +257,13 @@ def ensure_directories():
 # ==============================================================================
 
 def get_drive_service():
+    for _var in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']:
+        _val = os.environ.get(_var, '')
+        if 'http://127.0.0.1:2080' in _val:
+            os.environ[_var] = 'socks5h://127.0.0.1:2080'
+    if not os.environ.get('ALL_PROXY'):
+        os.environ['ALL_PROXY'] = 'socks5h://127.0.0.1:2080'
+
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build

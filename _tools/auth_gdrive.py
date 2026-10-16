@@ -6,6 +6,14 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 
+# Нормализуем прокси: 127.0.0.1:2080 работает как socks5h, а не http
+for _var in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']:
+    _val = os.environ.get(_var, '')
+    if 'http://127.0.0.1:2080' in _val:
+        os.environ[_var] = 'socks5h://127.0.0.1:2080'
+if not os.environ.get('ALL_PROXY'):
+    os.environ['ALL_PROXY'] = 'socks5h://127.0.0.1:2080'
+
 # В среде WSL регистрируем браузер Windows для автоматического открытия ссылки
 if os.path.exists("/mnt/c/WINDOWS/system32/cmd.exe"):
     class WindowsDefaultBrowser(webbrowser.BaseBrowser):
