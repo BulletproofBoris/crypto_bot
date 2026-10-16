@@ -10,9 +10,12 @@ def log(msg):
 
 def deploy_all():
     log("1. Подключение к VPS через SSH...")
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(vps_config.VPS_HOST, port=vps_config.VPS_PORT, username=vps_config.VPS_USER, password=vps_config.VPS_PASS, timeout=10)
+    if hasattr(vps_config, "create_ssh_client"):
+        ssh = vps_config.create_ssh_client(timeout=10)
+    else:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(vps_config.VPS_HOST, port=vps_config.VPS_PORT, username=vps_config.VPS_USER, password=vps_config.VPS_PASS, timeout=10)
     log("1. Подключение успешно!")
 
     sftp = ssh.open_sftp()

@@ -19,6 +19,7 @@ HOST = vps_config.VPS_HOST
 PORT = vps_config.VPS_PORT
 USER = vps_config.VPS_USER
 PASS = vps_config.VPS_PASS
+create_ssh_client = getattr(vps_config, "create_ssh_client", None)
 
 # Пороги предупреждений
 MEM_WARNING_PERCENT = 85.0
@@ -134,12 +135,13 @@ def format_stats(stats):
     return "\n".join(out)
 
 def monitor(once=False, interval=10):
-    print(f"📡 Подключение к VPS {HOST}:{PORT}...")
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    
     try:
-        ssh.connect(HOST, port=PORT, username=USER, password=PASS, timeout=10)
+        if create_ssh_client:
+            ssh = create_ssh_client(timeout=10)
+        else:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(HOST, port=PORT, username=USER, password=PASS, timeout=10)
         
         if once:
             stats = get_server_stats(ssh)

@@ -32,12 +32,11 @@ logger = logging.getLogger("integrate_onchain")
 LOCAL_HIST_CSV = os.path.join(BASE_DIR, "data", "metadata", "pearl_historical_blocks.csv")
 
 def download_from_vps():
-    import paramiko
-    logger.info(f"⚡ Подключение к VPS для загрузки pearl_historical_blocks.csv...")
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(VPS_HOST, port=VPS_PORT, username=VPS_USER, password=VPS_PASS, timeout=10)
-    
+    try:
+        from _tools.vps_config import create_ssh_client
+    except ImportError:
+        from vps_config import create_ssh_client
+    ssh = create_ssh_client(timeout=10)
     sftp = ssh.open_sftp()
     remote_path = "/opt/crypto_bot/data/realtime/onchain/pearl_historical_blocks.csv"
     os.makedirs(os.path.dirname(LOCAL_HIST_CSV), exist_ok=True)

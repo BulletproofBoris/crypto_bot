@@ -12,9 +12,12 @@ user = vps_config.VPS_USER
 secret = vps_config.VPS_PASS
 
 print(f"Connecting to {host}:{port} as {user}...")
-client = paramiko.SSHClient()
-client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-client.connect(hostname=host, port=port, username=user, password=secret)
+if hasattr(vps_config, "create_ssh_client"):
+    client = vps_config.create_ssh_client(timeout=10)
+else:
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(hostname=host, port=port, username=user, password=secret)
 
 def run(cmd):
     print(f"Running: {cmd}")

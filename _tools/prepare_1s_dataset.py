@@ -44,19 +44,23 @@ def calc_effective_vwap(df, side='ask', target_usd=100.0, max_levels=50):
     last_valid_price = prices[0].copy()
 
     for p, q in zip(prices, qtys):
-        valid_mask = np.isfinite(p) & (p > 0) & np.isfinite(q) & (q > 0)
-        last_valid_price = np.where(valid_mask, p, last_valid_price)
-        p_clean = np.where(valid_mask, p, 0.0)
-        q_clean = np.where(valid_mask, q, 0.0)
-
-        level_usd = p_clean * q_clean
-        needed_usd = np.maximum(0.0, target_usd - filled_usd)
+        active = filled_usd < target_usd
+        if not np.any(active):
+            break
+        valid_mask = active & np.isfinite(p) & (p > 0) & np.isfinite(q) & (q > 0)
+        if not np.any(valid_mask):
+            continue
+        last_valid_price[valid_mask] = p[valid_mask]
+        p_act = p[valid_mask]
+        q_act = q[valid_mask]
+        level_usd = p_act * q_act
+        needed_usd = target_usd - filled_usd[valid_mask]
         take_usd = np.minimum(needed_usd, level_usd)
         with np.errstate(divide='ignore', invalid='ignore'):
-            take_qty = np.where(p_clean > 0, take_usd / p_clean, 0.0)
+            take_qty = np.where(p_act > 0, take_usd / p_act, 0.0)
 
-        filled_usd += take_usd
-        filled_qty += take_qty
+        filled_usd[valid_mask] += take_usd
+        filled_qty[valid_mask] += take_qty
 
     rem_usd = np.maximum(0.0, target_usd - filled_usd)
     penalty_mult = 1.005 if side == 'ask' else 0.995
@@ -431,6 +435,8 @@ def build_features_for_coin(coin_name, macro_df=None):
     st_silent = merged['ST_sec_since_tick'] > 180.0 if 'ST_sec_since_tick' in merged.columns else pd.Series(False, index=merged.index)
     bo_silent = merged['BO_sec_since_tick'] > 180.0 if 'BO_sec_since_tick' in merged.columns else pd.Series(True, index=merged.index)
     merged['is_data_gap'] = (st_silent & bo_silent).astype(np.int8)
+    if 'ST_sec_since_tick' in merged.columns:
+        merged['is_st_gap_60s'] = (merged['ST_sec_since_tick'] > 60.0).astype(np.int8)
     merged = merged.fillna(0)
 
     # 6. Многочастотный стационарный банк фильтров W = [5, 20, 60, 300]с и полосовые разности (Band-Pass)
@@ -457,21 +463,27 @@ def build_features_for_coin(coin_name, macro_df=None):
     if f64_to_f32:
         merged[f64_to_f32] = merged[f64_to_f32].astype(np.float32)
 
-    # Сохранение в data/features/{coin}_1s_features.parquet
+    # Сохранение в data/features/{coin}_1s_features.parquet (zstd компрессия)
     out_dir = os.path.join(BASE_DIR, 'data', 'features')
     os.makedirs(out_dir, exist_ok=True)
     out_file = os.path.join(out_dir, f"{coin}_1s_features.parquet")
-    merged.to_parquet(out_file)
+    merged.to_parquet(out_file, compression='zstd')
     size_mb = os.path.getsize(out_file) / (1024 * 1024)
 
     print(f"{Fore.GREEN}✅ [{coin.upper()}] Датасет признаков сохранен: {os.path.basename(out_file)} ({size_mb:.2f} MB)")
     print(f"   Строк: {len(merged):,} | Признаков: {len(merged.columns)} | Период: {merged.index.min()} -> {merged.index.max()}{Style.RESET_ALL}")
 
-    # Для PRL сохраняем также merged_1s_base.parquet для обратной совместимости
+    # Для PRL сохраняем также merged_1s_base.parquet для обратной совместимости (через symlink)
     if coin == 'prl':
         legacy_out = os.path.join(out_dir, "merged_1s_base.parquet")
-        merged.to_parquet(legacy_out)
-        print(f"   (Также сохранен legacy файл: {os.path.basename(legacy_out)})")
+        try:
+            if os.path.islink(legacy_out) or os.path.exists(legacy_out):
+                os.remove(legacy_out)
+            os.symlink(os.path.basename(out_file), legacy_out)
+            print(f"   (Создана быстрая ссылка: {os.path.basename(legacy_out)} -> {os.path.basename(out_file)})")
+        except Exception:
+            merged.to_parquet(legacy_out, compression='zstd')
+            print(f"   (Также сохранен legacy файл: {os.path.basename(legacy_out)})")
 
     return merged
 

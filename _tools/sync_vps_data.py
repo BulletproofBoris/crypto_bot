@@ -19,11 +19,14 @@ FILES = ["trades.csv", "depth.csv", "collection.log"]
 
 def sync_data():
     print(f"🔗 Подключение к {HOST}...")
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    
     try:
-        ssh.connect(HOST, port=PORT, username=USER, password=PASS, timeout=10)
+        ssh = getattr(vps_config, "create_ssh_client", None)
+        if ssh:
+            ssh = vps_config.create_ssh_client(timeout=10)
+        else:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(HOST, port=PORT, username=USER, password=PASS, timeout=10)
         sftp = ssh.open_sftp()
         
         # Directories

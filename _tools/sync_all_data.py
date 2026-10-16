@@ -55,10 +55,10 @@ TOKEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'token.jso
 
 # Импорт конфигурации VPS
 try:
-    from _tools.vps_config import VPS_HOST, VPS_PORT, VPS_USER, VPS_PASS
+    from _tools.vps_config import VPS_HOST, VPS_PORT, VPS_USER, VPS_PASS, VPS_KEY_PATH
 except ImportError:
     # Попытка относительного импорта
-    from vps_config import VPS_HOST, VPS_PORT, VPS_USER, VPS_PASS
+    from vps_config import VPS_HOST, VPS_PORT, VPS_USER, VPS_PASS, VPS_KEY_PATH
 
 REMOTE_FILES = [
     # PRL/USDT
@@ -415,7 +415,18 @@ def sync_vps_hot():
     transport = paramiko.Transport(sock)
     transport.banner_timeout = 10.0
     try:
-        transport.connect(username=VPS_USER, password=VPS_PASS)
+        connected = False
+        if VPS_KEY_PATH and os.path.exists(VPS_KEY_PATH):
+            try:
+                pkey = paramiko.Ed25519Key.from_private_key_file(VPS_KEY_PATH)
+                transport.connect(username=VPS_USER, pkey=pkey)
+                connected = True
+                logger.info(f"🔑 Авторизация на VPS по SSH-ключу: {VPS_KEY_PATH}")
+            except Exception as e:
+                logger.debug(f"Не удалось авторизоваться по ключу {VPS_KEY_PATH}: {e}")
+        if not connected:
+            transport.connect(username=VPS_USER, password=VPS_PASS)
+            logger.info("🔑 Авторизация на VPS по паролю")
         sftp = paramiko.SFTPClient.from_transport(transport)
 
         # Выгрузка архивных срезов из archive_pending на VPS (если ротация произошла, но выгрузка на GDrive задержана)
