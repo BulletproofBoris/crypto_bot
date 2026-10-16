@@ -1,22 +1,47 @@
 import os
+import sys
+import webbrowser
+import subprocess
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
+
+# В среде WSL регистрируем браузер Windows для автоматического открытия ссылки
+if os.path.exists("/mnt/c/WINDOWS/system32/cmd.exe"):
+    class WindowsDefaultBrowser(webbrowser.BaseBrowser):
+        def open(self, url, new=0, autoraise=True):
+            try:
+                subprocess.Popen(["/mnt/c/WINDOWS/system32/cmd.exe", "/c", "start", "", url.replace("&", "^&")])
+                return True
+            except Exception:
+                return False
+    webbrowser.register("windows-default", WindowsDefaultBrowser, preferred=True)
 
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
 CLIENT_SECRET_FILE = os.path.join(os.path.dirname(__file__), 'client_secret.json')
 TOKEN_FILE = os.path.join(os.path.dirname(__file__), 'token.json')
 
-def authenticate():
+def authenticate(force_new=False):
     creds = None
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    if os.path.exists(TOKEN_FILE) and not force_new:
+        try:
+            creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+        except Exception:
+            creds = None
     
     if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            print("🚀 Запускаем процесс авторизации...")
+        refreshed = False
+        if creds and creds.expired and creds.refresh_token and not force_new:
+            try:
+                print("🔄 Попытка обновления существующего токена...")
+                creds.refresh(Request())
+                refreshed = True
+            except Exception as e:
+                print(f"⚠️ Токен просрочен или отозван ({e}).")
+                print("🌐 Запускаем повторный вход через браузер...")
+        
+        if not refreshed:
+            print("🚀 Запускаем процесс авторизации через браузер...")
             flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES)
             creds = flow.run_local_server(port=0)
         
@@ -26,4 +51,6 @@ def authenticate():
     print("✅ Успешная авторизация! Файл token.json сохранен и готов к работе на сервере.")
 
 if __name__ == '__main__':
-    authenticate()
+    import sys
+    force = "--force" in sys.argv
+    authenticate(force_new=force)
