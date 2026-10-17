@@ -26,6 +26,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Импортируем наш SwarmRegimeRouter
 sys.path.insert(0, str(BASE_DIR))
 from _tools.swarm_router import SwarmRegimeRouter
+from _tools.data_labeler import compute_single_horizon_labels, COIN_CONFIG
 
 COIN_RULES = {
     'prl': {
@@ -47,8 +48,8 @@ COIN_RULES = {
 def parse_args():
     parser = argparse.ArgumentParser(description="SafeTrade Execution Simulator with Swarm Router")
     parser.add_argument("--coin", type=str, default="prl", help="Монета (prl, quantus)")
-    parser.add_argument("--horizon", type=int, default=8, help="Горизонт модели H (сек)")
-    parser.add_argument("--ratio", type=int, default=None, help="Соотношение K (L/H)")
+    parser.add_argument("--horizon", type=int, default=5, help="Горизонт модели H (сек)")
+    parser.add_argument("--ratio", type=float, default=None, help="Соотношение K (L/H)")
     parser.add_argument("--mode", type=str, default="router", choices=["router", "uniform", "latest"],
                         help="Режим ансамбля (router, uniform, latest)")
     parser.add_argument("--maker-fee", type=float, default=0.000, help="Комиссия Maker (0.0%% на SafeTrade)")
@@ -68,10 +69,19 @@ def run_execution_simulation(args):
     if args.ratio is not None:
         K = args.ratio
     else:
-        K = 2 if coin == 'prl' and H == 8 else (3 if coin == 'prl' and H == 25 else 1)
+        if H == 5:
+            K = 3.0
+        elif H in (12, 13, 14, 15):
+            K = 3.5
+        elif H >= 18:
+            K = 3.0
+        else:
+            K = 3.0
+
+    k_str = f"{K:g}"
 
     print("\n" + "=" * 105)
-    print(f"🚀 СИМУЛЯЦИЯ ИСПОЛНЕНИЯ SAFETRADE: {coin.upper()} | H = {H}с, K = {K} | Режим: {args.mode.upper()}")
+    print(f"🚀 СИМУЛЯЦИЯ ИСПОЛНЕНИЯ SAFETRADE: {coin.upper()} | H = {H}с, K = {k_str} | Режим: {args.mode.upper()}")
     print(f"   Шаг цены (tick_size): {tick_size} USDT | Комиссии: Maker={args.maker_fee*100:.1f}%, Taker={args.taker_fee*100:.1f}%")
     print(f"   Инвариант: целевая функция оптимизирована на чистый прирост монет (Q_token)")
     print("=" * 105)
@@ -81,19 +91,35 @@ def run_execution_simulation(args):
 
     # 2. Загрузка данных тестирования (чистый OOS)
     labeled_path = BASE_DIR / "data" / "labeled" / coin / f"{coin}_labeled.parquet"
-    target_c7_col = f"target_class_7_h{H}_k{K}"
-    target_dt_col = f"target_dt_ticks_h{H}_k{K}"
+    target_c7_col = f"target_class_7_h{H}_k{k_str}"
+    target_dt_col = f"target_dt_ticks_h{H}_k{k_str}"
+
+    schema_cols = set(pq.read_schema(labeled_path).names)
+    need_labeling = (target_c7_col not in schema_cols) or (target_dt_col not in schema_cols)
 
     exec_cols = [
         'timestamp', 'sample_split', 'ST_bid_1_price', 'ST_ask_1_price',
         'ST_bid_1_qty', 'ST_ask_1_qty', 'ST_mid_price', 'ST_spread', 'ST_spread_pct',
-        'ST_trade_vol', 'ST_buy_vol', 'ST_sell_vol', target_c7_col, target_dt_col
+        'ST_trade_vol', 'ST_buy_vol', 'ST_sell_vol',
+        'ST_bids_vol_top5', 'ST_asks_vol_top5'
     ]
-    load_cols = list(dict.fromkeys(router.feature_names + exec_cols))
+    if not need_labeling:
+        exec_cols += [target_c7_col, target_dt_col]
+
+    load_cols = list(dict.fromkeys([c for c in router.feature_names + exec_cols if c in schema_cols]))
     
     print("📥 Чтение тестового OOS-датасета...")
     tbl = pq.read_table(labeled_path, columns=load_cols)
     df = tbl.to_pandas()
+
+    if need_labeling:
+        cfg_label = COIN_CONFIG[coin]
+        labels = compute_single_horizon_labels(df, coin, H, K, cfg_label['min_vol'], cfg_label['tick_size'])
+        df['target_class'] = labels['class_7']
+        df['target_dt'] = labels['dt_ticks']
+    else:
+        df['target_class'] = df[target_c7_col]
+        df['target_dt'] = df[target_dt_col]
 
     val_mask = (df['sample_split'] == 'val')
     val_df = df[val_mask].copy().reset_index(drop=True)

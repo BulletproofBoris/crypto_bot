@@ -28,17 +28,21 @@ import lightgbm as lgb
 from sklearn.metrics import roc_auc_score
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE_DIR))
+
+from _tools.data_labeler import compute_single_horizon_labels, COIN_CONFIG
 
 class SwarmRegimeRouter:
     """Контекстный роутер и блендер экспертов пула моделей."""
 
-    def __init__(self, coin: str, H: int, K: int, temperature: float = 0.5):
+    def __init__(self, coin: str, H: int, K: float = 3.0, temperature: float = 0.5):
         self.coin = coin.lower()
         self.H = H
-        self.K = K
-        self.L = H * K
+        self.K = float(K)
+        self.L = int(round(H * self.K))
         self.temperature = max(0.01, temperature)
-        self.model_dir = BASE_DIR / "models" / self.coin / f"h{H}s_k{K}"
+        k_str = f"{self.K:g}"
+        self.model_dir = BASE_DIR / "models" / self.coin / f"h{H}s_k{k_str}"
         
         manifest_path = self.model_dir / "manifest.json"
         if not manifest_path.exists():
@@ -183,12 +187,35 @@ def benchmark_router(coin: str, H: int, K: int):
     router = SwarmRegimeRouter(coin, H, K)
 
     labeled_path = BASE_DIR / "data" / "labeled" / coin / f"{coin}_labeled.parquet"
-    target_c7_col = f"target_class_7_h{H}_k{K}"
-    target_dt_col = f"target_dt_ticks_h{H}_k{K}"
+    k_str = f"{K:g}"
+    target_c7_col = f"target_class_7_h{H}_k{k_str}"
+    target_dt_col = f"target_dt_ticks_h{H}_k{k_str}"
 
-    cols = list(dict.fromkeys(router.feature_names + ['timestamp', 'sample_split', 'ST_spread_pct', target_c7_col, target_dt_col]))
+    schema_cols = set(pq.read_schema(labeled_path).names)
+    need_labeling = (target_c7_col not in schema_cols) or (target_dt_col not in schema_cols)
+
+    extra_cols = ['timestamp', 'sample_split', 'ST_spread_pct']
+    if need_labeling:
+        extra_cols += [
+            'ST_mid_price', 'ST_spread', 'ST_bid_1_price', 'ST_ask_1_price',
+            'ST_bid_1_qty', 'ST_ask_1_qty', 'ST_bids_vol_top5', 'ST_asks_vol_top5',
+            'ST_trade_vol'
+        ]
+    else:
+        extra_cols += [target_c7_col, target_dt_col]
+
+    cols = list(dict.fromkeys([c for c in router.feature_names + extra_cols if c in schema_cols]))
     tbl = pq.read_table(labeled_path, columns=cols)
     df = tbl.to_pandas()
+
+    if need_labeling:
+        cfg = COIN_CONFIG[coin]
+        labels = compute_single_horizon_labels(df, coin, H, K, cfg['min_vol'], cfg['tick_size'])
+        df['target_class'] = labels['class_7']
+        df['target_dt'] = labels['dt_ticks']
+    else:
+        df['target_class'] = df[target_c7_col]
+        df['target_dt'] = df[target_dt_col]
 
     # Берем чистый OOS (последние 20% Val)
     val_mask = (df['sample_split'] == 'val')
@@ -198,8 +225,8 @@ def benchmark_router(coin: str, H: int, K: int):
         val_df = df.iloc[int(len(df)*0.8):].copy()
 
     X_val = val_df[router.feature_names].values
-    y_val = val_df[target_c7_col].values + 3
-    dt_val = val_df[target_dt_col].values
+    y_val = val_df['target_class'].values + 3
+    dt_val = val_df['target_dt'].values
 
     print(f"\n📊 БЭКТЕСТ РОУТЕРА НА ВАЛИДАЦИОННОМ OOS ({len(val_df):,} сек):")
     print(f"{'Стратегия ансамблирования':<30} | {'OOS IC':<8} | {'AUC OVR':<8} | {'Top-2% PnL':<12} | {'WinRate (Top-2%)':<16} | {'Прирост':<10}")
@@ -246,8 +273,8 @@ def benchmark_router(coin: str, H: int, K: int):
 def main():
     parser = argparse.ArgumentParser(description="Swarm Regime Router & Benchmark")
     parser.add_argument("--coin", type=str, default="prl", help="Монета (prl, quantus)")
-    parser.add_argument("--horizon", type=int, default=8, help="Горизонт H (сек)")
-    parser.add_argument("--ratio", type=int, default=None, help="Коэффициент K (L/H)")
+    parser.add_argument("--horizon", type=int, default=5, help="Горизонт H (сек)")
+    parser.add_argument("--ratio", type=float, default=None, help="Коэффициент K (L/H)")
     parser.add_argument("--benchmark", action="store_true", default=True, help="Запустить сравнительный бэктест")
     args = parser.parse_args()
 
@@ -256,7 +283,14 @@ def main():
     if args.ratio is not None:
         K = args.ratio
     else:
-        K = 2 if coin == 'prl' and H == 8 else (3 if coin == 'prl' and H == 25 else 1)
+        if H == 5:
+            K = 3.0
+        elif H in (12, 13, 14, 15):
+            K = 3.5
+        elif H >= 18:
+            K = 3.0
+        else:
+            K = 3.0
 
     benchmark_router(coin, H, K)
 

@@ -25,28 +25,39 @@ import lightgbm as lgb
 from sklearn.metrics import roc_auc_score, log_loss
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE_DIR))
+
+from _tools.data_labeler import compute_single_horizon_labels, COIN_CONFIG
 
 SAFE_WORKERS = min(14, max(4, os.cpu_count() - 2 if os.cpu_count() else 4))
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Rolling Swarm Trainer")
     parser.add_argument("--coins", type=str, default="prl,quantus", help="Монеты через запятую")
-    parser.add_argument("--horizons", type=str, default="3,8", help="Горизонты H (сек)")
+    parser.add_argument("--horizons", type=str, default="5,12,25", help="Горизонты H (сек)")
+    parser.add_argument("--k-values", type=str, default="", help="Значения K через запятую (например 3.0,3.5,3.0)")
     parser.add_argument("--n-estimators", type=int, default=70, help="Количество деревьев LightGBM")
     parser.add_argument("--n-jobs", type=int, default=SAFE_WORKERS, help="Количество потоков CPU")
     return parser.parse_args()
 
 
-def get_default_k(coin: str, H: int) -> int:
-    """Возвращает утвержденное оптимальное соотношение K = L / H."""
-    c = coin.lower()
-    if H == 3:
-        return 1
-    elif H == 8:
-        return 2 if c == 'prl' else 1
-    elif H == 25:
-        return 3 if c == 'prl' else 2
-    return 1
+def get_default_k(coin: str, H: int) -> float:
+    """
+    Возвращает эмпирически подтвержденное оптимальное соотношение K = L / H (K >= 3.0).
+    - H in [1..11]: K* = 3.0 (высокая скорость реакции BBO, L <= 33s)
+    - H in [12..17]: K* = 3.5 (ядро удержания спреда, L in [42..60]s, погрешность < 1.0%)
+    - H in [18..25]: K* = 3.0 (ограничение N_eff >= 5000, L <= 75s)
+    """
+    if H == 5:
+        return 3.0
+    elif H in (12, 13, 14, 15):
+        return 3.5
+    elif H >= 18:
+        return 3.0
+    elif H < 11:
+        return 3.0
+    else:
+        return 3.5
 
 
 def find_clean_segments(df: pd.DataFrame):
@@ -75,15 +86,17 @@ def find_clean_segments(df: pd.DataFrame):
     return segments
 
 
-def generate_rolling_windows_reverse(segments: list, H: int, K: int, n_target: int = 5000):
+def generate_rolling_windows_reverse(segments: list, H: int, K: float, n_target: int = 5000):
     """
     Генерирует окна строго с конца временного ряда:
     T_train = 5000 * L
     T_test = int(5000 * L / 0.8)
     W = T_train + buffer + T_test
     Step = W // 2
+    Если сегмент вмещает T_train + buffer + min_test, но меньше полного W,
+    генерируется окно с фактическим доступным размером теста.
     """
-    L = H * K
+    L = int(round(H * K))
     t_train = n_target * L
     t_test = int(n_target * L / 0.8)
     buffer = H + 360
@@ -91,8 +104,37 @@ def generate_rolling_windows_reverse(segments: list, H: int, K: int, n_target: i
     step = W // 2
 
     windows = []
+    min_test = max(3600, int(L * 50))
+
     for seg_idx, (seg_start, seg_end) in enumerate(segments):
+        seg_len = seg_end - seg_start
+        if seg_len < t_train + buffer + min_test:
+            continue
+
         curr_end = seg_end
+        if seg_len < W:
+            # Сегмент вмещает полный Train (5000*L), но тест чуть короче идеального
+            w_start = seg_start
+            tr_start = w_start
+            tr_end = tr_start + t_train
+            te_start = tr_end + buffer
+            te_end = curr_end
+            if te_end - te_start >= min_test:
+                windows.append({
+                    'segment_id': seg_idx,
+                    'tr_start': tr_start,
+                    'tr_end': tr_end,
+                    'te_start': te_start,
+                    'te_end': te_end,
+                    't_train': t_train,
+                    't_test': te_end - te_start,
+                    'W': te_end - tr_start,
+                    'L': L,
+                    'H': H,
+                    'K': K
+                })
+            continue
+
         while curr_end - W >= seg_start:
             w_start = curr_end - W
             tr_start = w_start
@@ -136,7 +178,7 @@ def compute_regime_fingerprint(df_slice: pd.DataFrame):
     return fp
 
 
-def train_coin_horizon(coin: str, H: int, K: int, n_estimators: int, n_jobs: int):
+def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: int):
     """Обучает полный пул Rolling-моделей для монеты и горизонта H."""
     coin = coin.lower()
     labeled_path = BASE_DIR / "data" / "labeled" / coin / f"{coin}_labeled.parquet"
@@ -149,27 +191,51 @@ def train_coin_horizon(coin: str, H: int, K: int, n_estimators: int, n_jobs: int
     with open(feats_json) as f:
         feature_cols = json.load(f)["feature_order"]
 
-    target_c7_col = f"target_class_7_h{H}_k{K}"
-    target_dt_col = f"target_dt_ticks_h{H}_k{K}"
+    k_str = f"{K:g}"
+    target_c7_col = f"target_class_7_h{H}_k{k_str}"
+    target_dt_col = f"target_dt_ticks_h{H}_k{k_str}"
 
-    cols_to_load = list(set(feature_cols + [
+    schema_cols = set(pq.read_schema(labeled_path).names)
+    need_labeling = (target_c7_col not in schema_cols) or (target_dt_col not in schema_cols)
+
+    base_cols = [
         'timestamp', 'sample_split', 'is_data_gap',
-        target_c7_col, target_dt_col,
         'rvol_300s_ticks', 'ST_spread', 'ST_spread_pct', 'ofi_norm_300s', 'cvd_norm_300s'
-    ]))
-    cols_to_load = [c for c in cols_to_load if c in pq.read_schema(labeled_path).names]
+    ]
+    if need_labeling:
+        orderbook_cols = [
+            'ST_mid_price', 'ST_spread', 'ST_bid_1_price', 'ST_ask_1_price',
+            'ST_bid_1_qty', 'ST_ask_1_qty', 'ST_bids_vol_top5', 'ST_asks_vol_top5',
+            'ST_trade_vol'
+        ]
+        base_cols += orderbook_cols
+    else:
+        base_cols += [target_c7_col, target_dt_col]
 
+    cols_to_load = list(dict.fromkeys([c for c in feature_cols + base_cols if c in schema_cols]))
+
+    L = int(round(H * K))
     print(f"\n{'='*95}")
-    print(f"🚀 ОБУЧЕНИЕ ROLLING SWARM: {coin.upper()} | H = {H}с, K = {K} (L = {H*K}с)")
+    print(f"🚀 ОБУЧЕНИЕ ROLLING SWARM: {coin.upper()} | H = {H}с, K = {k_str} (L = {L}с)")
     print(f"   Признаков: {len(feature_cols)} | Потоков CPU: {n_jobs} | Целевой таргет: {target_c7_col}")
     print(f"{'='*95}")
 
     t0 = time.time()
     tbl = pq.read_table(labeled_path, columns=cols_to_load)
     df = tbl.to_pandas()
-    df['target_class'] = df[target_c7_col]
-    df['target_dt'] = df[target_dt_col]
     print(f"⏱️ Данные загружены за {time.time()-t0:.2f}с ({len(df):,} строк)")
+
+    if need_labeling:
+        print(f"⚙️ Динамический расчет микроструктурных меток для H = {H}с, K = {k_str}...")
+        cfg = COIN_CONFIG[coin]
+        labels = compute_single_horizon_labels(df, coin, H, K, cfg['min_vol'], cfg['tick_size'])
+        df['target_class'] = labels['class_7']
+        df['target_dt'] = labels['dt_ticks']
+        df['is_void'] = labels['is_void']
+    else:
+        df['target_class'] = df[target_c7_col]
+        df['target_dt'] = df[target_dt_col]
+        df['is_void'] = False
 
     # Поиск непрерывных сегментов (без гэпов)
     segments = find_clean_segments(df)
@@ -182,7 +248,7 @@ def train_coin_horizon(coin: str, H: int, K: int, n_estimators: int, n_jobs: int
         print("⚠️ Нет непрерывных сегментов достаточной длины для данного горизонта!")
         return
 
-    out_dir = BASE_DIR / "models" / coin / f"h{H}s_k{K}"
+    out_dir = BASE_DIR / "models" / coin / f"h{H}s_k{k_str}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     manifest = []
@@ -245,7 +311,14 @@ def train_coin_horizon(coin: str, H: int, K: int, n_estimators: int, n_jobs: int
         ic = float(np.corrcoef(expected_z, dt_test)[0, 1]) if np.std(expected_z) > 1e-6 else 0.0
         
         try:
-            auc = float(roc_auc_score(y_test, full_probs, multi_class='ovr', labels=list(range(7))))
+            present_classes = [c for c in range(7) if np.sum(y_test == c) > 0]
+            if len(present_classes) > 1:
+                # Нормализация вероятностей для присутствующих классов
+                p_sub = full_probs[:, present_classes]
+                p_sub = p_sub / np.maximum(p_sub.sum(axis=1, keepdims=True), 1e-7)
+                auc = float(roc_auc_score(y_test, p_sub, multi_class='ovr', labels=present_classes))
+            else:
+                auc = 0.5
         except Exception:
             auc = 0.5
 
@@ -302,15 +375,21 @@ def main():
     args = parse_args()
     coins = [c.strip().lower() for c in args.coins.split(',') if c.strip()]
     horizons = [int(h.strip()) for h in args.horizons.split(',') if h.strip()]
+    k_vals = [float(k.strip()) for k in args.k_values.split(',') if k.strip()] if args.k_values else None
 
     print(f"\n{'='*80}")
     print(f"🤖 ЗАПУСК ОБУЧЕНИЯ ПУЛА ЭКСПЕРТОВ (ROLLING SWARM) С РАЗМЕТКОЙ С КОНЦА")
     print(f"   Монеты: {coins} | Горизонты: {horizons} | Потоков CPU: {args.n_jobs}")
+    if k_vals:
+        print(f"   Пользовательские K: {k_vals}")
     print(f"{'='*80}")
 
     for coin in coins:
-        for H in horizons:
-            K = get_default_k(coin, H)
+        for idx, H in enumerate(horizons):
+            if k_vals and idx < len(k_vals):
+                K = k_vals[idx]
+            else:
+                K = get_default_k(coin, H)
             train_coin_horizon(coin, H, K, args.n_estimators, args.n_jobs)
 
 
