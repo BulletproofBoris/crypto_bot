@@ -58,6 +58,7 @@ METADATA_DIR = os.path.join(BASE_DIR, "data", "metadata")
 FOLDER_ID = '1-qWy2q2nYoZtSCiMDZ1DiKZ5roBqXx-c'
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
 TOKEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'token.json')
+SERVICE_ACCOUNT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'service_account.json')
 
 # Импорт конфигурации VPS
 try:
@@ -283,19 +284,49 @@ def get_drive_service():
     from googleapiclient.discovery import build
     import socket
     socket.setdefaulttimeout(30.0)
+
+    if os.path.exists(SERVICE_ACCOUNT_PATH):
+        try:
+            from google.oauth2 import service_account
+            import httplib2
+            import google_auth_httplib2
+            creds = service_account.Credentials.from_service_account_file(
+                SERVICE_ACCOUNT_PATH, scopes=SCOPES
+            )
+            http_transport = httplib2.Http(proxy_info=httplib2.proxy_info_from_environment, timeout=30)
+            auth_http = google_auth_httplib2.AuthorizedHttp(creds, http=http_transport)
+            logger.info("🔑 Используется Google Cloud Service Account (бессрочный доступ).")
+            return build('drive', 'v3', http=auth_http, cache_discovery=False)
+        except Exception as e:
+            logger.warning(f"Ошибка загрузки service_account.json: {e}")
+
     if not os.path.exists(TOKEN_PATH):
         raise FileNotFoundError(f"Файл токена не найден: {TOKEN_PATH}. Запустите auth_gdrive.py.")
     creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-    if creds and creds.expired and creds.refresh_token:
-        try:
-            creds.refresh(Request())
-            tmp_token = TOKEN_PATH + ".tmp"
-            with open(tmp_token, "w", encoding="utf-8") as f:
-                f.write(creds.to_json())
-            os.replace(tmp_token, TOKEN_PATH)
-        except Exception as e:
-            logger.warning(f"Не удалось предварительно обновить токен: {e}")
-            raise RuntimeError(f"Токен Google Drive недействителен: {e}")
+    if creds and creds.refresh_token:
+        needs_refresh = False
+        if not creds.valid or creds.expired:
+            needs_refresh = True
+        elif creds.expiry:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            expiry = creds.expiry
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            if (expiry - now).total_seconds() < 600:
+                needs_refresh = True
+
+        if needs_refresh:
+            try:
+                creds.refresh(Request())
+                tmp_token = TOKEN_PATH + ".tmp"
+                with open(tmp_token, "w", encoding="utf-8") as f:
+                    f.write(creds.to_json())
+                os.replace(tmp_token, TOKEN_PATH)
+                logger.info("🔄 Токен Google OAuth успешно обновлен и сохранен.")
+            except Exception as e:
+                logger.warning(f"Не удалось предварительно обновить токен: {e}")
+                raise RuntimeError(f"Токен Google Drive недействителен: {e}")
     import httplib2
     import google_auth_httplib2
     http_transport = httplib2.Http(proxy_info=httplib2.proxy_info_from_environment, timeout=30)

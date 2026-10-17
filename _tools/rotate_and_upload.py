@@ -34,6 +34,7 @@ logger = logging.getLogger("rotate_and_upload")
 FOLDER_ID = '1-qWy2q2nYoZtSCiMDZ1DiKZ5roBqXx-c'
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
 TOKEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'token.json')
+SERVICE_ACCOUNT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'service_account.json')
 
 # Порог свободного места для аварийной ротации (в гигабайтах)
 MIN_FREE_DISK_GB = 2.5
@@ -101,19 +102,49 @@ def get_free_disk_gb(path="/"):
     return free_bytes / (1024 ** 3)
 
 def get_drive_service():
-    """Инициализирует и возвращает сервис Google Drive API с автосохранением обновленного токена."""
-    if not os.path.exists(TOKEN_PATH):
-        raise FileNotFoundError(f"Файл токена авторизации не найден: {TOKEN_PATH}. Запустите auth_gdrive.py.")
-    creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-    if creds and creds.expired and creds.refresh_token:
+    """
+    Инициализирует и возвращает сервис Google Drive API.
+    Приоритет:
+    1. Service Account (service_account.json) — вечный ключ без срока годности.
+    2. OAuth User Token (token.json) с проактивным автообновлением и сохранением.
+    """
+    if os.path.exists(SERVICE_ACCOUNT_PATH):
         try:
-            creds.refresh(Request())
-            tmp_token = TOKEN_PATH + ".tmp"
-            with open(tmp_token, "w", encoding="utf-8") as f:
-                f.write(creds.to_json())
-            os.replace(tmp_token, TOKEN_PATH)
+            from google.oauth2 import service_account
+            creds = service_account.Credentials.from_service_account_file(
+                SERVICE_ACCOUNT_PATH, scopes=SCOPES
+            )
+            logger.info("🔑 Используется Google Cloud Service Account (бессрочный доступ).")
+            return build('drive', 'v3', credentials=creds, cache_discovery=False)
         except Exception as e:
-            logger.warning(f"Не удалось предварительно обновить токен: {e}")
+            logger.warning(f"Ошибка загрузки service_account.json: {e}")
+
+    if not os.path.exists(TOKEN_PATH):
+        raise FileNotFoundError(f"Файл авторизации не найден: {TOKEN_PATH} или {SERVICE_ACCOUNT_PATH}. Запустите auth_gdrive.py.")
+    
+    creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+    if creds and creds.refresh_token:
+        needs_refresh = False
+        if not creds.valid or creds.expired:
+            needs_refresh = True
+        elif creds.expiry:
+            now = datetime.now(timezone.utc)
+            expiry = creds.expiry
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            if (expiry - now).total_seconds() < 600:
+                needs_refresh = True
+
+        if needs_refresh:
+            try:
+                creds.refresh(Request())
+                tmp_token = TOKEN_PATH + ".tmp"
+                with open(tmp_token, "w", encoding="utf-8") as f:
+                    f.write(creds.to_json())
+                os.replace(tmp_token, TOKEN_PATH)
+                logger.info("🔄 Токен Google OAuth успешно обновлен и сохранен.")
+            except Exception as e:
+                logger.warning(f"Не удалось предварительно обновить токен: {e}")
     return build('drive', 'v3', credentials=creds, cache_discovery=False)
 
 def get_or_create_date_folder(service, parent_id, date_str):
@@ -292,6 +323,8 @@ def flush_pending_archives(service):
                 if upload_file_to_drive(service, fpath, f_id, fname):
                     os.remove(fpath)
                     logger.info(f"☁️ Докачан отложенный архив из буфера: {d_name}/{fname}")
+            if not os.listdir(d_path):
+                os.rmdir(d_path)
         except Exception as e:
             logger.warning(f"Не удалось докачать отложенные архивы за {d_name}: {e}")
 
