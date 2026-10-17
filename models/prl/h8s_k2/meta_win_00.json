@@ -1,0 +1,53 @@
+{
+  "window_id": "win_00",
+  "coin": "PRL",
+  "H": 8,
+  "K": 2,
+  "L": 16,
+  "train_ts_range": [
+    "2026-10-13 01:01:39",
+    "2026-10-13 23:14:59"
+  ],
+  "test_ts_range": [
+    "2026-10-13 23:21:07",
+    "2026-10-15 03:07:47"
+  ],
+  "n_train": 80000,
+  "n_test": 100000,
+  "metrics_oos": {
+    "ic_dt_ticks": 0.259,
+    "roc_auc_ovr": 0.8486,
+    "top2pct_mean_ticks": 0.36
+  },
+  "regime_fingerprint_train": {
+    "median_ST_spread": 0.010000000000000009,
+    "mean_ST_spread": 0.012182125000000007,
+    "std_ST_spread": 0.006001214917362566,
+    "median_ST_spread_pct": 0.006191950291395187,
+    "mean_ST_spread_pct": 0.007391523104161024,
+    "std_ST_spread_pct": 0.0037411944940686226,
+    "pct_class_-3": 3.765,
+    "pct_class_-2": 2.15375,
+    "pct_class_-1": 0.47375000000000006,
+    "pct_class_+0": 87.37,
+    "pct_class_+1": 0.49874999999999997,
+    "pct_class_+2": 1.79,
+    "pct_class_+3": 3.94875
+  },
+  "regime_fingerprint_test": {
+    "median_ST_spread": 0.010000000000000009,
+    "mean_ST_spread": 0.012444799999999995,
+    "std_ST_spread": 0.005195474276714297,
+    "median_ST_spread_pct": 0.005305039696395397,
+    "mean_ST_spread_pct": 0.006537748966366053,
+    "std_ST_spread_pct": 0.0027425785083323717,
+    "pct_class_-3": 4.488,
+    "pct_class_-2": 2.6020000000000003,
+    "pct_class_-1": 0.822,
+    "pct_class_+0": 83.988,
+    "pct_class_+1": 0.9259999999999999,
+    "pct_class_+2": 2.704,
+    "pct_class_+3": 4.47
+  },
+  "model_file": "model_win_00.txt"
+}
