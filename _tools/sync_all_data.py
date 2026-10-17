@@ -21,8 +21,13 @@ import time
 import glob
 import gzip
 import logging
+import argparse
 import numpy as np
 import pandas as pd
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
 from concurrent.futures import ThreadPoolExecutor
 from _tools.system_resources import SAFE_WORKERS
 
