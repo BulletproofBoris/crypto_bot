@@ -32,10 +32,10 @@ def _worker_label_pair(args):
     res = compute_single_horizon_labels(df_mini, coin, H, K, min_vol, tick_size)
     return (H, K, res)
 
-# Микроструктурные параметры монет (SafeTrade)
+# Физические параметры биржи SafeTrade (шаг цены и минимальный лот)
 COIN_CONFIG = {
-    'prl': {'tick_size': 0.005, 'typical_trade': 17.3, 'min_vol': 50.0, 'spread_factor': 0.30},
-    'quantus': {'tick_size': 0.05, 'typical_trade': 2.2, 'min_vol': 2.0, 'spread_factor': 0.20},
+    'prl': {'tick_size': 0.005, 'typical_trade': 17.3, 'min_vol': 50.0},
+    'quantus': {'tick_size': 0.05, 'typical_trade': 2.2, 'min_vol': 2.0},
 }
 
 # Пороги квантильных плато
@@ -144,34 +144,45 @@ def compute_single_horizon_labels(df, coin, H, K, min_vol, tick_size):
     d_vol = (pd.Series(vol_L) - pd.Series(vol_L).shift(t_wave)).fillna(0).values / t_wave
     d_vol = np.clip(d_vol, -2.0, 2.0)
     
-    cfg = COIN_CONFIG.get(coin.lower(), COIN_CONFIG['prl'])
-    spread_factor = cfg.get('spread_factor', 0.10)
-    
-    # 5. Горизонтно-адаптивное многослойное сопротивление M(H)
-    if H <= 5:
-        # Микро-масштаб (H <= 5s): трейды поглощают только 1-2 уровни
-        sp_w = spread_factor * 1.0
-        depth_up = np.clip(a12_L / np.maximum(q12_ask, eps_q), 0.4, 2.5) ** 0.08
-        depth_dn = np.clip(b12_L / np.maximum(q12_bid, eps_q), 0.4, 2.5) ** 0.08
-        kin_up = 1.0 + 0.10 * np.tanh(np.maximum(0, v_wave))
-        kin_dn = 1.0 + 0.10 * np.tanh(np.maximum(0, -v_wave))
-    elif H <= 20:
-        # Волновой масштаб (5 < H <= 20s): плотность top-5 + плотность очередей top-2
-        sp_w = spread_factor * 0.8
-        depth_up = (np.clip(asks_L / np.maximum(a5, min_vol), 0.4, 2.5) ** 0.08) * (np.clip(a12_L / np.maximum(q12_ask, eps_q), 0.5, 2.0) ** 0.04)
-        depth_dn = (np.clip(bids_L / np.maximum(b5, min_vol), 0.4, 2.5) ** 0.08) * (np.clip(b12_L / np.maximum(q12_bid, eps_q), 0.5, 2.0) ** 0.04)
-        kin_up = 1.0 + 0.12 * np.tanh(np.maximum(0, v_wave))
-        kin_dn = 1.0 + 0.12 * np.tanh(np.maximum(0, -v_wave))
+    # 5. Самоадаптивное динамическое сопротивление M(t, H)
+    # 5.1. Динамическая эластичность спреда к локальному режиму (300с медиана)
+    med_spread = pd.Series(spread_ticks).rolling(300, min_periods=30).median().bfill().values
+    med_spread = np.maximum(1.0, np.nan_to_num(med_spread, nan=1.0))
+    spread_ratio = np.clip(spread_ticks / med_spread, 0.2, 5.0)
+
+    # 5.2. Направленная асимметрия наклона книги заявок (Book Slope Asymmetry / Kyle's Lambda)
+    bid_dist = np.maximum(0.5, (mid - b1_p) / tick_size + 0.5)
+    ask_dist = np.maximum(0.5, (a1_p - mid) / tick_size + 0.5)
+    slope_bid = b5 / bid_dist
+    slope_ask = a5 / ask_dist
+    slope_ratio = np.clip(slope_bid / np.maximum(slope_ask, 1e-4), 0.3, 3.0)
+
+    # 5.3. Непрерывный масштаб горизонта (Continuous Horizon Scaling)
+    h_scale = (5.0 / (H + 4.0)) ** 0.5
+    dyn_sp_up = 0.22 * h_scale * (spread_ratio ** (-0.25)) * (slope_ratio ** 0.15)
+    dyn_sp_dn = 0.22 * h_scale * (spread_ratio ** (-0.25)) * (slope_ratio ** (-0.15))
+
+    # 5.4. Непрерывная глубина стакана и кинематика волны
+    depth_w12 = (5.0 / (H + 5.0)) * 0.08
+    depth_w5 = (H / (H + 5.0)) * 0.08
+    depth_up = (np.clip(asks_L / np.maximum(a5, min_vol), 0.4, 2.5) ** depth_w5) * (np.clip(a12_L / np.maximum(q12_ask, eps_q), 0.5, 2.0) ** depth_w12)
+    depth_dn = (np.clip(bids_L / np.maximum(b5, min_vol), 0.4, 2.5) ** depth_w5) * (np.clip(b12_L / np.maximum(q12_bid, eps_q), 0.5, 2.0) ** depth_w12)
+
+    kin_coef = 0.10 + 0.05 * (H / (H + 20.0))
+    kin_up = 1.0 + kin_coef * np.tanh(np.maximum(0, v_wave))
+    kin_dn = 1.0 + kin_coef * np.tanh(np.maximum(0, -v_wave))
+
+    # 5.5. Арбитражное смещение внешних поводырей (Lead-Lag Momentum)
+    if 'arb_spread_zscore_20s' in df.columns:
+        arb_z = np.clip(df['arb_spread_zscore_20s'].values, -3.0, 3.0)
+        arb_mult_up = np.exp(-0.04 * arb_z)
+        arb_mult_dn = np.exp(+0.04 * arb_z)
     else:
-        # Макро-масштаб (H > 20s): сопротивление глубины top-5
-        sp_w = spread_factor * 0.5
-        depth_up = np.clip(asks_L / np.maximum(a5, min_vol), 0.4, 2.5) ** 0.10
-        depth_dn = np.clip(bids_L / np.maximum(b5, min_vol), 0.4, 2.5) ** 0.10
-        kin_up = 1.0 + 0.15 * np.tanh(np.maximum(0, v_wave))
-        kin_dn = 1.0 + 0.15 * np.tanh(np.maximum(0, -v_wave))
-        
-    M_up_base = (spread_ticks * sp_w + vol_L * np.sqrt(H)) * depth_up * kin_up
-    M_dn_base = (spread_ticks * sp_w + vol_L * np.sqrt(H)) * depth_dn * kin_dn
+        arb_mult_up = 1.0
+        arb_mult_dn = 1.0
+
+    M_up_base = (spread_ticks * dyn_sp_up + vol_L * np.sqrt(H)) * depth_up * kin_up * arb_mult_up
+    M_dn_base = (spread_ticks * dyn_sp_dn + vol_L * np.sqrt(H)) * depth_dn * kin_dn * arb_mult_dn
     M_up = np.maximum(0.5, np.nan_to_num(M_up_base, nan=1.0))
     M_dn = np.maximum(0.5, np.nan_to_num(M_dn_base, nan=1.0))
     
