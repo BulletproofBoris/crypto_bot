@@ -2,7 +2,10 @@ import paramiko
 import sys
 import time
 
-sys.path.append('/home/restorator/crypto_bot/_tools')
+import os
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+if CURRENT_DIR not in sys.path:
+    sys.path.append(CURRENT_DIR)
 import vps_config
 
 def log(msg):
@@ -30,7 +33,7 @@ def deploy_all():
 
     log("2. Загрузка обновленных скриптов на VPS через SFTP...")
     for local_name, remote_path in files_to_upload:
-        local_path = f"/home/restorator/crypto_bot/_tools/{local_name}"
+        local_path = os.path.join(CURRENT_DIR, local_name)
         log(f"   ⬆️ {local_name} -> {remote_path}")
         sftp.put(local_path, remote_path)
 

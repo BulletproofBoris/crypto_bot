@@ -485,9 +485,13 @@ def process_coin_labeling(
             legacy_tr = os.path.join(base_outdir, f"train_labeled_h{pH}s.parquet")
             legacy_va = os.path.join(base_outdir, f"val_labeled_h{pH}s.parquet")
             legacy_full = os.path.join(base_outdir, f"full_labeled_h{pH}s.parquet")
-            tr_df.to_parquet(legacy_tr, index=False, compression="zstd")
-            va_df.to_parquet(legacy_va, index=False, compression="zstd")
-            out_df[out_df['is_valid_sample']].to_parquet(legacy_full, index=False, compression="zstd")
+            for src_p, leg_p in [(tr_path, legacy_tr), (va_path, legacy_va), (full_path, legacy_full)]:
+                try:
+                    if os.path.islink(leg_p) or os.path.exists(leg_p):
+                        os.remove(leg_p)
+                    os.symlink(os.path.relpath(src_p, os.path.dirname(leg_p)), leg_p)
+                except Exception:
+                    pass
             
     return out_df, grid_records
 

@@ -51,9 +51,11 @@ files = [
     "rotate_data.py", 
     "token.json"
 ]
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 for f in files:
-    src = f"/home/restorator/crypto_bot/_tools/{f}"
+    src = os.path.join(CURRENT_DIR, f)
     if os.path.exists(src):
+
         print(f"Uploading {f}...")
         sftp.put(src, f"/opt/crypto_bot/_tools/{f}")
 sftp.close()

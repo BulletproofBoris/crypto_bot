@@ -1,8 +1,11 @@
 .env
 .venv/
+venv/
 
 # Secrets
+Safetrade_API.txt
 _tools/*.json
+
 
 # Data
 data

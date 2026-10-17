@@ -621,7 +621,13 @@ def build_dataset_for_config(cfg, include_vps=True):
     if "hierarchical_file" in cfg:
         h_path = cfg["hierarchical_file"]
         os.makedirs(os.path.dirname(h_path), exist_ok=True)
-        full_df.to_parquet(h_path, index=False)
+        try:
+            if os.path.islink(h_path) or os.path.exists(h_path):
+                os.remove(h_path)
+            os.symlink(os.path.relpath(parquet_path, os.path.dirname(h_path)), h_path)
+        except Exception:
+            full_df.to_parquet(h_path, index=False)
+
 
     logger.info(f"📊 {key}: {len(full_df):,} записей сохранены в {os.path.basename(parquet_path)} ({file_size_mb:.2f} MB)")
     if 'timestamp' in full_df.columns and not full_df.empty:

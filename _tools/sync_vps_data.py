@@ -13,7 +13,8 @@ USER = vps_config.VPS_USER
 PASS = vps_config.VPS_PASS
 
 REMOTE_DIR = "/opt/crypto_bot/data/realtime/prlusdt"
-LOCAL_DIR = "/home/restorator/crypto_bot/data/realtime/prlusdt"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOCAL_DIR = os.path.join(BASE_DIR, "data", "realtime", "prlusdt")
 
 FILES = ["trades.csv", "depth.csv", "collection.log"]
 
@@ -33,12 +34,12 @@ def sync_data():
         dirs_to_sync = [
             {
                 "remote": "/opt/crypto_bot/data/realtime/prlusdt",
-                "local": "/home/restorator/crypto_bot/data/realtime/prlusdt",
+                "local": os.path.join(BASE_DIR, "data", "realtime", "prlusdt"),
                 "files": ["trades.csv", "depth.csv", "collection.log"]
             },
             {
                 "remote": "/opt/crypto_bot/data/realtime/prlusdt_bigone",
-                "local": "/home/restorator/crypto_bot/data/realtime/prlusdt_bigone",
+                "local": os.path.join(BASE_DIR, "data", "realtime", "prlusdt_bigone"),
                 "files": ["trades_bigone.csv", "depth_bigone.csv", "collection_bigone.log"]
             }
         ]

@@ -9,8 +9,10 @@ import pandas as pd
 from sklearn.metrics import roc_auc_score
 import lightgbm as lgb
 
-BASE_DIR = '/home/restorator/.gemini/antigravity/worktrees/crypto_bot/warp_luna_soars_08h28'
-sys.path.insert(0, BASE_DIR)
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
 from _tools.experiment_hk_selection import get_stationary_feature_cols
 from _tools.data_labeler import COIN_CONFIG
 from _tools.system_resources import SAFE_WORKERS
