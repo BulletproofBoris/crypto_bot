@@ -1,0 +1,24 @@
+[
+  {
+    "window_id": "win_00",
+    "model_type": "causal_cnn",
+    "coin": "PRL",
+    "H": 25,
+    "seq_len": 75,
+    "train_ts_range": [
+      "2026-10-15 23:01:18",
+      "2026-10-18 09:21:17"
+    ],
+    "test_ts_range": [
+      "2026-10-18 09:27:30",
+      "2026-10-18 15:13:47"
+    ],
+    "metrics_oos": {
+      "ic_dt_ticks": 0.161,
+      "roc_auc_ovr": 0.677,
+      "log_loss": 1.7968,
+      "top2pct_mean_ticks": 0.03
+    },
+    "weights_file": "model_win_00.keras"
+  }
+]

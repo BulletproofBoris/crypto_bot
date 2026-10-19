@@ -119,17 +119,17 @@ def init_csv_files():
             ])
 
 def fetch_safetrade_rules():
-    """Получает торговые правила SafeTrade для prlusdt, quantususdt."""
+    """Получает торговые правила SafeTrade для pearlusdt (prlusdt), quantususdt."""
     logger.info("Запрос торговых правил SafeTrade...")
     markets_data = []
-    target_ids = {"prlusdt": "PRL", "quantususdt": "QUANTUS"}
+    target_ids = {"pearlusdt": "PRL", "prlusdt": "PRL", "quantususdt": "QUANTUS"}
     rules = {}
     
     for proxies in [None, {"http": SAFETRADE_PROXY, "https": SAFETRADE_PROXY}]:
         markets_data = []
         try:
             for page in range(1, 6):
-                url = f"https://safe.trade/api/v2/peatio/public/markets?page={page}&limit=100"
+                url = f"https://safe.trade/api/v2/trade/public/markets?page={page}&limit=100"
                 if HAS_CURL_CFFI:
                     r = cffi_requests.get(url, proxies=proxies, impersonate="chrome120", timeout=10)
                 else:

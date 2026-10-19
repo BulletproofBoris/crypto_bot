@@ -35,12 +35,14 @@ from _tools.data_labeler import compute_single_horizon_labels, COIN_CONFIG
 class SwarmRegimeRouter:
     """Контекстный роутер и блендер экспертов пула моделей."""
 
-    def __init__(self, coin: str, H: int, K: float = 3.0, temperature: float = 0.5):
+    def __init__(self, coin: str, H: int, K: float = 3.0, temperature: float = 0.5, use_neural: bool = True, neural_weight: float = 0.15):
         self.coin = coin.lower()
         self.H = H
         self.K = float(K)
         self.L = int(round(H * self.K))
         self.temperature = max(0.01, temperature)
+        self.use_neural = use_neural
+        self.neural_weight = float(neural_weight)
         k_str = f"{self.K:g}"
         self.model_dir = BASE_DIR / "models" / self.coin / f"h{H}s_k{k_str}"
         
@@ -72,7 +74,47 @@ class SwarmRegimeRouter:
             feats_json = BASE_DIR / "data" / "features" / f"selected_features_{self.coin}_h8s.json"
             with open(feats_json) as f:
                 self.feature_names = json.load(f)["feature_order"]
-        print(f"✅ Успешно загружено {self.num_models} моделей-экспертов в RAM ({len(self.feature_names)} признаков).")
+        print(f"✅ Успешно загружено {self.num_models} моделей-экспертов LightGBM в RAM ({len(self.feature_names)} признаков).")
+
+        # Загрузка мультиархитектурных нейросетевых экспертов (Conv1D+GRU, Causal CNN, Attention, MLP)
+        self.neural_experts = []
+        self.alliance_cfg = None
+        alliance_path = BASE_DIR / "models" / self.coin / f"ensemble_alliance_h{H}s.json"
+        if self.use_neural and alliance_path.exists():
+            try:
+                os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+                import tensorflow as tf
+                with open(alliance_path) as f:
+                    self.alliance_cfg = json.load(f)
+                for arch_dir_name, arch_key in [
+                    ("conv1d_gru", "conv1d+gru"),
+                    ("causal_cnn", "causal_cnn"),
+                    ("mlp_bottleneck", "mlp_bottleneck"),
+                    ("attention", "attention")
+                ]:
+                    n_dir = BASE_DIR / "models" / self.coin / f"{arch_dir_name}_h{H}s"
+                    k_file = n_dir / "model_win_00.keras"
+                    m_file = n_dir / "meta_win_00.json"
+                    if k_file.exists() and m_file.exists():
+                        with open(m_file) as mf:
+                            n_meta = json.load(mf)
+                        ic_val = float(n_meta.get("metrics_oos", {}).get("ic_dt_ticks", 0.1))
+                        if ic_val >= 0.10:
+                            k_model = tf.keras.models.load_model(str(k_file), compile=False)
+                            self.neural_experts.append({
+                                "arch": arch_key,
+                                "model": k_model,
+                                "seq_len": int(n_meta["seq_len"]),
+                                "mean": np.array(n_meta["feature_norm"]["mean"], dtype=np.float32),
+                                "std": np.array(n_meta["feature_norm"]["std"], dtype=np.float32),
+                                "ic": ic_val,
+                                "train_ts_range": n_meta.get("train_ts_range", [])
+                            })
+                if self.neural_experts:
+                    archs_str = ", ".join(f"{e['arch']}(IC={e['ic']:+.3f})" for e in self.neural_experts)
+                    print(f"🧬 Подключен нейросетевой альянс H={H}с ({len(self.neural_experts)} арх.): {archs_str}")
+            except Exception as e:
+                print(f"⚠️ Не удалось загрузить нейросети для H={H}с: {e}")
 
         # Подготовка матрицы признаков режимов экспертов
         self._build_regime_matrix()
@@ -166,9 +208,81 @@ class SwarmRegimeRouter:
         else:
             raise ValueError(f"Неизвестный режим: {mode}")
 
-        # Ожидаемый импульс E[z] в тиках
+        # Ожидаемый импульс E[z] в тиках от LightGBM
         class_values = np.array([-3, -2, -1, 0, 1, 2, 3], dtype=np.float32)
         expected_z = np.dot(blend_probs, class_values)
+
+        # Если подключены нейросетевые эксперты (Conv1D+GRU, Causal CNN, MLP, Attention),
+        # формируем IC-взвешенный альянс нейросетей с байесовской калибровкой априорных весов классов
+        if self.use_neural and self.neural_experts and self.neural_weight > 0.0:
+            cw = np.array(self.alliance_cfg.get("class_weights", [1.0]*7), dtype=np.float32) if self.alliance_cfg else np.ones(7, dtype=np.float32)
+            cw_pow = np.power(np.maximum(cw, 1e-3), 0.85)[np.newaxis, :]
+
+            nn_ez_list = []
+            nn_probs_list = []
+            nn_ic_weights = []
+            lgb_ez_std = float(np.std(expected_z)) + 1e-6
+
+            for exp in self.neural_experts:
+                sl = exp["seq_len"]
+                arch_clean = exp["arch"].replace("+", "_")
+                cache_dir = BASE_DIR / "data" / "cache"
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                cache_file = cache_dir / f"nn_preds_{self.coin}_h{self.H}s_{arch_clean}_{n_samples}.npy"
+                full_cache_file = cache_dir / f"nn_preds_{self.coin}_h{self.H}s_{arch_clean}_84178.npy"
+
+                if cache_file.exists():
+                    p_raw = np.load(cache_file)
+                elif n_samples <= 84178 and full_cache_file.exists():
+                    p_raw = np.load(full_cache_file)[:n_samples]
+                else:
+                    x_norm = np.clip((X - exp["mean"]) / exp["std"], -5.0, 5.0).astype(np.float32)
+                    x_norm = np.nan_to_num(x_norm, nan=0.0, posinf=5.0, neginf=-5.0)
+                    x_pad = np.vstack([np.repeat(x_norm[:1], sl - 1, axis=0), x_norm])
+                    x_3d_view = np.lib.stride_tricks.sliding_window_view(x_pad, (sl, x_norm.shape[1]))[:, 0, :, :]
+
+                    # Пакетный инференс чанками по 8192 строк (экономит 7.5 ГБ RAM!)
+                    p_chunks = []
+                    chunk_sz = 8192
+                    for start_i in range(0, n_samples, chunk_sz):
+                        end_i = min(n_samples, start_i + chunk_sz)
+                        x_batch = np.ascontiguousarray(x_3d_view[start_i:end_i], dtype=np.float32)
+                        p_batch = exp["model"].predict_on_batch(x_batch)
+                        p_chunks.append(np.asarray(p_batch, dtype=np.float32))
+                    p_raw = np.vstack(p_chunks)
+                    try:
+                        np.save(cache_file, p_raw)
+                    except Exception:
+                        pass
+
+                p_raw = np.clip(p_raw, 1e-7, 1.0 - 1e-7)
+
+                # 1. Сохраняем максимальный IC сырого нейросетевого прогноза, приводя дисперсию к шкале роутера
+                ez_raw = np.dot(p_raw, class_values)
+                ez_std = float(np.std(ez_raw)) + 1e-6
+                ez_scaled = (ez_raw - float(np.mean(ez_raw))) * (lgb_ez_std / ez_std) + float(np.mean(expected_z))
+
+                # 2. Байесовская калибровка вероятностей для совместимости с порогами p_buy / p_sell
+                p_cal = p_raw / cw_pow
+                p_cal = p_cal / np.sum(p_cal, axis=1, keepdims=True)
+
+                nn_ez_list.append(ez_scaled)
+                nn_probs_list.append(p_cal)
+                nn_ic_weights.append(max(0.01, exp["ic"] ** 2))
+
+            if nn_ez_list:
+                w_ic = np.array(nn_ic_weights, dtype=np.float32)
+                w_ic = w_ic / np.sum(w_ic)
+                nn_ez_blend = sum(w_ic[i] * nn_ez_list[i] for i in range(len(nn_ez_list)))
+                nn_probs_blend = sum(w_ic[i] * nn_probs_list[i] for i in range(len(nn_probs_list)))
+
+                w_nn = np.clip(self.neural_weight, 0.0, 1.0)
+                lgb_mean = float(np.mean(expected_z))
+                raw_blend_ez = (1.0 - w_nn) * expected_z + w_nn * nn_ez_blend
+                blend_std = float(np.std(raw_blend_ez)) + 1e-6
+                # Сохраняем амплитуду дисперсии сигнала, чтобы пороги диспетчера (trend_gate, threshold_core) не размывались
+                expected_z = (raw_blend_ez - float(np.mean(raw_blend_ez))) * (lgb_ez_std / blend_std) + lgb_mean
+                blend_probs = (1.0 - w_nn) * blend_probs + w_nn * nn_probs_blend
 
         # Сигналы на вход
         p_buy = blend_probs[:, 5] + blend_probs[:, 6]   # P(+2) + P(+3)

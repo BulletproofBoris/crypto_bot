@@ -22,8 +22,10 @@ def upload_file(service, file_path, folder_id):
     
     print(f"Загрузка {file_name} в Google Drive...")
     file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-    print(f"✅ Файл успешно загружен. File ID: {file.get('id')}")
-    return file.get('id')
+    file_id = file.get('id')
+    service.permissions().create(fileId=file_id, body={'type': 'anyone', 'role': 'reader'}).execute()
+    print(f"✅ Файл успешно загружен (доступ по ссылке открыт). File ID: {file_id}")
+    return file_id
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

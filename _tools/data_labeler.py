@@ -524,7 +524,10 @@ def process_coin_labeling(
                 except Exception:
                     pass
             
-    return out_df, grid_records
+    import gc
+    del out_df
+    gc.collect()
+    return None, grid_records
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-Asset Dynamic Dataset Labeling Engine")
@@ -541,10 +544,10 @@ def main():
     args = parser.parse_args()
     
     coins = ["prl", "quantus"] if args.coin == "all" else [args.coin]
-    all_coin_dfs = []
     all_records = []
+    import gc
     for c in coins:
-        cdf, recs = process_coin_labeling(
+        _, recs = process_coin_labeling(
             coin=c,
             horizon_spec=args.horizon,
             ratio_spec=args.ratio,
@@ -556,19 +559,9 @@ def main():
             save_legacy_splits=not args.no_legacy_splits,
             pairs_spec=args.pairs
         )
-        if cdf is not None:
-            all_coin_dfs.append(cdf)
+        if recs:
             all_records.extend(recs)
-            
-    # Объединение всех монет в единый мастер-файл
-    if args.coin == "all" and all_coin_dfs:
-        merged_master_path = os.path.join(args.outdir, "all_coins_labeled.parquet")
-        master_df = pd.concat(all_coin_dfs, ignore_index=True)
-        master_df.to_parquet(merged_master_path, index=False, compression="zstd")
-        print("\n" + "=" * 80)
-        print(f"🏆 ВСЕ МОНЕТЫ ОБЪЕДИНЕНЫ В ЕДИНЫЙ ФАЙЛ: {merged_master_path}")
-        print(f"   Всего строк: {len(master_df):,} | Колонок: {len(master_df.columns)}")
-        print("=" * 80)
+        gc.collect()
         
     # Сохранение сводной CSV-таблицы валидации сетки
     if all_records:

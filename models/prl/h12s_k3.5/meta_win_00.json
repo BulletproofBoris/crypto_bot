@@ -15,9 +15,9 @@
   "n_train": 210000,
   "n_test": 13102,
   "metrics_oos": {
-    "ic_dt_ticks": 0.159,
-    "roc_auc_ovr": 0.7929,
-    "top2pct_mean_ticks": 0.1
+    "ic_dt_ticks": 0.2588,
+    "roc_auc_ovr": 0.8285,
+    "top2pct_mean_ticks": 0.09
   },
   "regime_fingerprint_train": {
     "median_ST_spread": 0.010000000000000009,

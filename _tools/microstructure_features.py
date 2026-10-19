@@ -342,7 +342,7 @@ def add_cross_exchange_and_macro_filters(merged, coin="prl"):
         tv = merged["ST_trade_vol"].astype(float) if "ST_trade_vol" in merged.columns else pd.Series(0.0, index=merged.index)
         has_trade = (tc > 0) | (tv > 0)
         trade_grp = has_trade.cumsum()
-        tslt = merged.groupby(trade_grp).cumcount().astype(float).clip(upper=600.0)
+        tslt = trade_grp.groupby(trade_grp).cumcount().astype(float).clip(upper=600.0)
         new_cols["ST_time_since_last_trade"] = tslt
         new_cols["ST_flow_regime"] = np.where(tslt <= 30.0, 1.0, 0.0)
         new_cols["ST_trades_burst_10s"] = has_trade.astype(float).rolling(10, min_periods=1).sum().fillna(0.0)
@@ -360,7 +360,7 @@ def add_cross_exchange_and_macro_filters(merged, coin="prl"):
         if isinstance(bh, pd.DataFrame):
             bh = bh.iloc[:, 0]
         block_changed = (bh != bh.shift(1)).cumsum()
-        new_cols["onchain_seconds_since_block"] = merged.groupby(block_changed).cumcount().astype(float)
+        new_cols["onchain_seconds_since_block"] = block_changed.groupby(block_changed).cumcount().astype(float)
 
     whale_col = "onchain_whale_volume_5k" if "onchain_whale_volume_5k" in merged.columns else (
         "onchain_whale_transfers_5m" if "onchain_whale_transfers_5m" in merged.columns else None

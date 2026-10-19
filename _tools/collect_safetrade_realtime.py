@@ -32,7 +32,7 @@ def notify_systemd(state="WATCHDOG=1"):
 
 MARKETS = [
     {
-        "id": "prlusdt",
+        "id": "pearlusdt",
         "data_dir": "/opt/crypto_bot/data/realtime/prlusdt"
     },
     {
@@ -211,8 +211,11 @@ async def fetch_snapshot(session, market_id):
     logger.info(f"📥 [{market_id}] Скачиваем снимок стакана...")
     rest_url = f"https://safe.trade/api/v2/trade/public/markets/{market_id}/depth?limit=300"
 
-    # Сначала пробуем прямое подключение (работает за <100мс с VPS), при сбое — резервный прокси
-    for attempt_name, proxies in [("DIRECT", None), ("PROXY", {"http": FALLBACK_PROXY, "https": FALLBACK_PROXY})]:
+    attempts = [("DIRECT", None)]
+    if FALLBACK_PROXY:
+        attempts.append(("PROXY", {"http": FALLBACK_PROXY, "https": FALLBACK_PROXY}))
+
+    for attempt_name, proxies in attempts:
         try:
             r = await session.get(rest_url, proxies=proxies, timeout=8)
             if r.status_code == 200:
@@ -249,6 +252,8 @@ async def fetch_snapshot(session, market_id):
                     return True
             else:
                 logger.warning(f"[{market_id}] Snapshot ({attempt_name}) HTTP {r.status_code}: {r.text[:100]}")
+                if r.status_code in (400, 404, 422):
+                    break
         except Exception as e:
             logger.warning(f"⚠️ [{market_id}] Ошибка снимка ({attempt_name}): {e}")
 
@@ -347,7 +352,10 @@ def append_trades_to_csv(mid, trade_list):
 
 async def fetch_recent_trades(session, market_id):
     rest_url = f"https://safe.trade/api/v2/trade/public/markets/{market_id}/trades?limit=50"
-    for attempt_name, proxies in [("DIRECT", None), ("PROXY", {"http": FALLBACK_PROXY, "https": FALLBACK_PROXY})]:
+    attempts = [("DIRECT", None)]
+    if FALLBACK_PROXY:
+        attempts.append(("PROXY", {"http": FALLBACK_PROXY, "https": FALLBACK_PROXY}))
+    for attempt_name, proxies in attempts:
         try:
             r = await session.get(rest_url, proxies=proxies, timeout=8)
             if r.status_code == 200:
@@ -356,6 +364,8 @@ async def fetch_recent_trades(session, market_id):
                     trades_sorted = sorted(trades, key=lambda x: int(x.get("id", 0) or 0))
                     append_trades_to_csv(market_id, trades_sorted)
                 return True
+            elif r.status_code in (400, 404, 422):
+                break
         except Exception as e:
             logger.debug(f"[{market_id}] Ошибка догрузки REST сделок ({attempt_name}): {e}")
     return False

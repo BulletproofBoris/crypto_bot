@@ -103,26 +103,27 @@
 
 ---
 
-## 6. РАЗВЕРТЫВАНИЕ И СТАТУС ОНЛАЙН ДЕМОНА НА VPS (18.10.2026)
+## 6. ФАБРИКА НЕЙРОСЕТЕЙ И МУЛЬТИМОДЕЛЬНЫЙ АЛЬЯНС (19.10.2026)
 
-1. **Развертывание моделей и зависимостей на сервере (`81.19.137.18:2222`):**
-   - В `/opt/crypto_bot/models/` перенесены все 12 моделей LightGBM ($H=5, 12, 25$) для PRL и QUANTUS, переобученные в рамках Модернизации Этапа 2.
-   - В окружение `/opt/crypto_bot/venv/` установлены `lightgbm`, `numpy`, `pandas`, `pyarrow`, `scipy`, `scikit-learn`.
-   - Задержка расчёта триады моделей на сервере: **$<0.3\,\text{мс}$** на тик.
+1. **Обучение 4 специализированных архитектур Keras (`H=12с, K=3.5, L=42с`) для PRL (`Train_PRL_Conv1D_GRU_Colab.ipynb`):**
+   - `conv1d+gru` (`models/prl/conv1d_gru_h12s/`): OOS IC $+0.1604$, ROC-AUC $0.7249$.
+   - `causal_cnn` (`models/prl/causal_cnn_h12s/`): OOS IC $+0.1445$, ROC-AUC $0.7196$.
+   - `attention` (`models/prl/attention_h12s/`): OOS IC $+0.0757$, ROC-AUC $0.6936$.
+   - `mlp_bottleneck` (`models/prl/mlp_bottleneck_h12s/`): OOS IC $+0.1774$, ROC-AUC $0.8062$.
+   - Конфигурация весов ансамбля сохранена в `models/prl/ensemble_alliance.json` (OOS IC альянса $+0.2161$, ROC-AUC $0.8123$).
 
-2. **Запуск обновленной системной службы `crypto-paper-trader.service`:**
-   - Скрипт: `_tools/live_paper_trader.py`.
-   - Внедрены: **Inventory Rebalancing Pull** (авто-откуп токенов при кэше $>25\%$), **Conviction Sizing** (до $2.0\times$ лота при сильном сигнале), **Dynamic TTL** (60с).
-   - Статус: **`active (running)`**, память $\approx 138\,\text{MB}$, логи: `/opt/crypto_bot/data/logs/paper_trader.log`.
-   - Мониторинг: интеграция в `_tools/monitor_vps.py` (выводит текущие PnL, активный ордер, число исполнений и балансы в реальном времени).
+2. **Ревизия инфраструктуры и отказ от серверного Paper-Trading демона (19.10.2026):**
+   - **Миграция тикера SafeTrade (`prlusdt` $\to$ `pearlusdt`):** 18.10.2026 в 16:53 UTC биржа SafeTrade переименовала рынок `prlusdt` в `pearlusdt` (`PEARL/USDT`). Сборщик `_tools/collect_safetrade_realtime.py` и `_tools/collect_onchain_and_rules.py` переведены на `pearlusdt` с сохранением записи в директорию `data/realtime/prlusdt` для полной обратной совместимости конвейера.
+   - **Чистый VPS только для сбора данных:** Служба `crypto-paper-trader.service` и сопутствующие скрипты онлайн-котирования удалены с VPS и из репозитория. Сервер `81.19.137.18` выполняет исключительно сбор и ротацию сырых данных (`5` служб сборщиков).
+   - **Локальное тестирование на исторических данных:** Все бэктесты, валидация триады и стресс-тестирование выполняются локально через `_tools/triad_dispatcher.py` и `_tools/simulate_execution.py`.
 
 ---
 
 ## 7. АКТУАЛЬНЫЙ ПРИОРИТЕТ ДЛЯ СЛЕДУЮЩЕГО ШАГА
 
-1. **Длительный мониторинг стабильности онлайн-демона:**
-   Накопление статистики исполнений (Fills, Slippage, Queue Wait Time) на реальной суточной волатильности без вмешательства в депозит.
-2. **Переход на боевое исполнение (Live Trading):**
-   При предоставлении API-ключей SafeTrade (`SAFETRADE_ACCESS_KEY`, `SAFETRADE_SECRET_KEY`) добавить флаг `--live-execution` в `live_paper_trader.py` для выставления подписанных реальных лимитных ордеров через REST/WebSocket SafeTrade.
+1. **Интеграция нейросетевого альянса (`ensemble_alliance.json`) в локальный бэктестер:**
+   Подключение моделей Keras (`conv1d+gru`, `causal_cnn`, `mlp_bottleneck`) совместно с LightGBM в `_tools/swarm_router.py` и `_tools/triad_dispatcher.py` для проверки прироста $Q_{\text{token}}$ на локальных исторических данных.
+2. **Накопление новой истории `pearlusdt` после переименования тикера на SafeTrade:**
+   Регулярная синхронизация через `sync_all_data.py` и локальная переоценка устойчивости моделей на новых рыночных режимах.
 
 

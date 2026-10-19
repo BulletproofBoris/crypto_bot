@@ -27,12 +27,11 @@ MEM_WARNING_PERCENT = 85.0
 DISK_WARNING_PERCENT = 90.0
 
 SERVICES = [
-    ("safetrade-collector", "SafeTrade (PRL, Quantus)"),
+    ("safetrade-collector", "SafeTrade (PEARL/PRL, Quantus)"),
     ("bigone-collector", "BigONE (PRL, QTC)"),
     ("rhea-collector", "Rhea Finance / Near Intents"),
     ("binance-collector", "Binance Macro (BTC + NEAR)"),
     ("onchain-collector", "On-chain Metrics & Rules"),
-    ("crypto-paper-trader", "Online Triad Paper Trader (PRL, Quantus)"),
 ]
 
 def get_server_stats(ssh):
@@ -91,15 +90,6 @@ def get_server_stats(ssh):
     stdin, stdout, stderr = ssh.exec_command(cmd_files)
     stats['files'] = stdout.read().decode().strip()
 
-    # 5. Проверка статуса Online Paper-Trading
-    stdin, stdout, stderr = ssh.exec_command("cat /opt/crypto_bot/data/paper_trading_status.json 2>/dev/null")
-    paper_raw = stdout.read().decode().strip()
-    if paper_raw:
-        try:
-            stats['paper_trading'] = json.loads(paper_raw)
-        except Exception:
-            pass
-
     return stats
 
 def format_stats(stats):
@@ -132,17 +122,6 @@ def format_stats(stats):
             icon = f"🔴 {status.upper()}"
             all_ok = False
         out.append(f"  - {s_name:<22} [{icon}] ({desc})")
-
-    if 'paper_trading' in stats:
-        pt = stats['paper_trading']
-        out.append("\n🎯 ТОРГОВЫЙ СТАТУС ТРИАДЫ (ONLINE PAPER TRADING):")
-        out.append(f"  Обновлено: {pt.get('updated_at', 'N/A')}")
-        if 'prl' in pt:
-            p = pt['prl']
-            out.append(f"  • PRL / USDT:     ${p['mid_price']} | Q_PnL: {p['pnl_pct']:+5.2f}% | Order: {p['active_order']:<22} | Fills: {p['fills']} | Tokens: {p['tokens']:,.1f} | USDT: ${p['usdt']:,.2f}")
-        if 'quantus' in pt:
-            q = pt['quantus']
-            out.append(f"  • QUANTUS / USDT: ${q['mid_price']} | Q_PnL: {q['pnl_pct']:+5.2f}% | Order: {q['active_order']:<22} | Fills: {q['fills']} | Tokens: {q['tokens']:,.1f} | USDT: ${q['usdt']:,.2f}")
 
     if stats.get('files'):
         out.append("\n📁 Размеры файлов данных на сервере:")

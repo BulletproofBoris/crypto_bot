@@ -36,7 +36,8 @@ def export_prl_colab_dataset(upload_gdrive=False):
     meta_cols = [
         'timestamp',
         'target_class_7_h5_k3', 'target_dt_ticks_h5_k3',
-        'target_class_7_h12_k3.5', 'target_dt_ticks_h12_k3.5'
+        'target_class_7_h12_k3.5', 'target_dt_ticks_h12_k3.5',
+        'target_class_7_h25_k3', 'target_dt_ticks_h25_k3'
     ]
 
     print(f"📥 Чтение Parquet ({len(feature_cols)} признаков + мета-колонки)...")
@@ -52,7 +53,7 @@ def export_prl_colab_dataset(upload_gdrive=False):
     tr_s_ts = pd.to_datetime(ref_meta['train_ts_range'][0])
     tr_e_ts = pd.to_datetime(ref_meta['train_ts_range'][1])
     te_s_ts = pd.to_datetime(ref_meta['test_ts_range'][0])
-    te_e_ts = pd.to_datetime(df['timestamp'].iloc[-1])
+    te_e_ts = pd.to_datetime("2026-10-18 15:13:48")
 
     if ts_series.dt.tz is not None:
         tr_s_ts = tr_s_ts.tz_localize(ts_series.dt.tz) if tr_s_ts.tzinfo is None else tr_s_ts.tz_convert(ts_series.dt.tz)
@@ -72,12 +73,15 @@ def export_prl_colab_dataset(upload_gdrive=False):
     X_train = df[feature_cols].iloc[tr_s_idx:tr_e_idx].values.astype(np.float32)
     y_train_h5 = (df['target_class_7_h5_k3'].iloc[tr_s_idx:tr_e_idx].values + 3).astype(np.int32)
     y_train_h12 = (df['target_class_7_h12_k3.5'].iloc[tr_s_idx:tr_e_idx].values + 3).astype(np.int32)
+    y_train_h25 = (df['target_class_7_h25_k3'].iloc[tr_s_idx:tr_e_idx].values + 3).astype(np.int32)
 
     X_test = df[feature_cols].iloc[te_s_idx:te_e_idx].values.astype(np.float32)
     y_test_h5 = (df['target_class_7_h5_k3'].iloc[te_s_idx:te_e_idx].values + 3).astype(np.int32)
     y_test_h12 = (df['target_class_7_h12_k3.5'].iloc[te_s_idx:te_e_idx].values + 3).astype(np.int32)
+    y_test_h25 = (df['target_class_7_h25_k3'].iloc[te_s_idx:te_e_idx].values + 3).astype(np.int32)
     dt_test_h5 = df['target_dt_ticks_h5_k3'].iloc[te_s_idx:te_e_idx].values.astype(np.float32)
     dt_test_h12 = df['target_dt_ticks_h12_k3.5'].iloc[te_s_idx:te_e_idx].values.astype(np.float32)
+    dt_test_h25 = df['target_dt_ticks_h25_k3'].iloc[te_s_idx:te_e_idx].values.astype(np.float32)
 
     ts_train = df['timestamp'].iloc[tr_s_idx:tr_e_idx].astype(str).values
     ts_test = df['timestamp'].iloc[te_s_idx:te_e_idx].astype(str).values
@@ -91,11 +95,14 @@ def export_prl_colab_dataset(upload_gdrive=False):
         X_train=X_train,
         y_train_h5=y_train_h5,
         y_train_h12=y_train_h12,
+        y_train_h25=y_train_h25,
         X_test=X_test,
         y_test_h5=y_test_h5,
         y_test_h12=y_test_h12,
+        y_test_h25=y_test_h25,
         dt_test_h5=dt_test_h5,
         dt_test_h12=dt_test_h12,
+        dt_test_h25=dt_test_h25,
         ts_train=ts_train,
         ts_test=ts_test,
         features=np.array(feature_cols)

@@ -96,6 +96,18 @@ def parse_args():
                         help="Базовый размер лота в токенах (для PRL по умолчанию 50.0)")
     parser.add_argument("--min-order-val", type=float, default=0.5,
                         help="Минимальный объем ордера в USDT на бирже SafeTrade")
+    parser.add_argument("--neural-weight", type=float, default=0.15,
+                        help="Вес нейросетевого альянса (Conv1D+GRU, Causal CNN, MLP, Attention) в бленде с LightGBM")
+    parser.add_argument("--no-neural", dest="use_neural", action="store_false", default=True,
+                        help="Отключить нейросетевой альянс (только LightGBM)")
+    parser.add_argument("--target-token-ratio", type=float, default=0.55,
+                        help="Целевая нейтральная доля портфеля в монетах (по умолчанию 0.55 = 55%% PRL / 45%% USDT)")
+    parser.add_argument("--penny-jump-penalty", type=float, default=0.10,
+                        help="Штраф конкурентной очереди при шаге внутрь спреда (доля от BBO, по умолчанию 0.10)")
+    parser.add_argument("--max-participation", type=float, default=0.50,
+                        help="Максимальная доля рыночного объема секунды, которую может забрать один наш ордер (по умолчанию 0.50)")
+    parser.add_argument("--stale-timeout", type=int, default=180,
+                        help="Таймаут заморозки стакана SafeTrade (сек без сделок и сдвигов BBO) для защитной паузы")
     parser.add_argument("--max-steps", type=int, default=None, help="Ограничить шаги для быстрого теста")
     parser.add_argument("--plot", type=str, default=None, help="Путь для сохранения PNG-графика бэктеста")
     return parser.parse_args()
@@ -104,15 +116,15 @@ def parse_args():
 class TriadDispatcher:
     """Мультигоризонтный координатор триады экспертов (H=5, 12, 25)."""
 
-    def __init__(self, coin: str):
+    def __init__(self, coin: str, use_neural: bool = True, neural_weight: float = 0.15):
         self.coin = coin.lower()
-        print(f"\n📦 Инициализация триады масштабов для {self.coin.upper()}...")
+        print(f"\n📦 Инициализация триады масштабов для {self.coin.upper()} (use_neural={use_neural}, w_nn={neural_weight:.2f})...")
         # Scale 1: Sniper
-        self.router_5 = SwarmRegimeRouter(self.coin, H=5, K=3.0)
+        self.router_5 = SwarmRegimeRouter(self.coin, H=5, K=3.0, use_neural=use_neural, neural_weight=neural_weight)
         # Scale 2: Core Spread Maker
-        self.router_12 = SwarmRegimeRouter(self.coin, H=12, K=3.5)
+        self.router_12 = SwarmRegimeRouter(self.coin, H=12, K=3.5, use_neural=use_neural, neural_weight=neural_weight)
         # Scale 3: Wave Regime Trend Gate
-        self.router_25 = SwarmRegimeRouter(self.coin, H=25, K=3.0)
+        self.router_25 = SwarmRegimeRouter(self.coin, H=25, K=3.0, use_neural=use_neural, neural_weight=neural_weight)
         print("✅ Триада экспертов успешно загружена в оперативную память!")
 
 
@@ -130,7 +142,7 @@ def run_triad_simulation(args):
     print("=" * 105)
 
     # 1. Загрузка триады
-    dispatcher = TriadDispatcher(coin)
+    dispatcher = TriadDispatcher(coin, use_neural=args.use_neural, neural_weight=args.neural_weight)
 
     # 2. Загрузка чистого OOS-датасета
     labeled_path = BASE_DIR / "data" / "labeled" / coin / f"{coin}_labeled.parquet"
@@ -183,6 +195,24 @@ def run_triad_simulation(args):
             else:
                 print(f"⚠️ Внимание: после {safe_oos_ts} нет данных, используется срез val_df")
 
+    # Исключаем интервал длительного обрыва связи (неизменная цена > 1800 с) и данные после него
+    if not getattr(args, 'keep_outage', False):
+        active_mask = (
+            (val_df['ST_buy_vol'].fillna(0) > 0) |
+            (val_df['ST_sell_vol'].fillna(0) > 0) |
+            (val_df['ST_bid_1_price'].diff().abs().fillna(0) > 1e-8) |
+            (val_df['ST_ask_1_price'].diff().abs().fillna(0) > 1e-8)
+        )
+        active_idx = np.where(active_mask)[0]
+        if len(active_idx) > 1:
+            gaps = np.diff(active_idx)
+            outage_pos = np.where(gaps > 1800)[0]
+            if len(outage_pos) > 0:
+                cut_idx = int(active_idx[outage_pos[0]]) + 1
+                removed_rows = len(val_df) - cut_idx
+                val_df = val_df.iloc[:cut_idx].copy().reset_index(drop=True)
+                print(f"✂️ Исключен период обрыва связи и хвост после него: удалено {removed_rows:,} с (оставлено {len(val_df):,} с живого рынка до {val_df['timestamp'].iloc[-1]})")
+
     if args.max_steps:
         val_df = val_df.iloc[:args.max_steps].copy()
 
@@ -232,7 +262,15 @@ def run_triad_simulation(args):
     cancels = 0
     trend_blocks = 0
     leadlag_shields = 0
+    stale_skips = 0
+    rebuy_blocks = 0
+    trend_holds = 0
     saved_fees_usdt = 0.0
+    avg_buy_price = p_mid_0
+    last_sell_anchor = 0.0
+    last_sell_t = -99999
+    stale_run = 0
+    warmup_left = 0
 
     q_total_history = []
     usd_total_history = []
@@ -240,6 +278,7 @@ def run_triad_simulation(args):
     bid_prices = val_df['ST_bid_1_price'].values
     ask_prices = val_df['ST_ask_1_price'].values
     mid_prices = val_df['ST_mid_price'].values
+    ema_30m = pd.Series(mid_prices).ewm(span=1800, min_periods=1).mean().values
     buy_vols = val_df['ST_buy_vol'].values
     sell_vols = val_df['ST_sell_vol'].values
     bid_qtys = val_df['ST_bid_1_qty'].values if 'ST_bid_1_qty' in val_df.columns else np.full(n_seconds, 100.0)
@@ -252,7 +291,9 @@ def run_triad_simulation(args):
     bo_buy_vols = val_df['BO_buy_vol'].values if 'BO_buy_vol' in val_df.columns else np.zeros(n_seconds)
     bo_sell_vols = val_df['BO_sell_vol'].values if 'BO_sell_vol' in val_df.columns else np.zeros(n_seconds)
     ll_60s = val_df['leadlag_accum_bo_st_60s'].values if 'leadlag_accum_bo_st_60s' in val_df.columns else np.zeros(n_seconds)
+    ll_300s = val_df['leadlag_accum_bo_st_300s'].values if 'leadlag_accum_bo_st_300s' in val_df.columns else np.zeros(n_seconds)
     ll_ticks_5s = val_df['leadlag_bo_minus_st_5s_ticks'].values if 'leadlag_bo_minus_st_5s_ticks' in val_df.columns else np.zeros(n_seconds)
+    ll_ticks_20s = val_df['leadlag_bo_minus_st_20s_ticks'].values if 'leadlag_bo_minus_st_20s_ticks' in val_df.columns else np.zeros(n_seconds)
 
     for t in range(n_seconds):
         bid_p = bid_prices[t]
@@ -260,6 +301,25 @@ def run_triad_simulation(args):
         mid_p = mid_prices[t]
         sell_vol = sell_vols[t]
         buy_vol = buy_vols[t]
+
+        # 3. Защита от «мертвых полок» ffill (Stale Book Guard)
+        if t > 0 and sell_vol == 0 and buy_vol == 0 and bid_p == bid_prices[t - 1] and ask_p == ask_prices[t - 1] and bid_qtys[t] == bid_qtys[t - 1]:
+            stale_run += 1
+        else:
+            if stale_run >= args.stale_timeout:
+                warmup_left = 75  # Прогрев окон L=75с после восстановления связи с биржей
+            stale_run = 0
+
+        if stale_run >= args.stale_timeout or warmup_left > 0:
+            if warmup_left > 0 and stale_run == 0:
+                warmup_left -= 1
+            if active_order is not None:
+                active_order = None
+                cancels += 1
+            stale_skips += 1
+            q_total_history.append(tokens + (usdt / mid_p))
+            usd_total_history.append(usdt + (tokens * mid_p))
+            continue
 
         bo_mid = bo_mid_prices[t]
         bo_bid = bo_bid_prices[t]
@@ -314,31 +374,28 @@ def run_triad_simulation(args):
 
             if is_active and rem_qty > 0:
                 fill_qty = 0.0
+                max_part = float(args.max_participation)
                 if o_side == 'buy':
                     if ask_p <= o_price:
-                        avail = max(ask_qtys[t], sell_vol) if args.queue_model != 'instant' else rem_qty
+                        avail = max(ask_qtys[t] * max_part, sell_vol * max_part) if args.queue_model != 'instant' else rem_qty
                         fill_qty = min(rem_qty, avail)
                     elif sell_vol > 0 and bid_p <= o_price:
                         if args.queue_model == 'instant':
                             fill_qty = rem_qty
                         else:
-                            if o_price < bid_p:
+                            if sell_vol <= active_order['q_ahead']:
+                                active_order['q_ahead'] -= sell_vol
                                 fill_qty = 0.0
-                            elif o_price == bid_p:
-                                if sell_vol <= active_order['q_ahead']:
-                                    active_order['q_ahead'] -= sell_vol
-                                    fill_qty = 0.0
-                                else:
-                                    avail = sell_vol - active_order['q_ahead']
-                                    active_order['q_ahead'] = 0.0
-                                    fill_qty = min(rem_qty, avail)
                             else:
-                                fill_qty = min(rem_qty, sell_vol)
+                                avail = (sell_vol - active_order['q_ahead']) * max_part
+                                active_order['q_ahead'] = 0.0
+                                fill_qty = min(rem_qty, avail)
 
                     if fill_qty > 0:
                         cost = fill_qty * o_price
                         fee = cost * args.maker_fee
                         if usdt >= cost + fee:
+                            avg_buy_price = ((tokens * avg_buy_price) + (fill_qty * o_price)) / max(tokens + fill_qty, 1e-6)
                             usdt -= (cost + fee)
                             tokens += fill_qty
                             active_order['rem_qty'] -= fill_qty
@@ -350,24 +407,19 @@ def run_triad_simulation(args):
 
                 elif o_side == 'sell':
                     if bid_p >= o_price:
-                        avail = max(bid_qtys[t], buy_vol) if args.queue_model != 'instant' else rem_qty
+                        avail = max(bid_qtys[t] * max_part, buy_vol * max_part) if args.queue_model != 'instant' else rem_qty
                         fill_qty = min(rem_qty, avail)
                     elif buy_vol > 0 and ask_p >= o_price:
                         if args.queue_model == 'instant':
                             fill_qty = rem_qty
                         else:
-                            if o_price > ask_p:
+                            if buy_vol <= active_order['q_ahead']:
+                                active_order['q_ahead'] -= buy_vol
                                 fill_qty = 0.0
-                            elif o_price == ask_p:
-                                if buy_vol <= active_order['q_ahead']:
-                                    active_order['q_ahead'] -= buy_vol
-                                    fill_qty = 0.0
-                                else:
-                                    avail = buy_vol - active_order['q_ahead']
-                                    active_order['q_ahead'] = 0.0
-                                    fill_qty = min(rem_qty, avail)
                             else:
-                                fill_qty = min(rem_qty, buy_vol)
+                                avail = (buy_vol - active_order['q_ahead']) * max_part
+                                active_order['q_ahead'] = 0.0
+                                fill_qty = min(rem_qty, avail)
 
                     if fill_qty > 0:
                         rev = fill_qty * o_price
@@ -378,6 +430,8 @@ def run_triad_simulation(args):
                             active_order['rem_qty'] -= fill_qty
                             maker_fills += 1
                             saved_fees_usdt += (rev * args.taker_fee)
+                            last_sell_anchor = o_price if last_sell_anchor <= 0 else (0.7 * o_price + 0.3 * last_sell_anchor)
+                            last_sell_t = t
                             trades.append({'t': t, 'side': 'SELL_MAKER', 'price': o_price, 'qty': fill_qty, 'tokens': tokens, 'usdt': usdt, 'scale': active_order.get('scale', 'triad')})
                             if active_order['rem_qty'] <= 1e-6:
                                 order_done = True
@@ -393,36 +447,52 @@ def run_triad_simulation(args):
             z5 = ez_5[t]
             z12 = ez_12[t]
             z25 = ez_25[t]
+            ll300 = ll_300s[t]
+            ll20 = ll_ticks_20s[t]
 
-            # 1. Avellaneda-Stoikov Inventory Skew (Stage 2) & Conviction Sizing
+            # 1. Режимно-адаптивный таргетинг инвентаря (Regime-Adaptive Target Ratio)
+            total_equity_usd = usdt + (tokens * mid_p)
+            token_ratio = (tokens * mid_p) / max(total_equity_usd, 1e-4)
+            ema_val = ema_30m[t]
+            rel_dev = (mid_p - ema_val) / max(ema_val, 1e-4)
+
+            # На просадке (rel_dev < 0) или бычьем накоплении BigONE повышаем целевую долю PRL до 82-85%,
+            # а на сильном перегреве (> +2.5% над EMA_30m при угасании импульса) снижаем до 45% для фиксации профита
+            base_target = float(args.target_token_ratio)
+            dip_bonus = np.clip(-rel_dev * 12.0, -0.18, 0.28)
+            trend_bonus = 0.15 if (z25 > 0.04 or ll300 > 0.5 or bo_mid > mid_p) else 0.0
+            target_ratio = float(np.clip(base_target + 0.15 + dip_bonus + trend_bonus, 0.45, 0.88))
+            in_profit = (tokens > 10.0) and (mid_p >= avg_buy_price + 3.0 * tick_size)
+
             if args.inventory_skew:
-                excess_usdt = max(0.0, usdt - 20.0)
-                cash_boost = min(3.0, excess_usdt / 30.0)
-                conviction_boost = max(0.0, z12 * 2.0) if z12 > 0 else 0.0
+                # Избыток кэша относительно целевого коридора
+                underweight_tokens = max(0.0, target_ratio - token_ratio)
+                overweight_tokens = max(0.0, token_ratio - target_ratio)
 
-                desired_buy_lot = base_lot * (1.0 + cash_boost * 0.75 + conviction_boost)
+                cash_boost = min(2.8, underweight_tokens * 4.5)
+                conviction_boost = max(0.0, z12 * 1.8) if z12 > 0 else 0.0
+                # Если портфель уже перегружен монетами (>82%) и цена сильно выше средней закупки, тормозим докупку на хаях
+                top_brake = 0.25 if (token_ratio > 0.82 and mid_p > avg_buy_price + 4.0 * tick_size) else 1.0
+
+                desired_buy_lot = base_lot * (1.0 + cash_boost + conviction_boost) * top_brake
                 max_buyable = max(0.0, (usdt - 1.0) / max(bid_p, 1e-4))
                 effective_buy_lot = min(desired_buy_lot, max_buyable)
 
-                cash_drag = min(0.6, excess_usdt / 250.0)
-                desired_sell_lot = base_lot * (1.0 - cash_drag)
+                # На стороне продаж: если монет много (> target_ratio) и мы в плюсе, увеличиваем лот фиксации прибыли в USDT
+                sell_boost = min(2.5, overweight_tokens * 4.5) if in_profit else 0.0
+                cash_drag = min(0.5, underweight_tokens * 1.2)
+                desired_sell_lot = base_lot * max(0.4, 1.0 - cash_drag + sell_boost)
                 effective_sell_lot = min(tokens, desired_sell_lot)
 
-                effective_buy_gate = -(args.trend_gate + min(0.12, (excess_usdt / 100.0) * 0.10))
-                effective_buy_thresh = max(0.08, args.threshold_core - min(0.10, (excess_usdt / 100.0) * 0.08))
+                effective_buy_gate = -(args.trend_gate + min(0.10, underweight_tokens * 0.20))
+                effective_buy_thresh = max(0.09, args.threshold_core - min(0.09, underweight_tokens * 0.18) + (0.08 if (token_ratio > 0.75 and in_profit) else 0.0))
             else:
-                total_equity_usd = usdt + (tokens * mid_p)
-                cash_ratio = usdt / total_equity_usd if total_equity_usd > 1e-4 else 0.0
+                cash_ratio = 1.0 - token_ratio
                 cash_excess = max(0.0, cash_ratio - 0.25)
-
                 effective_buy_gate = -(args.trend_gate + min(0.15, cash_excess * 0.6))
                 effective_buy_thresh = max(0.08, args.threshold_core - min(0.12, cash_excess * 0.5))
-
-                effective_lot = base_lot
-                if abs(z12) > 0.35 and abs(z5) > 0.25:
-                    effective_lot = min(base_lot * 2.0, tokens if z12 < 0 else usdt / max(bid_p, 1e-4))
-                effective_buy_lot = effective_lot
-                effective_sell_lot = effective_lot
+                effective_buy_lot = base_lot
+                effective_sell_lot = base_lot
 
             # 2. Локальные экстремумы в окне 30с
             w_win = max(0, t - 30)
@@ -442,32 +512,51 @@ def run_triad_simulation(args):
                 if is_bo_bounce and pb_12[t] > 0.15 and z12 > 0.05:
                     is_bo_dip_sniping = True
 
-            # Локальное истощение пампа на вершине (Peak Exhaustion):
+            # 3. Тренд-фильтр удержания прибыли (Lead-Lag & H3 Trend Hold)
+            # Запрещаем ранний сброс монет на старте ралли, пока старший горизонт H=25с или поводырь BigONE тянут цену вверх
+            strong_bull_hold = (z25 > 0.06) or (ll20 >= 1.0) or (ll60 > 0.6) or (bo_mid >= ask_p)
+            if strong_bull_hold:
+                trend_holds += 1
+
+            # Локальное истощение пампа на вершине (Peak Exhaustion) — активно только выше EMA_30m (+1.2%) и без бычьего удержания:
             z5_prev = ez_5[t - 1] if t > 0 else z5
-            is_peak_exhaustion = (is_near_top and z5 < z5_prev and z5 < 0.15 and ps_12[t] > 0.15)
+            is_peak_exhaustion = (
+                is_near_top and (rel_dev > 0.012 or not in_profit) and not strong_bull_hold and
+                z5 < z5_prev and z5 < 0.12 and ps_12[t] > 0.16
+            )
             is_pump_accelerating = (z5 > 0.20) or (buy_vol > 0 and z5 > 0.05)
 
             # А. Трендовый шлюз Scale 3 (H=25)
             allow_buy = (z25 >= effective_buy_gate) or is_bottom_absorption or is_bo_dip_sniping
-            allow_sell = (z25 <= args.trend_gate) or is_peak_exhaustion
+            allow_sell = ((z25 <= args.trend_gate) and not strong_bull_hold) or is_peak_exhaustion
 
-            # Б. Согласование сигналов покупки (импульс, ребалансировка кэша или поглощение дна)
-            trigger_buy = allow_buy and (
+            # 2. Защита от «откупа дороже продажи» (High-Water Mark Rebuy Guard)
+            # Если недавно продали часть позиции, не откупаем обратно дороже цены продажи (кроме арбитражного пробоя BigONE)
+            rebuy_ok = True
+            if last_sell_anchor > 0.0 and (t - last_sell_t) < 5400 and token_ratio > 0.45:
+                if bid_p > last_sell_anchor - 2.0 * tick_size and not (is_bo_dip_sniping and bo_mid > ask_p + tick_size):
+                    rebuy_ok = False
+                    rebuy_blocks += 1
+
+            # Б. Согласование сигналов покупки (с торможением при перегрузе монетами > 82% в плюсе)
+            can_buy_more = rebuy_ok and not (token_ratio > 0.84 and in_profit and z12 < 0.22)
+            trigger_buy = allow_buy and can_buy_more and (
                 (z12 > effective_buy_thresh and z5 > -0.05 and pb_12[t] > 0.18) or 
                 is_bottom_absorption or 
                 is_bo_dip_sniping
             )
 
+            pj_pen = float(args.penny_jump_penalty)
             if trigger_buy and effective_buy_lot >= 1.0:
                 limit_p = round(bid_p, 4)
                 q_ahead = float(bid_qtys[t])
-                # Если спред широкий, котируем агрессивно внутрь спреда
+                # Если спред широкий, котируем внутрь спреда, но с учетом штрафа конкуренции (Penny-Jumping)
                 if ask_p - bid_p > 2 * tick_size:
                     limit_p = round(bid_p + tick_size, 4)
-                    q_ahead = 0.0
-                elif args.inventory_skew and (usdt > 100.0) and (ask_p - bid_p > tick_size):
+                    q_ahead = float(bid_qtys[t]) * pj_pen
+                elif args.inventory_skew and (token_ratio < target_ratio) and (ask_p - bid_p > tick_size):
                     limit_p = round(bid_p + tick_size, 4)
-                    q_ahead = 0.0
+                    q_ahead = float(bid_qtys[t]) * pj_pen
 
                 if limit_p * effective_buy_lot >= args.min_order_val and usdt >= (effective_buy_lot * limit_p):
                     if is_bo_dip_sniping:
@@ -490,11 +579,16 @@ def run_triad_simulation(args):
                         'scale': scale_label
                     }
 
-            # Условие продажи:
-            sell_threshold = args.threshold_core + max(0.0, z25 * args.q_token_bias)
-            trigger_sell = allow_sell and (
-                (z12 < -sell_threshold and z5 < 0.05 and ps_12[t] > 0.18) or 
-                is_peak_exhaustion
+            # Условие продажи (включая ребалансировку в USDT только на настоящем перегреве > +2% к EMA_30m):
+            is_profit_rebalance = (
+                args.inventory_skew and in_profit and (rel_dev > 0.018) and not strong_bull_hold and
+                (token_ratio > target_ratio + 0.06) and (z5 < 0.04) and (z12 < 0.02) and (ll5 < 0.3)
+            )
+            sell_threshold = max(0.08, args.threshold_core + max(0.0, z25 * args.q_token_bias) - (0.06 if (in_profit and rel_dev > 0.02 and token_ratio > target_ratio) else 0.0))
+            trigger_sell = (allow_sell or is_profit_rebalance) and (
+                (z12 < -sell_threshold and z5 < 0.05 and ps_12[t] > 0.18 and not strong_bull_hold) or 
+                is_peak_exhaustion or
+                is_profit_rebalance
             )
 
             if trigger_sell and tokens >= effective_sell_lot and effective_sell_lot >= 1.0:
@@ -502,18 +596,18 @@ def run_triad_simulation(args):
                     # Ask Escalator: памп разгоняется! Не отдаем монеты на взлете, ставим аск выше с премией
                     ticks_premium = max(2, min(8, int(round(z5 * 10))))
                     limit_p = round(ask_p + ticks_premium * tick_size, 4)
-                    q_ahead = 0.0
+                    q_ahead = float(ask_qtys[t]) * pj_pen
                 elif is_peak_exhaustion:
-                    # На пике истощения продаем прямо по лучшему аску
+                    # На пике истощения продаем по лучшему аску (с учетом очереди/конкуренции)
                     limit_p = round(ask_p, 4)
-                    q_ahead = 0.0
+                    q_ahead = float(ask_qtys[t]) * pj_pen
                 elif args.ask_skew and z25 > 0.05:
                     ticks_premium = min(5, max(1, int(round(z25 * 10))))
                     limit_p = round(ask_p + ticks_premium * tick_size, 4)
-                    q_ahead = 0.0
+                    q_ahead = float(ask_qtys[t]) * pj_pen
                 elif ask_p - bid_p > 2 * tick_size:
                     limit_p = round(ask_p - tick_size, 4)
-                    q_ahead = 0.0
+                    q_ahead = float(ask_qtys[t]) * pj_pen
                 else:
                     limit_p = round(ask_p, 4)
                     q_ahead = float(ask_qtys[t])
@@ -521,10 +615,10 @@ def run_triad_simulation(args):
                 # Привязка Ask Escalator к стакану BigONE (Stage 1)
                 if args.bo_ask_peg and bo_ask > ask_p:
                     limit_p = round(max(limit_p, bo_ask - tick_size), 4)
-                    q_ahead = 0.0
+                    q_ahead = float(ask_qtys[t]) * pj_pen
 
                 if limit_p * effective_sell_lot >= args.min_order_val:
-                    scale_label = 'PEAK_EXHAUSTION_SELL' if is_peak_exhaustion else ('ASK_ESCALATOR_SELL' if is_pump_accelerating else 'TRIAD_CORE_SELL')
+                    scale_label = 'PEAK_EXHAUSTION_SELL' if (is_peak_exhaustion or is_profit_rebalance) else ('ASK_ESCALATOR_SELL' if is_pump_accelerating else 'TRIAD_CORE_SELL')
                     active_order = {
                         'side': 'sell',
                         'price': limit_p,
@@ -564,18 +658,28 @@ def run_triad_simulation(args):
     max_dd_q = float(np.min(drawdowns_q))
 
     total_trades = len(trades)
+    bot_buy_tokens = sum(tr['qty'] for tr in trades if 'BUY' in tr['side'])
+    bot_sell_tokens = sum(tr['qty'] for tr in trades if 'SELL' in tr['side'])
+    bot_total_tokens = bot_buy_tokens + bot_sell_tokens
+    bot_total_usdt = sum(tr['qty'] * tr['price'] for tr in trades)
+    st_market_vol = float(np.sum(buy_vols) + np.sum(sell_vols))
+    st_market_usdt = float(np.sum((buy_vols + sell_vols) * mid_prices))
+    market_share_pct = (bot_total_tokens / st_market_vol * 100.0) if st_market_vol > 0 else 0.0
 
     print("\n" + "=" * 105)
     print("🏆 РЕЗУЛЬТАТЫ СИНХРОНИЗИРОВАННОЙ ТРИАДЫ НА SAFETRADE (ИНВАРИАНТ Q_TOKEN)")
     print("=" * 105)
+    final_token_ratio_pct = ((tokens * p_mid_final) / final_usd_total * 100.0) if final_usd_total > 0 else 0.0
     print(f"  • Стартовый капитал:  {initial_tokens:,.1f} {coin.upper()} + {initial_usdt:,.2f} USDT (Всего в монетах: {initial_q_total:,.2f})")
-    print(f"  • Итоговый капитал:   {tokens:,.1f} {coin.upper()} + {usdt:,.2f} USDT (Всего в монетах: {final_q_total:,.2f})")
-    print(f"  • Стартовая цена mid: ${p_mid_0:.4f}  ➔  Итоговая цена mid: ${p_mid_final:.4f} (Движение рынка: {hodl_price_pct:+.2f}%)")
+    print(f"  • Итоговый капитал:   {tokens:,.1f} {coin.upper()} + {usdt:,.2f} USDT (Доля монеты: {final_token_ratio_pct:.1f}% | Всего в монетах: {final_q_total:,.2f})")
+    print(f"  • Стартовая цена mid: ${p_mid_0:.4f}  ➔  Итоговая цена mid: ${p_mid_final:.4f} (Движение рынка: {hodl_price_pct:+.2f}% | Средняя цена закупа: ${avg_buy_price:.4f})")
     print("-" * 105)
     print(f"  🎯 ЧИСТЫЙ ПРИРОСТ МОНЕТ (Q_token PnL): {delta_q:+,.2f} {coin.upper()} ({delta_q_pct:+.2f}%) 🚀")
     print(f"  💵 Прирост портфеля в USD:             {delta_usd:+,.2f} USDT ({delta_usd_pct:+.2f}%)")
     print(f"  🛡️ Максимальная просадка по монетам:  {max_dd_q:.2f}%")
-    print(f"  🔄 Исполнено Maker-сделок:             {total_trades:,} (Отмен: {cancels:,} | Срабатываний тренд-шлюза: {trend_blocks:,} | Защит Lead-Lag: {leadlag_shields:,})")
+    print(f"  📊 Оборот биржи SafeTrade за период:   {st_market_vol:,.1f} {coin.upper()} (~${st_market_usdt:,.0f} USDT | Buy: {np.sum(buy_vols):,.1f} | Sell: {np.sum(sell_vols):,.1f})")
+    print(f"  🔄 Оборот нашего бота за период:       {bot_total_tokens:,.1f} {coin.upper()} (~${bot_total_usdt:,.0f} USDT | Куплено: {bot_buy_tokens:,.1f} | Продано: {bot_sell_tokens:,.1f} | Доля рынка: {market_share_pct:.2f}%)")
+    print(f"  ⚡ Исполнено Maker-сделок:             {total_trades:,} (Отмен: {cancels:,} | Rebuy-защит: {rebuy_blocks:,} | Trend-Hold: {trend_holds:,} | Lead-Lag: {leadlag_shields:,})")
     print(f"  💰 Сэкономлено на Maker комиссиях:     ${saved_fees_usdt:.2f} USDT")
     if getattr(args, 'plot', None):
         import matplotlib.pyplot as plt
@@ -592,8 +696,9 @@ def run_triad_simulation(args):
 
         ts_series = pd.to_datetime(val_df['timestamp'])
 
-        # Панель 1: Mid Price & Maker Fills
+        # Панель 1: Mid Price, EMA_30m & Maker Fills
         ax1.plot(ts_series, mid_prices, label=f'{coin.upper()} Mid Price', color='#58a6ff', lw=1.5, zorder=2)
+        ax1.plot(ts_series, ema_30m, label='EMA 30m (Regime Anchor)', color='#a371f7', linestyle='--', lw=1.2, alpha=0.85, zorder=2)
 
         # Сделки
         if trades:
@@ -610,13 +715,13 @@ def run_triad_simulation(args):
             if not buys_bo_sniper.empty:
                 ax1.scatter(buys_bo_sniper['time'], buys_bo_sniper['price'], color='#38d9a9', marker='^', s=90, edgecolors='white', lw=1.2, label=f'⚡ BigONE Sniper Buy ({len(buys_bo_sniper)})', zorder=6)
             if not buys_sniper.empty:
-                ax1.scatter(buys_sniper['time'], buys_sniper['price'], color='#2ea043', marker='^', s=80, edgecolors='white', lw=1.2, label=f'🟢 Absorption Dip Buy ({len(buys_sniper)})', zorder=5)
+                ax1.scatter(buys_sniper['time'], buys_sniper['price'], color='#2ea043', marker='^', s=80, edgecolors='white', lw=1.2, label=f'Absorption Dip Buy ({len(buys_sniper)})', zorder=5)
             if not buys_core.empty:
                 ax1.scatter(buys_core['time'], buys_core['price'], color='#3fb950', marker='^', s=45, alpha=0.7, label=f'Core Buy ({len(buys_core)})', zorder=4)
             if not sells_peak.empty:
-                ax1.scatter(sells_peak['time'], sells_peak['price'], color='#f85149', marker='v', s=80, edgecolors='white', lw=1.2, label=f'🔴 Peak Exhaustion Sell ({len(sells_peak)})', zorder=5)
+                ax1.scatter(sells_peak['time'], sells_peak['price'], color='#f85149', marker='v', s=80, edgecolors='white', lw=1.2, label=f'Peak Exhaustion Sell ({len(sells_peak)})', zorder=5)
             if not sells_esc.empty:
-                ax1.scatter(sells_esc['time'], sells_esc['price'], color='#d29922', marker='v', s=55, alpha=0.8, label=f'🟠 Ask Escalator ({len(sells_esc)})', zorder=4)
+                ax1.scatter(sells_esc['time'], sells_esc['price'], color='#d29922', marker='v', s=55, alpha=0.8, label=f'Ask Escalator ({len(sells_esc)})', zorder=4)
             if not sells_core.empty:
                 ax1.scatter(sells_core['time'], sells_core['price'], color='#da3633', marker='v', s=35, alpha=0.6, label=f'Core Sell ({len(sells_core)})', zorder=3)
 
@@ -624,11 +729,13 @@ def run_triad_simulation(args):
         ax1.set_title(f'STRICT OUT-OF-SAMPLE BACKTEST — {coin.upper()} / USDT (Maker 0% Fee, RTT=1s)', color='#f0f6fc', fontsize=13, fontweight='bold', pad=10)
         ax1.legend(loc='upper left', facecolor='#161b22', edgecolor='#30363d', labelcolor='#c9d1d9', fontsize=8.5)
 
-        # Панель 2: Прирост монет Q_token (%)
+        # Панель 2: Прирост монет Q_token (%) и Прирост портфеля в USD (%)
         q_pnl_pct_arr = ((np.array(q_total_history) - initial_q_total) / initial_q_total) * 100.0
-        ax2.plot(ts_series, q_pnl_pct_arr, color='#e3b341', lw=1.8, label=f'Accumulated {coin.upper()} Q_token ({delta_q_pct:+.2f}%)', zorder=3)
+        usd_pnl_pct_arr = ((np.array(usd_total_history) - initial_usd_total) / initial_usd_total) * 100.0
+        ax2.plot(ts_series, usd_pnl_pct_arr, color='#3fb950', lw=1.8, label=f'USD Portfolio Equity ({delta_usd_pct:+.2f}%)', zorder=4)
+        ax2.plot(ts_series, q_pnl_pct_arr, color='#e3b341', lw=1.6, label=f'Accumulated {coin.upper()} Q_token ({delta_q_pct:+.2f}%)', zorder=3)
         ax2.axhline(0, color='#8b949e', linestyle=':', lw=1, alpha=0.7)
-        ax2.set_ylabel('Token PnL (%)', color='#c9d1d9', fontsize=11)
+        ax2.set_ylabel('PnL (%)', color='#c9d1d9', fontsize=11)
         ax2.legend(loc='upper left', facecolor='#161b22', edgecolor='#30363d', labelcolor='#c9d1d9', fontsize=9)
 
         # Панель 3: Drawdown (%)
@@ -654,7 +761,8 @@ def run_triad_simulation(args):
         'cancels': cancels,
         'trend_blocks': trend_blocks,
         'leadlag_shields': leadlag_shields,
-        'saved_fees_usdt': saved_fees_usdt
+        'saved_fees_usdt': saved_fees_usdt,
+        'trades': trades
     }
 
 

@@ -501,7 +501,10 @@ def build_features_for_coin(coin_name, macro_df=None):
             merged.to_parquet(legacy_out, compression='zstd')
             print(f"   (Также сохранен legacy файл: {os.path.basename(legacy_out)})")
 
-    return merged
+    del merged
+    import gc
+    gc.collect()
+    return True
 
 def main():
     parser = argparse.ArgumentParser(description="Синхронизация и построение 1-секундного базового датасета (PRL, QUANTUS).")
@@ -510,7 +513,7 @@ def main():
     args = parser.parse_args()
 
     if args.sync:
-        print(f"{Fore.CYAN}🔄 Выполняется синхронизация данных...{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}🔄 Выполняется синхронизацию данных...{Style.RESET_ALL}")
         sync_data()
 
     print(f"{Fore.CYAN}==================================================={Style.RESET_ALL}")
@@ -520,17 +523,10 @@ def main():
     macro_df = load_macro()
     coins = ["prl", "quantus"] if args.coin == "all" else [args.coin]
 
-    from concurrent.futures import ProcessPoolExecutor
-    workers = min(len(coins), SAFE_WORKERS)
-    if workers > 1:
-        print(f"⚡ Мультипроцессорная сборка датасетов: {workers} параллельных процессов (лимит CPU <= 80%, {os.cpu_count() - SAFE_WORKERS} ядер свободно для ОС)")
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(build_features_for_coin, c, macro_df) for c in coins]
-            for f in futures:
-                f.result()
-    else:
-        for c in coins:
-            build_features_for_coin(c, macro_df=macro_df)
+    import gc
+    for c in coins:
+        build_features_for_coin(c, macro_df=macro_df)
+        gc.collect()
 
     print(f"\n{Fore.GREEN}🎉 Построение 1-секундных датасетов успешно завершено!{Style.RESET_ALL}\n")
 

@@ -1,0 +1,94 @@
+{
+  "coin": "PRL",
+  "H": 12,
+  "seq_len": 42,
+  "optimal_weights": {
+    "lightgbm": 0.3239,
+    "conv1d+gru": 0.2333,
+    "causal_cnn": 0.4428,
+    "attention": 0.0,
+    "mlp_bottleneck": 0.0
+  },
+  "ensemble_metrics_oos": {
+    "ic": 0.221,
+    "auc": 0.8129,
+    "log_loss": 0.9796,
+    "w_log_loss": 1.5401,
+    "top2_pnl": 0.1157
+  },
+  "leaderboard": [
+    {
+      "model": "lightgbm",
+      "params": 0,
+      "time_s": 15.0,
+      "ic": 0.221376,
+      "auc": 0.806728,
+      "log_loss": 1.217276,
+      "w_log_loss": 1.349099,
+      "top2_pnl": 0.045783
+    },
+    {
+      "model": "mlp_bottleneck",
+      "params": 208221,
+      "time_s": 195.3,
+      "ic": 0.177425,
+      "auc": 0.806186,
+      "log_loss": 2.092208,
+      "w_log_loss": 1.36246,
+      "top2_pnl": 0.187952
+    },
+    {
+      "model": "conv1d+gru",
+      "params": 46237,
+      "time_s": 668.0,
+      "ic": 0.160401,
+      "auc": 0.724871,
+      "log_loss": 1.464317,
+      "w_log_loss": 2.376766,
+      "top2_pnl": 0.101205
+    },
+    {
+      "model": "causal_cnn",
+      "params": 67037,
+      "time_s": 687.2,
+      "ic": 0.14446,
+      "auc": 0.719571,
+      "log_loss": 1.262454,
+      "w_log_loss": 2.559233,
+      "top2_pnl": 0.13494
+    },
+    {
+      "model": "attention",
+      "params": 41309,
+      "time_s": 489.1,
+      "ic": 0.075662,
+      "auc": 0.693558,
+      "log_loss": 1.688104,
+      "w_log_loss": 2.526918,
+      "top2_pnl": 0.077108
+    }
+  ],
+  "optimal_weights_ic_alliance": {
+    "lightgbm": 0.25,
+    "conv1d+gru": 0.25,
+    "causal_cnn": 0.25,
+    "mlp_bottleneck": 0.25,
+    "attention": 0.0
+  },
+  "ic_alliance_metrics_oos": {
+    "ic": 0.2253,
+    "auc": 0.8207,
+    "log_loss": 1.131,
+    "w_log_loss": 1.3867,
+    "top2_pnl": 0.1157
+  },
+  "class_weights": [
+    19.888061,
+    12.946367,
+    6.88657,
+    0.156856,
+    6.701104,
+    10.651329,
+    17.408092
+  ]
+}
