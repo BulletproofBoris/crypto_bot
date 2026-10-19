@@ -31,13 +31,10 @@ if BASE_DIR not in sys.path:
 from concurrent.futures import ThreadPoolExecutor
 from _tools.system_resources import SAFE_WORKERS
 
-# Нормализуем прокси до любых сетевых обращений
-for _var in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']:
-    _val = os.environ.get(_var, '')
-    if 'http://127.0.0.1:2080' in _val:
-        os.environ[_var] = 'socks5h://127.0.0.1:2080'
-if not os.environ.get('ALL_PROXY'):
-    os.environ['ALL_PROXY'] = 'socks5h://127.0.0.1:2080'
+# Очищаем невалидный локальный socks-прокси 127.0.0.1:2080, если он не слушает
+for _var in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy']:
+    if '127.0.0.1:2080' in os.environ.get(_var, ''):
+        del os.environ[_var]
 
 # Настройка логирования
 logging.basicConfig(
@@ -272,12 +269,9 @@ def ensure_directories():
 # ==============================================================================
 
 def get_drive_service():
-    for _var in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']:
-        _val = os.environ.get(_var, '')
-        if 'http://127.0.0.1:2080' in _val:
-            os.environ[_var] = 'socks5h://127.0.0.1:2080'
-    if not os.environ.get('ALL_PROXY'):
-        os.environ['ALL_PROXY'] = 'socks5h://127.0.0.1:2080'
+    for _var in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy']:
+        if '127.0.0.1:2080' in os.environ.get(_var, ''):
+            del os.environ[_var]
 
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
@@ -288,15 +282,11 @@ def get_drive_service():
     if os.path.exists(SERVICE_ACCOUNT_PATH):
         try:
             from google.oauth2 import service_account
-            import httplib2
-            import google_auth_httplib2
             creds = service_account.Credentials.from_service_account_file(
                 SERVICE_ACCOUNT_PATH, scopes=SCOPES
             )
-            http_transport = httplib2.Http(proxy_info=httplib2.proxy_info_from_environment, timeout=30)
-            auth_http = google_auth_httplib2.AuthorizedHttp(creds, http=http_transport)
             logger.info("🔑 Используется Google Cloud Service Account (бессрочный доступ).")
-            return build('drive', 'v3', http=auth_http, cache_discovery=False)
+            return build('drive', 'v3', credentials=creds, cache_discovery=False)
         except Exception as e:
             logger.warning(f"Ошибка загрузки service_account.json: {e}")
 
@@ -327,11 +317,8 @@ def get_drive_service():
             except Exception as e:
                 logger.warning(f"Не удалось предварительно обновить токен: {e}")
                 raise RuntimeError(f"Токен Google Drive недействителен: {e}")
-    import httplib2
-    import google_auth_httplib2
-    http_transport = httplib2.Http(proxy_info=httplib2.proxy_info_from_environment, timeout=30)
-    auth_http = google_auth_httplib2.AuthorizedHttp(creds, http=http_transport)
-    return build('drive', 'v3', http=auth_http, cache_discovery=False)
+
+    return build('drive', 'v3', credentials=creds, cache_discovery=False)
 
 def sync_gdrive():
     """Скачивает все недостающие архивы .csv.gz из Google Drive в локальный кэш с повторными попытками."""

@@ -7,6 +7,7 @@
 import os
 import sys
 import time
+import json
 import argparse
 from datetime import datetime
 import paramiko
@@ -31,6 +32,7 @@ SERVICES = [
     ("rhea-collector", "Rhea Finance / Near Intents"),
     ("binance-collector", "Binance Macro (BTC + NEAR)"),
     ("onchain-collector", "On-chain Metrics & Rules"),
+    ("crypto-paper-trader", "Online Triad Paper Trader (PRL, Quantus)"),
 ]
 
 def get_server_stats(ssh):
@@ -88,7 +90,16 @@ def get_server_stats(ssh):
     )
     stdin, stdout, stderr = ssh.exec_command(cmd_files)
     stats['files'] = stdout.read().decode().strip()
-    
+
+    # 5. Проверка статуса Online Paper-Trading
+    stdin, stdout, stderr = ssh.exec_command("cat /opt/crypto_bot/data/paper_trading_status.json 2>/dev/null")
+    paper_raw = stdout.read().decode().strip()
+    if paper_raw:
+        try:
+            stats['paper_trading'] = json.loads(paper_raw)
+        except Exception:
+            pass
+
     return stats
 
 def format_stats(stats):
@@ -122,6 +133,17 @@ def format_stats(stats):
             all_ok = False
         out.append(f"  - {s_name:<22} [{icon}] ({desc})")
 
+    if 'paper_trading' in stats:
+        pt = stats['paper_trading']
+        out.append("\n🎯 ТОРГОВЫЙ СТАТУС ТРИАДЫ (ONLINE PAPER TRADING):")
+        out.append(f"  Обновлено: {pt.get('updated_at', 'N/A')}")
+        if 'prl' in pt:
+            p = pt['prl']
+            out.append(f"  • PRL / USDT:     ${p['mid_price']} | Q_PnL: {p['pnl_pct']:+5.2f}% | Order: {p['active_order']:<22} | Fills: {p['fills']} | Tokens: {p['tokens']:,.1f} | USDT: ${p['usdt']:,.2f}")
+        if 'quantus' in pt:
+            q = pt['quantus']
+            out.append(f"  • QUANTUS / USDT: ${q['mid_price']} | Q_PnL: {q['pnl_pct']:+5.2f}% | Order: {q['active_order']:<22} | Fills: {q['fills']} | Tokens: {q['tokens']:,.1f} | USDT: ${q['usdt']:,.2f}")
+
     if stats.get('files'):
         out.append("\n📁 Размеры файлов данных на сервере:")
         for line in stats['files'].splitlines():
@@ -131,10 +153,11 @@ def format_stats(stats):
                 fname = path.split("realtime/")[-1]
                 out.append(f"  • {size:>7}  -> {fname}")
 
-    out.append("\n" + ("✅ Все 5 служб работают штатно!" if all_ok else "⚠️ Внимание: некоторые службы остановлены!"))
+    out.append("\n" + ("✅ Все службы работают штатно!" if all_ok else "⚠️ Внимание: некоторые службы остановлены!"))
     return "\n".join(out)
 
 def monitor(once=False, interval=10):
+    ssh = None
     try:
         if create_ssh_client:
             ssh = create_ssh_client(timeout=10)
@@ -160,7 +183,8 @@ def monitor(once=False, interval=10):
     except Exception as e:
         print(f"❌ Ошибка подключения к серверу: {e}")
     finally:
-        ssh.close()
+        if ssh is not None:
+            ssh.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Мониторинг состояния VPS и сборщиков данных.")

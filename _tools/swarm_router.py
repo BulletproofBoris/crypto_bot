@@ -51,10 +51,6 @@ class SwarmRegimeRouter:
         with open(manifest_path) as f:
             self.manifest = json.load(f)
 
-        feats_json = BASE_DIR / "data" / "features" / f"selected_features_{self.coin}_h8s.json"
-        with open(feats_json) as f:
-            self.feature_names = json.load(f)["feature_order"]
-
         # Загрузка моделей LightGBM в память
         self.models = []
         self.model_ids = []
@@ -70,7 +66,13 @@ class SwarmRegimeRouter:
                 self.regime_fingerprints.append(item['regime_fingerprint_train'])
 
         self.num_models = len(self.models)
-        print(f"✅ Успешно загружено {self.num_models} моделей-экспертов в RAM.")
+        if self.models and hasattr(self.models[0], 'feature_name'):
+            self.feature_names = list(self.models[0].feature_name())
+        else:
+            feats_json = BASE_DIR / "data" / "features" / f"selected_features_{self.coin}_h8s.json"
+            with open(feats_json) as f:
+                self.feature_names = json.load(f)["feature_order"]
+        print(f"✅ Успешно загружено {self.num_models} моделей-экспертов в RAM ({len(self.feature_names)} признаков).")
 
         # Подготовка матрицы признаков режимов экспертов
         self._build_regime_matrix()

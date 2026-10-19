@@ -242,7 +242,7 @@ def add_cross_exchange_and_macro_filters(merged, coin="prl"):
             std_w = diff_ticks.rolling(w, min_periods=5).std().fillna(0.0)
             new_cols[f"arb_spread_zscore_{w}s"] = (diff_ticks - ema_w) / (std_w + 0.25)
 
-        for w in (5, 20, 60):
+        for w in (5, 20, 60, 300):
             if f"BO_ret_{w}s_ticks" in merged.columns and f"ST_ret_{w}s_ticks" in merged.columns:
                 new_cols[f"leadlag_bo_minus_st_{w}s_ticks"] = (
                     merged[f"BO_ret_{w}s_ticks"] - merged[f"ST_ret_{w}s_ticks"]
@@ -251,6 +251,11 @@ def add_cross_exchange_and_macro_filters(merged, coin="prl"):
                 new_cols[f"leadlag_bo_minus_st_ofi_{w}s"] = (
                     merged[f"BO_ofi_norm_{w}s"] - merged[f"ST_ofi_norm_{w}s"]
                 )
+
+        if "BO_ret_60s_ticks" in merged.columns and "ST_ret_60s_ticks" in merged.columns:
+            new_cols["leadlag_accum_bo_st_60s"] = (merged["BO_ret_60s_ticks"] - merged["ST_ret_60s_ticks"]).rolling(60, min_periods=5).mean().fillna(0.0)
+        if "BO_ret_300s_ticks" in merged.columns and "ST_ret_300s_ticks" in merged.columns:
+            new_cols["leadlag_accum_bo_st_300s"] = (merged["BO_ret_300s_ticks"] - merged["ST_ret_300s_ticks"]).rolling(300, min_periods=10).mean().fillna(0.0)
 
         # Кросс-биржевые триггеры импульса с BigONE и токсичность потока
         bo_vol = merged["BO_trade_vol"].astype(float) if "BO_trade_vol" in merged.columns else pd.Series(0.0, index=merged.index)
@@ -331,6 +336,24 @@ def add_cross_exchange_and_macro_filters(merged, coin="prl"):
         act_raw = (vol_int.astype(float) / (sp_ticks.astype(float) + 1.0)).clip(0.0, 10.0)
         new_cols["market_activity_regime"] = 2.0 / (1.0 + np.exp(-0.5 * act_raw)) - 1.0
 
+    # Динамика потока сделок SafeTrade (Flow Regime & Stale Book Detection)
+    if "ST_trade_count" in merged.columns or "ST_trade_vol" in merged.columns:
+        tc = merged["ST_trade_count"].astype(float) if "ST_trade_count" in merged.columns else pd.Series(0.0, index=merged.index)
+        tv = merged["ST_trade_vol"].astype(float) if "ST_trade_vol" in merged.columns else pd.Series(0.0, index=merged.index)
+        has_trade = (tc > 0) | (tv > 0)
+        trade_grp = has_trade.cumsum()
+        tslt = merged.groupby(trade_grp).cumcount().astype(float).clip(upper=600.0)
+        new_cols["ST_time_since_last_trade"] = tslt
+        new_cols["ST_flow_regime"] = np.where(tslt <= 30.0, 1.0, 0.0)
+        new_cols["ST_trades_burst_10s"] = has_trade.astype(float).rolling(10, min_periods=1).sum().fillna(0.0)
+
+    # Макро-согласие на старшем горизонте 300с
+    if "ST_ret_300s_ticks" in merged.columns and "macro_btc_ret_300s_bps" in new_cols:
+        st_ret_300 = merged["ST_ret_300s_ticks"]
+        if isinstance(st_ret_300, pd.DataFrame):
+            st_ret_300 = st_ret_300.iloc[:, 0]
+        new_cols["macro_btc_alignment_300s"] = (np.sign(st_ret_300) * np.sign(new_cols["macro_btc_ret_300s_bps"])).fillna(0.0)
+
     # Стационарные ончейн-признаки: время с момента последнего блока (в секундах)
     if "onchain_block_height" in merged.columns:
         bh = merged["onchain_block_height"]
@@ -338,6 +361,13 @@ def add_cross_exchange_and_macro_filters(merged, coin="prl"):
             bh = bh.iloc[:, 0]
         block_changed = (bh != bh.shift(1)).cumsum()
         new_cols["onchain_seconds_since_block"] = merged.groupby(block_changed).cumcount().astype(float)
+
+    whale_col = "onchain_whale_volume_5k" if "onchain_whale_volume_5k" in merged.columns else (
+        "onchain_whale_transfers_5m" if "onchain_whale_transfers_5m" in merged.columns else None
+    )
+    if whale_col:
+        wv = merged[whale_col].astype(float)
+        new_cols["onchain_whale_surge_300s"] = (wv - wv.shift(300)).clip(lower=0.0).fillna(0.0)
 
     mp_col = "onchain_mempool_size" if "onchain_mempool_size" in merged.columns else (
         "onchain_mempool_pending_count" if "onchain_mempool_pending_count" in merged.columns else None

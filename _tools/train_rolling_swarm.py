@@ -38,6 +38,7 @@ def parse_args():
     parser.add_argument("--k-values", type=str, default="", help="Значения K через запятую (например 3.0,3.5,3.0)")
     parser.add_argument("--n-estimators", type=int, default=70, help="Количество деревьев LightGBM")
     parser.add_argument("--n-jobs", type=int, default=SAFE_WORKERS, help="Количество потоков CPU")
+    parser.add_argument("--align-horizon", type=int, default=None, help="Выравнивать временные окна под референсный горизонт H (например 12)")
     return parser.parse_args()
 
 
@@ -178,7 +179,7 @@ def compute_regime_fingerprint(df_slice: pd.DataFrame):
     return fp
 
 
-def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: int):
+def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: int, align_horizon: int = None):
     """Обучает полный пул Rolling-моделей для монеты и горизонта H."""
     coin = coin.lower()
     labeled_path = BASE_DIR / "data" / "labeled" / coin / f"{coin}_labeled.parquet"
@@ -237,12 +238,61 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
         df['target_dt'] = df[target_dt_col]
         df['is_void'] = False
 
-    # Поиск непрерывных сегментов (без гэпов)
-    segments = find_clean_segments(df)
-    windows, W, step, t_train, t_test = generate_rolling_windows_reverse(segments, H, K)
+    windows = []
+    if align_horizon is not None:
+        ref_k = get_default_k(coin, align_horizon)
+        ref_manifest_path = BASE_DIR / "models" / coin / f"h{align_horizon}s_k{ref_k:g}" / "manifest.json"
+        if ref_manifest_path.exists():
+            print(f"🔗 Синхронизация временных окон с эталоном H={align_horizon}с ({ref_manifest_path.relative_to(BASE_DIR)})")
+            with open(ref_manifest_path) as f:
+                ref_manifest = json.load(f)
 
-    print(f"📐 Формула окна W = Train ({t_train:,}с) + Buffer + Test ({t_test:,}с) = {W:,}с ({W/3600:.1f}ч)")
-    print(f"   Шаг сдвига W/2 = {step:,}с ({step/3600:.1f}ч) | Всего валидных окон: {len(windows)}")
+            ts_series = pd.to_datetime(df['timestamp'])
+            for item in ref_manifest:
+                tr_s_ts = pd.to_datetime(item['train_ts_range'][0])
+                tr_e_ts = pd.to_datetime(item['train_ts_range'][1])
+                te_s_ts = pd.to_datetime(item['test_ts_range'][0])
+                # Для win_00 расширяем тест до конца текущего датасета
+                if item['window_id'] == 'win_00':
+                    te_e_ts = pd.to_datetime(df['timestamp'].iloc[-1])
+                else:
+                    te_e_ts = pd.to_datetime(item['test_ts_range'][1])
+
+                if ts_series.dt.tz is not None:
+                    tr_s_ts = tr_s_ts.tz_localize(ts_series.dt.tz) if tr_s_ts.tzinfo is None else tr_s_ts.tz_convert(ts_series.dt.tz)
+                    tr_e_ts = tr_e_ts.tz_localize(ts_series.dt.tz) if tr_e_ts.tzinfo is None else tr_e_ts.tz_convert(ts_series.dt.tz)
+                    te_s_ts = te_s_ts.tz_localize(ts_series.dt.tz) if te_s_ts.tzinfo is None else te_s_ts.tz_convert(ts_series.dt.tz)
+                    te_e_ts = te_e_ts.tz_localize(ts_series.dt.tz) if te_e_ts.tzinfo is None else te_e_ts.tz_convert(ts_series.dt.tz)
+
+                tr_s_idx = int(ts_series.searchsorted(tr_s_ts))
+                tr_e_idx = int(ts_series.searchsorted(tr_e_ts))
+                te_s_idx = int(ts_series.searchsorted(te_s_ts))
+                te_e_idx = int(ts_series.searchsorted(te_e_ts))
+
+                windows.append({
+                    'segment_id': 0,
+                    'tr_start': tr_s_idx,
+                    'tr_end': tr_e_idx,
+                    'te_start': te_s_idx,
+                    'te_end': te_e_idx,
+                    't_train': tr_e_idx - tr_s_idx,
+                    't_test': te_e_idx - te_s_idx,
+                    'W': te_e_idx - tr_s_idx,
+                    'L': int(round(H * K)),
+                    'H': H,
+                    'K': K
+                })
+            print(f"✅ Успешно сформировано {len(windows)} окон строго по референсной сетке H={align_horizon}с!")
+        else:
+            print(f"⚠️ Референсный манифест {ref_manifest_path} не найден! Переход к стандартной нарезке.")
+
+    if not windows:
+        # Поиск непрерывных сегментов (без гэпов)
+        segments = find_clean_segments(df)
+        windows, W, step, t_train, t_test = generate_rolling_windows_reverse(segments, H, K)
+
+        print(f"📐 Формула окна W = Train ({t_train:,}с) + Buffer + Test ({t_test:,}с) = {W:,}с ({W/3600:.1f}ч)")
+        print(f"   Шаг сдвига W/2 = {step:,}с ({step/3600:.1f}ч) | Всего валидных окон: {len(windows)}")
 
     if not windows:
         print("⚠️ Нет непрерывных сегментов достаточной длины для данного горизонта!")
@@ -262,10 +312,10 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
         tr_s, tr_e = w['tr_start'], w['tr_end']
         te_s, te_e = w['te_start'], w['te_end']
 
-        ts_tr_start = str(df['timestamp'].iloc[tr_s])[:19]
-        ts_tr_end = str(df['timestamp'].iloc[tr_e])[:19]
-        ts_te_start = str(df['timestamp'].iloc[te_s])[:19]
-        ts_te_end = str(df['timestamp'].iloc[te_e])[:19]
+        ts_tr_start = str(df['timestamp'].iloc[min(tr_s, len(df)-1)])[:19]
+        ts_tr_end = str(df['timestamp'].iloc[min(tr_e, len(df)-1)])[:19]
+        ts_te_start = str(df['timestamp'].iloc[min(te_s, len(df)-1)])[:19]
+        ts_te_end = str(df['timestamp'].iloc[min(te_e, len(df)-1)])[:19]
 
         X_train = X_all[tr_s:tr_e]
         y_train = df['target_class'].iloc[tr_s:tr_e].values + 3  # Сдвиг [-3..3] -> [0..6]
@@ -278,10 +328,18 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
         df_train = pd.DataFrame(X_train, columns=feature_cols)
         df_test = pd.DataFrame(X_test, columns=feature_cols)
 
+        # Асимметричные веса классов для защиты от False Positive Buy на проливах
+        from sklearn.utils.class_weight import compute_class_weight
+        base_weights = compute_class_weight('balanced', classes=np.arange(7), y=y_train)
+        custom_weights = dict(enumerate(base_weights))
+        custom_weights[0] *= 1.35  # Class -3 (защита от ножей)
+        custom_weights[1] *= 1.25  # Class -2
+        custom_weights[2] *= 1.10  # Class -1
+
         clf = lgb.LGBMClassifier(
             objective="multiclass",
             num_class=7,
-            class_weight="balanced",
+            class_weight=custom_weights,
             n_estimators=n_estimators,
             learning_rate=0.08,
             num_leaves=31,
@@ -390,7 +448,7 @@ def main():
                 K = k_vals[idx]
             else:
                 K = get_default_k(coin, H)
-            train_coin_horizon(coin, H, K, args.n_estimators, args.n_jobs)
+            train_coin_horizon(coin, H, K, args.n_estimators, args.n_jobs, align_horizon=args.align_horizon)
 
 
 if __name__ == '__main__':

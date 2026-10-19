@@ -1,0 +1,21 @@
+[
+  {
+    "window_id": 0,
+    "model_file": "model_win_00.keras",
+    "meta_file": "meta_win_00.json",
+    "model_type": "conv1d+gru",
+    "train_ts_range": [
+      "2026-10-15 23:01:18",
+      "2026-10-18 09:21:17"
+    ],
+    "test_ts_range": [
+      "2026-10-18 09:27:30",
+      "2026-10-18 15:13:47"
+    ],
+    "metrics_oos": {
+      "ic_dt_ticks": 0.138,
+      "roc_auc_ovr": 0.7207,
+      "top2pct_mean_ticks": -0.04
+    }
+  }
+]

@@ -240,6 +240,16 @@ def process_exchange_l2(depth_df, trades_df, prefix):
         trades_1s['cvd_total'] = trades_1s['delta_vol'].cumsum()
         vol_1m = trades_1s['trade_vol'].rolling(60, min_periods=1).sum()
         trades_1s['trade_imbalance_1m'] = (trades_1s['cvd_1m'] / vol_1m.replace(0, np.nan)).fillna(0)
+
+        # -------------------------------------------------------------
+        # 🛡️ ПРИНЦИП СТРОГОЙ ПРИЧИННОСТИ (STRICT CAUSALITY / ZERO-LOOKAHEAD):
+        # -------------------------------------------------------------
+        # Ресемплинг '1s' агрегирует сделки за интервал [t.000, t.999].
+        # Стакан L2 (depth_1s) зафиксирован на НАЧАЛО секунды t.000.
+        # Чтобы в момент t не знать сделки, которые произойдут в течение секунды t,
+        # поток сделок ОБЯЗАН быть сдвинут на 1 секунду в прошлое: trades_1s.shift(1).
+        # В строке t будут находиться только сделки, завершившиеся в [t-1, t).
+        trades_1s = trades_1s.shift(1).fillna(0.0)
     else:
         trades_1s = pd.DataFrame(index=depth_1s.index, data={
             'trade_vol': 0.0,
@@ -417,6 +427,11 @@ def build_features_for_coin(coin_name, macro_df=None):
         if 'macro_near_bid_qty' in m_1s.columns and 'macro_near_ask_qty' in m_1s.columns:
             nr_tot = (m_1s['macro_near_bid_qty'] + m_1s['macro_near_ask_qty']).replace(0, np.nan)
             m_1s['macro_near_bbo_imb'] = ((m_1s['macro_near_bid_qty'] - m_1s['macro_near_ask_qty']) / nr_tot).fillna(0)
+
+        # Сдвиг макро-объемов сделок на 1с для строгой причинности
+        for mc in ['macro_btc_buy_vol', 'macro_btc_sell_vol', 'macro_near_buy_vol', 'macro_near_sell_vol']:
+            if mc in m_1s.columns:
+                m_1s[mc] = m_1s[mc].shift(1).fillna(0.0)
 
         merged = pd.merge(merged, m_1s, left_index=True, right_index=True, how='left')
         for c in m_1s.columns:

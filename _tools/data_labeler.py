@@ -19,12 +19,21 @@ Production Data Labeling Engine for PRL/USDT and QUANTUS
 
 import os
 import sys
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
 import argparse
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 from concurrent.futures import ProcessPoolExecutor
-from _tools.system_resources import SAFE_WORKERS
+try:
+    from _tools.system_resources import SAFE_WORKERS
+except ImportError:
+    SAFE_WORKERS = min(14, max(4, os.cpu_count() - 2 if os.cpu_count() else 4))
 
 def _worker_label_pair(args):
     """Изолированный воркер для параллельного расчета таргетов пары (H, K)."""
@@ -38,28 +47,28 @@ COIN_CONFIG = {
     'quantus': {'tick_size': 0.05, 'typical_trade': 2.2, 'min_vol': 2.0},
 }
 
-# Пороги квантильных плато
-TH_P1_P2 = 0.50
-TH_P2_P3 = 1.00
-TH_M1_M2 = -0.50
-TH_M2_M3 = -0.95
+# Пороги квантильных плато (откалиброваны под естественное распределение импульса z)
+TH_P1_P2 = 1.25
+TH_P2_P3 = 2.50
+TH_M1_M2 = -1.25
+TH_M2_M3 = -2.50
 
 def parse_ratio_spec(ratio_input):
     """Парсит соотношение K = L/H (число, список или срез 3:6)."""
     if isinstance(ratio_input, (int, float)):
-        return [int(ratio_input)]
+        return [float(ratio_input)]
     s = str(ratio_input).strip()
     if s.startswith('[') and s.endswith(']'):
         s = s[1:-1].strip()
     if ':' in s:
-        parts = [int(p.strip()) for p in s.split(':')]
+        parts = [float(p.strip()) for p in s.split(':')]
         if len(parts) == 2:
-            return list(range(parts[0], parts[1] + 1))
+            return [round(x, 2) for x in np.arange(parts[0], parts[1] + 0.001, 1.0)]
         elif len(parts) == 3:
-            return list(range(parts[0], parts[1] + 1, parts[2]))
+            return [round(x, 2) for x in np.arange(parts[0], parts[1] + 0.001, parts[2])]
     if ',' in s:
-        return [int(p.strip()) for p in s.split(',') if p.strip()]
-    return [int(s)]
+        return [float(p.strip()) for p in s.split(',') if p.strip()]
+    return [float(s)]
 
 def parse_horizon_spec(horizon_input, L_max, K):
     """
@@ -294,7 +303,8 @@ def process_coin_labeling(
     n_target=5000,
     purge_sec=None,
     embargo_sec=0,
-    save_legacy_splits=True
+    save_legacy_splits=True,
+    pairs_spec=None
 ):
     """
     Размечает датасет для монеты (одиночный или по сетке H и K).
@@ -318,18 +328,28 @@ def process_coin_labeling(
     train_80 = int(total_rows * split_ratio)
     L_max = max(10, train_80 // n_target)
     
-    ratios = parse_ratio_spec(ratio_spec)
-    pairs = []
-    for K in ratios:
-        h_vals = parse_horizon_spec(horizon_spec, L_max, K)
-        for H in h_vals:
-            pairs.append((H, K))
+    if pairs_spec:
+        pairs = []
+        for item in str(pairs_spec).split(','):
+            if ':' in item:
+                h_str, k_str = item.split(':')
+                pairs.append((int(h_str.strip()), float(k_str.strip())))
+            elif '-' in item:
+                h_str, k_str = item.split('-')
+                pairs.append((int(h_str.strip()), float(k_str.strip())))
+    else:
+        ratios = parse_ratio_spec(ratio_spec)
+        pairs = []
+        for K in ratios:
+            h_vals = parse_horizon_spec(horizon_spec, L_max, K)
+            for H in h_vals:
+                pairs.append((H, K))
             
     if not pairs:
-        pairs = [(5, 4)]
+        pairs = [(5, 3.0)]
         
     max_H = max(p[0] for p in pairs)
-    max_L = max(p[0] * p[1] for p in pairs)
+    max_L = int(round(max(p[0] * p[1] for p in pairs)))
     purge_steps = int(purge_sec if purge_sec is not None else max_H)
     embargo_steps = int(embargo_sec)
     gap_steps = purge_steps + embargo_steps
@@ -397,10 +417,10 @@ def process_coin_labeling(
         ]
 
     for H, K, res in pair_results:
-        L = H * K
+        L = int(round(H * K))
         
         # Добавляем таргеты с суффиксами в общий датасет
-        suffix = f"_h{H}_k{K}"
+        suffix = f"_h{H}_k{K:g}"
         extra_cols[f'target_class_7{suffix}'] = res['class_7']
         extra_cols[f'target_class_5{suffix}'] = res['class_5']
         extra_cols[f'target_velocity_z{suffix}'] = res['z']
@@ -511,6 +531,7 @@ def main():
     parser.add_argument("--coin", type=str, default="all", choices=["prl", "quantus", "all"], help="Монета для разметки (по умолчанию all)")
     parser.add_argument("--horizon", type=str, default="5", help="Горизонт H или интервал (например: 5, '5,10,15', '5:Lmax:5', '5:30:5')")
     parser.add_argument("--ratio", type=str, default="4", help="Соотношение K=L/H или интервал (например: 4, '[3,4,5,6]', '3,4,5', '3:6')")
+    parser.add_argument("--pairs", type=str, default=None, help="Явный список пар H:K через запятую (например: '5:3,12:3.5,25:3')")
     parser.add_argument("--outdir", type=str, default="data/labeled", help="Выходная директория")
     parser.add_argument("--split-ratio", type=float, default=0.8, help="Доля обучающей выборки Train (по умолчанию 0.8)")
     parser.add_argument("--n-target", type=int, default=5000, help="Минимум независимых отсчетов N для расчета L_max = T_train // N (по умолчанию 5000)")
@@ -532,7 +553,8 @@ def main():
             n_target=args.n_target,
             purge_sec=args.purge_sec,
             embargo_sec=args.embargo_sec,
-            save_legacy_splits=not args.no_legacy_splits
+            save_legacy_splits=not args.no_legacy_splits,
+            pairs_spec=args.pairs
         )
         if cdf is not None:
             all_coin_dfs.append(cdf)

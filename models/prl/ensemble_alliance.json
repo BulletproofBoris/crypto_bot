@@ -1,0 +1,78 @@
+{
+  "coin": "PRL",
+  "H": 12,
+  "seq_len": 42,
+  "optimal_weights": {
+    "lightgbm": 0.7949,
+    "conv1d+gru": 0.0731,
+    "causal_cnn": 0.12,
+    "attention": 0.0045,
+    "mlp_bottleneck": 0.0075
+  },
+  "ensemble_metrics_oos": {
+    "ic": 0.1788,
+    "auc": 0.8127,
+    "log_loss": 0.5701,
+    "top2_pnl": 0.0289
+  },
+  "leaderboard": [
+    {
+      "model": "lightgbm",
+      "params": 0,
+      "time_s": 118.4,
+      "ic": 0.13960833781770407,
+      "auc": 0.7962637432079411,
+      "log_loss": 0.6131916926860644,
+      "top2_pnl": 0.028915662318468094
+    },
+    {
+      "model": "conv1d+gru",
+      "params": 46237,
+      "time_s": 668.0,
+      "ic": 0.1604011329986628,
+      "auc": 0.7248724667690623,
+      "log_loss": 1.4643052920186503,
+      "top2_pnl": 0.10120481997728348
+    },
+    {
+      "model": "causal_cnn",
+      "params": 67037,
+      "time_s": 687.2,
+      "ic": 0.14446389843356652,
+      "auc": 0.719571263737687,
+      "log_loss": 1.2624298093714998,
+      "top2_pnl": 0.1349397599697113
+    },
+    {
+      "model": "attention",
+      "params": 41309,
+      "time_s": 489.1,
+      "ic": 0.07566172405550256,
+      "auc": 0.6935584926508518,
+      "log_loss": 1.6881038003517195,
+      "top2_pnl": 0.07710843533277512
+    },
+    {
+      "model": "mlp_bottleneck",
+      "params": 208221,
+      "time_s": 195.3,
+      "ic": 0.17742584402021866,
+      "auc": 0.8061866760905743,
+      "log_loss": 2.0922051036220486,
+      "top2_pnl": 0.18795180320739746
+    }
+  ],
+  "optimal_weights_ic_alliance": {
+    "lightgbm": 0.25,
+    "conv1d+gru": 0.25,
+    "causal_cnn": 0.25,
+    "mlp_bottleneck": 0.25,
+    "attention": 0.0
+  },
+  "ic_alliance_metrics_oos": {
+    "ic": 0.2161,
+    "auc": 0.8123,
+    "log_loss": 0.8515,
+    "top2_pnl": 0.0867
+  }
+}

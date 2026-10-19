@@ -56,6 +56,11 @@ def parse_args():
     parser.add_argument("--taker-fee", type=float, default=0.002, help="Комиссия Taker (0.2%% на SafeTrade)")
     parser.add_argument("--threshold-maker", type=float, default=0.25, help="Порог входа лимитным ордером E[z]")
     parser.add_argument("--threshold-taker", type=float, default=0.35, help="Порог экстренного маркет-ордера P(±3)")
+    parser.add_argument("--pure-maker", action="store_true", help="Чистый Maker-режим (отключает экстренные Taker-сделки)")
+    parser.add_argument("--latency-sec", type=int, default=1, help="Задержка постановки/отмены ордера (сек, RTT SafeTrade)")
+    parser.add_argument("--queue-model", type=str, default="realistic", choices=["realistic", "instant"],
+                        help="Модель очереди (realistic: учет позиции в очереди и объема, instant: мгновенный fill)")
+    parser.add_argument("--cancel-timeout", type=int, default=30, help="Таймаут жизни пассивного ордера в стакане (сек)")
     parser.add_argument("--max-steps", type=int, default=None, help="Ограничить количество секунд для быстрого теста")
     return parser.parse_args()
 
@@ -80,9 +85,13 @@ def run_execution_simulation(args):
 
     k_str = f"{K:g}"
 
+    if args.pure_maker:
+        args.threshold_taker = 1.0
+
     print("\n" + "=" * 105)
     print(f"🚀 СИМУЛЯЦИЯ ИСПОЛНЕНИЯ SAFETRADE: {coin.upper()} | H = {H}с, K = {k_str} | Режим: {args.mode.upper()}")
     print(f"   Шаг цены (tick_size): {tick_size} USDT | Комиссии: Maker={args.maker_fee*100:.1f}%, Taker={args.taker_fee*100:.1f}%")
+    print(f"   Реализм: Модель очереди={args.queue_model.upper()} | Сетевая задержка RTT={args.latency_sec}с | Pure Maker={args.pure_maker}")
     print(f"   Инвариант: целевая функция оптимизирована на чистый прирост монет (Q_token)")
     print("=" * 105)
 
@@ -175,6 +184,8 @@ def run_execution_simulation(args):
     mid_prices = val_df['ST_mid_price'].values
     buy_vols = val_df['ST_buy_vol'].values
     sell_vols = val_df['ST_sell_vol'].values
+    bid_qtys = val_df['ST_bid_1_qty'].values if 'ST_bid_1_qty' in val_df.columns else np.full(n_seconds, 100.0)
+    ask_qtys = val_df['ST_ask_1_qty'].values if 'ST_ask_1_qty' in val_df.columns else np.full(n_seconds, 100.0)
 
     for t in range(n_seconds):
         bid_p = bid_prices[t]
@@ -187,40 +198,96 @@ def run_execution_simulation(args):
         if active_order is not None:
             o_side = active_order['side']
             o_price = active_order['price']
-            o_qty = active_order['qty']
+            rem_qty = active_order['rem_qty']
+            is_active = (t >= active_order['active_after'])
 
-            filled = False
-            # Maker BUY: исполняется если пришли рыночные продажи (sell_vol > 0) на уровне <= o_price
-            # или если спред опустился до цены ордера
-            if o_side == 'buy':
-                if (sell_vol > 0 and bid_p <= o_price) or (ask_p <= o_price):
-                    cost = o_qty * o_price
-                    fee = cost * args.maker_fee
-                    if usdt >= cost + fee:
-                        usdt -= (cost + fee)
-                        tokens += o_qty
-                        filled = True
-                        maker_fills += 1
-                        saved_fees_usdt += (cost * args.taker_fee)  # сэкономили разницу с Taker
-                        trades.append({'t': t, 'side': 'BUY_MAKER', 'price': o_price, 'qty': o_qty, 'tokens': tokens, 'usdt': usdt})
+            # Проверка таймаута пассивного ордера
+            if not active_order['canceling'] and (t - active_order['placed_at'] > args.cancel_timeout):
+                active_order['canceling'] = True
+                active_order['cancel_after'] = t + args.latency_sec
 
-            # Maker SELL: исполняется если пришли рыночные покупки (buy_vol > 0) на уровне >= o_price
-            # или если бид поднялся до цены ордера
-            elif o_side == 'sell':
-                if (buy_vol > 0 and ask_p >= o_price) or (bid_p >= o_price):
-                    rev = o_qty * o_price
-                    fee = rev * args.maker_fee
-                    if tokens >= o_qty:
-                        tokens -= o_qty
-                        usdt += (rev - fee)
-                        filled = True
-                        maker_fills += 1
-                        saved_fees_usdt += (rev * args.taker_fee)
-                        trades.append({'t': t, 'side': 'SELL_MAKER', 'price': o_price, 'qty': o_qty, 'tokens': tokens, 'usdt': usdt})
+            order_done = False
 
-            if filled:
+            if is_active and rem_qty > 0:
+                fill_qty = 0.0
+                if o_side == 'buy':
+                    # Сквозной пробой уровня: цена ask упала до или ниже цены нашего лимитного бида
+                    if ask_p <= o_price:
+                        avail = max(ask_qtys[t], sell_vol) if args.queue_model != 'instant' else rem_qty
+                        fill_qty = min(rem_qty, avail)
+                    # Трейды на уровне бида: рыночные продажи
+                    elif sell_vol > 0 and bid_p <= o_price:
+                        if args.queue_model == 'instant':
+                            fill_qty = rem_qty
+                        else:
+                            # Реалистичная модель очереди:
+                            if o_price < bid_p:
+                                fill_qty = 0.0
+                            elif o_price == bid_p:
+                                # Мы стоим на BBO за объемом q_ahead
+                                if sell_vol <= active_order['q_ahead']:
+                                    active_order['q_ahead'] -= sell_vol
+                                    fill_qty = 0.0
+                                else:
+                                    avail = sell_vol - active_order['q_ahead']
+                                    active_order['q_ahead'] = 0.0
+                                    fill_qty = min(rem_qty, avail)
+                            else:
+                                # Мы стоим внутри спреда (лучшая цена): мы первые в очереди
+                                fill_qty = min(rem_qty, sell_vol)
+
+                    if fill_qty > 0:
+                        cost = fill_qty * o_price
+                        fee = cost * args.maker_fee
+                        if usdt >= cost + fee:
+                            usdt -= (cost + fee)
+                            tokens += fill_qty
+                            active_order['rem_qty'] -= fill_qty
+                            maker_fills += 1
+                            saved_fees_usdt += (cost * args.taker_fee)
+                            trades.append({'t': t, 'side': 'BUY_MAKER', 'price': o_price, 'qty': fill_qty, 'tokens': tokens, 'usdt': usdt})
+                            if active_order['rem_qty'] <= 1e-6:
+                                order_done = True
+
+                elif o_side == 'sell':
+                    # Сквозной пробой уровня: цена bid поднялась до или выше цены нашего лимитного аска
+                    if bid_p >= o_price:
+                        avail = max(bid_qtys[t], buy_vol) if args.queue_model != 'instant' else rem_qty
+                        fill_qty = min(rem_qty, avail)
+                    # Трейды на уровне аска: рыночные покупки
+                    elif buy_vol > 0 and ask_p >= o_price:
+                        if args.queue_model == 'instant':
+                            fill_qty = rem_qty
+                        else:
+                            if o_price > ask_p:
+                                fill_qty = 0.0
+                            elif o_price == ask_p:
+                                if buy_vol <= active_order['q_ahead']:
+                                    active_order['q_ahead'] -= buy_vol
+                                    fill_qty = 0.0
+                                else:
+                                    avail = buy_vol - active_order['q_ahead']
+                                    active_order['q_ahead'] = 0.0
+                                    fill_qty = min(rem_qty, avail)
+                            else:
+                                fill_qty = min(rem_qty, buy_vol)
+
+                    if fill_qty > 0:
+                        rev = fill_qty * o_price
+                        fee = rev * args.maker_fee
+                        if tokens >= fill_qty:
+                            tokens -= fill_qty
+                            usdt += (rev - fee)
+                            active_order['rem_qty'] -= fill_qty
+                            maker_fills += 1
+                            saved_fees_usdt += (rev * args.taker_fee)
+                            trades.append({'t': t, 'side': 'SELL_MAKER', 'price': o_price, 'qty': fill_qty, 'tokens': tokens, 'usdt': usdt})
+                            if active_order['rem_qty'] <= 1e-6:
+                                order_done = True
+
+            if order_done:
                 active_order = None
-            elif t - active_order['placed_at'] > 30:  # Ордер завис дольше 30 сек без исполнения -> отмена
+            elif active_order is not None and active_order['canceling'] and t >= active_order['cancel_after']:
                 active_order = None
                 cancels += 1
 
@@ -259,19 +326,42 @@ def run_execution_simulation(args):
             # Сигнал на покупку: ожидаемый импульс вверх и вероятность роста > порога
             if ez > args.threshold_maker and pb > 0.20:
                 if usdt >= (trade_size * bid_p):
-                    # Ставим лимитный ордер на лучший Bid (или внутри спреда, если спред широкий)
                     limit_p = round(bid_p, 4)
+                    q_ahead = float(bid_qtys[t])
                     if ask_p - bid_p > 2 * tick_size:
                         limit_p = round(bid_p + tick_size, 4)
-                    active_order = {'side': 'buy', 'price': limit_p, 'qty': trade_size, 'placed_at': t}
+                        q_ahead = 0.0
+                    active_order = {
+                        'side': 'buy',
+                        'price': limit_p,
+                        'qty': trade_size,
+                        'rem_qty': trade_size,
+                        'placed_at': t,
+                        'active_after': t + args.latency_sec,
+                        'q_ahead': q_ahead,
+                        'canceling': False,
+                        'cancel_after': None
+                    }
 
             # Сигнал на продажу: ожидаемый импульс вниз и вероятность спада > порога
             elif ez < -args.threshold_maker and ps > 0.20:
                 if tokens >= trade_size:
                     limit_p = round(ask_p, 4)
+                    q_ahead = float(ask_qtys[t])
                     if ask_p - bid_p > 2 * tick_size:
                         limit_p = round(ask_p - tick_size, 4)
-                    active_order = {'side': 'sell', 'price': limit_p, 'qty': trade_size, 'placed_at': t}
+                        q_ahead = 0.0
+                    active_order = {
+                        'side': 'sell',
+                        'price': limit_p,
+                        'qty': trade_size,
+                        'rem_qty': trade_size,
+                        'placed_at': t,
+                        'active_after': t + args.latency_sec,
+                        'q_ahead': q_ahead,
+                        'canceling': False,
+                        'cancel_after': None
+                    }
 
         # 4.3. Оценка баланса портфеля в монетах Q_total(t)
         q_total_t = tokens + (usdt / mid_p)
