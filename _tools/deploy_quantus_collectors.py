@@ -27,6 +27,7 @@ def deploy_all():
         ("collect_safetrade_realtime.py", "/opt/crypto_bot/_tools/collect_safetrade_realtime.py"),
         ("collect_bigone_realtime.py", "/opt/crypto_bot/_tools/collect_bigone_realtime.py"),
         ("collect_rhea_realtime.py", "/opt/crypto_bot/_tools/collect_rhea_realtime.py"),
+        ("collect_onchain_and_rules.py", "/opt/crypto_bot/_tools/collect_onchain_and_rules.py"),
         ("rotate_and_upload.py", "/opt/crypto_bot/_tools/rotate_and_upload.py"),
         ("watchdog_collectors.py", "/opt/crypto_bot/_tools/watchdog_collectors.py"),
     ]
@@ -67,12 +68,12 @@ WantedBy=multi-user.target
     stdin.close()
     stdout.read()
 
-    # 5. Перезапуск systemd и всех 3 служб
+    # 5. Перезапуск systemd и всех служб
     log("5. Перезапуск systemd и всех служб сборщиков...")
     cmds = [
         "systemctl daemon-reload",
         "systemctl enable rhea-collector",
-        "systemctl restart safetrade-collector bigone-collector rhea-collector"
+        "systemctl restart safetrade-collector bigone-collector rhea-collector onchain-collector"
     ]
     for c in cmds:
         stdin, stdout, stderr = ssh.exec_command(c)

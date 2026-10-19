@@ -63,7 +63,8 @@ def get_default_k(coin: str, H: int) -> float:
 
 def find_clean_segments(df: pd.DataFrame):
     """
-    Разбивает датасет на непрерывные валидные сегменты, исключая разрывы связи (is_data_gap).
+    Разбивает датасет на непрерывные валидные сегменты, исключая разрывы связи (is_data_gap)
+    и длительные заморозки цены (> 1800 с).
     Возвращает список диапазонов (start_idx, end_idx) в обратном хронологическом порядке (с конца).
     """
     is_valid = np.ones(len(df), dtype=bool)
@@ -71,6 +72,15 @@ def find_clean_segments(df: pd.DataFrame):
         is_valid &= (df['sample_split'] != 'purged_gap') & (df['sample_split'] != 'warmup') & (df['sample_split'] != 'tail')
     if 'is_data_gap' in df.columns:
         is_valid &= (df['is_data_gap'] == 0)
+
+    if 'ST_mid_price' in df.columns:
+        mid_diff = df['ST_mid_price'].diff().abs().fillna(0).values
+        tr_vol = df['ST_trade_vol'].fillna(0).values if 'ST_trade_vol' in df.columns else np.zeros(len(df))
+        active_idx = np.where((mid_diff > 1e-8) | (tr_vol > 0))[0]
+        if len(active_idx) > 1:
+            gaps = np.diff(active_idx)
+            for pos in np.where(gaps > 1800)[0]:
+                is_valid[int(active_idx[pos]) + 1 : int(active_idx[pos + 1]) + 75] = False
 
     # Ищем непрерывные блоки True
     change_points = np.diff(np.pad(is_valid.astype(np.int8), (1, 1), 'constant'))
@@ -89,20 +99,17 @@ def find_clean_segments(df: pd.DataFrame):
 
 def generate_rolling_windows_reverse(segments: list, H: int, K: float, n_target: int = 5000):
     """
-    Генерирует окна строго с конца временного ряда:
-    T_train = 5000 * L
-    T_test = int(5000 * L / 0.8)
-    W = T_train + buffer + T_test
-    Step = W // 2
-    Если сегмент вмещает T_train + buffer + min_test, но меньше полного W,
-    генерируется окно с фактическим доступным размером теста.
+    Генерирует окна строго с конца временного ряда.
+    Для синхронизации триады (H=5, 12, 25) при больших L использует канонический размер
+    обучающего окна t_train = min(n_target * L, 210000), чтобы все горизонты обучались
+    на одних и тех же рыночных режимах.
     """
     L = int(round(H * K))
-    t_train = n_target * L
-    t_test = int(n_target * L / 0.8)
+    t_train = min(n_target * L, 210000)
+    t_test = int(t_train / 0.8)
     buffer = H + 360
     W = t_train + buffer + t_test
-    step = W // 2
+    step = t_train
 
     windows = []
     min_test = max(3600, int(L * 50))
@@ -114,7 +121,6 @@ def generate_rolling_windows_reverse(segments: list, H: int, K: float, n_target:
 
         curr_end = seg_end
         if seg_len < W:
-            # Сегмент вмещает полный Train (5000*L), но тест чуть короче идеального
             w_start = seg_start
             tr_start = w_start
             tr_end = tr_start + t_train
@@ -130,6 +136,25 @@ def generate_rolling_windows_reverse(segments: list, H: int, K: float, n_target:
                     't_train': t_train,
                     't_test': te_end - te_start,
                     'W': te_end - tr_start,
+                    'L': L,
+                    'H': H,
+                    'K': K
+                })
+            # Если в этом же длинном сегменте помещается еще одно независимое окно у правого края:
+            if seg_len >= 2 * t_train + buffer + min_test:
+                tr2_start = seg_end - t_train - buffer - min_test
+                tr2_end = tr2_start + t_train
+                te2_start = tr2_end + buffer
+                te2_end = seg_end
+                windows.insert(len(windows) - 1, {
+                    'segment_id': seg_idx,
+                    'tr_start': tr2_start,
+                    'tr_end': tr2_end,
+                    'te_start': te2_start,
+                    'te_end': te2_end,
+                    't_train': t_train,
+                    't_test': te2_end - te2_start,
+                    'W': te2_end - tr2_start,
                     'L': L,
                     'H': H,
                     'K': K
@@ -164,7 +189,11 @@ def generate_rolling_windows_reverse(segments: list, H: int, K: float, n_target:
 def compute_regime_fingerprint(df_slice: pd.DataFrame):
     """Считывает макро- и микроструктурный паспорт рынка для RL-роутера."""
     fp = {}
-    for col in ['rvol_300s_ticks', 'rvol_60s_ticks', 'ST_spread', 'ST_spread_pct', 'ofi_norm_300s', 'cvd_norm_300s']:
+    for col in [
+        'ST_vol_300s_ticks', 'ST_vol_60s_ticks', 'ST_spread', 'ST_spread_pct',
+        'ST_ofi_norm_300s', 'ST_cvd_5m', 'ST_cvd_norm_20s',
+        'rvol_300s_ticks', 'ofi_norm_300s', 'cvd_norm_300s'
+    ]:
         if col in df_slice.columns:
             fp[f"median_{col}"] = float(np.nanmedian(df_slice[col].values))
             fp[f"mean_{col}"] = float(np.nanmean(df_slice[col].values))
@@ -200,8 +229,9 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
     need_labeling = (target_c7_col not in schema_cols) or (target_dt_col not in schema_cols)
 
     base_cols = [
-        'timestamp', 'sample_split', 'is_data_gap',
-        'rvol_300s_ticks', 'ST_spread', 'ST_spread_pct', 'ofi_norm_300s', 'cvd_norm_300s'
+        'timestamp', 'sample_split', 'is_data_gap', 'ST_mid_price', 'ST_trade_vol',
+        'ST_vol_300s_ticks', 'ST_vol_60s_ticks', 'ST_spread', 'ST_spread_pct',
+        'ST_ofi_norm_300s', 'ST_cvd_5m', 'ST_cvd_norm_20s'
     ]
     if need_labeling:
         orderbook_cols = [
@@ -252,11 +282,7 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
                 tr_s_ts = pd.to_datetime(item['train_ts_range'][0])
                 tr_e_ts = pd.to_datetime(item['train_ts_range'][1])
                 te_s_ts = pd.to_datetime(item['test_ts_range'][0])
-                # Для win_00 расширяем тест до конца текущего датасета
-                if item['window_id'] == 'win_00':
-                    te_e_ts = pd.to_datetime(df['timestamp'].iloc[-1])
-                else:
-                    te_e_ts = pd.to_datetime(item['test_ts_range'][1])
+                te_e_ts = pd.to_datetime(item['test_ts_range'][1])
 
                 if ts_series.dt.tz is not None:
                     tr_s_ts = tr_s_ts.tz_localize(ts_series.dt.tz) if tr_s_ts.tzinfo is None else tr_s_ts.tz_convert(ts_series.dt.tz)

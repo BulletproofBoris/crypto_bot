@@ -175,7 +175,7 @@ def fetch_bigone_rules():
         r_pairs = requests.get("https://big.one/api/v3/asset_pairs", timeout=10)
         pairs_data = r_pairs.json().get("data", []) if r_pairs.status_code == 200 else []
 
-        target_pairs = {"PRL-USDT": "PRL", "QTC-USDT": "QUANTUS"}
+        target_pairs = {"PEARL-USDT": "PRL", "PRL-USDT": "PRL", "QTC-USDT": "QUANTUS"}
         for p in pairs_data:
             name = p.get("name")
             if name in target_pairs:
@@ -193,15 +193,16 @@ def fetch_bigone_rules():
 
         for a in assets_data:
             sym = a.get("symbol")
-            pair_key = "PRL-USDT" if sym == "PRL" else ("QTC-USDT" if sym == "QTC" else None)
-            if pair_key and pair_key in rules:
-                gateways = a.get("binding_gateways", [])
-                if gateways:
-                    gw = gateways[0]
-                    rules[pair_key]["deposit_enabled"] = gw.get("is_deposit_enabled", True)
-                    rules[pair_key]["withdrawal_enabled"] = gw.get("is_withdrawal_enabled", True)
-                    rules[pair_key]["withdrawal_fee"] = float(gw.get("withdrawal_fee", 0))
-                    rules[pair_key]["min_withdrawal_amount"] = float(gw.get("min_withdrawal_amount", 0))
+            pair_keys = ["PEARL-USDT", "PRL-USDT"] if sym in ("PEARL", "PRL") else (["QTC-USDT"] if sym == "QTC" else [])
+            for pair_key in pair_keys:
+                if pair_key in rules:
+                    gateways = a.get("binding_gateways", [])
+                    if gateways:
+                        gw = gateways[0]
+                        rules[pair_key]["deposit_enabled"] = gw.get("is_deposit_enabled", True)
+                        rules[pair_key]["withdrawal_enabled"] = gw.get("is_withdrawal_enabled", True)
+                        rules[pair_key]["withdrawal_fee"] = float(gw.get("withdrawal_fee", 0))
+                        rules[pair_key]["min_withdrawal_amount"] = float(gw.get("min_withdrawal_amount", 0))
 
     except Exception as e:
         logger.error(f"Ошибка запроса BigONE: {e}")

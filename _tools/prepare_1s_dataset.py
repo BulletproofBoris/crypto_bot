@@ -316,11 +316,21 @@ def build_features_for_coin(coin_name, macro_df=None):
         print(f"{Fore.RED}❌ Нет рыночных данных для монеты {coin}!{Style.RESET_ALL}")
         return None
 
-    # Объединение по времени
+    # Объединение по времени (левое слияние по основному стакану ST с ffill вторичных площадок)
     main_prefix, merged = parts[0]
+    start_ts = max(p_df.index.min() for _, p_df in parts)
+    merged = merged[merged.index >= start_ts]
     for pfx, part_df in parts[1:]:
         print(f"  Слияние {main_prefix} и {pfx}...")
-        merged = pd.merge(merged, part_df, left_index=True, right_index=True, how='inner')
+        orig_part_idx = part_df.index
+        merged = pd.merge(merged, part_df, left_index=True, right_index=True, how='left')
+        part_cols = list(part_df.columns)
+        merged[part_cols] = merged[part_cols].ffill()
+        missing_part = ~merged.index.isin(orig_part_idx)
+        if missing_part.any():
+            p_flow = [c for c in part_cols if any(k in c for k in ['trade_vol', 'buy_vol', 'sell_vol', 'trade_count', 'delta_vol'])]
+            if p_flow:
+                merged.loc[missing_part, p_flow] = 0.0
 
     # Арбитражные фичи (если есть и ST, и BO)
     if 'BO_bid_1_price' in merged.columns and 'ST_ask_1_price' in merged.columns:

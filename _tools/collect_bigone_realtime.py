@@ -25,7 +25,7 @@ def notify_systemd(state="WATCHDOG=1"):
 
 PAIRS = [
     {
-        "symbol": "PRL-USDT",
+        "symbol": "PEARL-USDT",
         "dir": "/opt/crypto_bot/data/realtime/prlusdt_bigone"
     },
     {

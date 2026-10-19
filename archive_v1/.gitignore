@@ -1,0 +1,21 @@
+.env
+.venv/
+venv/
+
+# Secrets
+Safetrade_API.txt
+_tools/*.json
+
+
+# Data
+data
+data/
+*remote.csv
+*.log
+__pycache__/
+*/__pycache__/
+*/*/__pycache__/
+*.py[cod]
+*$py.class
+.vscode/
+*.png

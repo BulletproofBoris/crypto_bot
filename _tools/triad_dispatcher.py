@@ -96,8 +96,14 @@ def parse_args():
                         help="Базовый размер лота в токенах (для PRL по умолчанию 50.0)")
     parser.add_argument("--min-order-val", type=float, default=0.5,
                         help="Минимальный объем ордера в USDT на бирже SafeTrade")
-    parser.add_argument("--neural-weight", type=float, default=0.15,
-                        help="Вес нейросетевого альянса (Conv1D+GRU, Causal CNN, MLP, Attention) в бленде с LightGBM")
+    parser.add_argument("--neural-weight", type=float, default=None,
+                        help="Единый вес нейросетей (если задан, переопределяет w-nn-5/12/25)")
+    parser.add_argument("--w-nn-5", type=float, default=0.10,
+                        help="Вес нейросетевого альянса для H=5с (по умолчанию 0.10)")
+    parser.add_argument("--w-nn-12", type=float, default=0.35,
+                        help="Вес нейросетевого альянса для H=12с (по умолчанию 0.35)")
+    parser.add_argument("--w-nn-25", type=float, default=0.25,
+                        help="Вес нейросетевого альянса для H=25с (по умолчанию 0.25)")
     parser.add_argument("--no-neural", dest="use_neural", action="store_false", default=True,
                         help="Отключить нейросетевой альянс (только LightGBM)")
     parser.add_argument("--target-token-ratio", type=float, default=0.55,
@@ -108,6 +114,8 @@ def parse_args():
                         help="Максимальная доля рыночного объема секунды, которую может забрать один наш ордер (по умолчанию 0.50)")
     parser.add_argument("--stale-timeout", type=int, default=180,
                         help="Таймаут заморозки стакана SafeTrade (сек без сделок и сдвигов BBO) для защитной паузы")
+    parser.add_argument("--initial-usdt", type=float, default=None, help="Стартовый баланс USDT (по умолчанию из COIN_RULES: 8000 для PRL)")
+    parser.add_argument("--initial-tokens", type=float, default=None, help="Стартовый баланс токенов (по умолчанию из COIN_RULES: 0 для PRL)")
     parser.add_argument("--max-steps", type=int, default=None, help="Ограничить шаги для быстрого теста")
     parser.add_argument("--plot", type=str, default=None, help="Путь для сохранения PNG-графика бэктеста")
     return parser.parse_args()
@@ -116,15 +124,27 @@ def parse_args():
 class TriadDispatcher:
     """Мультигоризонтный координатор триады экспертов (H=5, 12, 25)."""
 
-    def __init__(self, coin: str, use_neural: bool = True, neural_weight: float = 0.15):
+    def __init__(
+        self,
+        coin: str,
+        use_neural: bool = True,
+        neural_weight: float = None,
+        w_nn_5: float = 0.10,
+        w_nn_12: float = 0.35,
+        w_nn_25: float = 0.25,
+    ):
         self.coin = coin.lower()
-        print(f"\n📦 Инициализация триады масштабов для {self.coin.upper()} (use_neural={use_neural}, w_nn={neural_weight:.2f})...")
-        # Scale 1: Sniper
-        self.router_5 = SwarmRegimeRouter(self.coin, H=5, K=3.0, use_neural=use_neural, neural_weight=neural_weight)
-        # Scale 2: Core Spread Maker
-        self.router_12 = SwarmRegimeRouter(self.coin, H=12, K=3.5, use_neural=use_neural, neural_weight=neural_weight)
-        # Scale 3: Wave Regime Trend Gate
-        self.router_25 = SwarmRegimeRouter(self.coin, H=25, K=3.0, use_neural=use_neural, neural_weight=neural_weight)
+        if neural_weight is not None:
+            w5 = w12 = w25 = float(neural_weight)
+        else:
+            w5, w12, w25 = float(w_nn_5), float(w_nn_12), float(w_nn_25)
+        print(
+            f"\n📦 Инициализация триады масштабов для {self.coin.upper()} "
+            f"(use_neural={use_neural}, w_nn=[H5:{w5:.2f}, H12:{w12:.2f}, H25:{w25:.2f}])..."
+        )
+        self.router_5 = SwarmRegimeRouter(self.coin, H=5, K=3.0, use_neural=use_neural, neural_weight=w5)
+        self.router_12 = SwarmRegimeRouter(self.coin, H=12, K=3.5, use_neural=use_neural, neural_weight=w12)
+        self.router_25 = SwarmRegimeRouter(self.coin, H=25, K=3.0, use_neural=use_neural, neural_weight=w25)
         print("✅ Триада экспертов успешно загружена в оперативную память!")
 
 
@@ -142,79 +162,24 @@ def run_triad_simulation(args):
     print("=" * 105)
 
     # 1. Загрузка триады
-    dispatcher = TriadDispatcher(coin, use_neural=args.use_neural, neural_weight=args.neural_weight)
+    dispatcher = TriadDispatcher(
+        coin,
+        use_neural=args.use_neural,
+        neural_weight=args.neural_weight,
+        w_nn_5=args.w_nn_5,
+        w_nn_12=args.w_nn_12,
+        w_nn_25=args.w_nn_25,
+    )
 
-    # 2. Загрузка чистого OOS-датасета
+    from _tools.triad_utils import load_strict_oos_slice
     labeled_path = BASE_DIR / "data" / "labeled" / coin / f"{coin}_labeled.parquet"
-    schema_cols = set(pq.read_schema(labeled_path).names)
-
-    exec_cols = [
-        'timestamp', 'sample_split', 'ST_bid_1_price', 'ST_ask_1_price',
-        'ST_bid_1_qty', 'ST_ask_1_qty', 'ST_mid_price', 'ST_spread', 'ST_spread_pct',
-        'ST_trade_vol', 'ST_buy_vol', 'ST_sell_vol',
-        'BO_bid_1_price', 'BO_ask_1_price', 'BO_mid_price',
-        'BO_sell_vol', 'BO_buy_vol', 'BO_trade_vol',
-        'leadlag_accum_bo_st_60s', 'leadlag_accum_bo_st_300s',
-        'leadlag_bo_minus_st_5s_ticks', 'leadlag_bo_minus_st_20s_ticks',
-        'leadlag_bo_minus_st_60s_ticks', 'leadlag_bo_minus_st_300s_ticks'
-    ]
-
-    all_feat_cols = list(dict.fromkeys(
-        dispatcher.router_5.feature_names +
-        dispatcher.router_12.feature_names +
-        dispatcher.router_25.feature_names
-    ))
-    load_cols = list(dict.fromkeys([c for c in all_feat_cols + exec_cols if c in schema_cols]))
-
-    print(f"📥 Чтение OOS-выборки ({len(load_cols)} колонок)...")
-    tbl = pq.read_table(labeled_path, columns=load_cols)
-    df = tbl.to_pandas()
-
-    val_mask = (df['sample_split'] == 'val')
-    val_df = df[val_mask].copy().reset_index(drop=True)
-    if len(val_df) == 0:
-        val_df = df.iloc[int(len(df)*0.8):].copy().reset_index(drop=True)
-
-    if args.strict_oos:
-        all_train_ends = []
-        for r in [dispatcher.router_5, dispatcher.router_12, dispatcher.router_25]:
-            for m in r.manifest:
-                if 'train_ts_range' in m and len(m['train_ts_range']) > 1:
-                    all_train_ends.append(pd.to_datetime(m['train_ts_range'][1]))
-        if all_train_ends:
-            latest_train_ts = max(all_train_ends)
-            print(f"🛡️ Strict OOS: максимальная дата обучения моделей в триаде = {latest_train_ts}")
-            safe_oos_ts = latest_train_ts + pd.Timedelta(seconds=360)
-            ts_series = pd.to_datetime(df['timestamp'])
-            if ts_series.dt.tz is not None and safe_oos_ts.tzinfo is None:
-                safe_oos_ts = safe_oos_ts.tz_localize(ts_series.dt.tz)
-            df_oos = df[ts_series > safe_oos_ts].copy().reset_index(drop=True)
-            if len(df_oos) > 0:
-                val_df = df_oos
-                print(f"✅ Успешно выделен чистый OOS срез: {len(val_df):,} строк ({val_df['timestamp'].iloc[0]} ➔ {val_df['timestamp'].iloc[-1]})")
-            else:
-                print(f"⚠️ Внимание: после {safe_oos_ts} нет данных, используется срез val_df")
-
-    # Исключаем интервал длительного обрыва связи (неизменная цена > 1800 с) и данные после него
-    if not getattr(args, 'keep_outage', False):
-        active_mask = (
-            (val_df['ST_buy_vol'].fillna(0) > 0) |
-            (val_df['ST_sell_vol'].fillna(0) > 0) |
-            (val_df['ST_bid_1_price'].diff().abs().fillna(0) > 1e-8) |
-            (val_df['ST_ask_1_price'].diff().abs().fillna(0) > 1e-8)
-        )
-        active_idx = np.where(active_mask)[0]
-        if len(active_idx) > 1:
-            gaps = np.diff(active_idx)
-            outage_pos = np.where(gaps > 1800)[0]
-            if len(outage_pos) > 0:
-                cut_idx = int(active_idx[outage_pos[0]]) + 1
-                removed_rows = len(val_df) - cut_idx
-                val_df = val_df.iloc[:cut_idx].copy().reset_index(drop=True)
-                print(f"✂️ Исключен период обрыва связи и хвост после него: удалено {removed_rows:,} с (оставлено {len(val_df):,} с живого рынка до {val_df['timestamp'].iloc[-1]})")
-
-    if args.max_steps:
-        val_df = val_df.iloc[:args.max_steps].copy()
+    val_df = load_strict_oos_slice(
+        labeled_path,
+        dispatcher,
+        strict_oos=args.strict_oos,
+        keep_outage=getattr(args, 'keep_outage', False),
+        max_steps=args.max_steps,
+    )
 
     n_seconds = len(val_df)
     t_start = val_df['timestamp'].iloc[0]
@@ -247,8 +212,8 @@ def run_triad_simulation(args):
     ps_12 = preds_12['p_sell']
 
     # 4. Моделирование мультигоризонтного исполнения заявок
-    initial_tokens = cfg['initial_tokens']
-    initial_usdt = cfg['initial_usdt']
+    initial_tokens = args.initial_tokens if getattr(args, 'initial_tokens', None) is not None else cfg['initial_tokens']
+    initial_usdt = args.initial_usdt if getattr(args, 'initial_usdt', None) is not None else cfg['initial_usdt']
     p_mid_0 = float(val_df['ST_mid_price'].iloc[0])
     initial_q_total = initial_tokens + (initial_usdt / p_mid_0)
 
@@ -278,7 +243,13 @@ def run_triad_simulation(args):
     bid_prices = val_df['ST_bid_1_price'].values
     ask_prices = val_df['ST_ask_1_price'].values
     mid_prices = val_df['ST_mid_price'].values
-    ema_30m = pd.Series(mid_prices).ewm(span=1800, min_periods=1).mean().values
+    ts_gaps = pd.to_datetime(val_df['timestamp']).diff().dt.total_seconds().fillna(1.0).values
+    seam_indices = np.where(ts_gaps > 600.0)[0]
+    ema_30m = np.empty_like(mid_prices, dtype=np.float64)
+    seg_starts = [0] + list(seam_indices) + [len(mid_prices)]
+    for s_i in range(len(seg_starts) - 1):
+        a, b = seg_starts[s_i], seg_starts[s_i + 1]
+        ema_30m[a:b] = pd.Series(mid_prices[a:b]).ewm(span=1800, min_periods=1).mean().values
     buy_vols = val_df['ST_buy_vol'].values
     sell_vols = val_df['ST_sell_vol'].values
     bid_qtys = val_df['ST_bid_1_qty'].values if 'ST_bid_1_qty' in val_df.columns else np.full(n_seconds, 100.0)
@@ -295,12 +266,18 @@ def run_triad_simulation(args):
     ll_ticks_5s = val_df['leadlag_bo_minus_st_5s_ticks'].values if 'leadlag_bo_minus_st_5s_ticks' in val_df.columns else np.zeros(n_seconds)
     ll_ticks_20s = val_df['leadlag_bo_minus_st_20s_ticks'].values if 'leadlag_bo_minus_st_20s_ticks' in val_df.columns else np.zeros(n_seconds)
 
+    ts_gaps = pd.to_datetime(val_df['timestamp']).diff().dt.total_seconds().fillna(1.0).values
+
     for t in range(n_seconds):
         bid_p = bid_prices[t]
         ask_p = ask_prices[t]
         mid_p = mid_prices[t]
         sell_vol = sell_vols[t]
         buy_vol = buy_vols[t]
+
+        if ts_gaps[t] > 60.0:
+            warmup_left = 75
+            stale_run = 0
 
         # 3. Защита от «мертвых полок» ffill (Stale Book Guard)
         if t > 0 and sell_vol == 0 and buy_vol == 0 and bid_p == bid_prices[t - 1] and ask_p == ask_prices[t - 1] and bid_qtys[t] == bid_qtys[t - 1]:
@@ -682,75 +659,12 @@ def run_triad_simulation(args):
     print(f"  ⚡ Исполнено Maker-сделок:             {total_trades:,} (Отмен: {cancels:,} | Rebuy-защит: {rebuy_blocks:,} | Trend-Hold: {trend_holds:,} | Lead-Lag: {leadlag_shields:,})")
     print(f"  💰 Сэкономлено на Maker комиссиях:     ${saved_fees_usdt:.2f} USDT")
     if getattr(args, 'plot', None):
-        import matplotlib.pyplot as plt
-        import matplotlib.dates as mdates
-
-        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 10), sharex=True, gridspec_kw={'height_ratios': [2.2, 1.2, 1.0]})
-        fig.patch.set_facecolor('#0d1117')
-        for ax in (ax1, ax2, ax3):
-            ax.set_facecolor('#161b22')
-            ax.tick_params(colors='#c9d1d9')
-            ax.grid(True, color='#30363d', linestyle='--', alpha=0.6)
-            for spine in ax.spines.values():
-                spine.set_color('#30363d')
-
-        ts_series = pd.to_datetime(val_df['timestamp'])
-
-        # Панель 1: Mid Price, EMA_30m & Maker Fills
-        ax1.plot(ts_series, mid_prices, label=f'{coin.upper()} Mid Price', color='#58a6ff', lw=1.5, zorder=2)
-        ax1.plot(ts_series, ema_30m, label='EMA 30m (Regime Anchor)', color='#a371f7', linestyle='--', lw=1.2, alpha=0.85, zorder=2)
-
-        # Сделки
-        if trades:
-            df_tr = pd.DataFrame(trades)
-            df_tr['time'] = ts_series.iloc[df_tr['t']].values
-
-            buys_bo_sniper = df_tr[(df_tr['side'] == 'BUY_MAKER') & (df_tr['scale'] == 'BO_LEADLAG_SNIPER_BUY')]
-            buys_sniper = df_tr[(df_tr['side'] == 'BUY_MAKER') & (df_tr['scale'] == 'SNIPER_DIP_BUY')]
-            buys_core = df_tr[(df_tr['side'] == 'BUY_MAKER') & (~df_tr['scale'].isin(['BO_LEADLAG_SNIPER_BUY', 'SNIPER_DIP_BUY']))]
-            sells_peak = df_tr[(df_tr['side'] == 'SELL_MAKER') & (df_tr['scale'] == 'PEAK_EXHAUSTION_SELL')]
-            sells_esc = df_tr[(df_tr['side'] == 'SELL_MAKER') & (df_tr['scale'] == 'ASK_ESCALATOR_SELL')]
-            sells_core = df_tr[(df_tr['side'] == 'SELL_MAKER') & (~df_tr['scale'].isin(['PEAK_EXHAUSTION_SELL', 'ASK_ESCALATOR_SELL']))]
-
-            if not buys_bo_sniper.empty:
-                ax1.scatter(buys_bo_sniper['time'], buys_bo_sniper['price'], color='#38d9a9', marker='^', s=90, edgecolors='white', lw=1.2, label=f'⚡ BigONE Sniper Buy ({len(buys_bo_sniper)})', zorder=6)
-            if not buys_sniper.empty:
-                ax1.scatter(buys_sniper['time'], buys_sniper['price'], color='#2ea043', marker='^', s=80, edgecolors='white', lw=1.2, label=f'Absorption Dip Buy ({len(buys_sniper)})', zorder=5)
-            if not buys_core.empty:
-                ax1.scatter(buys_core['time'], buys_core['price'], color='#3fb950', marker='^', s=45, alpha=0.7, label=f'Core Buy ({len(buys_core)})', zorder=4)
-            if not sells_peak.empty:
-                ax1.scatter(sells_peak['time'], sells_peak['price'], color='#f85149', marker='v', s=80, edgecolors='white', lw=1.2, label=f'Peak Exhaustion Sell ({len(sells_peak)})', zorder=5)
-            if not sells_esc.empty:
-                ax1.scatter(sells_esc['time'], sells_esc['price'], color='#d29922', marker='v', s=55, alpha=0.8, label=f'Ask Escalator ({len(sells_esc)})', zorder=4)
-            if not sells_core.empty:
-                ax1.scatter(sells_core['time'], sells_core['price'], color='#da3633', marker='v', s=35, alpha=0.6, label=f'Core Sell ({len(sells_core)})', zorder=3)
-
-        ax1.set_ylabel('Price (USDT)', color='#c9d1d9', fontsize=11)
-        ax1.set_title(f'STRICT OUT-OF-SAMPLE BACKTEST — {coin.upper()} / USDT (Maker 0% Fee, RTT=1s)', color='#f0f6fc', fontsize=13, fontweight='bold', pad=10)
-        ax1.legend(loc='upper left', facecolor='#161b22', edgecolor='#30363d', labelcolor='#c9d1d9', fontsize=8.5)
-
-        # Панель 2: Прирост монет Q_token (%) и Прирост портфеля в USD (%)
-        q_pnl_pct_arr = ((np.array(q_total_history) - initial_q_total) / initial_q_total) * 100.0
-        usd_pnl_pct_arr = ((np.array(usd_total_history) - initial_usd_total) / initial_usd_total) * 100.0
-        ax2.plot(ts_series, usd_pnl_pct_arr, color='#3fb950', lw=1.8, label=f'USD Portfolio Equity ({delta_usd_pct:+.2f}%)', zorder=4)
-        ax2.plot(ts_series, q_pnl_pct_arr, color='#e3b341', lw=1.6, label=f'Accumulated {coin.upper()} Q_token ({delta_q_pct:+.2f}%)', zorder=3)
-        ax2.axhline(0, color='#8b949e', linestyle=':', lw=1, alpha=0.7)
-        ax2.set_ylabel('PnL (%)', color='#c9d1d9', fontsize=11)
-        ax2.legend(loc='upper left', facecolor='#161b22', edgecolor='#30363d', labelcolor='#c9d1d9', fontsize=9)
-
-        # Панель 3: Drawdown (%)
-        ax3.fill_between(ts_series, drawdowns_q, 0, color='#f85149', alpha=0.35, label=f'Token Drawdown (Max: {max_dd_q:.2f}%)')
-        ax3.plot(ts_series, drawdowns_q, color='#f85149', lw=1.0)
-        ax3.set_ylabel('Drawdown (%)', color='#c9d1d9', fontsize=11)
-        ax3.set_xlabel('Время', color='#c9d1d9', fontsize=11)
-        ax3.legend(loc='lower left', facecolor='#161b22', edgecolor='#30363d', labelcolor='#c9d1d9', fontsize=9)
-        ax3.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
-
-        plt.tight_layout()
-        os.makedirs(os.path.dirname(os.path.abspath(args.plot)), exist_ok=True)
-        plt.savefig(args.plot, dpi=160, facecolor=fig.get_facecolor(), edgecolor='none')
-        print(f"📊 График бэктеста успешно сохранен: {args.plot}")
-        plt.close()
+        from _tools.triad_utils import save_backtest_plot
+        save_backtest_plot(
+            args.plot, coin, val_df, mid_prices, ema_30m, trades,
+            q_total_history, usd_total_history, initial_q_total, initial_usd_total,
+            delta_q_pct, delta_usd_pct, drawdowns_q, max_dd_q
+        )
 
     return {
         'coin': coin.upper(),

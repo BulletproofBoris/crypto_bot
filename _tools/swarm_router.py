@@ -76,14 +76,13 @@ class SwarmRegimeRouter:
                 self.feature_names = json.load(f)["feature_order"]
         print(f"✅ Успешно загружено {self.num_models} моделей-экспертов LightGBM в RAM ({len(self.feature_names)} признаков).")
 
-        # Загрузка мультиархитектурных нейросетевых экспертов (Conv1D+GRU, Causal CNN, Attention, MLP)
+        # Загрузка метаданных мультиархитектурных нейросетевых экспертов (Conv1D+GRU, Causal CNN, Attention, MLP)
+        # Сами графы Keras подгружаются лениво (только при отсутствии готового .npy кэша предсказаний)
         self.neural_experts = []
         self.alliance_cfg = None
         alliance_path = BASE_DIR / "models" / self.coin / f"ensemble_alliance_h{H}s.json"
-        if self.use_neural and alliance_path.exists():
+        if self.use_neural and self.neural_weight > 0.0 and alliance_path.exists():
             try:
-                os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-                import tensorflow as tf
                 with open(alliance_path) as f:
                     self.alliance_cfg = json.load(f)
                 for arch_dir_name, arch_key in [
@@ -100,10 +99,10 @@ class SwarmRegimeRouter:
                             n_meta = json.load(mf)
                         ic_val = float(n_meta.get("metrics_oos", {}).get("ic_dt_ticks", 0.1))
                         if ic_val >= 0.10:
-                            k_model = tf.keras.models.load_model(str(k_file), compile=False)
                             self.neural_experts.append({
                                 "arch": arch_key,
-                                "model": k_model,
+                                "k_file": str(k_file),
+                                "model": None,
                                 "seq_len": int(n_meta["seq_len"]),
                                 "mean": np.array(n_meta["feature_norm"]["mean"], dtype=np.float32),
                                 "std": np.array(n_meta["feature_norm"]["std"], dtype=np.float32),
@@ -121,18 +120,19 @@ class SwarmRegimeRouter:
 
     def _build_regime_matrix(self):
         """Формирует нормализованную матрицу профилей режимов для экспертов."""
-        self.regime_keys = [
-            'median_ST_spread_pct', 'mean_ST_spread_pct',
-            'pct_class_+2', 'pct_class_-2', 'pct_class_+3', 'pct_class_-3'
+        self.live_feature_map = [
+            ('mean_ST_spread_pct', 'ST_spread_pct'),
+            ('median_ST_spread_pct', 'ST_spread_pct'),
+            ('mean_ST_vol_300s_ticks', 'ST_vol_300s_ticks'),
+            ('mean_ST_ofi_norm_300s', 'ST_ofi_norm_300s'),
+            ('mean_ST_cvd_5m', 'ST_cvd_5m'),
         ]
-        
         mat = []
         for fp in self.regime_fingerprints:
-            row = [fp.get(k, 0.0) for k in self.regime_keys]
+            row = [fp.get(fp_k, 0.0) for fp_k, _ in self.live_feature_map]
             mat.append(row)
-            
+
         self.regime_matrix = np.array(mat, dtype=np.float32)
-        # Центрирование и нормализация
         self.regime_mean = np.mean(self.regime_matrix, axis=0, keepdims=True)
         self.regime_std = np.std(self.regime_matrix, axis=0, keepdims=True) + 1e-6
         self.norm_regime_matrix = (self.regime_matrix - self.regime_mean) / self.regime_std
@@ -140,37 +140,48 @@ class SwarmRegimeRouter:
     def compute_routing_weights(self, current_regime_df: pd.DataFrame) -> np.ndarray:
         """
         Вычисляет матрицу весов W (N x M) для каждой секунды на основе близости
-        текущего рыночного профиля к историческому профилю эксперта.
+        текущего рыночного профиля к историческому профилю эксперта + приора свежести.
         """
         n_samples = len(current_regime_df)
         if self.num_models == 1:
             return np.ones((n_samples, 1), dtype=np.float32)
 
-        # Текущий вектор режима
-        cur_spread = current_regime_df['ST_spread_pct'].values if 'ST_spread_pct' in current_regime_df.columns else np.zeros(n_samples)
-        
-        # Эвристическая оценка локальной доли пробоев
-        pct_p2 = np.full(n_samples, 1.5, dtype=np.float32)
-        pct_m2 = np.full(n_samples, 1.5, dtype=np.float32)
-        pct_p3 = np.full(n_samples, 2.5, dtype=np.float32)
-        pct_m3 = np.full(n_samples, 2.5, dtype=np.float32)
+        cols = []
+        for idx, (fp_k, col_name) in enumerate(self.live_feature_map):
+            if col_name in current_regime_df.columns and np.std(self.regime_matrix[:, idx]) > 1e-7:
+                cols.append(np.nan_to_num(current_regime_df[col_name].values, nan=float(self.regime_mean[0, idx])).astype(np.float32))
+            else:
+                cols.append(np.full(n_samples, float(self.regime_mean[0, idx]), dtype=np.float32))
 
-        cur_mat = np.column_stack([cur_spread, cur_spread, pct_p2, pct_m2, pct_p3, pct_m3]).astype(np.float32)
-        norm_cur = (cur_mat - self.regime_mean) / self.regime_std
+        cur_mat = np.column_stack(cols).astype(np.float32)
+        norm_cur = np.clip((cur_mat - self.regime_mean) / self.regime_std, -4.0, 4.0)
 
-        # Евклидово расстояние между текущим режимом и каждым экспертом
-        # norm_cur: (N, D), norm_regime: (M, D) -> dist: (N, M)
         diff = norm_cur[:, np.newaxis, :] - self.norm_regime_matrix[np.newaxis, :, :]
-        dist_sq = np.sum(diff ** 2, axis=-1)
+        dist_sq = np.mean(diff ** 2, axis=-1)
 
-        # Softmax с регулируемой температурой
-        logits = -dist_sq / self.temperature
-        # Численная стабильность
+        # Мягкий приор свежести: win_00 получает преимущество при равном режиме
+        recency_bonus = -0.35 * np.arange(self.num_models, dtype=np.float32)[np.newaxis, :]
+        logits = (-dist_sq / self.temperature) + recency_bonus
         logits_max = np.max(logits, axis=-1, keepdims=True)
         exp_logits = np.exp(logits - logits_max)
         weights = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
-        
+
         return weights.astype(np.float32)
+
+    def _compute_slice_hash(self, X: np.ndarray) -> str:
+        import hashlib
+        n = len(X)
+        if n == 0:
+            return "empty"
+        sample_pts = np.asarray([
+            n,
+            float(X[0, 0]),
+            float(X[-1, 0]),
+            float(X[n // 2, 0]),
+            float(np.nansum(X[:, 0])),
+            float(np.nansum(X[:, min(12, X.shape[1] - 1)]))
+        ], dtype=np.float64)
+        return hashlib.md5(sample_pts.tobytes()).hexdigest()[:10]
 
     def predict_ensemble(self, X: np.ndarray, current_regime_df: pd.DataFrame, mode: str = "router"):
         """
@@ -181,20 +192,37 @@ class SwarmRegimeRouter:
           - 'latest': только самая свежая модель (win_00)
         """
         n_samples = len(X)
-        all_probs = np.zeros((self.num_models, n_samples, 7), dtype=np.float32)
+        slice_hash = self._compute_slice_hash(X)
+        cache_dir = BASE_DIR / "data" / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
 
-        for i, booster in enumerate(self.models):
-            raw_p = booster.predict(X)
-            # В LightGBM при predict возвращается (N, num_classes)
-            if raw_p.shape[1] == 7:
-                all_probs[i] = raw_p
-            else:
-                # Если редкий класс отсутствовал
-                for col_idx in range(min(7, raw_p.shape[1])):
-                    all_probs[i, :, col_idx] = raw_p[:, col_idx]
+        manifest_mtime = int((self.model_dir / "manifest.json").stat().st_mtime)
+        lgb_cache_file = cache_dir / f"lgb_probs_{self.coin}_h{self.H}s_k{self.K:g}_{n_samples}_{slice_hash}_{manifest_mtime}.npy"
+
+        if getattr(self, "_lgb_cache_sig", None) == (slice_hash, manifest_mtime):
+            all_probs = self._lgb_cache_probs
+        elif lgb_cache_file.exists():
+            all_probs = np.load(lgb_cache_file)
+            self._lgb_cache_sig = (slice_hash, manifest_mtime)
+            self._lgb_cache_probs = all_probs
+        else:
+            all_probs = np.zeros((self.num_models, n_samples, 7), dtype=np.float32)
+            for i, booster in enumerate(self.models):
+                raw_p = booster.predict(X)
+                if raw_p.shape[1] == 7:
+                    all_probs[i] = raw_p
+                else:
+                    for col_idx in range(min(7, raw_p.shape[1])):
+                        all_probs[i, :, col_idx] = raw_p[:, col_idx]
+            self._lgb_cache_sig = (slice_hash, manifest_mtime)
+            self._lgb_cache_probs = all_probs
+            try:
+                np.save(lgb_cache_file, all_probs)
+            except Exception:
+                pass
 
         if mode == "latest":
-            blend_probs = all_probs[0]
+            blend_probs = all_probs[0].copy()
             weights = np.zeros((n_samples, self.num_models), dtype=np.float32)
             weights[:, 0] = 1.0
         elif mode == "uniform":
@@ -202,8 +230,6 @@ class SwarmRegimeRouter:
             weights = np.full((n_samples, self.num_models), 1.0 / self.num_models, dtype=np.float32)
         elif mode == "router":
             weights = self.compute_routing_weights(current_regime_df)
-            # weights: (N, M), all_probs: (M, N, 7) -> (N, 7)
-            # einsum: w_nm, p_mnc -> n_c
             blend_probs = np.einsum('nm,mnc->nc', weights, all_probs)
         else:
             raise ValueError(f"Неизвестный режим: {mode}")
@@ -226,16 +252,15 @@ class SwarmRegimeRouter:
             for exp in self.neural_experts:
                 sl = exp["seq_len"]
                 arch_clean = exp["arch"].replace("+", "_")
-                cache_dir = BASE_DIR / "data" / "cache"
-                cache_dir.mkdir(parents=True, exist_ok=True)
-                cache_file = cache_dir / f"nn_preds_{self.coin}_h{self.H}s_{arch_clean}_{n_samples}.npy"
-                full_cache_file = cache_dir / f"nn_preds_{self.coin}_h{self.H}s_{arch_clean}_84178.npy"
+                cache_file = cache_dir / f"nn_preds_{self.coin}_h{self.H}s_{arch_clean}_{n_samples}_{slice_hash}.npy"
 
                 if cache_file.exists():
                     p_raw = np.load(cache_file)
-                elif n_samples <= 84178 and full_cache_file.exists():
-                    p_raw = np.load(full_cache_file)[:n_samples]
                 else:
+                    if exp["model"] is None:
+                        os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+                        import tensorflow as tf
+                        exp["model"] = tf.keras.models.load_model(exp["k_file"], compile=False)
                     x_norm = np.clip((X - exp["mean"]) / exp["std"], -5.0, 5.0).astype(np.float32)
                     x_norm = np.nan_to_num(x_norm, nan=0.0, posinf=5.0, neginf=-5.0)
                     x_pad = np.vstack([np.repeat(x_norm[:1], sl - 1, axis=0), x_norm])

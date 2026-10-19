@@ -1,126 +1,45 @@
-# Архитектура проекта, каталог инструментов и дорожная карта (Roadmap)
+# Архитектура проекта и каталог активных инструментов
+
+**Актуализация:** 20 октября 2026 г.  
+**Рабочая директория:** `/home/restorator/crypto_bot`
 
 ---
 
-## 1. Обзор проекта и концепция
+## 1. Концепция и целевой инвариант
 
-### 1.1. Главная цель
-Разработка автономной высокочастотной и статистически устойчивой торговой системы для биржи **SafeTrade** по монетам микрокап-сегмента: **PRL/USDT**, **QUAN/USDT (Quantus)** и **TSC/USDT**.
+Автономная высокочастотная и среднесрочная алгоритмическая система котирования для биржи **SafeTrade** по монетам:
+- **`PRL/USDT` (`pearlusdt`, Pearl):** `tick_size = 0.005 USDT`. Поводырь: **BigONE (`PRL-USDT`)** + ончейн **Pearl (`api.prlscan.com`)**.
+- **`QUANTUS/USDT` (`quantususdt`, Quantus):** `tick_size = 0.05 USDT`. Поводыри: **BigONE (`QTC-USDT`)**, **Rhea Finance DEX (`QTC/USDC`)** + ончейн **Quantus**.
+- **Макро-поводыри:** **Binance (`BTC/USDT`, `NEAR/USDT`)** 1s BBO и потоки сделок.
 
-Ключевой инвариант: **целевая функция оптимизирована на максимальный физический прирост монет (Q_token)**, а не на нестабильный USD PnL. Торговля ведется исключительно на SafeTrade, но для предсказания динамики цен используется широкий межбиржевой и ончейн-контекст:
-- Ликвидность и арбитражные окна с биржи **BigONE** (PRL, QUAN).
-- Децентрализованные пулы ликвидности **Rhea Finance / Near Intents** (DEX для Quantus).
-- Мировые макро-поводыри с **Binance** (секундные котировки BTC/USDT и NEAR/USDT).
-- Ончейн-метрики блокчейнов (Pearl Hashrate, майнинг-пулы, транзакции китов, высота блоков).
+**Ключевой инвариант:** целевая функция оптимизирована на максимальный физический прирост монет ($Q_{\text{token}}$) в режиме чистого **Maker (`0.0%` комиссия)** с защитой от токсичного потока (Adverse Selection) и учётом приоритета очереди $Q_{\text{ahead}}$ и задержки сети $\text{RTT} = 1.0\,\text{с}$.
 
 ---
 
-## 2. Описание проделанной работы
+## 2. Каталог активного ядра (`_tools/`)
 
-### 2.1. Создание отказоустойчивой инфраструктуры сбора данных (Lambda Data Lake)
-- **Обход Cloudflare:** Развернут WebSocket и REST коллектор с эмуляцией TLS-отпечатков браузера (`curl_cffi`, Chrome110 impersonation) и ротацией через резидентные прокси на удаленном VPS сервере.
-- **Многопоточный сбор:** Параллельный сбор стаканов L2 (топ-50 уровней) и тиков сделок SafeTrade, BigONE, котировок Rhea DEX, макро-тиков Binance и ончейн-метрик.
-- **Двухуровневое хранилище:**
-  - *Горячий слой (Hot Layer):* оперативные файлы на VPS с автоматической суточной ротацией.
-  - *Холодный слой (Cold Archive):* сжатые суточные архивы `.csv.gz` на Google Диске в строго структурированном виде `YYYY-MM-DD/`.
-  - *Локальный Parquet Data Lake:* консолидированные таблицы в ультрабыстром колоночном формате в `data/processed/`.
+После рефакторинга и очистки устаревших скриптов проект содержит только боевые модули конвейера:
 
-### 2.2. Анализ тепловых карт ошибок и исследование микроструктуры
-- Проведен детальный аудит расхождений статистических характеристик меток между обучающей выборкой (Train, первые 80%) и проверочной (Val, последние 20%).
-- Обнаружено, что в зоне 70%–90% квантилей наблюдались резкие скачки ошибок (желтые полосы на тепловых картах), вызванные неоднородностью плотности стакана и скачками волатильности.
-- Было отвергнуто искусственное усечение значений (clipping/редуцирование), как нарушающее физику рынка, в пользу моделирования физических законов книги заявок.
+### 2.1. Сбор данных на VPS (`81.19.137.18:2222`) и ротация
+- [_tools/collect_safetrade_realtime.py](file:///home/restorator/crypto_bot/_tools/collect_safetrade_realtime.py) — сбор стакана L2 (топ-50 + глубокие стены) и сделок SafeTrade (`pearlusdt`, `quantususdt`).
+- [_tools/collect_bigone_realtime.py](file:///home/restorator/crypto_bot/_tools/collect_bigone_realtime.py) — асинхронный сбор стакана и сделок BigONE (`PRL-USDT`, `QTC-USDT`).
+- [_tools/collect_rhea_realtime.py](file:///home/restorator/crypto_bot/_tools/collect_rhea_realtime.py) — сбор пула ликвидности `QTC/USDC` на Rhea Finance.
+- [_tools/collect_binance_macro.py](file:///home/restorator/crypto_bot/_tools/collect_binance_macro.py) — WebSocket `bookTicker` + `trade` для `BTCUSDT` и `NEARUSDT`.
+- [_tools/collect_onchain_and_rules.py](file:///home/restorator/crypto_bot/_tools/collect_onchain_and_rules.py) — ончейн-метрики Pearl / Quantus и правила бирж (`exchange_rules.json`).
+- [_tools/watchdog_collectors.py](file:///home/restorator/crypto_bot/_tools/watchdog_collectors.py), [_tools/rotate_and_upload.py](file:///home/restorator/crypto_bot/_tools/rotate_and_upload.py), [_tools/monitor_vps.py](file:///home/restorator/crypto_bot/_tools/monitor_vps.py) — мониторинг 5 служб и суточная выгрузка `.csv.gz` на Google Drive.
 
-### 2.3. Открытие закона двойного квантования и кинематики стакана
-В ходе математических экспериментов были выведены и эмпирически доказаны три закона микроструктуры SafeTrade:
-1. **Двойное квантование:** 
-   - Цена квантована минимальным шагом котирования биржи (для PRL tick = 0.005 USDT, для QUAN tick = 0.001 USDT, для TSC tick = 0.0001 USDT).
-   - Ликвидность квантована лотами первого уровня стакана (Ask1_qty / Bid1_qty). Учет объема первого уровня в знаменателе динамического масштаба сопротивления сжал ошибку класса +2 с 28.8% до 3.5%.
-2. **Асимметричная эластичность глубины книги заявок:** сопротивление стакана движению вверх и вниз масштабируется степенным законом от суммарного объема Asks_top5 и Bids_top5 в степени 0.25.
-3. **Кинематика набегающей волны:** смещение микроцены (центра масс стакана) относительно спреда формирует скорость волны (v_wave) и ускорение локальной волатильности (d_vol), предсказывающие пробой задолго до фактического движения цены.
+### 2.2. Синхронизация, инженерия признаков и разметка
+- [_tools/sync_all_data.py](file:///home/restorator/crypto_bot/_tools/sync_all_data.py) + [_tools/data_sanitizer.py](file:///home/restorator/crypto_bot/_tools/data_sanitizer.py) — синхронизация архивов Google Drive и горячих CSV с VPS, очистка скрещенных стаканов и сборка `data/processed/{prl,quantus,macro}/*.parquet`.
+- [_tools/data_loader.py](file:///home/restorator/crypto_bot/_tools/data_loader.py) + [_tools/check_realtime_data.py](file:///home/restorator/crypto_bot/_tools/check_realtime_data.py) — фасад чтения данных и аудит непрерывности рядов.
+- [_tools/prepare_1s_dataset.py](file:///home/restorator/crypto_bot/_tools/prepare_1s_dataset.py) + [_tools/microstructure_features.py](file:///home/restorator/crypto_bot/_tools/microstructure_features.py) — генерация равномерной 1-секундной сетки (со строгим сдвигом сделок `shift(1)` без заглядывания вперёд) и стационарного банка фильтров $W \in [5, 20, 60, 300]\,\text{с}$ (OFI, CVD, Band-Pass, Lead-Lag).
+- [_tools/data_labeler.py](file:///home/restorator/crypto_bot/_tools/data_labeler.py) + [_tools/calculate_lmax.py](file:///home/restorator/crypto_bot/_tools/calculate_lmax.py) + [_tools/feature_selector.py](file:///home/restorator/crypto_bot/_tools/feature_selector.py) — физическая разметка на 7 классов (`-3..+3`) с двойным квантованием и отбор информативных признаков.
 
-### 2.4. 7 асимметричных классов на квантильных плато
-- Разработана система 7 классов, привязанных к устойчивым квантильным плато (75% и 90%):
-  - Классы **+2** (регулярный пробой) и **-2** (регулярный спад) показывают ошибку z-скорости **менее 3.5%** между Train и Val (целевой порог < 5% полностью достигнут).
-  - Классы **+3** и **-3** изолируют аномальные выбросы китов и фантомные сквизы пустых стаканов (Zero-Volume Liquidity Voids), исключая зашумление рабочих торговых классов.
-
-### 2.5. Мультигоризонтная валидация и универсализация для всех пар
-- Протестирована сетка параметров H (горизонт прогноза от 5 до 60с) и L/H (отношение окна наблюдения к горизонту от 3 до 5): метод показал абсолютную устойчивость во всех 12 режимах.
-- Рассчитаны максимальные длины окон наблюдения L_max при целевом объеме выборки N = 5000 и N = 4000:
-  - PRL/USDT: L_max = 46с (при N=5000) и 57с (при N=4000).
-  - QUAN/USDT: L_max = 23с (при N=5000) и 28с (при N=4000).
-  - TSC/USDT: L_max = 22с (при N=5000) и 27с (при N=4000).
-- Все 1-секундные базы и разметка классов для PRL, QUAN и TSC сгенерированы и сохранены на диске.
-
----
-
-## 3. Каталог инструментов проекта по этапам
-
-### Этап 0: Сбор данных реального времени и мониторинг
-- **[_tools/collect_safetrade_realtime.py](file:///home/restorator/crypto_bot/_tools/collect_safetrade_realtime.py):** WebSocket-клиент SafeTrade с impersonation Chrome110 и прокси. Собирает стаканы L2 и тики сделок для PRL, QUANTUS, TSC.
-- **[_tools/collect_bigone_realtime.py](file:///home/restorator/crypto_bot/_tools/collect_bigone_realtime.py):** WebSocket-клиент биржи BigONE для PRL и Quantus.
-- **[_tools/collect_rhea_realtime.py](file:///home/restorator/crypto_bot/_tools/collect_rhea_realtime.py):** Сборщик DEX-котировок и ликвидности Quantus с Rhea Finance / Near Intents.
-- **[_tools/collect_binance_macro.py](file:///home/restorator/crypto_bot/_tools/collect_binance_macro.py):** Высокочастотный сборщик 1-секундных BBO поводырей (BTC/USDT, NEAR/USDT).
-- **[_tools/collect_onchain_and_rules.py](file:///home/restorator/crypto_bot/_tools/collect_onchain_and_rules.py):** Ончейн-парсер (Pearl difficulty/mempool/whales, Quantus chain stats) и синхронизатор торговых правил бирж.
-- **[_tools/watchdog_collectors.py](file:///home/restorator/crypto_bot/_tools/watchdog_collectors.py):** Системный сторож (watchdog), перезапускающий сервисы при зависании или сетевых разрывах.
-- **[_tools/rotate_and_upload.py](file:///home/restorator/crypto_bot/_tools/rotate_and_upload.py):** Ежесуточная архивация, сжатие gzip и выгрузка архивов на Google Диск через OAuth2.
-
-### Этап 1: Синхронизация, проверка качества и загрузка
-- **[_tools/sync_all_data.py](file:///home/restorator/crypto_bot/_tools/sync_all_data.py):** Модуль склейки Lambda-хранилища (Google Drive архивы + VPS hot tail) в чистые Parquet-таблицы без дубликатов.
-- **[_tools/check_realtime_data.py](file:///home/restorator/crypto_bot/_tools/check_realtime_data.py):** Комплексный аудит свежести, непрерывности и пропусков данных с генерацией графиков плотности.
-- **[_tools/monitor_vps.py](file:///home/restorator/crypto_bot/_tools/monitor_vps.py):** Проверка здоровья служб и сетевых сокетов на сервере сбора.
-- **[_tools/data_loader.py](file:///home/restorator/crypto_bot/_tools/data_loader.py):** Удобный фасад для импорта данных в Jupyter Notebook (`load_coin`, `load_macro`, `load_rules`).
-
-### Этап 2: Построение базового 1-секундного таймлайна
-- **[_tools/prepare_1s_dataset.py](file:///home/restorator/crypto_bot/_tools/prepare_1s_dataset.py):** Ключевой инструмент синхронизации разнородных потоков. Выравнивает стаканы SafeTrade, BigONE, Rhea, Binance Macro и Ончейн в строго равномерную 1-секундную сетку с расчетом базовых L2 метрик (спреды, дисбаланс, эффективные VWAP, объемы, CVD). Поддерживает `--coin all` по умолчанию.
-- **[_tools/generate_features.py](file:///home/restorator/crypto_bot/_tools/generate_features.py):** Обертка обратной совместимости, перенаправляющая вызовы в `prepare_1s_dataset.py`.
-- **[_tools/visualize_data.py](file:///home/restorator/crypto_bot/_tools/visualize_data.py):** Визуализатор динамики стакана, спредов, арбитражных окон и профиля ликвидности.
-
-### Этап 3: Физическая разметка и квантование таргетов
-- **[_tools/data_labeler.py](file:///home/restorator/crypto_bot/_tools/data_labeler.py):** Производственный конвейер разметки. Реализует двойное квантование, кинематику волны, 7 асимметричных классов на квантильных плато и изоляцию выборок от утечки данных (Purging $H$ секунд и опциональный Embargo gap). Поддерживает PRL, QUAN и TSC. Сохраняет выборки в `data/labeled/`.
-- **[_tools/run_grid_validation.py](file:///home/restorator/crypto_bot/_tools/run_grid_validation.py):** Автоматизированная валидация сетки H = 5:Max_L/K:5 для K in [3, 4, 5] при целевом N.
-
-### Этап 4: Отбор признаков (Feature Selection)
-- **[_tools/feature_selector.py](file:///home/restorator/crypto_bot/_tools/feature_selector.py):** 
-  - Двухэтапный отсев избыточности:
-    1. Ускоренный расчет матрицы ранговых корреляций (Spearman via Rank+Pearson) с удалением мультиколлинеарных признаков (|r| > 0.85).
-    2. Оценка важности признаков через многопоточный LightGBM с отбором топ-признаков по кумулятивному порогу важности (95%).
-  - Сохранение порядка признаков в `data/processed/features_selected.json`.
-
-### Этап 5: Обучение роя моделей (Model Swarm)
-- **[_tools/ltsm_core/model_builder.py](file:///home/restorator/crypto_bot/_tools/ltsm_core/model_builder.py):** Фабрика архитектур глубоких нейросетей (`conv1d+gru`, `cnn`, `attention`, `mlp`).
-- **`start_swarm_amd.sh` и `stop_swarm.sh`:** Скрипты параллельного запуска роя моделей на GPU AMD с оптимизацией VRAM и балансировкой процессов.
-- **`run_all_ensembles.py`:** Построение взвешенных ансамблей из обученных чекпоинтов.
-
-### Этап 6: Оценка, бэктест и арбитраж
-- **[_tools/analyze_runs.py](file:///home/restorator/crypto_bot/_tools/analyze_runs.py):** Анализ кривых обучения, функций потерь и точности предсказания классов.
-- **[_tools/simulate_arbitrage_experiment.py](file:///home/restorator/crypto_bot/_tools/simulate_arbitrage_experiment.py):** Полный симулятор кросс-биржевого арбитража SafeTrade vs BigONE с учетом реальных комиссий, глубины стакана и задержки исполнения.
-- **[_tools/plot_arbitrage_simulation.py](file:///home/restorator/crypto_bot/_tools/plot_arbitrage_simulation.py):** Визуализация динамики прироста баланса монет в симуляциях.
-
----
-
-## 4. План реализации последующих этапов (Roadmap)
-
-### Шаг 1: Финализация отбора признаков (Feature Selection)
-- **Действие:** Запуск `_tools/feature_selector.py` на подготовленных и размеченных обучающих выборках `data/labeled/{coin}/train_labeled_h5s.parquet`.
-- **Результат:** Очистка от мультиколлинеарности (порог 0.85) и сохранение согласованного списка топ-признаков в `data/processed/features_selected.json` отдельно для PRL, QUAN и TSC.
-
-### Шаг 2: Обучение базового пула моделей (Swarm Training)
-- **Действие:** Конфигурирование и запуск роя обучения в `Trading bot notebook.ipynb`:
-  - Архитектуры: `conv1d+gru` (для захвата микроволновой динамики) и `attention` (для межбиржевого контекста).
-  - Параметры: окно наблюдения L = 20с, горизонт H = 5с (K = 4), батч 64-128, функция потерь Huber Loss + Focal Loss для 7 классов.
-- **Результат:** Сохранение лучших чекпоинтов моделей с валидационным лоссом и метриками F1-score по торговым классам +2 / -2.
-
-### Шаг 3: Построение взвешенного ансамбля
-- **Действие:** Запуск `run_all_ensembles.py` для отбора топ-K лучших моделей и объединения их выходов через Softmax-усреднение.
-- **Результат:** Устранение оверфиттинга одиночных моделей и стабилизация вероятностных оценок входов в позицию.
-
-### Шаг 4: Модуль смарт-исполнения ордеров (SafeTrade Execution Engine)
-- **Действие:** Разработка модуля исполнения, учитывающего специфику SafeTrade:
-  - Выставление лимитных ордеров в спред (Maker) для экономии на комиссиях.
-  - Двойной контроль квантования: выставление цен строго кратно tick_size (0.005 / 0.001 / 0.0001 USDT) и проверка минимальных лотов.
-  - Автоматическая отмена/перестановка ордеров при изменении микроструктурной волны (v_wave).
-- **Результат:** Программный класс `SafeTradeExecutor` с поддержкой Paper Trading.
-
-### Шаг 5: Тестирование в реальном времени (Paper Trading Canary)
-- **Действие:** Запуск торгового контура в режиме симуляции сделок на живом WebSocket-потоке с VPS.
-- **Метрика успеха:** Рост чистого баланса монет (Q_token) на тестовом отрезке без просадок по капиталу.
+### 2.3. Мультигоризонтная триада, роутер режимов и симуляция исполнения
+- [_tools/train_rolling_swarm.py](file:///home/restorator/crypto_bot/_tools/train_rolling_swarm.py) — обучение синхронизированного пула экспертов LightGBM с конца временного ряда (`win_00`, `win_01`, `win_02` по `210,000` с) для ортогональной триады масштабов:
+  1. **Scale 1 (Sniper):** $H_1 = 5\,\text{с}, K_1 = 3.0 \implies L_1 = 15\,\text{с}$
+  2. **Scale 2 (Core Maker):** $H_2 = 12\,\text{с}, K_2 = 3.5 \implies L_2 = 42\,\text{с}$
+  3. **Scale 3 (Wave Regime Trend):** $H_3 = 25\,\text{с}, K_3 = 3.0 \implies L_3 = 75\,\text{с}$
+- [_tools/swarm_router.py](file:///home/restorator/crypto_bot/_tools/swarm_router.py) — контекстный роутер экспертов LightGBM + блендер нейросетевого альянса (`conv1d+gru`, `causal_cnn`, `mlp_bottleneck`, `attention`) с быстрым дисковым кэшированием по MD5-отпечатку среза (`data/cache/`).
+- [_tools/triad_dispatcher.py](file:///home/restorator/crypto_bot/_tools/triad_dispatcher.py) + [_tools/triad_utils.py](file:///home/restorator/crypto_bot/_tools/triad_utils.py) — мультигоризонтный координатор ордеров и реалистичный симулятор SafeTrade с поддержкой раздельных весов нейросетей (`--w-nn-5`, `--w-nn-12`, `--w-nn-25`), Lead-Lag Shield по BigONE, адаптивным управлением инвентарём и строгой OOS-изоляцией.
+- [_tools/simulate_execution.py](file:///home/restorator/crypto_bot/_tools/simulate_execution.py) — базовый одномасштабный симулятор исполнения.
+- [_tools/export_colab_dataset.py](file:///home/restorator/crypto_bot/_tools/export_colab_dataset.py) — экспорт сжатого `.npz` пакета для обучения нейросетевых экспертов в Google Colab.
