@@ -22,10 +22,10 @@ def make_gpu_sequence_dataset(X_gpu, y_gpu, seq_len=75, batch_size=2048, shuffle
     if shuffle:
         ds = ds.shuffle(buffer_size=n_win, reshuffle_each_iteration=True)
     ds = ds.batch(batch_size)
-    ds = ds.map(
-        lambda b_idx: (tf.gather(X_gpu, b_idx[:, tf.newaxis] + offsets_gpu), tf.gather(y_gpu, b_idx)),
-        num_parallel_calls=tf.data.AUTOTUNE
-    )
+    @tf.autograph.experimental.do_not_convert
+    def _slice_batch(b_idx):
+        return tf.gather(X_gpu, b_idx[:, tf.newaxis] + offsets_gpu), tf.gather(y_gpu, b_idx)
+    ds = ds.map(_slice_batch, num_parallel_calls=tf.data.AUTOTUNE)
     return ds.prefetch(tf.data.AUTOTUNE)
 
     return ds.prefetch(tf.data.AUTOTUNE)
