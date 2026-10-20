@@ -14,6 +14,9 @@ from tensorflow.keras.models import Model
 from tensorflow.keras import regularizers
 
 def make_gpu_sequence_dataset(X_gpu, y_gpu, seq_len=75, batch_size=2048, shuffle=True):
+    X_gpu = tf.constant(X_gpu, dtype=tf.float16)
+    y_gpu = tf.constant(y_gpu, dtype=tf.float32)
+    offsets_gpu = tf.range(seq_len, dtype=tf.int32)[tf.newaxis, :]
     n_win = int(X_gpu.shape[0]) - seq_len + 1
     ds = tf.data.Dataset.from_tensor_slices(tf.range(n_win, dtype=tf.int32))
     if shuffle:
