@@ -16,6 +16,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE_DIR))
 
 def export_prl_colab_dataset(upload_gdrive=False):
     print("=" * 80)
@@ -34,57 +35,66 @@ def export_prl_colab_dataset(upload_gdrive=False):
         feature_cols = json.load(f)["feature_order"]
 
     meta_cols = [
-        'timestamp',
+        'timestamp', 'sample_split', 'is_data_gap', 'ST_mid_price', 'ST_trade_vol', 'BO_sec_since_tick',
         'target_class_7_h5_k3', 'target_dt_ticks_h5_k3',
         'target_class_7_h12_k3.5', 'target_dt_ticks_h12_k3.5',
         'target_class_7_h25_k3', 'target_dt_ticks_h25_k3'
     ]
 
     print(f"📥 Чтение Parquet ({len(feature_cols)} признаков + мета-колонки)...")
-    tbl = pq.read_table(labeled_path, columns=feature_cols + meta_cols)
+    schema_cols = set(pq.read_schema(labeled_path).names)
+    load_cols = list(dict.fromkeys([c for c in feature_cols + meta_cols if c in schema_cols]))
+    tbl = pq.read_table(labeled_path, columns=load_cols)
     df = tbl.to_pandas()
     print(f"✅ Загружено {len(df):,} строк.")
 
-    # Временные границы по референсной модели h12s_k3.5
-    with open(h12_manifest) as f:
-        ref_meta = json.load(f)[0] # win_00
+    # Очистка зависших осцилляторов BigONE (BO_sec_since_tick > 60s)
+    X_all = df[feature_cols].values.astype(np.float32).copy()
+    if 'BO_sec_since_tick' in df.columns:
+        bo_stale = (df['BO_sec_since_tick'].fillna(0).values > 60.0)
+        if np.any(bo_stale):
+            zero_prefixes = ('LL_', 'BO_ofi_', 'BO_cvd_', 'BO_imb_', 'BO_obi_', 'BO_micro_', 'BO_ret_', 'BO_vol_intensity_')
+            zero_cols = [i_c for i_c, fn in enumerate(feature_cols) if fn.startswith(zero_prefixes)]
+            if zero_cols:
+                X_all[np.ix_(bo_stale, zero_cols)] = 0.0
 
-    ts_series = pd.to_datetime(df['timestamp'])
-    tr_s_ts = pd.to_datetime(ref_meta['train_ts_range'][0])
-    tr_e_ts = pd.to_datetime(ref_meta['train_ts_range'][1])
-    te_s_ts = pd.to_datetime(ref_meta['test_ts_range'][0])
-    te_e_ts = pd.to_datetime("2026-10-18 15:13:48")
+    # Временные границы всех асинхронных окон Walk-Forward (H=5: 12 окон, H=12: 5 окон, H=25: 2 окна)
+    from _tools.train_rolling_swarm import find_clean_segments, generate_rolling_windows_reverse
+    segs = find_clean_segments(df)
+    wins_h5, _, _, _, _ = generate_rolling_windows_reverse(segs, H=5, K=3.0)
+    wins_h12, _, _, _, _ = generate_rolling_windows_reverse(segs, H=12, K=3.5)
+    wins_h25, _, _, _, _ = generate_rolling_windows_reverse(segs, H=25, K=3.0)
+    w0 = wins_h12[0]
+    tr_idx = w0['tr_idx']
+    te_idx = w0['te_idx']
 
-    if ts_series.dt.tz is not None:
-        tr_s_ts = tr_s_ts.tz_localize(ts_series.dt.tz) if tr_s_ts.tzinfo is None else tr_s_ts.tz_convert(ts_series.dt.tz)
-        tr_e_ts = tr_e_ts.tz_localize(ts_series.dt.tz) if tr_e_ts.tzinfo is None else tr_e_ts.tz_convert(ts_series.dt.tz)
-        te_s_ts = te_s_ts.tz_localize(ts_series.dt.tz) if te_s_ts.tzinfo is None else te_s_ts.tz_convert(ts_series.dt.tz)
-        te_e_ts = te_e_ts.tz_localize(ts_series.dt.tz) if te_e_ts.tzinfo is None else te_e_ts.tz_convert(ts_series.dt.tz)
+    print(f"⏱️ Сетка асинхронных окон: H=5 ({len(wins_h5)} окон по 75k), H=12 ({len(wins_h12)} окон по 210k), H=25 ({len(wins_h25)} окон по 375k)")
+    print(f"⏱️ Train win_00 (H=12) TS: {df['timestamp'].iloc[tr_idx[0]]} ➔ {df['timestamp'].iloc[tr_idx[-1]]} ({len(tr_idx):,} строк)")
+    print(f"⏱️ Test  win_00 (OOS)  TS: {df['timestamp'].iloc[te_idx[0]]} ➔ {df['timestamp'].iloc[te_idx[-1]]} ({len(te_idx):,} строк)")
 
-    tr_s_idx = int(ts_series.searchsorted(tr_s_ts))
-    tr_e_idx = int(ts_series.searchsorted(tr_e_ts))
-    te_s_idx = int(ts_series.searchsorted(te_s_ts))
-    te_e_idx = int(ts_series.searchsorted(te_e_ts))
+    windows_spec = {}
+    for h_key, w_list in [("h5", wins_h5), ("h12", wins_h12), ("h25", wins_h25)]:
+        windows_spec[f"{h_key}_n_windows"] = np.int32(len(w_list))
+        for w_i, w_obj in enumerate(w_list):
+            windows_spec[f"{h_key}_tr_idx_{w_i:02d}"] = w_obj['tr_idx'].astype(np.int32)
+            windows_spec[f"{h_key}_te_idx_{w_i:02d}"] = w_obj['te_idx'].astype(np.int32)
 
-    print(f"⏱️ Train TS: {df['timestamp'].iloc[tr_s_idx]} ➔ {df['timestamp'].iloc[tr_e_idx]} ({tr_e_idx-tr_s_idx:,} строк)")
-    print(f"⏱️ Test TS:  {df['timestamp'].iloc[te_s_idx]} ➔ {df['timestamp'].iloc[min(te_e_idx, len(df)-1)]} ({te_e_idx-te_s_idx:,} строк)")
+    # Выгрузка числовых массивов по чистым индексам win_00 + полный пул для асинхронных окон
+    X_train = X_all[tr_idx]
+    y_train_h5 = (df['target_class_7_h5_k3'].iloc[tr_idx].values + 3).astype(np.int32)
+    y_train_h12 = (df['target_class_7_h12_k3.5'].iloc[tr_idx].values + 3).astype(np.int32)
+    y_train_h25 = (df['target_class_7_h25_k3'].iloc[tr_idx].values + 3).astype(np.int32)
 
-    # Выгрузка числовых массивов
-    X_train = df[feature_cols].iloc[tr_s_idx:tr_e_idx].values.astype(np.float32)
-    y_train_h5 = (df['target_class_7_h5_k3'].iloc[tr_s_idx:tr_e_idx].values + 3).astype(np.int32)
-    y_train_h12 = (df['target_class_7_h12_k3.5'].iloc[tr_s_idx:tr_e_idx].values + 3).astype(np.int32)
-    y_train_h25 = (df['target_class_7_h25_k3'].iloc[tr_s_idx:tr_e_idx].values + 3).astype(np.int32)
+    X_test = X_all[te_idx]
+    y_test_h5 = (df['target_class_7_h5_k3'].iloc[te_idx].values + 3).astype(np.int32)
+    y_test_h12 = (df['target_class_7_h12_k3.5'].iloc[te_idx].values + 3).astype(np.int32)
+    y_test_h25 = (df['target_class_7_h25_k3'].iloc[te_idx].values + 3).astype(np.int32)
+    dt_test_h5 = df['target_dt_ticks_h5_k3'].iloc[te_idx].values.astype(np.float32)
+    dt_test_h12 = df['target_dt_ticks_h12_k3.5'].iloc[te_idx].values.astype(np.float32)
+    dt_test_h25 = df['target_dt_ticks_h25_k3'].iloc[te_idx].values.astype(np.float32)
 
-    X_test = df[feature_cols].iloc[te_s_idx:te_e_idx].values.astype(np.float32)
-    y_test_h5 = (df['target_class_7_h5_k3'].iloc[te_s_idx:te_e_idx].values + 3).astype(np.int32)
-    y_test_h12 = (df['target_class_7_h12_k3.5'].iloc[te_s_idx:te_e_idx].values + 3).astype(np.int32)
-    y_test_h25 = (df['target_class_7_h25_k3'].iloc[te_s_idx:te_e_idx].values + 3).astype(np.int32)
-    dt_test_h5 = df['target_dt_ticks_h5_k3'].iloc[te_s_idx:te_e_idx].values.astype(np.float32)
-    dt_test_h12 = df['target_dt_ticks_h12_k3.5'].iloc[te_s_idx:te_e_idx].values.astype(np.float32)
-    dt_test_h25 = df['target_dt_ticks_h25_k3'].iloc[te_s_idx:te_e_idx].values.astype(np.float32)
-
-    ts_train = df['timestamp'].iloc[tr_s_idx:tr_e_idx].astype(str).values
-    ts_test = df['timestamp'].iloc[te_s_idx:te_e_idx].astype(str).values
+    ts_train = df['timestamp'].iloc[tr_idx].astype(str).values
+    ts_test = df['timestamp'].iloc[te_idx].astype(str).values
 
     out_file = BASE_DIR / "data" / "prl_neural_colab_data.npz"
     out_file.parent.mkdir(parents=True, exist_ok=True)
@@ -92,6 +102,14 @@ def export_prl_colab_dataset(upload_gdrive=False):
     print(f"💾 Упаковка в сжатый NPZ: {out_file.relative_to(BASE_DIR)}...")
     np.savez_compressed(
         out_file,
+        X_all=X_all.astype(np.float32),
+        ts_all=df['timestamp'].astype(str).values,
+        y_all_h5=(df['target_class_7_h5_k3'].fillna(0).values + 3).astype(np.int8),
+        y_all_h12=(df['target_class_7_h12_k3.5'].fillna(0).values + 3).astype(np.int8),
+        y_all_h25=(df['target_class_7_h25_k3'].fillna(0).values + 3).astype(np.int8),
+        dt_all_h5=df['target_dt_ticks_h5_k3'].fillna(0).values.astype(np.float16),
+        dt_all_h12=df['target_dt_ticks_h12_k3.5'].fillna(0).values.astype(np.float16),
+        dt_all_h25=df['target_dt_ticks_h25_k3'].fillna(0).values.astype(np.float16),
         X_train=X_train,
         y_train_h5=y_train_h5,
         y_train_h12=y_train_h12,
@@ -105,7 +123,9 @@ def export_prl_colab_dataset(upload_gdrive=False):
         dt_test_h25=dt_test_h25,
         ts_train=ts_train,
         ts_test=ts_test,
-        features=np.array(feature_cols)
+        features=np.array(feature_cols),
+        n_windows=np.int32(len(wins_h12)),
+        **windows_spec
     )
 
     size_mb = out_file.stat().st_size / (1024 * 1024)

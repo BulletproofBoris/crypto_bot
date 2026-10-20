@@ -92,23 +92,29 @@ class SwarmRegimeRouter:
                     ("attention", "attention")
                 ]:
                     n_dir = BASE_DIR / "models" / self.coin / f"{arch_dir_name}_h{H}s"
-                    k_file = n_dir / "model_win_00.keras"
-                    m_file = n_dir / "meta_win_00.json"
-                    if k_file.exists() and m_file.exists():
-                        with open(m_file) as mf:
-                            n_meta = json.load(mf)
-                        ic_val = float(n_meta.get("metrics_oos", {}).get("ic_dt_ticks", 0.1))
-                        if ic_val >= 0.10:
-                            self.neural_experts.append({
-                                "arch": arch_key,
-                                "k_file": str(k_file),
-                                "model": None,
-                                "seq_len": int(n_meta["seq_len"]),
-                                "mean": np.array(n_meta["feature_norm"]["mean"], dtype=np.float32),
-                                "std": np.array(n_meta["feature_norm"]["std"], dtype=np.float32),
-                                "ic": ic_val,
-                                "train_ts_range": n_meta.get("train_ts_range", [])
-                            })
+                    if not n_dir.exists():
+                        continue
+                    for k_file in sorted(n_dir.glob("model_win_*.keras")):
+                        win_tag = k_file.stem.replace("model_", "")  # win_00, win_01...
+                        win_idx = int(win_tag.split("_")[-1]) if win_tag.split("_")[-1].isdigit() else 0
+                        m_file = n_dir / f"meta_{win_tag}.json"
+                        if m_file.exists():
+                            with open(m_file) as mf:
+                                n_meta = json.load(mf)
+                            ic_val = float(n_meta.get("metrics_oos", {}).get("ic_dt_ticks", 0.1))
+                            if ic_val >= 0.10:
+                                self.neural_experts.append({
+                                    "arch": arch_key if win_idx == 0 else f"{arch_key}_{win_tag}",
+                                    "base_arch": arch_key,
+                                    "win_idx": win_idx,
+                                    "k_file": str(k_file),
+                                    "model": None,
+                                    "seq_len": int(n_meta["seq_len"]),
+                                    "mean": np.array(n_meta["feature_norm"]["mean"], dtype=np.float32),
+                                    "std": np.array(n_meta["feature_norm"]["std"], dtype=np.float32),
+                                    "ic": ic_val,
+                                    "train_ts_range": n_meta.get("train_ts_range", [])
+                                })
                 if self.neural_experts:
                     archs_str = ", ".join(f"{e['arch']}(IC={e['ic']:+.3f})" for e in self.neural_experts)
                     print(f"🧬 Подключен нейросетевой альянс H={H}с ({len(self.neural_experts)} арх.): {archs_str}")
@@ -338,10 +344,15 @@ class SwarmRegimeRouter:
                 nn_ic_weights.append(max(0.01, exp["ic"] ** 2))
 
             if nn_ez_list:
-                w_ic = np.array(nn_ic_weights, dtype=np.float32)
-                w_ic = w_ic / np.sum(w_ic)
-                nn_ez_blend = sum(w_ic[i] * nn_ez_list[i] for i in range(len(nn_ez_list)))
-                nn_probs_blend = sum(w_ic[i] * nn_probs_list[i] for i in range(len(nn_probs_list)))
+                n_exp = len(nn_ez_list)
+                dyn_w = np.zeros((n_samples, n_exp), dtype=np.float32)
+                for i_e, exp in enumerate(self.neural_experts):
+                    w_idx = min(exp.get("win_idx", 0), weights.shape[1] - 1)
+                    reg_w = weights[:, w_idx] if len(set(e.get("win_idx", 0) for e in self.neural_experts)) > 1 else 1.0
+                    dyn_w[:, i_e] = max(0.01, exp["ic"] ** 2) * reg_w
+                dyn_w = dyn_w / np.maximum(np.sum(dyn_w, axis=1, keepdims=True), 1e-7)
+                nn_ez_blend = sum(dyn_w[:, i] * nn_ez_list[i] for i in range(n_exp))
+                nn_probs_blend = sum(dyn_w[:, i:i+1] * nn_probs_list[i] for i in range(n_exp))
 
                 w_nn = np.clip(self.neural_weight, 0.0, 1.0)
                 lgb_mean = float(np.mean(expected_z))

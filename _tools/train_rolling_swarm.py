@@ -97,91 +97,83 @@ def find_clean_segments(df: pd.DataFrame):
     return segments
 
 
-def generate_rolling_windows_reverse(segments: list, H: int, K: float, n_target: int = 5000):
+def generate_rolling_windows_reverse(segments: list, H: int, K: float, n_target: int = 5000, oos_holdout_sec: int = 85600):
     """
-    Генерирует окна строго с конца временного ряда.
-    Для синхронизации триады (H=5, 12, 25) при больших L использует канонический размер
-    обучающего окна t_train = min(n_target * L, 210000), чтобы все горизонты обучались
-    на одних и тех же рыночных режимах.
+    Генерирует окна строго с конца временного ряда по сшитому массиву чистых индексов (Seam-Purged Stitching).
+    - Разрывы связи полностью вырезаются с защитным буфером seam_purge = 360с на краях каждого сегмента;
+    - Самое свежее окно win_00 оставляет последние oos_holdout_sec (по умолчанию 43,200с = 12ч)
+      пост-разрывного сегмента под строгий неприкосновенный OOS-тест, а в обучение win_00 включает
+      первую половину пост-разрывного сегмента + чистую историю до разрыва.
     """
     L = int(round(H * K))
-    t_train = min(n_target * L, 210000)
+    t_train = int(n_target * L)
     t_test = int(t_train / 0.8)
     buffer = H + 360
     W = t_train + buffer + t_test
-    step = t_train
+    step = t_train // 2
 
+    seam_purge = 360
+    chron_segs = sorted(segments, key=lambda x: x[0])
+    clean_blocks = []
+    for s_idx, (s, e) in enumerate(chron_segs):
+        s_clean = s + (seam_purge if s_idx > 0 else 0)
+        e_clean = e - (seam_purge if s_idx < len(chron_segs) - 1 else 0)
+        if e_clean - s_clean > 1000:
+            clean_blocks.append(np.arange(s_clean, e_clean, dtype=np.int64))
+
+    if not clean_blocks:
+        return [], W, step, t_train, t_test
+
+    clean_idx = np.concatenate(clean_blocks)
+    n_clean = len(clean_idx)
     windows = []
-    min_test = max(3600, int(L * 50))
 
-    for seg_idx, (seg_start, seg_end) in enumerate(segments):
-        seg_len = seg_end - seg_start
-        if seg_len < t_train + buffer + min_test:
-            continue
+    te0_len = min(oos_holdout_sec, len(clean_blocks[-1]))
+    te0_end_pos = n_clean
+    te0_start_pos = te0_end_pos - te0_len
+    tr0_end_pos = te0_start_pos - buffer
+    tr0_start_pos = tr0_end_pos - t_train
 
-        curr_end = seg_end
-        if seg_len < W:
-            w_start = seg_start
-            tr_start = w_start
-            tr_end = tr_start + t_train
-            te_start = tr_end + buffer
-            te_end = curr_end
-            if te_end - te_start >= min_test:
-                windows.append({
-                    'segment_id': seg_idx,
-                    'tr_start': tr_start,
-                    'tr_end': tr_end,
-                    'te_start': te_start,
-                    'te_end': te_end,
-                    't_train': t_train,
-                    't_test': te_end - te_start,
-                    'W': te_end - tr_start,
-                    'L': L,
-                    'H': H,
-                    'K': K
-                })
-            # Если в этом же длинном сегменте помещается еще одно независимое окно у правого края:
-            if seg_len >= 2 * t_train + buffer + min_test:
-                tr2_start = seg_end - t_train - buffer - min_test
-                tr2_end = tr2_start + t_train
-                te2_start = tr2_end + buffer
-                te2_end = seg_end
-                windows.insert(len(windows) - 1, {
-                    'segment_id': seg_idx,
-                    'tr_start': tr2_start,
-                    'tr_end': tr2_end,
-                    'te_start': te2_start,
-                    'te_end': te2_end,
-                    't_train': t_train,
-                    't_test': te2_end - te2_start,
-                    'W': te2_end - tr2_start,
-                    'L': L,
-                    'H': H,
-                    'K': K
-                })
-            continue
-
-        while curr_end - W >= seg_start:
-            w_start = curr_end - W
-            tr_start = w_start
-            tr_end = tr_start + t_train
-            te_start = tr_end + buffer
-            te_end = curr_end
-
-            windows.append({
-                'segment_id': seg_idx,
-                'tr_start': tr_start,
-                'tr_end': tr_end,
-                'te_start': te_start,
-                'te_end': te_end,
-                't_train': t_train,
-                't_test': te_end - te_start,
-                'W': W,
-                'L': L,
-                'H': H,
-                'K': K
-            })
-            curr_end -= step
+    if tr0_start_pos >= 0:
+        windows.append({
+            'segment_id': 0,
+            'tr_idx': clean_idx[tr0_start_pos:tr0_end_pos],
+            'te_idx': clean_idx[te0_start_pos:te0_end_pos],
+            'tr_start': int(clean_idx[tr0_start_pos]),
+            'tr_end': int(clean_idx[tr0_end_pos - 1]) + 1,
+            'te_start': int(clean_idx[te0_start_pos]),
+            'te_end': int(clean_idx[te0_end_pos - 1]) + 1,
+            't_train': t_train,
+            't_test': te0_len,
+            'W': t_train + buffer + te0_len,
+            'L': L,
+            'H': H,
+            'K': K
+        })
+    curr_tr_end = tr0_end_pos - step
+    while curr_tr_end - t_train >= 0 and len(windows) < 12:
+        tr_e_pos = curr_tr_end
+        tr_s_pos = tr_e_pos - t_train
+        te_s_pos = tr_e_pos + buffer
+        te_e_pos = min(n_clean, te_s_pos + step)
+        if te_e_pos - te_s_pos < 3600:
+            break
+        windows.append({
+            'segment_id': len(windows),
+            'tr_idx': clean_idx[tr_s_pos:tr_e_pos],
+            'te_idx': clean_idx[te_s_pos:te_e_pos],
+            'tr_start': int(clean_idx[tr_s_pos]),
+            'tr_end': int(clean_idx[tr_e_pos - 1]) + 1,
+            'te_start': int(clean_idx[te_s_pos]),
+            'te_end': int(clean_idx[te_e_pos - 1]) + 1,
+            't_train': t_train,
+            't_test': te_e_pos - te_s_pos,
+            'W': t_train + buffer + (te_e_pos - te_s_pos),
+            'L': L,
+            'H': H,
+            'K': K
+        })
+        curr_tr_end -= step
 
     return windows, W, step, t_train, t_test
 
@@ -229,7 +221,7 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
     need_labeling = (target_c7_col not in schema_cols) or (target_dt_col not in schema_cols)
 
     base_cols = [
-        'timestamp', 'sample_split', 'is_data_gap', 'ST_mid_price', 'ST_trade_vol',
+        'timestamp', 'sample_split', 'is_data_gap', 'ST_mid_price', 'ST_trade_vol', 'BO_sec_since_tick',
         'ST_vol_300s_ticks', 'ST_vol_60s_ticks', 'ST_spread', 'ST_spread_pct',
         'ST_ofi_norm_300s', 'ST_cvd_5m', 'ST_cvd_norm_20s'
     ]
@@ -331,24 +323,33 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
     print(f"\n{'Win':<6} | {'Train TS':<33} | {'Test TS':<33} | {'OOS IC':<8} | {'AUC OVR':<8} | {'Top-2% PnL':<11} | {'Статус':<10}")
     print("-" * 125)
 
-    X_all = df[feature_cols].values
+    X_all = df[feature_cols].values.copy()
+    if 'BO_sec_since_tick' in df.columns:
+        bo_stale = (df['BO_sec_since_tick'].fillna(0).values > 60.0)
+        if np.any(bo_stale):
+            zero_prefixes = ('LL_', 'BO_ofi_', 'BO_cvd_', 'BO_imb_', 'BO_obi_', 'BO_micro_', 'BO_ret_', 'BO_vol_intensity_')
+            zero_cols = [i_c for i_c, fn in enumerate(feature_cols) if fn.startswith(zero_prefixes)]
+            if zero_cols:
+                X_all[np.ix_(bo_stale, zero_cols)] = 0.0
 
     for idx, w in enumerate(windows):
         win_id = f"win_{idx:02d}"
         tr_s, tr_e = w['tr_start'], w['tr_end']
         te_s, te_e = w['te_start'], w['te_end']
+        tr_idx = w.get('tr_idx', np.arange(tr_s, tr_e))
+        te_idx = w.get('te_idx', np.arange(te_s, te_e))
 
         ts_tr_start = str(df['timestamp'].iloc[min(tr_s, len(df)-1)])[:19]
-        ts_tr_end = str(df['timestamp'].iloc[min(tr_e, len(df)-1)])[:19]
+        ts_tr_end = str(df['timestamp'].iloc[min(tr_e - 1, len(df)-1)])[:19]
         ts_te_start = str(df['timestamp'].iloc[min(te_s, len(df)-1)])[:19]
-        ts_te_end = str(df['timestamp'].iloc[min(te_e, len(df)-1)])[:19]
+        ts_te_end = str(df['timestamp'].iloc[min(te_e - 1, len(df)-1)])[:19]
 
-        X_train = X_all[tr_s:tr_e]
-        y_train = df['target_class'].iloc[tr_s:tr_e].values + 3  # Сдвиг [-3..3] -> [0..6]
+        X_train = X_all[tr_idx]
+        y_train = df['target_class'].iloc[tr_idx].values + 3  # Сдвиг [-3..3] -> [0..6]
 
-        X_test = X_all[te_s:te_e]
-        y_test = df['target_class'].iloc[te_s:te_e].values + 3
-        dt_test = df['target_dt'].iloc[te_s:te_e].values
+        X_test = X_all[te_idx]
+        y_test = df['target_class'].iloc[te_idx].values + 3
+        dt_test = df['target_dt'].iloc[te_idx].values
 
         # Обучение LightGBM
         df_train = pd.DataFrame(X_train, columns=feature_cols)
@@ -416,8 +417,8 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
         clf.booster_.save_model(str(model_path))
 
         # Паспорт режима (Regime Fingerprint)
-        fp_train = compute_regime_fingerprint(df.iloc[tr_s:tr_e])
-        fp_test = compute_regime_fingerprint(df.iloc[te_s:te_e])
+        fp_train = compute_regime_fingerprint(df.iloc[tr_idx])
+        fp_test = compute_regime_fingerprint(df.iloc[te_idx])
 
         meta = {
             'window_id': win_id,
