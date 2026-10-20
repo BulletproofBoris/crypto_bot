@@ -11,21 +11,44 @@ import numpy as np
 import pandas as pd
 
 
-def filter_outage_intervals(val_df: pd.DataFrame, max_flat_sec: int = 1800) -> pd.DataFrame:
-    """Исключает неактуальные интервалы обрыва связи (неизменная цена > max_flat_sec)."""
+def filter_outage_intervals(val_df: pd.DataFrame, max_flat_sec: int = 1800, post_outage_only: bool = True) -> pd.DataFrame:
+    """
+    Исключает неактуальные интервалы обрыва связи (неизменный стакан/цена > max_flat_sec).
+    При post_outage_only=True (по умолчанию) оставляет непрерывный актуальный срез данных строго ПОСЛЕ разрыва.
+    """
+    if 'ST_sec_since_tick' in val_df.columns:
+        stale_book = val_df['ST_sec_since_tick'].fillna(0) > 600.0
+    else:
+        stale_book = pd.Series(False, index=val_df.index)
+
     active_mask = (
-        (val_df['ST_buy_vol'].fillna(0) > 0) |
-        (val_df['ST_sell_vol'].fillna(0) > 0) |
-        (val_df['ST_bid_1_price'].diff().abs().fillna(0) > 1e-8) |
-        (val_df['ST_ask_1_price'].diff().abs().fillna(0) > 1e-8)
+        ~stale_book & (
+            (val_df['ST_buy_vol'].fillna(0) > 0) |
+            (val_df['ST_sell_vol'].fillna(0) > 0) |
+            (val_df['ST_bid_1_price'].diff().abs().fillna(0) > 1e-8) |
+            (val_df['ST_ask_1_price'].diff().abs().fillna(0) > 1e-8)
+        )
     )
     active_idx = np.where(active_mask)[0]
     if len(active_idx) <= 1:
         return val_df
 
-    keep_mask = np.ones(len(val_df), dtype=bool)
     gaps = np.diff(active_idx)
     outage_pos = np.where(gaps > max_flat_sec)[0]
+
+    if post_outage_only and len(outage_pos) > 0:
+        last_pos = outage_pos[-1]
+        resume_idx = int(active_idx[last_pos + 1])
+        outage_start_ts = val_df['timestamp'].iloc[int(active_idx[last_pos]) + 1]
+        outage_end_ts = val_df['timestamp'].iloc[resume_idx - 1]
+        val_df = val_df.iloc[resume_idx:].copy().reset_index(drop=True)
+        print(
+            f"✂️ Выбран непрерывный срез ПОСЛЕ разрыва связи ({outage_start_ts} ➔ {outage_end_ts}): "
+            f"{len(val_df):,} с живого рынка ({val_df['timestamp'].iloc[0]} ➔ {val_df['timestamp'].iloc[-1]})"
+        )
+        return val_df
+
+    keep_mask = np.ones(len(val_df), dtype=bool)
     outage_ranges = []
     for pos in outage_pos:
         g_start = int(active_idx[pos]) + 1
@@ -137,9 +160,9 @@ def load_strict_oos_slice(labeled_path, dispatcher, exec_cols: list = None, stri
         exec_cols = [
             'timestamp', 'sample_split', 'ST_bid_1_price', 'ST_ask_1_price',
             'ST_bid_1_qty', 'ST_ask_1_qty', 'ST_mid_price', 'ST_spread', 'ST_spread_pct',
-            'ST_trade_vol', 'ST_buy_vol', 'ST_sell_vol',
+            'ST_trade_vol', 'ST_buy_vol', 'ST_sell_vol', 'ST_sec_since_tick',
             'BO_bid_1_price', 'BO_ask_1_price', 'BO_mid_price',
-            'BO_sell_vol', 'BO_buy_vol', 'BO_trade_vol',
+            'BO_sell_vol', 'BO_buy_vol', 'BO_trade_vol', 'BO_sec_since_tick',
             'leadlag_accum_bo_st_60s', 'leadlag_accum_bo_st_300s',
             'leadlag_bo_minus_st_5s_ticks', 'leadlag_bo_minus_st_20s_ticks',
             'leadlag_bo_minus_st_60s_ticks', 'leadlag_bo_minus_st_300s_ticks'

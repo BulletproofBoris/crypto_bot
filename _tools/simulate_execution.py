@@ -33,7 +33,7 @@ COIN_RULES = {
         'tick_size': 0.005,
         'min_vol': 1.0,
         'initial_tokens': 0.0,
-        'initial_usdt': 8000.0,
+        'initial_usdt': 10000.0,
         'trade_size_tokens': 200.0,
     },
     'quantus': {

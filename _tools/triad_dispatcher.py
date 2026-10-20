@@ -98,12 +98,12 @@ def parse_args():
                         help="Минимальный объем ордера в USDT на бирже SafeTrade")
     parser.add_argument("--neural-weight", type=float, default=None,
                         help="Единый вес нейросетей (если задан, переопределяет w-nn-5/12/25)")
-    parser.add_argument("--w-nn-5", type=float, default=0.10,
-                        help="Вес нейросетевого альянса для H=5с (по умолчанию 0.10)")
-    parser.add_argument("--w-nn-12", type=float, default=0.35,
-                        help="Вес нейросетевого альянса для H=12с (по умолчанию 0.35)")
-    parser.add_argument("--w-nn-25", type=float, default=0.25,
-                        help="Вес нейросетевого альянса для H=25с (по умолчанию 0.25)")
+    parser.add_argument("--w-nn-5", type=float, default=0.12,
+                        help="Вес нейросетевого альянса для H=5с (по умолчанию 0.12)")
+    parser.add_argument("--w-nn-12", type=float, default=0.15,
+                        help="Вес нейросетевого альянса для H=12с (по умолчанию 0.15)")
+    parser.add_argument("--w-nn-25", type=float, default=0.15,
+                        help="Вес нейросетевого альянса для H=25с (по умолчанию 0.15)")
     parser.add_argument("--no-neural", dest="use_neural", action="store_false", default=True,
                         help="Отключить нейросетевой альянс (только LightGBM)")
     parser.add_argument("--target-token-ratio", type=float, default=0.55,
@@ -129,9 +129,9 @@ class TriadDispatcher:
         coin: str,
         use_neural: bool = True,
         neural_weight: float = None,
-        w_nn_5: float = 0.10,
-        w_nn_12: float = 0.35,
-        w_nn_25: float = 0.25,
+        w_nn_5: float = 0.12,
+        w_nn_12: float = 0.15,
+        w_nn_25: float = 0.15,
     ):
         self.coin = coin.lower()
         if neural_weight is not None:
@@ -261,6 +261,7 @@ def run_triad_simulation(args):
     bo_ask_prices = val_df['BO_ask_1_price'].values if 'BO_ask_1_price' in val_df.columns else ask_prices
     bo_buy_vols = val_df['BO_buy_vol'].values if 'BO_buy_vol' in val_df.columns else np.zeros(n_seconds)
     bo_sell_vols = val_df['BO_sell_vol'].values if 'BO_sell_vol' in val_df.columns else np.zeros(n_seconds)
+    bo_sec_since = val_df['BO_sec_since_tick'].values if 'BO_sec_since_tick' in val_df.columns else np.zeros(n_seconds)
     ll_60s = val_df['leadlag_accum_bo_st_60s'].values if 'leadlag_accum_bo_st_60s' in val_df.columns else np.zeros(n_seconds)
     ll_300s = val_df['leadlag_accum_bo_st_300s'].values if 'leadlag_accum_bo_st_300s' in val_df.columns else np.zeros(n_seconds)
     ll_ticks_5s = val_df['leadlag_bo_minus_st_5s_ticks'].values if 'leadlag_bo_minus_st_5s_ticks' in val_df.columns else np.zeros(n_seconds)
@@ -298,13 +299,14 @@ def run_triad_simulation(args):
             usd_total_history.append(usdt + (tokens * mid_p))
             continue
 
-        bo_mid = bo_mid_prices[t]
-        bo_bid = bo_bid_prices[t]
-        bo_ask = bo_ask_prices[t]
-        bo_sell = bo_sell_vols[t]
-        bo_buy = bo_buy_vols[t]
-        ll60 = ll_60s[t]
-        ll5 = ll_ticks_5s[t]
+        bo_fresh = (bo_sec_since[t] <= 60.0)
+        bo_mid = bo_mid_prices[t] if bo_fresh else mid_p
+        bo_bid = bo_bid_prices[t] if bo_fresh else bid_p
+        bo_ask = bo_ask_prices[t] if bo_fresh else ask_p
+        bo_sell = bo_sell_vols[t] if bo_fresh else 0.0
+        bo_buy = bo_buy_vols[t] if bo_fresh else 0.0
+        ll60 = ll_60s[t] if bo_fresh else 0.0
+        ll5 = ll_ticks_5s[t] if bo_fresh else 0.0
 
         # 4.1. Проверка существующего ордера
         if active_order is not None:
@@ -317,7 +319,7 @@ def run_triad_simulation(args):
             z25_now = ez_25[t]
             if not active_order['canceling']:
                 # Защита Lead-Lag Shield по опережению BigONE (Stage 1)
-                if args.leadlag_shield:
+                if args.leadlag_shield and bo_fresh:
                     if o_side == 'buy':
                         # Защита от токсичного пролива: BigONE mid уже провалился ниже нашего бида, либо резкий сброс
                         is_toxic_dump = (bo_mid < o_price) or (ll60 < -1.8) or (bo_sell > 50.0 and bo_mid <= o_price)
@@ -339,7 +341,7 @@ def run_triad_simulation(args):
                         active_order['canceling'] = True
                         active_order['cancel_after'] = t + args.latency_sec
                         trend_blocks += 1
-                    elif o_side == 'sell' and (z25_now > args.trend_gate or ez_5[t] > 0.18 or (buy_vol > 0 and o_price <= ask_p)):
+                    elif o_side == 'sell' and (z25_now > max(0.55, args.trend_gate) or ez_5[t] > 0.65):
                         active_order['canceling'] = True
                         active_order['cancel_after'] = t + args.latency_sec
                         trend_blocks += 1
@@ -424,8 +426,8 @@ def run_triad_simulation(args):
             z5 = ez_5[t]
             z12 = ez_12[t]
             z25 = ez_25[t]
-            ll300 = ll_300s[t]
-            ll20 = ll_ticks_20s[t]
+            ll300 = ll_300s[t] if bo_fresh else 0.0
+            ll20 = ll_ticks_20s[t] if bo_fresh else 0.0
 
             # 1. Режимно-адаптивный таргетинг инвентаря (Regime-Adaptive Target Ratio)
             total_equity_usd = usdt + (tokens * mid_p)
@@ -437,9 +439,10 @@ def run_triad_simulation(args):
             # а на сильном перегреве (> +2.5% над EMA_30m при угасании импульса) снижаем до 45% для фиксации профита
             base_target = float(args.target_token_ratio)
             dip_bonus = np.clip(-rel_dev * 12.0, -0.18, 0.28)
-            trend_bonus = 0.15 if (z25 > 0.04 or ll300 > 0.5 or bo_mid > mid_p) else 0.0
-            target_ratio = float(np.clip(base_target + 0.15 + dip_bonus + trend_bonus, 0.45, 0.88))
+            trend_bonus = 0.15 if (z25 > 0.25 or ll300 > 0.5 or (bo_fresh and bo_mid > mid_p)) else 0.0
+            target_ratio = float(np.clip(base_target + 0.15 + dip_bonus + trend_bonus, 0.45, 0.85))
             in_profit = (tokens > 10.0) and (mid_p >= avg_buy_price + 3.0 * tick_size)
+            deep_in_profit = (tokens > 500.0) and (token_ratio >= 0.52) and (mid_p >= avg_buy_price + 6.0 * tick_size)
 
             if args.inventory_skew:
                 # Избыток кэша относительно целевого коридора
@@ -447,9 +450,9 @@ def run_triad_simulation(args):
                 overweight_tokens = max(0.0, token_ratio - target_ratio)
 
                 cash_boost = min(2.8, underweight_tokens * 4.5)
-                conviction_boost = max(0.0, z12 * 1.8) if z12 > 0 else 0.0
-                # Если портфель уже перегружен монетами (>82%) и цена сильно выше средней закупки, тормозим докупку на хаях
-                top_brake = 0.25 if (token_ratio > 0.82 and mid_p > avg_buy_price + 4.0 * tick_size) else 1.0
+                conviction_boost = max(0.0, min(1.5, z12 * 1.2)) if z12 > 0 else 0.0
+                # Тормозим докупку при заполнении портфеля монетами свыше 78%
+                top_brake = 0.25 if (token_ratio > 0.78 and (in_profit or rel_dev > 0.0)) else (0.50 if token_ratio > 0.82 else 1.0)
 
                 desired_buy_lot = base_lot * (1.0 + cash_boost + conviction_boost) * top_brake
                 max_buyable = max(0.0, (usdt - 1.0) / max(bid_p, 1e-4))
@@ -482,45 +485,52 @@ def run_triad_simulation(args):
             recent_sell_vol = np.sum(sell_vols[max(0, t - 5) : t + 1])
             is_bottom_absorption = (is_near_bottom and recent_sell_vol > 0 and z5 > 0.08 and pb_12[t] > 0.15)
 
-            # Снайпинг проливов по опережающему отскоку BigONE (Stage 1):
+            # Снайпинг проливов по опережающему отскоку BigONE (Stage 1) — только ниже перегрева (rel_dev <= +1.0%):
             is_bo_dip_sniping = False
-            if args.dip_sniper:
+            if args.dip_sniper and bo_fresh and (rel_dev <= 0.010):
                 is_bo_bounce = (ll60 > 0.8) or (ll5 > 0.8) or (bo_mid > mid_p + tick_size and z5 > 0.02)
                 if is_bo_bounce and pb_12[t] > 0.15 and z12 > 0.05:
                     is_bo_dip_sniping = True
 
             # 3. Тренд-фильтр удержания прибыли (Lead-Lag & H3 Trend Hold)
-            # Запрещаем ранний сброс монет на старте ралли, пока старший горизонт H=25с или поводырь BigONE тянут цену вверх
-            strong_bull_hold = (z25 > 0.06) or (ll20 >= 1.0) or (ll60 > 0.6) or (bo_mid >= ask_p)
+            # Запрещаем ранний сброс монет на старте ралли, пока старший горизонт H=25с (топ-20% импульсов) или поводырь BigONE тянут цену вверх
+            strong_bull_hold = (z25 > 0.55) or (bo_fresh and ((ll20 >= 1.0) or (ll60 > 0.6) or (bo_mid >= ask_p)))
             if strong_bull_hold:
                 trend_holds += 1
 
-            # Локальное истощение пампа на вершине (Peak Exhaustion) — активно только выше EMA_30m (+1.2%) и без бычьего удержания:
+            # Локальное истощение пампа на вершине (Peak Exhaustion) — активно ТОЛЬКО в плюсе (in_profit) выше EMA_30m (+1.2%):
             z5_prev = ez_5[t - 1] if t > 0 else z5
             is_peak_exhaustion = (
-                is_near_top and (rel_dev > 0.012 or not in_profit) and not strong_bull_hold and
-                z5 < z5_prev and z5 < 0.12 and ps_12[t] > 0.16
+                is_near_top and in_profit and (rel_dev > 0.012) and not strong_bull_hold and
+                z5 < z5_prev and z5 < 0.25 and ps_12[t] > 0.16
             )
-            is_pump_accelerating = (z5 > 0.20) or (buy_vol > 0 and z5 > 0.05)
+            is_pump_accelerating = (z5 > 0.45) or (buy_vol > 0 and z5 > 0.20)
+
+            # Откуп откатов после фиксации прибыли или при недоборе позиции на дне:
+            is_pullback_rebuy = (
+                is_near_bottom and (z5 > 0.03) and (pb_12[t] > 0.14) and (z12 > 0.02) and
+                ((last_sell_anchor > 0.0 and mid_p <= last_sell_anchor - 5.0 * tick_size) or (token_ratio < 0.65 and rel_dev <= -0.002))
+            )
 
             # А. Трендовый шлюз Scale 3 (H=25)
-            allow_buy = (z25 >= effective_buy_gate) or is_bottom_absorption or is_bo_dip_sniping
-            allow_sell = ((z25 <= args.trend_gate) and not strong_bull_hold) or is_peak_exhaustion
+            allow_buy = (z25 >= effective_buy_gate) or is_bottom_absorption or is_bo_dip_sniping or is_pullback_rebuy
+            allow_sell = ((z25 <= args.trend_gate) and not strong_bull_hold and (in_profit or rel_dev > 0.008 or z12 < -0.26)) or is_peak_exhaustion
 
             # 2. Защита от «откупа дороже продажи» (High-Water Mark Rebuy Guard)
             # Если недавно продали часть позиции, не откупаем обратно дороже цены продажи (кроме арбитражного пробоя BigONE)
             rebuy_ok = True
-            if last_sell_anchor > 0.0 and (t - last_sell_t) < 5400 and token_ratio > 0.45:
+            if last_sell_anchor > 0.0 and (t - last_sell_t) < 3600 and token_ratio > 0.45:
                 if bid_p > last_sell_anchor - 2.0 * tick_size and not (is_bo_dip_sniping and bo_mid > ask_p + tick_size):
                     rebuy_ok = False
                     rebuy_blocks += 1
 
-            # Б. Согласование сигналов покупки (с торможением при перегрузе монетами > 82% в плюсе)
-            can_buy_more = rebuy_ok and not (token_ratio > 0.84 and in_profit and z12 < 0.22)
+            # Б. Согласование сигналов покупки (с жестким резервом кэша >= 14% при token_ratio > 0.86)
+            can_buy_more = rebuy_ok and (token_ratio < 0.86) and (not deep_in_profit or is_pullback_rebuy) and not (token_ratio > 0.72 and in_profit and z12 < 0.35 and not is_pullback_rebuy)
             trigger_buy = allow_buy and can_buy_more and (
                 (z12 > effective_buy_thresh and z5 > -0.05 and pb_12[t] > 0.18) or 
                 is_bottom_absorption or 
-                is_bo_dip_sniping
+                is_bo_dip_sniping or
+                is_pullback_rebuy
             )
 
             pj_pen = float(args.penny_jump_penalty)
@@ -590,7 +600,7 @@ def run_triad_simulation(args):
                     q_ahead = float(ask_qtys[t])
 
                 # Привязка Ask Escalator к стакану BigONE (Stage 1)
-                if args.bo_ask_peg and bo_ask > ask_p:
+                if args.bo_ask_peg and bo_fresh and bo_ask > ask_p:
                     limit_p = round(max(limit_p, bo_ask - tick_size), 4)
                     q_ahead = float(ask_qtys[t]) * pj_pen
 

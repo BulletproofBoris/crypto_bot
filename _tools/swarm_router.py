@@ -121,20 +121,21 @@ class SwarmRegimeRouter:
     def _build_regime_matrix(self):
         """Формирует нормализованную матрицу профилей режимов для экспертов."""
         self.live_feature_map = [
-            ('mean_ST_spread_pct', 'ST_spread_pct'),
-            ('median_ST_spread_pct', 'ST_spread_pct'),
-            ('mean_ST_vol_300s_ticks', 'ST_vol_300s_ticks'),
-            ('mean_ST_ofi_norm_300s', 'ST_ofi_norm_300s'),
-            ('mean_ST_cvd_5m', 'ST_cvd_5m'),
+            ('mean_ST_spread_pct', 'std_ST_spread_pct', 'ST_spread_pct'),
+            ('mean_ST_vol_300s_ticks', 'std_ST_vol_300s_ticks', 'ST_vol_300s_ticks'),
+            ('mean_ST_ofi_norm_300s', 'std_ST_ofi_norm_300s', 'ST_ofi_norm_300s'),
+            ('mean_ST_cvd_5m', 'std_ST_cvd_5m', 'ST_cvd_5m'),
         ]
-        mat = []
+        means = []
+        stds = []
         for fp in self.regime_fingerprints:
-            row = [fp.get(fp_k, 0.0) for fp_k, _ in self.live_feature_map]
-            mat.append(row)
+            means.append([fp.get(m_k, 0.0) for m_k, _, _ in self.live_feature_map])
+            stds.append([max(fp.get(s_k, 1.0), 1e-6) for _, s_k, _ in self.live_feature_map])
 
-        self.regime_matrix = np.array(mat, dtype=np.float32)
+        self.regime_matrix = np.array(means, dtype=np.float32)
+        self.regime_stds = np.array(stds, dtype=np.float32)
         self.regime_mean = np.mean(self.regime_matrix, axis=0, keepdims=True)
-        self.regime_std = np.std(self.regime_matrix, axis=0, keepdims=True) + 1e-6
+        self.regime_std = np.mean(self.regime_stds, axis=0, keepdims=True) + 1e-6
         self.norm_regime_matrix = (self.regime_matrix - self.regime_mean) / self.regime_std
 
     def compute_routing_weights(self, current_regime_df: pd.DataFrame) -> np.ndarray:
@@ -147,21 +148,20 @@ class SwarmRegimeRouter:
             return np.ones((n_samples, 1), dtype=np.float32)
 
         cols = []
-        for idx, (fp_k, col_name) in enumerate(self.live_feature_map):
-            if col_name in current_regime_df.columns and np.std(self.regime_matrix[:, idx]) > 1e-7:
+        for idx, (m_k, s_k, col_name) in enumerate(self.live_feature_map):
+            if col_name in current_regime_df.columns:
                 cols.append(np.nan_to_num(current_regime_df[col_name].values, nan=float(self.regime_mean[0, idx])).astype(np.float32))
             else:
                 cols.append(np.full(n_samples, float(self.regime_mean[0, idx]), dtype=np.float32))
 
         cur_mat = np.column_stack(cols).astype(np.float32)
-        norm_cur = np.clip((cur_mat - self.regime_mean) / self.regime_std, -4.0, 4.0)
-
-        diff = norm_cur[:, np.newaxis, :] - self.norm_regime_matrix[np.newaxis, :, :]
+        diff = (cur_mat[:, np.newaxis, :] - self.regime_matrix[np.newaxis, :, :]) / self.regime_stds[np.newaxis, :, :]
+        diff = np.clip(diff, -3.0, 3.0)
         dist_sq = np.mean(diff ** 2, axis=-1)
 
-        # Мягкий приор свежести: win_00 получает преимущество при равном режиме
-        recency_bonus = -0.35 * np.arange(self.num_models, dtype=np.float32)[np.newaxis, :]
-        logits = (-dist_sq / self.temperature) + recency_bonus
+        # Приор свежести: win_00 получает приоритет при сопоставимом рыночном режиме
+        recency_bonus = -1.0 * np.arange(self.num_models, dtype=np.float32)[np.newaxis, :]
+        logits = (-dist_sq / max(0.5, self.temperature)) + recency_bonus
         logits_max = np.max(logits, axis=-1, keepdims=True)
         exp_logits = np.exp(logits - logits_max)
         weights = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
@@ -182,6 +182,20 @@ class SwarmRegimeRouter:
             float(np.nansum(X[:, min(12, X.shape[1] - 1)]))
         ], dtype=np.float64)
         return hashlib.md5(sample_pts.tobytes()).hexdigest()[:10]
+
+    def _sanitize_stale_bo_features(self, X: np.ndarray, current_regime_df: pd.DataFrame) -> np.ndarray:
+        """Обнуляет направленные осцилляторы BigONE / Lead-Lag на секундах зависания коллектора (BO_sec_since_tick > 60s)."""
+        if 'BO_sec_since_tick' not in current_regime_df.columns:
+            return X
+        bo_stale = (current_regime_df['BO_sec_since_tick'].values > 60.0)
+        if not np.any(bo_stale):
+            return X
+        X_clean = X.copy()
+        zero_prefixes = ('LL_', 'BO_ofi_', 'BO_cvd_', 'BO_imb_', 'BO_obi_', 'BO_micro_', 'BO_ret_', 'BO_vol_intensity_')
+        zero_cols = [idx for idx, fname in enumerate(self.feature_names) if fname.startswith(zero_prefixes)]
+        if zero_cols:
+            X_clean[np.ix_(bo_stale, zero_cols)] = 0.0
+        return X_clean
 
     def predict_ensemble(self, X: np.ndarray, current_regime_df: pd.DataFrame, mode: str = "router"):
         """
@@ -206,9 +220,10 @@ class SwarmRegimeRouter:
             self._lgb_cache_sig = (slice_hash, manifest_mtime)
             self._lgb_cache_probs = all_probs
         else:
+            X_inf = self._sanitize_stale_bo_features(X, current_regime_df)
             all_probs = np.zeros((self.num_models, n_samples, 7), dtype=np.float32)
             for i, booster in enumerate(self.models):
-                raw_p = booster.predict(X)
+                raw_p = booster.predict(X_inf)
                 if raw_p.shape[1] == 7:
                     all_probs[i] = raw_p
                 else:
@@ -234,9 +249,35 @@ class SwarmRegimeRouter:
         else:
             raise ValueError(f"Неизвестный режим: {mode}")
 
-        # Ожидаемый импульс E[z] в тиках от LightGBM
+        # Ожидаемый импульс E[z] и калибровка исторических окон к эталонному окну win_00
         class_values = np.array([-3, -2, -1, 0, 1, 2, 3], dtype=np.float32)
-        expected_z = np.dot(blend_probs, class_values)
+        ref_probs = all_probs[0]
+        ref_ez = np.dot(ref_probs, class_values)
+        ref_mean = float(np.mean(ref_ez))
+        ref_std = float(np.std(ref_ez)) + 1e-6
+        ref_pb_mean = float(np.mean(ref_probs[:, 5] + ref_probs[:, 6])) + 1e-6
+        ref_ps_mean = float(np.mean(ref_probs[:, 0] + ref_probs[:, 1])) + 1e-6
+
+        cal_ez_all = np.zeros((self.num_models, n_samples), dtype=np.float32)
+        cal_pb_all = np.zeros((self.num_models, n_samples), dtype=np.float32)
+        cal_ps_all = np.zeros((self.num_models, n_samples), dtype=np.float32)
+        cal_ez_all[0] = ref_ez
+        cal_pb_all[0] = ref_probs[:, 5] + ref_probs[:, 6]
+        cal_ps_all[0] = ref_probs[:, 0] + ref_probs[:, 1]
+
+        for i in range(1, self.num_models):
+            p_i = all_probs[i]
+            ez_i = np.dot(p_i, class_values)
+            cal_ez_all[i] = (ez_i - float(np.mean(ez_i))) * (ref_std / (float(np.std(ez_i)) + 1e-6)) + ref_mean
+            pb_i = p_i[:, 5] + p_i[:, 6]
+            ps_i = p_i[:, 0] + p_i[:, 1]
+            cal_pb_all[i] = np.clip(pb_i * (ref_pb_mean / (float(np.mean(pb_i)) + 1e-6)), 0.0, 1.0)
+            cal_ps_all[i] = np.clip(ps_i * (ref_ps_mean / (float(np.mean(ps_i)) + 1e-6)), 0.0, 1.0)
+
+        expected_z = np.einsum('nm,mn->n', weights, cal_ez_all)
+        expected_z = (expected_z - float(np.mean(expected_z))) * (ref_std / (float(np.std(expected_z)) + 1e-6)) + ref_mean
+        p_buy = np.einsum('nm,mn->n', weights, cal_pb_all)
+        p_sell = np.einsum('nm,mn->n', weights, cal_ps_all)
 
         # Если подключены нейросетевые эксперты (Conv1D+GRU, Causal CNN, MLP, Attention),
         # формируем IC-взвешенный альянс нейросетей с байесовской калибровкой априорных весов классов
@@ -261,7 +302,8 @@ class SwarmRegimeRouter:
                         os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
                         import tensorflow as tf
                         exp["model"] = tf.keras.models.load_model(exp["k_file"], compile=False)
-                    x_norm = np.clip((X - exp["mean"]) / exp["std"], -5.0, 5.0).astype(np.float32)
+                    X_nn = self._sanitize_stale_bo_features(X, current_regime_df)
+                    x_norm = np.clip((X_nn - exp["mean"]) / exp["std"], -5.0, 5.0).astype(np.float32)
                     x_norm = np.nan_to_num(x_norm, nan=0.0, posinf=5.0, neginf=-5.0)
                     x_pad = np.vstack([np.repeat(x_norm[:1], sl - 1, axis=0), x_norm])
                     x_3d_view = np.lib.stride_tricks.sliding_window_view(x_pad, (sl, x_norm.shape[1]))[:, 0, :, :]
@@ -308,10 +350,37 @@ class SwarmRegimeRouter:
                 # Сохраняем амплитуду дисперсии сигнала, чтобы пороги диспетчера (trend_gate, threshold_core) не размывались
                 expected_z = (raw_blend_ez - float(np.mean(raw_blend_ez))) * (lgb_ez_std / blend_std) + lgb_mean
                 blend_probs = (1.0 - w_nn) * blend_probs + w_nn * nn_probs_blend
+                nn_pb = nn_probs_blend[:, 5] + nn_probs_blend[:, 6]
+                nn_ps = nn_probs_blend[:, 0] + nn_probs_blend[:, 1]
+                nn_pb = np.clip(nn_pb * (ref_pb_mean / (float(np.mean(nn_pb)) + 1e-6)), 0.0, 1.0)
+                nn_ps = np.clip(nn_ps * (ref_ps_mean / (float(np.mean(nn_ps)) + 1e-6)), 0.0, 1.0)
+                p_buy = (1.0 - w_nn) * p_buy + w_nn * nn_pb
+                p_sell = (1.0 - w_nn) * p_sell + w_nn * nn_ps
 
-        # Сигналы на вход
-        p_buy = blend_probs[:, 5] + blend_probs[:, 6]   # P(+2) + P(+3)
-        p_sell = blend_probs[:, 1] + blend_probs[:, 0]  # P(-2) + P(-3)
+        # Защита ML-инференса от зависания коллектора второй биржи (BO_sec_since_tick > 60s):
+        # когда 135 признаков BO_*/LL_* замирают, дисперсия прогноза сжимается на 30-35% и возникает ложный сдвиг среднего.
+        # Выравниваем масштаб (mean/std) и вероятности хвостов на интервалах заморозки BO к живым участкам SafeTrade.
+        if 'BO_sec_since_tick' in current_regime_df.columns:
+            bo_stale = (current_regime_df['BO_sec_since_tick'].values > 60.0)
+            n_stale = int(np.sum(bo_stale))
+            n_fresh = int(len(bo_stale) - n_stale)
+            if n_stale > 60 and n_fresh > 60:
+                f_mean = float(np.mean(expected_z[~bo_stale]))
+                f_std = float(np.std(expected_z[~bo_stale])) + 1e-6
+                s_mean = float(np.mean(expected_z[bo_stale]))
+                s_std = float(np.std(expected_z[bo_stale])) + 1e-6
+                expected_z = expected_z.copy()
+                expected_z[bo_stale] = (expected_z[bo_stale] - s_mean) * (f_std / s_std) + f_mean
+
+                f_pb = float(np.mean(p_buy[~bo_stale])) + 1e-6
+                s_pb = float(np.mean(p_buy[bo_stale])) + 1e-6
+                p_buy = p_buy.copy()
+                p_buy[bo_stale] = np.clip(p_buy[bo_stale] * (f_pb / s_pb), 0.0, 1.0)
+
+                f_ps = float(np.mean(p_sell[~bo_stale])) + 1e-6
+                s_ps = float(np.mean(p_sell[bo_stale])) + 1e-6
+                p_sell = p_sell.copy()
+                p_sell[bo_stale] = np.clip(p_sell[bo_stale] * (f_ps / s_ps), 0.0, 1.0)
 
         return {
             'probs': blend_probs,
