@@ -79,23 +79,6 @@ def export_prl_colab_dataset(upload_gdrive=False):
             windows_spec[f"{h_key}_tr_idx_{w_i:02d}"] = w_obj['tr_idx'].astype(np.int32)
             windows_spec[f"{h_key}_te_idx_{w_i:02d}"] = w_obj['te_idx'].astype(np.int32)
 
-    # Выгрузка числовых массивов по чистым индексам win_00 + полный пул для асинхронных окон
-    X_train = X_all[tr_idx]
-    y_train_h5 = (df['target_class_7_h5_k3'].iloc[tr_idx].values + 3).astype(np.int32)
-    y_train_h12 = (df['target_class_7_h12_k3.5'].iloc[tr_idx].values + 3).astype(np.int32)
-    y_train_h25 = (df['target_class_7_h25_k3'].iloc[tr_idx].values + 3).astype(np.int32)
-
-    X_test = X_all[te_idx]
-    y_test_h5 = (df['target_class_7_h5_k3'].iloc[te_idx].values + 3).astype(np.int32)
-    y_test_h12 = (df['target_class_7_h12_k3.5'].iloc[te_idx].values + 3).astype(np.int32)
-    y_test_h25 = (df['target_class_7_h25_k3'].iloc[te_idx].values + 3).astype(np.int32)
-    dt_test_h5 = df['target_dt_ticks_h5_k3'].iloc[te_idx].values.astype(np.float32)
-    dt_test_h12 = df['target_dt_ticks_h12_k3.5'].iloc[te_idx].values.astype(np.float32)
-    dt_test_h25 = df['target_dt_ticks_h25_k3'].iloc[te_idx].values.astype(np.float32)
-
-    ts_train = df['timestamp'].iloc[tr_idx].astype(str).values
-    ts_test = df['timestamp'].iloc[te_idx].astype(str).values
-
     out_file = BASE_DIR / "data" / "prl_neural_colab_data.npz"
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -110,19 +93,6 @@ def export_prl_colab_dataset(upload_gdrive=False):
         dt_all_h5=df['target_dt_ticks_h5_k3'].fillna(0).values.astype(np.float16),
         dt_all_h12=df['target_dt_ticks_h12_k3.5'].fillna(0).values.astype(np.float16),
         dt_all_h25=df['target_dt_ticks_h25_k3'].fillna(0).values.astype(np.float16),
-        X_train=X_train,
-        y_train_h5=y_train_h5,
-        y_train_h12=y_train_h12,
-        y_train_h25=y_train_h25,
-        X_test=X_test,
-        y_test_h5=y_test_h5,
-        y_test_h12=y_test_h12,
-        y_test_h25=y_test_h25,
-        dt_test_h5=dt_test_h5,
-        dt_test_h12=dt_test_h12,
-        dt_test_h25=dt_test_h25,
-        ts_train=ts_train,
-        ts_test=ts_test,
         features=np.array(feature_cols),
         n_windows=np.int32(len(wins_h12)),
         **windows_spec
