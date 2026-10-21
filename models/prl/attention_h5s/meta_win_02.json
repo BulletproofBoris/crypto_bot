@@ -1,5 +1,5 @@
 {
-  "model_type": "conv1d+gru",
+  "model_type": "attention",
   "coin": "PRL",
   "H": 5,
   "seq_len": 15,
@@ -12,10 +12,10 @@
     "2026-10-18 15:13:47"
   ],
   "metrics_oos": {
-    "ic_dt_ticks": 0.1471,
-    "roc_auc_ovr": 0.7869,
-    "log_loss": 1.6821,
-    "top2pct_mean_ticks": 0.06
+    "ic_dt_ticks": 0.141,
+    "roc_auc_ovr": 0.7904,
+    "log_loss": 1.5054,
+    "top2pct_mean_ticks": 0.03
   },
   "feature_norm": {
     "mean": [
@@ -621,5 +621,6 @@
       0.6690725088119507
     ]
   },
-  "weights_file": "model_win_00.keras"
+  "weights_file": "model_win_02.keras",
+  "window_id": "win_02"
 }

@@ -621,5 +621,6 @@
       0.6690725088119507
     ]
   },
-  "weights_file": "model_win_00.keras"
+  "weights_file": "model_win_02.keras",
+  "window_id": "win_02"
 }
