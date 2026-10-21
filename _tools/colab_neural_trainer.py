@@ -136,7 +136,8 @@ def train_window_swarm(
 ) -> dict:
     if archs is None:
         archs = ["conv1d+gru", "causal_cnn", "attention", "mlp_bottleneck"]
-    tf.keras.mixed_precision.set_global_policy("mixed_float16")
+    has_gpu = len(tf.config.list_physical_devices("GPU")) > 0
+    tf.keras.mixed_precision.set_global_policy("mixed_float16" if has_gpu else "float32")
     k_ratio, seq_len = get_horizon_defaults(horizon)
     win_tag = f"win_{win_idx:02d}"
     pack_dir = pack_dir or f"prl_ensemble_pack_h{horizon}s"
@@ -178,8 +179,9 @@ def train_window_swarm(
 
     mean = np.nanmean(X_tr, axis=0)
     std = np.nanstd(X_tr, axis=0) + 1e-6
-    X_tr_norm = np.clip((X_tr - mean) / std, -5.0, 5.0).astype(np.float16)
-    X_te_norm = np.clip((X_te - mean) / std, -5.0, 5.0).astype(np.float16)
+    target_dtype = np.float16 if has_gpu else np.float32
+    X_tr_norm = np.clip((X_tr - mean) / std, -5.0, 5.0).astype(target_dtype)
+    X_te_norm = np.clip((X_te - mean) / std, -5.0, 5.0).astype(target_dtype)
     del X_tr, X_te, w_data
     _trim_memory()
 

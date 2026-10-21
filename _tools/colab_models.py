@@ -14,7 +14,8 @@ from tensorflow.keras.models import Model
 from tensorflow.keras import regularizers
 
 def make_gpu_sequence_dataset(X_gpu, y_gpu, seq_len=75, batch_size=2048, shuffle=True):
-    X_gpu = tf.constant(X_gpu, dtype=tf.float16)
+    has_gpu = len(tf.config.list_physical_devices("GPU")) > 0
+    X_gpu = tf.constant(X_gpu, dtype=tf.float16 if has_gpu else tf.float32)
     y_gpu = tf.constant(y_gpu, dtype=tf.float32)
     offsets_gpu = tf.range(seq_len, dtype=tf.int32)[tf.newaxis, :]
     n_win = int(X_gpu.shape[0]) - seq_len + 1
@@ -26,8 +27,6 @@ def make_gpu_sequence_dataset(X_gpu, y_gpu, seq_len=75, batch_size=2048, shuffle
     def _slice_batch(b_idx):
         return tf.gather(X_gpu, b_idx[:, tf.newaxis] + offsets_gpu), tf.gather(y_gpu, b_idx)
     ds = ds.map(_slice_batch, num_parallel_calls=tf.data.AUTOTUNE)
-    return ds.prefetch(tf.data.AUTOTUNE)
-
     return ds.prefetch(tf.data.AUTOTUNE)
 
 # 4. Фабрика 4 нейросетевых архитектур (из _tools/ltsm_core/model_builder.py)
