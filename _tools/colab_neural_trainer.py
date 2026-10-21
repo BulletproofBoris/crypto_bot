@@ -264,6 +264,11 @@ def train_window_swarm(
         }
         with open(os.path.join(arch_dir, f"meta_{win_tag}.json"), "w") as f:
             json.dump(meta, f, indent=2)
+        if os.path.isdir("models/prl"):
+            canon_dir = os.path.join("models/prl", f"{arch.replace('+', '_')}_h{horizon}s")
+            os.makedirs(canon_dir, exist_ok=True)
+            shutil.copy2(final_keras_path, os.path.join(canon_dir, f"model_{win_tag}.keras"))
+            shutil.copy2(os.path.join(arch_dir, f"meta_{win_tag}.json"), os.path.join(canon_dir, f"meta_{win_tag}.json"))
         leaderboard.append({"window": win_tag, "model": f"{arch} (r{best_r})", "params": best_params, **best_m})
 
     del train_ds, val_ds, X_tr_norm, X_te_norm, y_tr_oh, y_te_oh

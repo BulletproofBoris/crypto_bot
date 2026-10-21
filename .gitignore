@@ -19,3 +19,8 @@ __pycache__/
 *$py.class
 .vscode/
 *.png
+
+# Temporary trainer buffers & archives (canonical models live in models/prl/)
+trained_models/
+prl_ensemble_pack_*/
+prl_ensemble_pack_*.zip
