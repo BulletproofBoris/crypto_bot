@@ -327,10 +327,16 @@ def run_colab_pipeline(
             if force_retrain:
                 cmd.append("--force-retrain")
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-            for line in proc.stdout:
-                if not any(skip in line for skip in ("oneDNN custom operations", "Unable to register cu", "computation_placer.cc")):
-                    print(line, end="", flush=True)
-            proc.wait()
+            try:
+                for line in proc.stdout:
+                    if not any(skip in line for skip in ("oneDNN custom operations", "Unable to register cu", "computation_placer.cc")):
+                        print(line, end="", flush=True)
+                proc.wait()
+            except KeyboardInterrupt:
+                print("\n🛑 [Interrupt] Принудительная остановка дочернего процесса окна...")
+                proc.kill()
+                proc.wait()
+                break
             for arch in arch_list:
                 m_file = os.path.join(pack_dir, f"{arch.replace('+', '_')}_h{horizon}s", f"meta_win_{w_idx:02d}.json")
                 if os.path.exists(m_file):
