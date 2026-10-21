@@ -132,6 +132,17 @@ def generate_rolling_windows_reverse(segments: list, H: int, K: float, n_target:
     te0_end_pos = n_clean
     te0_start_pos = te0_end_pos - te0_len
     tr0_end_pos = te0_start_pos - buffer
+
+    # Привязка сетки H=5 к опорному якорю (2026-10-18 19:44:20+03:00, pos=678579),
+    # чтобы при добавлении новых данных окна сдвигались строго на целое число шагов step=37500,
+    # сохраняя 100% совместимость уже обученных чекпоинтов нейросетей!
+    anchor_pos_h5 = 678579
+    if int(H) == 5 and n_clean > anchor_pos_h5 + step:
+        n_steps_shift = max(0, (tr0_end_pos - anchor_pos_h5) // step)
+        tr0_end_pos = anchor_pos_h5 + n_steps_shift * step
+        te0_start_pos = tr0_end_pos + buffer
+        te0_len = te0_end_pos - te0_start_pos
+
     tr0_start_pos = tr0_end_pos - t_train
 
     if tr0_start_pos >= 0:
@@ -150,8 +161,9 @@ def generate_rolling_windows_reverse(segments: list, H: int, K: float, n_target:
             'H': H,
             'K': K
         })
+    max_wins = 14 if int(H) == 5 else 12
     curr_tr_end = tr0_end_pos - step
-    while curr_tr_end - t_train >= 0 and len(windows) < 12:
+    while curr_tr_end - t_train >= 0 and len(windows) < max_wins:
         tr_e_pos = curr_tr_end
         tr_s_pos = tr_e_pos - t_train
         te_s_pos = tr_e_pos + buffer

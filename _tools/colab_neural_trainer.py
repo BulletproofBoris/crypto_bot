@@ -304,7 +304,7 @@ def run_colab_pipeline(
     cache_dir = ensure_mmap_cache(data_file)
     h_key = f"h{int(horizon)}"
     if windows.strip().lower() == "all":
-        default_counts = {5: 12, 12: 5, 25: 2}
+        default_counts = {5: 14, 12: 6, 25: 3}
         nw_file = Path(cache_dir) / f"{h_key}_n_windows.npy"
         n_w = int(np.load(nw_file)) if nw_file.exists() else default_counts.get(int(horizon), 1)
         win_list = list(range(n_w))
