@@ -106,12 +106,17 @@ def run_execution_simulation(args):
     schema_cols = set(pq.read_schema(labeled_path).names)
     need_labeling = (target_c7_col not in schema_cols) or (target_dt_col not in schema_cols)
 
+    n_book_levels = 10
+    book_cols = []
+    for lvl in range(1, n_book_levels + 1):
+        book_cols.extend([f'ST_bid_{lvl}_price', f'ST_bid_{lvl}_qty', f'ST_ask_{lvl}_price', f'ST_ask_{lvl}_qty'])
+
     exec_cols = [
         'timestamp', 'sample_split', 'ST_bid_1_price', 'ST_ask_1_price',
         'ST_bid_1_qty', 'ST_ask_1_qty', 'ST_mid_price', 'ST_spread', 'ST_spread_pct',
         'ST_trade_vol', 'ST_buy_vol', 'ST_sell_vol',
         'ST_bids_vol_top5', 'ST_asks_vol_top5'
-    ]
+    ] + book_cols
     if not need_labeling:
         exec_cols += [target_c7_col, target_dt_col]
 
@@ -187,6 +192,50 @@ def run_execution_simulation(args):
     bid_qtys = val_df['ST_bid_1_qty'].values if 'ST_bid_1_qty' in val_df.columns else np.full(n_seconds, 100.0)
     ask_qtys = val_df['ST_ask_1_qty'].values if 'ST_ask_1_qty' in val_df.columns else np.full(n_seconds, 100.0)
 
+    # Матрицы 10 уровней L2-стакана (N, 10) для точного учета FIFO-очереди и глубины ликвидности
+    bid_p_mat = np.column_stack([val_df[f'ST_bid_{i}_price'].values if f'ST_bid_{i}_price' in val_df.columns else np.zeros(n_seconds) for i in range(1, n_book_levels + 1)])
+    bid_q_mat = np.column_stack([val_df[f'ST_bid_{i}_qty'].values if f'ST_bid_{i}_qty' in val_df.columns else np.zeros(n_seconds) for i in range(1, n_book_levels + 1)])
+    ask_p_mat = np.column_stack([val_df[f'ST_ask_{i}_price'].values if f'ST_ask_{i}_price' in val_df.columns else np.zeros(n_seconds) for i in range(1, n_book_levels + 1)])
+    ask_q_mat = np.column_stack([val_df[f'ST_ask_{i}_qty'].values if f'ST_ask_{i}_qty' in val_df.columns else np.zeros(n_seconds) for i in range(1, n_book_levels + 1)])
+
+    def get_lob_queue_state(t_idx: int, side: str, price: float):
+        """Возвращает (q_at_price, q_better_levels, q_crossed_opposite) в секунду t_idx."""
+        eps = 1e-6
+        if side == 'buy':
+            p_row, q_row = bid_p_mat[t_idx], bid_q_mat[t_idx]
+            op_p, op_q = ask_p_mat[t_idx], ask_q_mat[t_idx]
+            q_at = float(np.sum(q_row[np.abs(p_row - price) <= eps]))
+            q_better = float(np.sum(q_row[p_row > price + eps]))
+            q_cross = float(np.sum(op_q[(op_p > 0) & (op_p <= price + eps)]))
+        else:
+            p_row, q_row = ask_p_mat[t_idx], ask_q_mat[t_idx]
+            op_p, op_q = bid_p_mat[t_idx], bid_q_mat[t_idx]
+            q_at = float(np.sum(q_row[np.abs(p_row - price) <= eps]))
+            q_better = float(np.sum(q_row[(p_row > 0) & (p_row < price - eps)]))
+            q_cross = float(np.sum(op_q[op_p >= price - eps]))
+        return q_at, q_better, q_cross
+
+    def sweep_lob_taker(t_idx: int, side: str, max_qty: float, limit_price: float = None):
+        """Исполняет Taker-ордер по 10 уровням стакана с учетом реальной глубины каждого уровня."""
+        op_p = ask_p_mat[t_idx] if side == 'buy' else bid_p_mat[t_idx]
+        op_q = ask_q_mat[t_idx] if side == 'buy' else bid_q_mat[t_idx]
+        filled, total_notional = 0.0, 0.0
+        for p_lvl, q_lvl in zip(op_p, op_q):
+            if p_lvl <= 0 or q_lvl <= 0:
+                continue
+            if limit_price is not None:
+                if side == 'buy' and p_lvl > limit_price + 1e-6:
+                    break
+                if side == 'sell' and p_lvl < limit_price - 1e-6:
+                    break
+            take = min(max_qty - filled, float(q_lvl))
+            filled += take
+            total_notional += take * float(p_lvl)
+            if filled >= max_qty - 1e-6:
+                break
+        vwap = (total_notional / filled) if filled > 0 else 0.0
+        return filled, total_notional, vwap
+
     for t in range(n_seconds):
         bid_p = bid_prices[t]
         ask_p = ask_prices[t]
@@ -209,32 +258,30 @@ def run_execution_simulation(args):
             order_done = False
 
             if is_active and rem_qty > 0:
+                q_at, q_better, q_cross = get_lob_queue_state(t, o_side, o_price)
+                if not active_order.get('queue_init', False):
+                    active_order['q_ahead'] = q_at if args.queue_model != 'instant' else 0.0
+                    active_order['queue_init'] = True
+                elif args.queue_model != 'instant':
+                    active_order['q_ahead'] = min(active_order['q_ahead'], q_at)
+
                 fill_qty = 0.0
                 if o_side == 'buy':
-                    # Сквозной пробой уровня: цена ask упала до или ниже цены нашего лимитного бида
-                    if ask_p <= o_price:
-                        avail = max(ask_qtys[t], sell_vol) if args.queue_model != 'instant' else rem_qty
+                    if ask_p <= o_price + 1e-6:
+                        avail = max(q_cross, max(0.0, sell_vol - active_order['q_ahead'])) if args.queue_model != 'instant' else rem_qty
                         fill_qty = min(rem_qty, avail)
-                    # Трейды на уровне бида: рыночные продажи
-                    elif sell_vol > 0 and bid_p <= o_price:
+                        active_order['q_ahead'] = max(0.0, active_order['q_ahead'] - sell_vol)
+                    elif sell_vol > 0 and bid_p <= o_price + 1e-6:
                         if args.queue_model == 'instant':
                             fill_qty = rem_qty
                         else:
-                            # Реалистичная модель очереди:
-                            if o_price < bid_p:
-                                fill_qty = 0.0
-                            elif o_price == bid_p:
-                                # Мы стоим на BBO за объемом q_ahead
-                                if sell_vol <= active_order['q_ahead']:
-                                    active_order['q_ahead'] -= sell_vol
-                                    fill_qty = 0.0
-                                else:
-                                    avail = sell_vol - active_order['q_ahead']
-                                    active_order['q_ahead'] = 0.0
-                                    fill_qty = min(rem_qty, avail)
+                            vol_at_our_level = max(0.0, sell_vol - q_better)
+                            if vol_at_our_level <= active_order['q_ahead']:
+                                active_order['q_ahead'] -= vol_at_our_level
                             else:
-                                # Мы стоим внутри спреда (лучшая цена): мы первые в очереди
-                                fill_qty = min(rem_qty, sell_vol)
+                                avail = vol_at_our_level - active_order['q_ahead']
+                                active_order['q_ahead'] = 0.0
+                                fill_qty = min(rem_qty, avail)
 
                     if fill_qty > 0:
                         cost = fill_qty * o_price
@@ -250,27 +297,21 @@ def run_execution_simulation(args):
                                 order_done = True
 
                 elif o_side == 'sell':
-                    # Сквозной пробой уровня: цена bid поднялась до или выше цены нашего лимитного аска
-                    if bid_p >= o_price:
-                        avail = max(bid_qtys[t], buy_vol) if args.queue_model != 'instant' else rem_qty
+                    if bid_p >= o_price - 1e-6:
+                        avail = max(q_cross, max(0.0, buy_vol - active_order['q_ahead'])) if args.queue_model != 'instant' else rem_qty
                         fill_qty = min(rem_qty, avail)
-                    # Трейды на уровне аска: рыночные покупки
-                    elif buy_vol > 0 and ask_p >= o_price:
+                        active_order['q_ahead'] = max(0.0, active_order['q_ahead'] - buy_vol)
+                    elif buy_vol > 0 and ask_p >= o_price - 1e-6:
                         if args.queue_model == 'instant':
                             fill_qty = rem_qty
                         else:
-                            if o_price > ask_p:
-                                fill_qty = 0.0
-                            elif o_price == ask_p:
-                                if buy_vol <= active_order['q_ahead']:
-                                    active_order['q_ahead'] -= buy_vol
-                                    fill_qty = 0.0
-                                else:
-                                    avail = buy_vol - active_order['q_ahead']
-                                    active_order['q_ahead'] = 0.0
-                                    fill_qty = min(rem_qty, avail)
+                            vol_at_our_level = max(0.0, buy_vol - q_better)
+                            if vol_at_our_level <= active_order['q_ahead']:
+                                active_order['q_ahead'] -= vol_at_our_level
                             else:
-                                fill_qty = min(rem_qty, buy_vol)
+                                avail = vol_at_our_level - active_order['q_ahead']
+                                active_order['q_ahead'] = 0.0
+                                fill_qty = min(rem_qty, avail)
 
                     if fill_qty > 0:
                         rev = fill_qty * o_price
@@ -298,39 +339,32 @@ def run_execution_simulation(args):
         p_p3 = probs[t, 6]  # Class +3 (Экстремальный памп)
         p_m3 = probs[t, 0]  # Class -3 (Экстремальный дамп)
 
-        # А. Экстренный TAKER (импульс кита / защита от сквиза)
+        # А. Экстренный TAKER (импульс кита / защита от сквиза с учетом реальной ликвидности 10 уровней)
         if p_p3 > args.threshold_taker and usdt >= (trade_size * ask_p * 1.003):
-            # Taker BUY
-            exec_p = ask_p
-            cost = trade_size * exec_p
+            filled_q, cost, exec_p = sweep_lob_taker(t, 'buy', trade_size)
             fee = cost * args.taker_fee
-            usdt -= (cost + fee)
-            tokens += trade_size
-            taker_fills += 1
-            active_order = None
-            trades.append({'t': t, 'side': 'BUY_TAKER', 'price': exec_p, 'qty': trade_size, 'tokens': tokens, 'usdt': usdt})
+            if filled_q > 0 and usdt >= (cost + fee):
+                usdt -= (cost + fee)
+                tokens += filled_q
+                taker_fills += 1
+                active_order = None
+                trades.append({'t': t, 'side': 'BUY_TAKER', 'price': exec_p, 'qty': filled_q, 'tokens': tokens, 'usdt': usdt})
 
         elif p_m3 > args.threshold_taker and tokens >= trade_size:
-            # Taker SELL
-            exec_p = bid_p
-            rev = trade_size * exec_p
-            fee = rev * args.taker_fee
-            tokens -= trade_size
-            usdt += (rev - fee)
-            taker_fills += 1
-            active_order = None
-            trades.append({'t': t, 'side': 'SELL_TAKER', 'price': exec_p, 'qty': trade_size, 'tokens': tokens, 'usdt': usdt})
+            filled_q, rev, exec_p = sweep_lob_taker(t, 'sell', min(trade_size, tokens))
+            if filled_q > 0:
+                fee = rev * args.taker_fee
+                tokens -= filled_q
+                usdt += (rev - fee)
+                taker_fills += 1
+                active_order = None
+                trades.append({'t': t, 'side': 'SELL_TAKER', 'price': exec_p, 'qty': filled_q, 'tokens': tokens, 'usdt': usdt})
 
-        # Б. Регулярный MAKER (вход в спред по сигналу роутера)
+        # Б. Регулярный MAKER (вход в спред по сигналу роутера; очередь q_ahead фиксируется в момент прихода t + latency)
         elif active_order is None:
-            # Сигнал на покупку: ожидаемый импульс вверх и вероятность роста > порога
             if ez > args.threshold_maker and pb > 0.20:
                 if usdt >= (trade_size * bid_p):
-                    limit_p = round(bid_p, 4)
-                    q_ahead = float(bid_qtys[t])
-                    if ask_p - bid_p > 2 * tick_size:
-                        limit_p = round(bid_p + tick_size, 4)
-                        q_ahead = 0.0
+                    limit_p = round(bid_p + tick_size, 4) if (ask_p - bid_p > 2 * tick_size) else round(bid_p, 4)
                     active_order = {
                         'side': 'buy',
                         'price': limit_p,
@@ -338,19 +372,15 @@ def run_execution_simulation(args):
                         'rem_qty': trade_size,
                         'placed_at': t,
                         'active_after': t + args.latency_sec,
-                        'q_ahead': q_ahead,
+                        'q_ahead': 0.0,
+                        'queue_init': False,
                         'canceling': False,
                         'cancel_after': None
                     }
 
-            # Сигнал на продажу: ожидаемый импульс вниз и вероятность спада > порога
             elif ez < -args.threshold_maker and ps > 0.20:
                 if tokens >= trade_size:
-                    limit_p = round(ask_p, 4)
-                    q_ahead = float(ask_qtys[t])
-                    if ask_p - bid_p > 2 * tick_size:
-                        limit_p = round(ask_p - tick_size, 4)
-                        q_ahead = 0.0
+                    limit_p = round(ask_p - tick_size, 4) if (ask_p - bid_p > 2 * tick_size) else round(ask_p, 4)
                     active_order = {
                         'side': 'sell',
                         'price': limit_p,
@@ -358,7 +388,8 @@ def run_execution_simulation(args):
                         'rem_qty': trade_size,
                         'placed_at': t,
                         'active_after': t + args.latency_sec,
-                        'q_ahead': q_ahead,
+                        'q_ahead': 0.0,
+                        'queue_init': False,
                         'canceling': False,
                         'cancel_after': None
                     }

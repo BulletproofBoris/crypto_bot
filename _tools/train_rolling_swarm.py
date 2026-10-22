@@ -53,6 +53,8 @@ def get_default_k(coin: str, H: int) -> float:
         return 3.0
     elif H in (12, 13, 14, 15):
         return 3.5
+    elif H >= 50:
+        return 2.5
     elif H >= 18:
         return 3.0
     elif H < 11:

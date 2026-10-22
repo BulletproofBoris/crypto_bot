@@ -427,30 +427,12 @@ def sync_vps_hot():
     logger.info(f"⚡ Подключение к VPS ({VPS_HOST}:{VPS_PORT}) для выгрузки горячего хвоста...")
     ensure_directories()
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(10.0)
+    ssh_client = None
     try:
-        sock.connect((VPS_HOST, VPS_PORT))
-    except Exception as e:
-        logger.warning(f"Не удалось подключиться к VPS {VPS_HOST}:{VPS_PORT} (таймаут/сеть): {e}")
-        sock.close()
-        return
-
-    transport = paramiko.Transport(sock)
-    transport.banner_timeout = 10.0
-    try:
-        connected = False
-        if VPS_KEY_PATH and os.path.exists(VPS_KEY_PATH):
-            try:
-                pkey = paramiko.Ed25519Key.from_private_key_file(VPS_KEY_PATH)
-                transport.connect(username=VPS_USER, pkey=pkey)
-                connected = True
-                logger.info(f"🔑 Авторизация на VPS по SSH-ключу: {VPS_KEY_PATH}")
-            except Exception as e:
-                logger.debug(f"Не удалось авторизоваться по ключу {VPS_KEY_PATH}: {e}")
-        if not connected:
-            transport.connect(username=VPS_USER, password=VPS_PASS)
-            logger.info("🔑 Авторизация на VPS по паролю")
+        from _tools.vps_config import create_ssh_client
+        ssh_client = create_ssh_client(timeout=35.0)
+        transport = ssh_client.get_transport()
+        logger.info("🔑 Успешная SSH-авторизация на VPS")
         sftp = paramiko.SFTPClient.from_transport(transport)
 
         # Выгрузка архивных срезов из archive_pending на VPS (если ротация произошла, но выгрузка на GDrive задержана)
@@ -488,7 +470,11 @@ def sync_vps_hot():
     except Exception as e:
         logger.warning(f"Ошибка во время передачи данных с VPS: {e}")
     finally:
-        transport.close()
+        if ssh_client:
+            try:
+                ssh_client.close()
+            except Exception:
+                pass
 
     logger.info("✅ Горячие данные с VPS успешно обновлены.")
 
@@ -639,28 +625,19 @@ def sync_and_process_all(include_vps=True):
         except Exception as e:
             logger.error(f"Ошибка при скачивании данных с VPS: {e}")
 
-    # 3. Склеиваем и создаем Parquet-датасеты (параллельно)
-    logger.info(f"⚙️ Сборка и стандартизация датасетов ({len(DATASET_CONFIGS)} датасетов параллельно)...")
-    workers = min(4, SAFE_WORKERS)
-    results = {}
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_cfg = {
-            executor.submit(build_dataset_for_config, cfg, include_vps): cfg["key"]
-            for cfg in DATASET_CONFIGS
-        }
-        for future in future_to_cfg:
-            key = future_to_cfg[future]
-            try:
-                results[key] = future.result()
-            except Exception as e:
-                logger.error(f"Ошибка при сборке датасета {key}: {e}")
+    # 3. Склеиваем и создаем Parquet-датасеты (последовательно с очисткой RAM)
+    import gc
+    logger.info(f"⚙️ Сборка и стандартизация датасетов ({len(DATASET_CONFIGS)} датасетов последовательно с экономией RAM)...")
+    for cfg in DATASET_CONFIGS:
+        key = cfg["key"]
+        try:
+            df_res = build_dataset_for_config(cfg, include_vps)
+            del df_res
+            gc.collect()
+        except Exception as e:
+            logger.error(f"Ошибка при сборке датасета {key}: {e}")
 
-    return (
-        results.get("safetrade_depth", pd.DataFrame()),
-        results.get("safetrade_trades", pd.DataFrame()),
-        results.get("bigone_depth", pd.DataFrame()),
-        results.get("bigone_trades", pd.DataFrame()),
-    )
+    return None
 
 # ==============================================================================
 # ПУБЛИЧНЫЙ API ДЛЯ JUPYTER НОУТБУКА

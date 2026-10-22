@@ -406,15 +406,20 @@ def build_features_for_coin(coin_name, macro_df=None):
 
         merged = pd.merge(merged, on_1s, left_index=True, right_index=True, how='left')
         merged[[c for c in on_1s.columns]] = merged[[c for c in on_1s.columns]].ffill().fillna(0)
+        del df_on, on_1s
+    del cdata
+    import gc
+    gc.collect()
 
     # 5. Макро-поводыри Binance
     if macro_df is not None and not macro_df.empty:
         print("  Добавление макро-поводырей (Binance BTC & NEAR)...")
-        df_m = macro_df.copy()
+        df_m = macro_df
         if df_m['timestamp'].dt.tz is None:
             df_m['timestamp'] = df_m['timestamp'].dt.tz_localize('UTC').dt.tz_convert('Europe/Moscow')
         else:
             df_m['timestamp'] = df_m['timestamp'].dt.tz_convert('Europe/Moscow')
+        df_m = df_m[df_m['timestamp'] >= (merged.index.min() - pd.Timedelta(minutes=10))]
         df_m = df_m.sort_values('timestamp').drop_duplicates('timestamp').set_index('timestamp')
 
         m_cols = [
@@ -446,6 +451,8 @@ def build_features_for_coin(coin_name, macro_df=None):
         merged = pd.merge(merged, m_1s, left_index=True, right_index=True, how='left')
         for c in m_1s.columns:
             merged[c] = merged[c].ffill().fillna(0)
+        del df_m, m_1s
+        gc.collect()
 
     # Очистка: удаляем строки без ключевых BBO/mid_price и приводим сетку к строгому шагу 1 секунда без дыр
     key_cols = [c for c in merged.columns if 'mid_price' in c or 'bid_1_price' in c or 'ask_1_price' in c]

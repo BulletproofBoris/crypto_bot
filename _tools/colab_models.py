@@ -26,8 +26,14 @@ def make_gpu_sequence_dataset(X_gpu, y_gpu, seq_len=75, batch_size=2048, shuffle
     @tf.autograph.experimental.do_not_convert
     def _slice_batch(b_idx):
         return tf.gather(X_gpu, b_idx[:, tf.newaxis] + offsets_gpu), tf.gather(y_gpu, b_idx)
-    ds = ds.map(_slice_batch, num_parallel_calls=tf.data.AUTOTUNE)
-    return ds.prefetch(tf.data.AUTOTUNE)
+    if has_gpu:
+        opts = tf.data.Options()
+        opts.autotune.ram_budget = 2 * 1024 * 1024 * 1024
+        ds = ds.with_options(opts)
+        ds = ds.map(_slice_batch, num_parallel_calls=tf.data.AUTOTUNE)
+        return ds.prefetch(2)
+    ds = ds.map(_slice_batch, num_parallel_calls=2)
+    return ds.prefetch(1)
 
 # 4. Фабрика 4 нейросетевых архитектур (из _tools/ltsm_core/model_builder.py)
 def build_conv1d_gru(seq_len, n_features, n_classes=7, l2_reg=1e-4):

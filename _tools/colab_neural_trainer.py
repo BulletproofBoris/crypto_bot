@@ -44,7 +44,9 @@ def _trim_memory():
 
 
 def get_horizon_defaults(horizon: int) -> tuple[float, int]:
-    if int(horizon) == 25:
+    if int(horizon) >= 50:
+        return 2.5, int(round(horizon * 2.5))
+    elif int(horizon) == 25:
         return 3.0, 75
     elif int(horizon) in (12, 13, 14, 15):
         return 3.5, int(round(horizon * 3.5))
@@ -70,7 +72,10 @@ def evaluate_oos_probs(probs: np.ndarray, y_true: np.ndarray, dt_ticks: np.ndarr
 
 def ensure_mmap_cache(npz_path: str) -> str:
     """Распаковывает сжатый .npz в быстрый .npy кэш для чтения через mmap без затрат RAM."""
-    cache_dir = Path(npz_path).resolve().parent / "_mmap_cache"
+    p = Path(npz_path).resolve()
+    if p.is_dir() and (p / "ready.txt").exists():
+        return str(p)
+    cache_dir = p.parent / "_mmap_cache"
     marker = cache_dir / "ready.txt"
     if marker.exists():
         return str(cache_dir)
@@ -205,11 +210,30 @@ def train_window_swarm(
         best_m = None
         best_params = 0
         arch_losses = []
+        start_r = 1
         arch_dir = os.path.join(pack_dir, f"{arch.replace('+', '_')}_h{horizon}s")
         os.makedirs(arch_dir, exist_ok=True)
         final_keras_path = os.path.join(arch_dir, f"model_{win_tag}.keras")
+        prog_path = os.path.join(arch_dir, f"progress_{win_tag}.json")
 
-        for run_idx in range(1, runs_per_arch + 1):
+        if not force_retrain and os.path.exists(prog_path) and os.path.exists(final_keras_path):
+            with open(prog_path) as pf:
+                prog = json.load(pf)
+            start_r = int(prog.get("completed_runs", 0)) + 1
+            best_r = int(prog.get("best_r", 1))
+            best_m = prog.get("best_m")
+            best_params = int(prog.get("best_params", 0))
+            arch_losses = list(prog.get("arch_losses", []))
+            if best_m:
+                best_metric_tuple = (round(best_m["log_loss"], 3), -best_m["ic"])
+                print(
+                    f"🔄 [{arch.upper()} | {win_tag}] Предзагружен лидер r{best_r:02d}/{runs_per_arch} "
+                    f"(Loss: {best_m['log_loss']:.4f} | IC: {best_m['ic']:+.4f} | AUC: {best_m['auc']:.4f} | Top-2%: {best_m['top2_pnl']:+.2f}) "
+                    f"— продолжаем с r{start_r:02d}/{runs_per_arch}!",
+                    flush=True,
+                )
+
+        for run_idx in range(start_r, runs_per_arch + 1):
             tf.keras.backend.clear_session()
             _trim_memory()
             tf.random.set_seed(1000 + win_idx * 100 + run_idx * 17)
@@ -229,7 +253,7 @@ def train_window_swarm(
                 tf.keras.callbacks.TerminateOnNaN(),
                 profiler,
             ]
-            model.fit(train_ds, validation_data=val_ds, epochs=max_epochs, class_weight=custom_weights, callbacks=cbs, verbose=0)
+            model.fit(train_ds, validation_data=val_ds, epochs=max_epochs, class_weight=custom_weights, callbacks=cbs, shuffle=False, verbose=0)
             elapsed = round(time.time() - t_run, 1)
             if os.path.exists(temp_w):
                 model.load_weights(temp_w)
@@ -251,6 +275,18 @@ def train_window_swarm(
 
             mark = "🏆 РЕКОРД" if is_best else ("🔪 PRUNED" if profiler.pruned else "✅ OK")
             print(f"  [{arch.upper()} | {win_tag} | r{run_idx:02d}/{runs_per_arch}] {mark} ({elapsed}с) -> Loss: {metrics['log_loss']:.4f} | IC: {metrics['ic']:+.4f} | AUC: {metrics['auc']:.4f} | Top-2%: {metrics['top2_pnl']:+.2f}", flush=True)
+            with open(prog_path, "w") as pf:
+                json.dump(
+                    {
+                        "completed_runs": run_idx,
+                        "best_r": best_r,
+                        "best_m": best_m,
+                        "best_params": best_params,
+                        "arch_losses": arch_losses,
+                    },
+                    pf,
+                    indent=2,
+                )
             del model, opt, cbs, profiler
             _trim_memory()
 
@@ -264,6 +300,8 @@ def train_window_swarm(
         }
         with open(os.path.join(arch_dir, f"meta_{win_tag}.json"), "w") as f:
             json.dump(meta, f, indent=2)
+        if os.path.exists(prog_path):
+            os.remove(prog_path)
         if os.path.isdir("models/prl"):
             canon_dir = os.path.join("models/prl", f"{arch.replace('+', '_')}_h{horizon}s")
             os.makedirs(canon_dir, exist_ok=True)
@@ -334,7 +372,7 @@ def run_colab_pipeline(
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
             try:
                 for line in proc.stdout:
-                    if not any(skip in line for skip in ("oneDNN custom operations", "Unable to register cu", "computation_placer.cc")):
+                    if not any(skip in line for skip in ("oneDNN custom operations", "Unable to register cu", "computation_placer.cc", "prefetch_dataset_op.cc", "prefetch_autotuner.cc")):
                         print(line, end="", flush=True)
                 proc.wait()
             except KeyboardInterrupt:

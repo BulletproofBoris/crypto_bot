@@ -291,10 +291,12 @@ class SwarmRegimeRouter:
             cw = np.array(self.alliance_cfg.get("class_weights", [1.0]*7), dtype=np.float32) if self.alliance_cfg else np.ones(7, dtype=np.float32)
             cw_pow = np.power(np.maximum(cw, 1e-3), 0.85)[np.newaxis, :]
 
-            nn_ez_list = []
-            nn_probs_list = []
-            nn_ic_weights = []
+            nn_ez_num = np.zeros(n_samples, dtype=np.float32)
+            nn_probs_num = np.zeros((n_samples, 7), dtype=np.float32)
+            nn_w_sum = np.zeros(n_samples, dtype=np.float32)
             lgb_ez_std = float(np.std(expected_z)) + 1e-6
+            multi_win = len(set(e.get("win_idx", 0) for e in self.neural_experts)) > 1
+            X_nn = None
 
             for exp in self.neural_experts:
                 sl = exp["seq_len"]
@@ -304,11 +306,11 @@ class SwarmRegimeRouter:
                 if cache_file.exists():
                     p_raw = np.load(cache_file)
                 else:
-                    if exp["model"] is None:
-                        os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-                        import tensorflow as tf
-                        exp["model"] = tf.keras.models.load_model(exp["k_file"], compile=False)
-                    X_nn = self._sanitize_stale_bo_features(X, current_regime_df)
+                    if X_nn is None:
+                        X_nn = self._sanitize_stale_bo_features(X, current_regime_df)
+                    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+                    import tensorflow as tf
+                    model = tf.keras.models.load_model(exp["k_file"], compile=False)
                     x_norm = np.clip((X_nn - exp["mean"]) / exp["std"], -5.0, 5.0).astype(np.float32)
                     x_norm = np.nan_to_num(x_norm, nan=0.0, posinf=5.0, neginf=-5.0)
                     x_pad = np.vstack([np.repeat(x_norm[:1], sl - 1, axis=0), x_norm])
@@ -320,9 +322,11 @@ class SwarmRegimeRouter:
                     for start_i in range(0, n_samples, chunk_sz):
                         end_i = min(n_samples, start_i + chunk_sz)
                         x_batch = np.ascontiguousarray(x_3d_view[start_i:end_i], dtype=np.float32)
-                        p_batch = exp["model"].predict_on_batch(x_batch)
+                        p_batch = model.predict_on_batch(x_batch)
                         p_chunks.append(np.asarray(p_batch, dtype=np.float32))
                     p_raw = np.vstack(p_chunks)
+                    del model, x_norm, x_pad, x_3d_view, p_chunks
+                    tf.keras.backend.clear_session()
                     try:
                         np.save(cache_file, p_raw)
                     except Exception:
@@ -339,20 +343,18 @@ class SwarmRegimeRouter:
                 p_cal = p_raw / cw_pow
                 p_cal = p_cal / np.sum(p_cal, axis=1, keepdims=True)
 
-                nn_ez_list.append(ez_scaled)
-                nn_probs_list.append(p_cal)
-                nn_ic_weights.append(max(0.01, exp["ic"] ** 2))
+                w_idx = min(exp.get("win_idx", 0), weights.shape[1] - 1)
+                reg_w = weights[:, w_idx] if multi_win else 1.0
+                w_exp = np.asarray(max(0.01, exp["ic"] ** 2) * reg_w, dtype=np.float32)
+                nn_ez_num += w_exp * ez_scaled
+                nn_probs_num += w_exp[:, np.newaxis] * p_cal
+                nn_w_sum += w_exp
+                del p_raw, ez_raw, ez_scaled, p_cal
 
-            if nn_ez_list:
-                n_exp = len(nn_ez_list)
-                dyn_w = np.zeros((n_samples, n_exp), dtype=np.float32)
-                for i_e, exp in enumerate(self.neural_experts):
-                    w_idx = min(exp.get("win_idx", 0), weights.shape[1] - 1)
-                    reg_w = weights[:, w_idx] if len(set(e.get("win_idx", 0) for e in self.neural_experts)) > 1 else 1.0
-                    dyn_w[:, i_e] = max(0.01, exp["ic"] ** 2) * reg_w
-                dyn_w = dyn_w / np.maximum(np.sum(dyn_w, axis=1, keepdims=True), 1e-7)
-                nn_ez_blend = sum(dyn_w[:, i] * nn_ez_list[i] for i in range(n_exp))
-                nn_probs_blend = sum(dyn_w[:, i:i+1] * nn_probs_list[i] for i in range(n_exp))
+            if np.any(nn_w_sum > 0):
+                inv_w = 1.0 / np.maximum(nn_w_sum, 1e-7)
+                nn_ez_blend = nn_ez_num * inv_w
+                nn_probs_blend = nn_probs_num * inv_w[:, np.newaxis]
 
                 w_nn = np.clip(self.neural_weight, 0.0, 1.0)
                 lgb_mean = float(np.mean(expected_z))
