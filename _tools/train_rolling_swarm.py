@@ -135,23 +135,38 @@ def generate_rolling_windows_reverse(segments: list, H: int, K: float, n_target:
     te0_start_pos = te0_end_pos - te0_len
     tr0_end_pos = te0_start_pos - buffer
 
-    # Привязка сеток H=5, 12, 25 к опорным якорям уже обученных окон (2026-10-20),
-    # чтобы при добавлении новых данных окна сдвигались строго на целое число шагов step,
-    # сохраняя 100% совместимость уже обученных чекпоинтов нейросетей!
-    anchor_map = {5: 753429, 12: 764543, 25: 764530}
-    anchor_pos = anchor_map.get(int(H))
-    extra_edge_win = False
-    if anchor_pos is not None and n_clean > anchor_pos + step // 2:
-        n_steps_shift = max(0, (tr0_end_pos - anchor_pos) // step)
-        aligned_tr0_end = anchor_pos + n_steps_shift * step
-        # Для H=12, если справа от шага якоря осталось >80% полного шага (94.5k из 105k),
-        # добавляем самое свежее краевое окно win_00, а сетку якоря ставим с win_01!
-        if int(H) == 12 and (tr0_end_pos - aligned_tr0_end) >= int(0.8 * step):
-            extra_edge_win = True
-        else:
-            tr0_end_pos = aligned_tr0_end
-            te0_start_pos = tr0_end_pos + buffer
-            te0_len = te0_end_pos - te0_start_pos
+    # Привязка сеток H=5, 12, 25 к точным позициям уже обученных окон (n_clean=1,144,025) + новые окна спереди:
+    # H=5:  4 новых окна (1090929..978429) + 24 обученных окна (940929..78429, win_04..win_27) = 28 окон
+    # H=12: 1 новое окно (1038653, 100% Train + 100% Test=105,000с) + 8 обученных окон (win_01..win_08) = 9 окон
+    # H=25: 4 обученных окна (952030..389530, win_00..win_03) без изменений
+    fixed_tr_ends_map = {
+        5: [1090929 - k * 37500 for k in range(28)],
+        12: [n_clean - step - buffer, 964113] + [869543 - k * 105000 for k in range(7)],
+        25: [952030 - k * 187500 for k in range(4)],
+    }
+    if int(H) in fixed_tr_ends_map and n_clean >= 1100000:
+        for tr_e_pos in fixed_tr_ends_map[int(H)]:
+            if tr_e_pos > n_clean - buffer - 3600 or tr_e_pos - t_train < 0:
+                continue
+            tr_s_pos = tr_e_pos - t_train
+            te_s_pos = tr_e_pos + buffer
+            te_e_pos = min(n_clean, te_s_pos + step)
+            windows.append({
+                'segment_id': len(windows),
+                'tr_idx': clean_idx[tr_s_pos:tr_e_pos],
+                'te_idx': clean_idx[te_s_pos:te_e_pos],
+                'tr_start': int(clean_idx[tr_s_pos]),
+                'tr_end': int(clean_idx[tr_e_pos - 1]) + 1,
+                'te_start': int(clean_idx[te_s_pos]),
+                'te_end': int(clean_idx[te_e_pos - 1]) + 1,
+                't_train': t_train,
+                't_test': te_e_pos - te_s_pos,
+                'W': t_train + buffer + (te_e_pos - te_s_pos),
+                'L': L,
+                'H': H,
+                'K': K
+            })
+        return windows, W, step, t_train, t_test
 
     tr0_start_pos = tr0_end_pos - t_train
 
@@ -171,11 +186,8 @@ def generate_rolling_windows_reverse(segments: list, H: int, K: float, n_target:
             'H': H,
             'K': K
         })
-    max_wins = 24 if int(H) == 5 else 12
-    if extra_edge_win:
-        curr_tr_end = anchor_pos + max(0, (tr0_end_pos - anchor_pos) // step) * step
-    else:
-        curr_tr_end = tr0_end_pos - step
+    max_wins = 28 if int(H) == 5 else 12
+    curr_tr_end = tr0_end_pos - step
     while curr_tr_end - t_train >= 0 and len(windows) < max_wins:
         tr_e_pos = curr_tr_end
         tr_s_pos = tr_e_pos - t_train

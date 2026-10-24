@@ -807,12 +807,20 @@ def train_rl_agent(
     steps_per_epoch: int = 16384,
     live_plot: bool = False,
     seed: int = 3,
+    split_ts_msk: str = None,
 ):
     np.random.seed(seed)
     torch.manual_seed(seed)
     data = build_or_load_rl_cache(coin=coin, tail_hours=tail_hours)
     n_total = len(data["X_market"])
-    split_idx = int(n_total * 0.65)  # 65% RL-Train, 35% Blind OOS RL-Test
+    ts_msk = pd.to_datetime(data["ts"]).tz_convert("Europe/Moscow")
+    if split_ts_msk is not None:
+        split_idx = int(np.argmax(ts_msk > pd.Timestamp(split_ts_msk)))
+    else:
+        split_idx = int(n_total * 0.65)  # 65% RL-Train, 35% Blind OOS RL-Test
+
+    print(f"📅 RL-Train: {ts_msk[60]} ➔ {ts_msk[split_idx - 1]} ({(split_idx - 60)/3600:.2f} ч)")
+    print(f"📅 RL-Test:  {ts_msk[split_idx]} ➔ {ts_msk[n_total - 1]} ({(n_total - split_idx)/3600:.2f} ч)")
 
     train_env = SafeTradeL2ExecutionEnv(data, start_idx=60, end_idx=split_idx, episode_len=3600)
     test_env = SafeTradeL2ExecutionEnv(data, start_idx=split_idx, end_idx=n_total - 1, episode_len=n_total - split_idx - 2)
@@ -822,12 +830,16 @@ def train_rl_agent(
     out_dir = BASE_DIR / "models" / coin.lower() / "rl_execution"
     out_dir.mkdir(parents=True, exist_ok=True)
     base_ckpt = out_dir / "baseline_ppo_v2.pt"
+    warm_ckpt = out_dir / "best_maskable_ppo.pt" if (out_dir / "best_maskable_ppo.pt").exists() else base_ckpt
 
     model = MaskableActorCritic(obs_dim=train_env.obs_dim, n_actions=train_env.n_actions).to(device)
     base_model = None
     if base_ckpt.exists():
-        base_model = MaskableActorCritic(obs_dim=train_env.obs_dim, n_actions=train_env.n_actions).to(device)
-        base_model.load_state_dict(torch.load(base_ckpt, map_location=device))
+        sd2 = torch.load(base_ckpt, map_location=device, weights_only=False)
+        sd2 = sd2.get("model_state_dict", sd2) if isinstance(sd2, dict) else sd2
+        h2 = sd2["backbone.0.weight"].shape[0]
+        base_model = MaskableActorCritic(obs_dim=base_env.obs_dim, n_actions=base_env.n_actions, hidden_dim=h2).to(device)
+        base_model.load_state_dict(sd2)
         base_model.eval()
 
     oracle_info = test_env.get_oracle_benchmark()
@@ -847,12 +859,14 @@ def train_rl_agent(
     best_score = -1e9
 
     best_model_ref = MaskableActorCritic(obs_dim=train_env.obs_dim, n_actions=train_env.n_actions).to(device)
-    if base_ckpt.exists():
-        print("🎓 Warm-Start инициализация весов от базового эталона baseline_ppo_v2.pt...")
-        model.load_state_dict(torch.load(base_ckpt, map_location=device))
+    if warm_ckpt.exists():
+        print(f"🎓 Warm-Start инициализация весов от {warm_ckpt.name}...")
+        sd_w = torch.load(warm_ckpt, map_location=device, weights_only=False)
+        sd_w = sd_w.get("model_state_dict", sd_w) if isinstance(sd_w, dict) else sd_w
+        model.load_state_dict(sd_w)
         best_model_ref.load_state_dict(model.state_dict())
         best_model_ref.eval()
-        opt = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-4)
+        opt = torch.optim.AdamW(model.parameters(), lr=4e-5, weight_decay=1e-4)
         ws_res = evaluate_policy(test_env, model=model, device=device)
         best_pnl = ws_res["pnl_usd"]
         best_score = ws_res["efficiency_score"]

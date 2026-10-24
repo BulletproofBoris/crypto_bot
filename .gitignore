@@ -4,6 +4,7 @@ venv/
 
 # Secrets
 Safetrade_API.txt
+SafeTrade_API
 _tools/*.json
 
 

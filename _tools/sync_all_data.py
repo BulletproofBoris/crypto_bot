@@ -140,6 +140,11 @@ REMOTE_FILES = [
         "local": os.path.join(METADATA_DIR, "exchange_rules_history.csv"),
         "name": "Exchange Rules History CSV"
     },
+    {
+        "remote": "/opt/crypto_bot/data/realtime/prlusdt/rl_telemetry.csv",
+        "local": os.path.join(HOT_VPS_DIR, "prl_rl_telemetry_hot.csv"),
+        "name": "PRL Live RL Telemetry Hot CSV"
+    },
 ]
 
 DATASET_CONFIGS = [
@@ -252,6 +257,16 @@ DATASET_CONFIGS = [
         "hot_file": os.path.join(HOT_VPS_DIR, "binance_macro_hot.csv"),
         "parquet_file": os.path.join(PROCESSED_DIR, "binance_macro.parquet"),
         "hierarchical_file": os.path.join(PROCESSED_DIR, "macro", "binance_bbo.parquet"),
+        "dedup_key": "timestamp",
+    },
+    # Live RL Telemetry Dataset
+    {
+        "key": "prl_rl_telemetry",
+        "coin": "prl",
+        "cache_pattern": "prl_rl_telemetry_*.csv.gz",
+        "hot_file": os.path.join(HOT_VPS_DIR, "prl_rl_telemetry_hot.csv"),
+        "parquet_file": os.path.join(PROCESSED_DIR, "prl_rl_telemetry.parquet"),
+        "hierarchical_file": os.path.join(PROCESSED_DIR, "prl", "rl_telemetry.parquet"),
         "dedup_key": "timestamp",
     },
 ]

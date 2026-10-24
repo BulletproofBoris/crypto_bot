@@ -93,6 +93,10 @@ FILES_TO_ROTATE = [
         "prefix": "exchange_rules_history",
         "path": "/opt/crypto_bot/data/metadata/exchange_rules_history.csv",
     },
+    {
+        "prefix": "prl_rl_telemetry",
+        "path": "/opt/crypto_bot/data/realtime/prlusdt/rl_telemetry.csv",
+    },
 ]
 
 def get_free_disk_gb(path="/"):

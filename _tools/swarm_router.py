@@ -320,26 +320,24 @@ class SwarmRegimeRouter:
                 else:
                     if X_nn is None:
                         X_nn = self._sanitize_stale_bo_features(X, current_regime_df)
-                    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-                    import tensorflow as tf
+                    from _tools.fast_neural_engine import FastKerasModel
                     print(f"  ⚡ [H={self.H}s] Инференс нейросети {exp['arch']} (mean_w={float(np.mean(reg_w)):.3f})...", flush=True)
-                    model = tf.keras.models.load_model(exp["k_file"], compile=False)
+                    model = FastKerasModel(exp["k_file"], exp["base_arch"])
                     x_norm = np.clip((X_nn - exp["mean"]) / exp["std"], -5.0, 5.0).astype(np.float32)
                     x_norm = np.nan_to_num(x_norm, nan=0.0, posinf=5.0, neginf=-5.0)
                     x_pad = np.vstack([np.repeat(x_norm[:1], sl - 1, axis=0), x_norm])
                     x_3d_view = np.lib.stride_tricks.sliding_window_view(x_pad, (sl, x_norm.shape[1]))[:, 0, :, :]
 
-                    # Пакетный инференс чанками по 16384 строк
+                    # Пакетный инференс чанками по 16384 строк (Pure PyTorch без TensorFlow)
                     p_chunks = []
                     chunk_sz = 16384
                     for start_i in range(0, n_samples, chunk_sz):
                         end_i = min(n_samples, start_i + chunk_sz)
                         x_batch = np.ascontiguousarray(x_3d_view[start_i:end_i], dtype=np.float32)
-                        p_batch = model.predict_on_batch(x_batch)
+                        p_batch = model.predict_numpy(x_batch)
                         p_chunks.append(np.asarray(p_batch, dtype=np.float32))
                     p_raw = np.vstack(p_chunks)
                     del model, x_norm, x_pad, x_3d_view, p_chunks
-                    tf.keras.backend.clear_session()
                     try:
                         np.save(cache_file, p_raw)
                     except Exception:
@@ -414,6 +412,79 @@ class SwarmRegimeRouter:
             'p_buy': p_buy,
             'p_sell': p_sell,
             'weights': weights
+        }
+
+    def predict_live_tick(self, X_seq_2d: np.ndarray, current_regime_1row: pd.DataFrame) -> dict:
+        """
+        Мгновенный инференс 1 боевого тика (1 Гц) без обращения к диску и без TensorFlow.
+        X_seq_2d: массив последних >= 30 секунд формы (L, n_features) в порядке self.feature_names.
+        current_regime_1row: 1-строчный DataFrame текущей секунды для расчета весов роутера.
+        """
+        import torch
+        from _tools.fast_neural_engine import FastKerasModel
+        torch.set_num_threads(1)
+
+        x_last = X_seq_2d[-1:, :].astype(np.float32)
+        weights = self.compute_routing_weights(current_regime_1row)[0]  # (num_models,)
+        class_values = np.array([-3, -2, -1, 0, 1, 2, 3], dtype=np.float32)
+        top_wins = set(int(i) for i in np.argsort(weights)[-2:])
+
+        all_probs = np.zeros((self.num_models, 7), dtype=np.float32)
+        for i, booster in enumerate(self.models):
+            if weights[i] < 0.005 and i not in top_wins:
+                continue
+            raw_p = booster.predict(x_last, num_threads=1)[0]
+            all_probs[i, :min(7, len(raw_p))] = raw_p[:7]
+
+        blend_probs = np.dot(weights, all_probs)  # (7,)
+        ez_models = np.dot(all_probs, class_values)  # (num_models,)
+        expected_z = float(np.dot(weights, ez_models))
+
+        if self.use_neural and self.neural_weight > 0.0 and self.neural_experts:
+            nn_ez_num = 0.0
+            nn_probs_num = np.zeros(7, dtype=np.float32)
+            nn_w_sum = 0.0
+            for exp in self.neural_experts:
+                w_idx = min(exp.get("win_idx", 0), len(weights) - 1)
+                reg_w = float(weights[w_idx])
+                if w_idx not in top_wins or reg_w < 0.05:
+                    continue
+                if exp.get("fast_model") is None:
+                    exp["fast_model"] = FastKerasModel(exp["k_file"], exp["base_arch"])
+                sl = int(exp["seq_len"])
+                if len(X_seq_2d) >= sl:
+                    x_win = X_seq_2d[-sl:, :]
+                else:
+                    pad = np.repeat(X_seq_2d[:1, :], sl - len(X_seq_2d), axis=0)
+                    x_win = np.vstack([pad, X_seq_2d])
+                x_norm = np.clip((x_win - exp["mean"]) / exp["std"], -5.0, 5.0).astype(np.float32)
+                x_norm = np.nan_to_num(x_norm, nan=0.0, posinf=5.0, neginf=-5.0)
+                p_raw = exp["fast_model"].predict_numpy(x_norm[np.newaxis, :, :])[0]
+                p_raw = np.clip(p_raw, 1e-7, 1.0 - 1e-7)
+                ez_raw = float(np.dot(p_raw, class_values))
+                w_exp = max(0.01, exp["ic"] ** 2) * reg_w
+                nn_ez_num += w_exp * ez_raw
+                nn_probs_num += w_exp * p_raw
+                nn_w_sum += w_exp
+
+            if nn_w_sum > 0:
+                nn_ez_blend = nn_ez_num / nn_w_sum
+                nn_probs_blend = nn_probs_num / nn_w_sum
+                w_nn = float(np.clip(self.neural_weight, 0.0, 1.0))
+                expected_z = (1.0 - w_nn) * expected_z + w_nn * nn_ez_blend
+                blend_probs = (1.0 - w_nn) * blend_probs + w_nn * nn_probs_blend
+
+        p_safe = np.clip(blend_probs, 1e-7, 1.0)
+        p_safe = p_safe / np.sum(p_safe)
+        entropy = float(-np.sum(p_safe * np.log(p_safe)) / np.log(7.0))
+        agreement = float(np.max(weights))
+        return {
+            "expected_z": expected_z,
+            "p_buy": float(p_safe[5] + p_safe[6]),
+            "p_sell": float(p_safe[0] + p_safe[1]),
+            "entropy": entropy,
+            "agreement": agreement,
+            "probs": p_safe,
         }
 
 
