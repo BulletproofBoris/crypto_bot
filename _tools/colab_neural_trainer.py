@@ -317,7 +317,7 @@ def train_window_swarm(
 
 def run_colab_pipeline(
     data_file: str = "prl_neural_colab_data.npz",
-    file_id: str = "1IXq51Irot9L-pj8-EVAY980J7tql4xho",
+    file_id: str = "1XnalYuDXB8ywwPw9siVNWlFKH1bbjT7O",
     horizon: int = 12,
     windows: str = "all",
     archs: str = "conv1d+gru,causal_cnn,attention,mlp_bottleneck",
@@ -413,7 +413,7 @@ def run_colab_pipeline(
 def main():
     parser = argparse.ArgumentParser(description="Colab Neural Swarm Trainer (Walk-Forward Windows)")
     parser.add_argument("--data-file", type=str, default="prl_neural_colab_data.npz")
-    parser.add_argument("--file-id", type=str, default="1IXq51Irot9L-pj8-EVAY980J7tql4xho")
+    parser.add_argument("--file-id", type=str, default="1XnalYuDXB8ywwPw9siVNWlFKH1bbjT7O")
     parser.add_argument("--horizon", type=int, default=12, help="Горизонт H: 5, 12 или 25")
     parser.add_argument("--windows", type=str, default="all", help="Окна через запятую (0,1,2) или all")
     parser.add_argument("--archs", type=str, default="conv1d+gru,causal_cnn,attention,mlp_bottleneck")

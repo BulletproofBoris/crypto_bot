@@ -37,7 +37,7 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
     rl_cache_path = cache_dir / f"rl_triad_lob_cache_{coin}_{int(tail_hours)}h.npz"
 
     if rl_cache_path.exists() and not force_rebuild:
-        print(f"⚡ Загрузка готового кэша RL-полигона: {rl_cache_path.name}")
+        print(f"⚡ Загрузка готового кэша RL-полигона (Триада H=5,12,25s): {rl_cache_path.name}")
         data = np.load(rl_cache_path, allow_pickle=True)
         return {k: data[k] for k in data.files}
 
@@ -61,14 +61,17 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
     for H, K in horizons:
         print(f"\n🔮 Расчёт ансамбля H={H}s (K={K})...")
         router = SwarmRegimeRouter(coin, H, K, temperature=0.5, use_neural=True, neural_weight=0.15)
-        X_df = pd.DataFrame(index=df.index)
-        for col in router.feature_names:
-            X_df[col] = df[col].values if col in df.columns else 0.0
-        X = np.nan_to_num(X_df.values.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-        del X_df
+        X_cols = [
+            df[col].values.astype(np.float32) if col in df.columns else np.zeros(len(df), dtype=np.float32)
+            for col in router.feature_names
+        ]
+        X = np.nan_to_num(np.column_stack(X_cols), nan=0.0, posinf=0.0, neginf=0.0)
+        del X_cols
 
-        probs, ez, p_buy, p_sell, _ = router.predict_ensemble(X, df, mode="router")
-        del X, router
+        ens_out = router.predict_ensemble(X, df, mode="router")
+        probs = ens_out["probs"]
+        ez = ens_out["expected_z"]
+        del X, router, ens_out
 
         p_up = probs[:, 4] + probs[:, 5] + probs[:, 6]
         p_down = probs[:, 0] + probs[:, 1] + probs[:, 2]
@@ -78,8 +81,8 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
 
         triad_feats.append(np.column_stack([ez, p_up, p_down, p_tail_pos, p_tail_neg, entropy]).astype(np.float32))
 
-    # 18 признаков триады (3 горизонта x 6 метрик)
-    X_triad = np.hstack(triad_feats).astype(np.float32)
+    # 18 признаков триады (H=5,12,25s)
+    X_triad = np.hstack(triad_feats[:3]).astype(np.float32)
 
     # 10 уровней стакана SafeTrade
     tick_size = float(COIN_CONFIG[coin]["tick_size"])
@@ -131,9 +134,12 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
 
     X_market = np.nan_to_num(np.hstack([X_triad, X_lob]), nan=0.0, posinf=3.0, neginf=-3.0).astype(np.float32)
 
-    trade_vol = np.nan_to_num(df["ST_trade_vol_1s"].values if "ST_trade_vol_1s" in df.columns else np.zeros(len(df)), nan=0.0)
-    buy_vol = np.nan_to_num(df["ST_buy_vol_1s"].values if "ST_buy_vol_1s" in df.columns else np.zeros(len(df)), nan=0.0)
-    sell_vol = np.maximum(0.0, trade_vol - buy_vol)
+    t_col = "ST_trade_vol" if "ST_trade_vol" in df.columns else "ST_trade_vol_1s"
+    b_col = "ST_buy_vol" if "ST_buy_vol" in df.columns else "ST_buy_vol_1s"
+    s_col = "ST_sell_vol" if "ST_sell_vol" in df.columns else "ST_sell_vol_1s"
+    trade_vol = np.nan_to_num(df[t_col].values if t_col in df.columns else np.zeros(len(df)), nan=0.0)
+    buy_vol = np.nan_to_num(df[b_col].values if b_col in df.columns else np.zeros(len(df)), nan=0.0)
+    sell_vol = np.nan_to_num(df[s_col].values if s_col in df.columns else np.maximum(0.0, trade_vol - buy_vol), nan=0.0)
     vwap = np.nan_to_num(df["ST_vwap_1s"].values if "ST_vwap_1s" in df.columns else (bid_p[:, 0] + ask_p[:, 0]) * 0.5, nan=0.0)
     ts_arr = df["timestamp"].astype(str).values
 
@@ -168,7 +174,7 @@ class SafeTradeL2ExecutionEnv:
       6: PANIC_TAKER_EXIT (мгновенный выход по рынку через 10 уровней стакана)
     """
 
-    def __init__(self, data: dict, start_idx: int, end_idx: int, episode_len: int = 3600, order_usd: float = 15.0):
+    def __init__(self, data: dict, start_idx: int, end_idx: int, episode_len: int = 3600, order_usd: float = 15.0, legacy_v2: bool = False):
         self.X_market = data["X_market"]
         self.bid_p = data["bid_p"]
         self.bid_q = data["bid_q"]
@@ -183,8 +189,39 @@ class SafeTradeL2ExecutionEnv:
         self.end_idx = int(end_idx)
         self.episode_len = int(episode_len)
         self.order_usd = float(order_usd)
+        self.legacy_v2 = bool(legacy_v2)
         self.obs_dim = self.X_market.shape[1] + 10
         self.n_actions = 7
+
+        # Предрасчет каузальных индикаторов локальных экстремумов (5м / 15м / 60м) и вектора рыночной инерции
+        s_bid = pd.Series(self.bid_p[:, 0])
+        high_300 = s_bid.rolling(300, min_periods=1).max().values
+        high_900 = s_bid.rolling(900, min_periods=1).max().values
+        low_900 = s_bid.rolling(900, min_periods=1).min().values
+        high_3600 = s_bid.rolling(3600, min_periods=1).max().values
+        low_3600 = s_bid.rolling(3600, min_periods=1).min().values
+        low_30 = s_bid.rolling(30, min_periods=1).min().values
+        vel_b1_10 = (self.bid_p[:, 0] - s_bid.shift(10).bfill().values) / self.tick_size
+        vel_b1_15 = (self.bid_p[:, 0] - s_bid.shift(15).bfill().values) / self.tick_size
+        vel_b1_180 = (self.bid_p[:, 0] - s_bid.shift(180).bfill().values) / self.tick_size
+
+        self.dd_300 = ((high_300 - self.bid_p[:, 0]) / self.tick_size).astype(np.float32)
+        self.dd_900 = ((high_900 - self.bid_p[:, 0]) / self.tick_size).astype(np.float32)
+        self.pos_900 = ((self.bid_p[:, 0] - low_900) / np.maximum(high_900 - low_900, self.tick_size)).astype(np.float32)
+        self.pos_3600 = ((self.bid_p[:, 0] - low_3600) / np.maximum(high_3600 - low_3600, self.tick_size)).astype(np.float32)
+        self.vel_b1_10 = vel_b1_10.astype(np.float32)
+        self.vel_b1_180 = vel_b1_180.astype(np.float32)
+        self.reb_30 = ((self.bid_p[:, 0] - low_30) / self.tick_size).astype(np.float32)
+
+        ez5, ez12, ez25 = self.X_market[:, 0], self.X_market[:, 6], self.X_market[:, 12]
+        d_ez12 = ez12 - pd.Series(ez12).shift(5).bfill().values
+        imb1, imb5 = self.X_market[:, 19], self.X_market[:, 20]
+        self.inertia_arr = (
+            0.45 * ez25 + 0.35 * ez12 + 0.20 * ez5
+            + 0.25 * d_ez12 + 0.35 * imb5 + 0.15 * imb1
+            + 0.10 * np.clip(vel_b1_15, -3.0, 3.0)
+        ).astype(np.float32)
+
         self.reset()
 
     def _get_lob_queue(self, t: int, side: str, price: float):
@@ -239,6 +276,7 @@ class SafeTradeL2ExecutionEnv:
             self.max_t = self.t + self.episode_len
         self.pos_qty = 0.0
         self.avg_entry = 0.0
+        self.peak_bid = 0.0
         self.entry_t = 0
         self.order_side = None
         self.order_price = 0.0
@@ -257,13 +295,28 @@ class SafeTradeL2ExecutionEnv:
         if self.pos_qty <= 1e-8:
             in_cooldown = self.t < self.cooldown_until
             imb_l5 = float(self.X_market[self.t, 20])
-            if not in_cooldown:
+            pos900 = float(self.pos_900[self.t])
+            pos3600 = float(self.pos_3600[self.t])
+            dd300 = float(self.dd_300[self.t])
+            dd900 = float(self.dd_900[self.t])
+            vel10 = float(self.vel_b1_10[self.t])
+            vel180 = float(self.vel_b1_180[self.t])
+            reb30 = float(self.reb_30[self.t])
+            inertia = float(self.inertia_arr[self.t])
+            # Режим 1: Выкуп локального дна (при глубоком сливе dd900>=6т ждем первого реального тика отскока со дна reb30>=1т)
+            bounce_ok = (reb30 >= 1.0 and reb30 <= 2.0) if dd900 >= 6.0 else (reb30 <= 2.0)
+            dip_reversal = (pos900 <= 0.35) and (pos3600 <= 0.45) and (dd300 >= 2.0 or dd900 >= 3.0) and (vel10 >= 0.0) and bounce_ok and (inertia >= 0.28)
+            # Режим 2: Покупка по инерции восходящего тренда на микро-паузе (vel180 >= 2т, но ниже часового потолка pos3600 <= 0.72)
+            uptrend_cont = (vel180 >= 2.0) and (vel10 >= 0.0) and (pos3600 <= 0.72) and (dd300 >= 1.0) and (inertia >= 0.40)
+            in_dip_zone = True if self.legacy_v2 else (dip_reversal or uptrend_cont)
+            if not in_cooldown and in_dip_zone:
                 if imb_l5 > -0.75:
-                    mask[1] = True  # QUOTE_BID_BEST (блокируется при обвале стакана imb_l5 <= -0.75)
+                    mask[1] = True  # QUOTE_BID_BEST
                 mask[2] = True  # QUOTE_BID_PASSIVE
             if self.order_side is not None:
                 mask[5] = True  # CANCEL_ORDERS
         else:
+            mask[0] = (self.order_side == "SELL")
             mask[3] = True  # QUOTE_ASK_BEST
             mask[4] = True  # QUOTE_ASK_AGGRESSIVE
             mask[6] = True  # PANIC_TAKER_EXIT
@@ -300,9 +353,17 @@ class SafeTradeL2ExecutionEnv:
         model_err_12 = np.clip(actual_dt_12 - pred_dt_12, -10.0, 10.0)
         surprise_pen = max(0.0, -model_err_12) * 0.6
 
-        # Количественная оценка ожидаемой будущей выгоды с поправкой на ошибку моделей
-        exp_entry_edge = (0.5 * ez_25 + 0.35 * ez_12 + 0.15 * ez_5) * 4.0 + 0.5 * spread_ticks - p_tn_5 * 3.0 - surprise_pen
-        exp_hold_edge = (0.6 * ez_12 + 0.4 * ez_5) * 4.0 - p_dn_12 * spread_ticks - surprise_pen * 0.8
+        # Количественная оценка ожидаемой будущей выгоды с учетом глубины экстремума (15м) и рыночной инерции
+        if self.legacy_v2:
+            exp_entry_edge = (0.5 * ez_25 + 0.35 * ez_12 + 0.15 * ez_5) * 4.0 + 0.5 * spread_ticks - p_tn_5 * 3.0 - surprise_pen
+            exp_hold_edge = (0.6 * ez_12 + 0.4 * ez_5) * 4.0 - p_dn_12 * spread_ticks - surprise_pen * 0.8
+        else:
+            dd900 = float(self.dd_900[self.t])
+            pos900 = float(self.pos_900[self.t])
+            inertia = float(self.inertia_arr[self.t])
+            extremum_bonus = 0.35 * min(dd900, 10.0) * max(0.0, 1.0 - 1.5 * pos900) if inertia > 0.25 else -1.5 * max(0.0, pos900 - 0.65)
+            exp_entry_edge = (0.5 * ez_25 + 0.35 * ez_12 + 0.15 * ez_5) * 4.0 + 0.5 * spread_ticks - p_tn_5 * 3.0 - surprise_pen + extremum_bonus
+            exp_hold_edge = inertia * 3.0 - p_dn_12 * spread_ticks - surprise_pen * 0.6
         state_vec = np.array([
             has_pos, np.clip(unr_ticks / 10.0, -3.0, 3.0), hold_ratio,
             has_bid, has_ask, np.clip(dist / 5.0, -2.0, 2.0), q_ratio,
@@ -317,23 +378,59 @@ class SafeTradeL2ExecutionEnv:
         a1 = max(self.ask_p[t, 0], b1 + self.tick_size)
         tol = self.tick_size * 0.25
         requote_penalty = 0.0
+        inertia = float(self.inertia_arr[t])
+        pos900 = float(self.pos_900[t])
+        if self.pos_qty > 1e-8:
+            self.peak_bid = max(self.peak_bid, b1)
 
-        # 1. Обработка выбранного действия агента (с задержкой сети latency=1s)
+        # 1. Обработка выбранного действия агента + подтягивание ордеров по рыночной инерции
+        vel10 = float(self.vel_b1_10[t])
+        pos3600 = float(self.pos_3600[t])
+        if not self.legacy_v2 and self.pos_qty <= 1e-8 and self.order_side == "BUY" and action == 0:
+            # Если началась отрицательная инерция падения (vel10 < 0 или inertia < 0.05) или цена ушла к часовым хаям — снимаем Bid!
+            if pos3600 > 0.72 or vel10 < 0.0 or inertia < 0.05 or float(self.X_market[t, 20]) < -0.20:
+                action = 5
+            elif inertia > 0.40 and pos3600 <= 0.65 and b1 > self.order_price + tol:
+                action = 1
+
         if action in (1, 2) and self.pos_qty <= 1e-8:
             target_p = (b1 + self.tick_size if (a1 - b1) >= 2.0 * self.tick_size else b1) if action == 1 else max(self.tick_size, b1 - self.tick_size)
             if self.order_side != "BUY" or abs(self.order_price - target_p) > tol:
                 if self.order_side is not None:
-                    requote_penalty = 0.02
+                    requote_penalty = 0.01
                 self.order_side = "BUY"
                 self.order_price = round(target_p / self.tick_size) * self.tick_size
                 self.order_qty = self.order_usd / self.order_price
                 self.q_ahead = -1.0
                 self.active_after = t + 1
         elif action in (3, 4) and self.pos_qty > 1e-8:
-            target_p = a1 if action == 3 else max(b1 + self.tick_size, a1 - self.tick_size)
+            hold_s = t - self.entry_t
+            ez25_entry = float(self.X_market[self.entry_t, 12])
+            if self.legacy_v2:
+                trend_ticks = int(np.clip(round(max(ez25_entry, float(self.X_market[t, 12])) * 6.0), 2, 6))
+                if action == 3:
+                    target_p = max(a1, self.avg_entry + trend_ticks * self.tick_size)
+                else:
+                    min_p = (self.avg_entry + self.tick_size) if hold_s < 45 else self.avg_entry
+                    target_p = max(b1 + self.tick_size, min_p, a1 - self.tick_size)
+            else:
+                trend_ticks = int(np.clip(round(max(ez25_entry, float(self.X_market[t, 12]), inertia) * 6.0), 2, 8))
+                if hold_s > 90 and inertia < -0.15:
+                    # Быстрый сброс неверного входа по Ask (a1), пока цена не ушла в глубокий обвал
+                    target_p = a1
+                elif action == 3 or (inertia > 0.55 and hold_s < 45):
+                    # RIDE_WAVE_INERTIA: пока инерция положительная, держим Ask высоко и двигаем пол за растущим peak_bid
+                    if inertia > 0.35:
+                        target_p = max(a1 + self.tick_size, self.peak_bid + 2.0 * self.tick_size, self.avg_entry + trend_ticks * self.tick_size)
+                    else:
+                        target_p = max(a1, self.peak_bid, self.avg_entry + 2.0 * self.tick_size)
+                else:
+                    # TRAILING_PROFIT_SCALP: фиксация накопленного движения peak_bid строго по Ask (a1) или выше
+                    min_p = max(self.peak_bid, self.avg_entry + self.tick_size) if hold_s < 60 else max(self.peak_bid, self.avg_entry)
+                    target_p = max(a1, min_p)
             if self.order_side != "SELL" or abs(self.order_price - target_p) > tol:
                 if self.order_side is not None:
-                    requote_penalty = 0.02
+                    requote_penalty = 0.01
                 self.order_side = "SELL"
                 self.order_price = round(target_p / self.tick_size) * self.tick_size
                 self.order_qty = self.pos_qty
@@ -368,26 +465,29 @@ class SafeTradeL2ExecutionEnv:
             eff_q = self.q_ahead + q_better
 
             if self.order_side == "BUY":
-                crossed = (na1 <= self.order_price + tol) or (self.vwap[nt] > 0 and self.vwap[nt] < self.order_price - tol)
-                vol_hit = self.sell_vol[nt] if abs(nb1 - self.order_price) <= tol else 0.0
+                crossed = (na1 <= self.order_price + tol)
+                price_ok = (abs(nb1 - self.order_price) <= tol) if self.legacy_v2 else (nb1 <= self.order_price + tol and na1 > self.order_price + tol)
+                vol_hit = self.sell_vol[nt] if price_ok else 0.0
                 if crossed or vol_hit > eff_q:
                     fill_q = self.order_qty if crossed else min(self.order_qty, max(0.0, vol_hit - eff_q))
                     if fill_q >= self.order_qty * 0.25:
                         self.pos_qty = self.order_qty
                         self.avg_entry = self.order_price
+                        self.peak_bid = max(self.order_price, nb1)
                         self.entry_t = nt
                         self.order_side = None
                         self.n_trades += 1
                 elif vol_hit > 0:
                     self.q_ahead = max(0.0, self.q_ahead - max(0.0, vol_hit - q_better))
             elif self.order_side == "SELL":
-                crossed = (nb1 >= self.order_price - tol) or (self.vwap[nt] > 0 and self.vwap[nt] > self.order_price + tol)
+                crossed = (nb1 >= self.order_price - tol)
                 vol_hit = self.buy_vol[nt] if abs(na1 - self.order_price) <= tol else 0.0
                 if crossed or vol_hit > eff_q:
                     net_pnl = self.pos_qty * (self.order_price - self.avg_entry)
                     self.total_pnl_usd += net_pnl
                     self.pos_qty = 0.0
                     self.avg_entry = 0.0
+                    self.peak_bid = 0.0
                     self.order_side = None
                 elif vol_hit > 0:
                     self.q_ahead = max(0.0, self.q_ahead - max(0.0, vol_hit - q_better))
@@ -400,9 +500,11 @@ class SafeTradeL2ExecutionEnv:
         shaped_pnl = delta_pnl_ticks * 1.75 if delta_pnl_ticks < -0.5 else delta_pnl_ticks
         hold_sec = (nt - self.entry_t) if self.pos_qty > 1e-8 else 0
         inv_pen = 0.003 * (1.0 if self.pos_qty > 1e-8 else 0.0) + (0.01 if hold_sec > 35 else 0.0)
+
+        next_obs = self._get_obs()
         reward = float(shaped_pnl - inv_pen - requote_penalty)
         done = bool(nt >= self.max_t)
-        return self._get_obs(), reward, done
+        return next_obs, reward, done
 
 
 class MaskableActorCritic(nn.Module):
@@ -500,59 +602,83 @@ def evaluate_policy(env: SafeTradeL2ExecutionEnv, model: MaskableActorCritic = N
     }
 
 
-def train_rl_agent(coin: str = "prl", tail_hours: float = 115.0, ppo_epochs: int = 25, steps_per_epoch: int = 16384):
+def train_rl_agent(
+    coin: str = "prl",
+    tail_hours: float = 72.0,
+    ppo_epochs: int = 25,
+    steps_per_epoch: int = 16384,
+    live_plot: bool = False,
+    seed: int = 3,
+):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     data = build_or_load_rl_cache(coin=coin, tail_hours=tail_hours)
     n_total = len(data["X_market"])
-    split_idx = int(n_total * 0.65)  # 65% (~75 ч) RL-Train, 35% (~40 ч) Blind OOS RL-Test
+    split_idx = int(n_total * 0.65)  # 65% RL-Train, 35% Blind OOS RL-Test
 
     train_env = SafeTradeL2ExecutionEnv(data, start_idx=60, end_idx=split_idx, episode_len=3600)
     test_env = SafeTradeL2ExecutionEnv(data, start_idx=split_idx, end_idx=n_total - 1, episode_len=n_total - split_idx - 2)
+    base_env = SafeTradeL2ExecutionEnv(data, start_idx=split_idx, end_idx=n_total - 1, episode_len=n_total - split_idx - 2, legacy_v2=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = MaskableActorCritic(obs_dim=train_env.obs_dim, n_actions=train_env.n_actions).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
-
-    base_res = evaluate_policy(test_env, model=None, device=device)
-    print(f"\n📊 Базовая эвристика на слепом OOS ({base_res['hours']} ч): PnL = ${base_res['pnl_usd']:+.4f} ({base_res['pnl_pct']:+.2f}%) | Сделок: {base_res['trades']}")
-
-    # 1. Behavioral Cloning Warm-Start (инициализация от учителя)
-    print("🎓 Behavioral Cloning Warm-Start (сбор 30,000 демонстраций учителя)...")
-    bc_obs, bc_masks, bc_acts = [], [], []
-    obs = train_env.reset()
-    for _ in range(30000):
-        mask = train_env.get_action_mask()
-        act = teacher_heuristic_action(obs, mask)
-        bc_obs.append(obs)
-        bc_masks.append(mask)
-        bc_acts.append(act)
-        obs, _, done = train_env.step(act)
-        if done:
-            obs = train_env.reset()
-
-    t_obs = torch.as_tensor(np.array(bc_obs), dtype=torch.float32, device=device)
-    t_masks = torch.as_tensor(np.array(bc_masks), dtype=torch.bool, device=device)
-    t_acts = torch.as_tensor(np.array(bc_acts), dtype=torch.long, device=device)
-    for _ in range(8):
-        perm = torch.randperm(len(t_obs), device=device)
-        for i in range(0, len(t_obs), 1024):
-            idx = perm[i:i + 1024]
-            logits, _ = model(t_obs[idx], t_masks[idx])
-            loss = F.cross_entropy(logits, t_acts[idx])
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-
-    # 2. Обучение Maskable PPO в L2 FIFO среде
-    print(f"🚀 Запуск Maskable PPO ({ppo_epochs} эпох по {steps_per_epoch:,} шагов)...")
-    best_pnl = -1e9
     out_dir = BASE_DIR / "models" / coin.lower() / "rl_execution"
     out_dir.mkdir(parents=True, exist_ok=True)
+    base_ckpt = out_dir / "baseline_ppo_v2.pt"
+
+    model = MaskableActorCritic(obs_dim=train_env.obs_dim, n_actions=train_env.n_actions).to(device)
+    base_model = None
+    if base_ckpt.exists():
+        base_model = MaskableActorCritic(obs_dim=train_env.obs_dim, n_actions=train_env.n_actions).to(device)
+        base_model.load_state_dict(torch.load(base_ckpt, map_location=device))
+        base_model.eval()
+
+    base_res = evaluate_policy(base_env, model=base_model, device=device)
+    print(f"\n📊 Базовый эталон (PPO v2) на слепом OOS ({base_res['hours']} ч): PnL = ${base_res['pnl_usd']:+.4f} ({base_res['pnl_pct']:+.2f}%) | Сделок: {base_res['trades']}")
+    history = []
+    best_pnl = -1e9
+
+    if base_ckpt.exists():
+        print("🎓 Warm-Start инициализация весов от базового эталона baseline_ppo_v2.pt...")
+        model.load_state_dict(torch.load(base_ckpt, map_location=device))
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+        ws_res = evaluate_policy(test_env, model=model, device=device)
+        best_pnl = ws_res["pnl_usd"]
+        torch.save(model.state_dict(), out_dir / "best_maskable_ppo.pt")
+        history.append({"epoch": 0, **ws_res, "best_pnl_usd": round(float(best_pnl), 4)})
+        print(f"  [Warm-Start v3 (Extremum + Inertia)] 🏆 -> Blind OOS PnL: ${ws_res['pnl_usd']:+.4f} ({ws_res['pnl_pct']:+.2f}%) | Сделок: {ws_res['trades']}")
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
+        print("🎓 Behavioral Cloning Warm-Start (сбор 30,000 демонстраций учителя)...")
+        bc_obs, bc_masks, bc_acts = [], [], []
+        obs = train_env.reset()
+        for _ in range(30000):
+            mask = train_env.get_action_mask()
+            act = teacher_heuristic_action(obs, mask)
+            bc_obs.append(obs); bc_masks.append(mask); bc_acts.append(act)
+            obs, _, done = train_env.step(act)
+            if done:
+                obs = train_env.reset()
+        t_obs = torch.as_tensor(np.array(bc_obs), dtype=torch.float32, device=device)
+        t_masks = torch.as_tensor(np.array(bc_masks), dtype=torch.bool, device=device)
+        t_acts = torch.as_tensor(np.array(bc_acts), dtype=torch.long, device=device)
+        for _ in range(8):
+            perm = torch.randperm(len(t_obs), device=device)
+            for i in range(0, len(t_obs), 1024):
+                idx = perm[i:i + 1024]
+                logits, _ = model(t_obs[idx], t_masks[idx])
+                loss = F.cross_entropy(logits, t_acts[idx])
+                opt.zero_grad(); loss.backward(); opt.step()
+
+    # 2. Обучение Maskable PPO v3 в L2 FIFO среде с инерционным трейлингом и охотой за экстремумами
+    print(f"🚀 Запуск Maskable PPO v3 ({ppo_epochs} эпох по {steps_per_epoch:,} шагов, Extremum + Inertia Trailing)...")
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=ppo_epochs, eta_min=2e-5)
 
     for ep in range(1, ppo_epochs + 1):
-        b_obs, b_masks, b_acts, b_logp, b_rews, b_vals, b_dones = [], [], [], [], [], [], []
+        b_obs, b_masks, b_acts, b_tacts, b_logp, b_rews, b_vals, b_dones = [], [], [], [], [], [], [], []
         obs = train_env.reset()
         for _ in range(steps_per_epoch):
             mask = train_env.get_action_mask()
+            t_act = teacher_heuristic_action(obs, mask)
             with torch.no_grad():
                 o_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
                 m_t = torch.as_tensor(mask, dtype=torch.bool, device=device).unsqueeze(0)
@@ -562,7 +688,7 @@ def train_rl_agent(coin: str = "prl", tail_hours: float = 115.0, ppo_epochs: int
                 logp_t = dist.log_prob(act_t)
             act = int(act_t.item())
             next_obs, rew, done = train_env.step(act)
-            b_obs.append(obs); b_masks.append(mask); b_acts.append(act)
+            b_obs.append(obs); b_masks.append(mask); b_acts.append(act); b_tacts.append(t_act)
             b_logp.append(float(logp_t.item())); b_rews.append(rew); b_vals.append(float(val.item())); b_dones.append(done)
             obs = train_env.reset() if done else next_obs
 
@@ -580,6 +706,7 @@ def train_rl_agent(coin: str = "prl", tail_hours: float = 115.0, ppo_epochs: int
         T_obs = torch.as_tensor(np.array(b_obs), dtype=torch.float32, device=device)
         T_masks = torch.as_tensor(np.array(b_masks), dtype=torch.bool, device=device)
         T_acts = torch.as_tensor(np.array(b_acts), dtype=torch.long, device=device)
+        T_tacts = torch.as_tensor(np.array(b_tacts), dtype=torch.long, device=device)
         T_old_logp = torch.as_tensor(np.array(b_logp), dtype=torch.float32, device=device)
         T_advs = torch.as_tensor(advs, dtype=torch.float32, device=device)
         T_rets = torch.as_tensor(rets, dtype=torch.float32, device=device)
@@ -598,16 +725,151 @@ def train_rl_agent(coin: str = "prl", tail_hours: float = 115.0, ppo_epochs: int
                 opt.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
 
         oos_res = evaluate_policy(test_env, model=model, device=device)
-        is_best = oos_res["pnl_usd"] > best_pnl
+        is_best = (oos_res["pnl_usd"] > best_pnl) and (oos_res["trades"] >= 2)
         if is_best:
             best_pnl = oos_res["pnl_usd"]
             torch.save(model.state_dict(), out_dir / "best_maskable_ppo.pt")
         mark = "🏆 РЕКОРД" if is_best else "✅ OK"
+        history.append({"epoch": ep, **oos_res, "best_pnl_usd": round(float(best_pnl), 4)})
+        with open(out_dir / "training_history.json", "w") as f:
+            json.dump({"baseline": base_res, "history": history}, f, indent=2)
         print(
             f"  [PPO Ep {ep:02d}/{ppo_epochs}] {mark} -> Blind OOS PnL: ${oos_res['pnl_usd']:+.4f} ({oos_res['pnl_pct']:+.2f}%) | "
             f"Сделок: {oos_res['trades']} | Ожид.Edge: {oos_res['exp_edge_ticks']:+.2f}т (V={oos_res['critic_v_ticks']:+.2f}) -> "
-            f"Факт/сделку: ${oos_res['real_pnl_per_trade_usd']:+.4f}"
+            f"Факт/сделку: ${oos_res['real_pnl_per_trade_usd']:+.4f}",
+            flush=True,
         )
+        if live_plot:
+            try:
+                from IPython.display import clear_output
+                import matplotlib.pyplot as plt
+                clear_output(wait=True)
+                eps = [h["epoch"] for h in history]
+                pnls = [h["pnl_usd"] for h in history]
+                bests = [h["best_pnl_usd"] for h in history]
+                edges = [h["exp_edge_ticks"] for h in history]
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 4.2))
+                ax1.axhline(0.0, color="gray", linestyle="--", alpha=0.6)
+                ax1.axhline(base_res["pnl_usd"], color="red", linestyle=":", label=f"Heuristic (${base_res['pnl_usd']:+.2f})")
+                ax1.plot(eps, pnls, marker="o", label="Epoch OOS PnL ($)")
+                ax1.plot(eps, bests, linestyle="--", color="green", label="Best OOS PnL ($)")
+                ax1.set_title(f"Maskable PPO OOS Convergence (Ep {ep}/{ppo_epochs})")
+                ax1.set_xlabel("Epoch"); ax1.set_ylabel("Net PnL (USDT)"); ax1.legend(); ax1.grid(alpha=0.3)
+                ax2.plot(eps, edges, marker="s", color="darkorange", label="Mean Entry ExpEdge (ticks)")
+                ax2.set_title("Selectivity: Expected Entry Edge (ticks)")
+                ax2.set_xlabel("Epoch"); ax2.set_ylabel("Ticks"); ax2.legend(); ax2.grid(alpha=0.3)
+                plt.tight_layout(); plt.show()
+            except Exception:
+                pass
+    return {"baseline": base_res, "history": history}
+
+
+def inspect_and_plot_rl_oos(coin: str = "prl", tail_hours: float = 72.0):
+    """Прогоняет лучший чекпоинт Maskable PPO и базовую эвристику на слепом OOS с визуализацией сделок и кривой капитала."""
+    import matplotlib.pyplot as plt
+    data = build_or_load_rl_cache(coin=coin, tail_hours=tail_hours)
+    n_total = len(data["X_market"])
+    split_idx = int(n_total * 0.65)
+    test_env = SafeTradeL2ExecutionEnv(data, start_idx=split_idx, end_idx=n_total - 1, episode_len=n_total - split_idx - 2)
+    base_env = SafeTradeL2ExecutionEnv(data, start_idx=split_idx, end_idx=n_total - 1, episode_len=n_total - split_idx - 2, legacy_v2=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    ckpt = BASE_DIR / "models" / coin.lower() / "rl_execution" / "best_maskable_ppo.pt"
+    base_ckpt = BASE_DIR / "models" / coin.lower() / "rl_execution" / "baseline_ppo_v2.pt"
+    model = MaskableActorCritic(obs_dim=test_env.obs_dim, n_actions=test_env.n_actions).to(device)
+    if ckpt.exists():
+        model.load_state_dict(torch.load(ckpt, map_location=device))
+    model.eval()
+
+    base_model = None
+    if base_ckpt.exists():
+        base_model = MaskableActorCritic(obs_dim=base_env.obs_dim, n_actions=base_env.n_actions).to(device)
+        base_model.load_state_dict(torch.load(base_ckpt, map_location=device))
+        base_model.eval()
+
+    def _run_trace(pol_model, env_obj):
+        obs = env_obj.reset(eval_mode=True)
+        done = False
+        eq_mtm, eq_realized, mid_p, acts = [], [], [], []
+        trades_log = []
+        prev_pos = 0.0
+        realized_cum = 0.0
+        entry_t, entry_p, entry_eq, entry_eq_before = 0, 0.0, 0.0, 0.0
+        while not done:
+            t_cur = env_obj.t
+            mask = env_obj.get_action_mask()
+            if pol_model is None:
+                act = teacher_heuristic_action(obs, mask)
+            else:
+                with torch.no_grad():
+                    o_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+                    m_t = torch.as_tensor(mask, dtype=torch.bool, device=device).unsqueeze(0)
+                    logits, _ = pol_model(o_t, m_t)
+                    act = int(torch.argmax(logits, dim=-1).item())
+            obs, _, done = env_obj.step(act)
+            eq_mtm.append(float(env_obj.prev_mtm))
+            mid_p.append(float(0.5 * (env_obj.bid_p[t_cur, 0] + env_obj.ask_p[t_cur, 0])))
+            acts.append(act)
+            if prev_pos <= 1e-8 and env_obj.pos_qty > 1e-8:
+                entry_t, entry_p, entry_eq = t_cur, env_obj.avg_entry, entry_eq_before
+            elif prev_pos > 1e-8 and env_obj.pos_qty <= 1e-8:
+                tr_pnl = float(env_obj.prev_mtm - entry_eq)
+                realized_cum = float(env_obj.prev_mtm)
+                trades_log.append({
+                    "entry_step": int(entry_t - split_idx),
+                    "exit_step": int(t_cur - split_idx),
+                    "entry_ts": str(data["ts"][entry_t]),
+                    "exit_ts": str(data["ts"][t_cur]),
+                    "hold_sec": int(t_cur - entry_t),
+                    "entry_price": round(float(entry_p), 6),
+                    "exit_action": "Panic Taker" if act == 6 else "Maker Ask (Passive)",
+                    "net_pnl_usd": round(tr_pnl, 4),
+                    "cum_pnl_usd": round(realized_cum, 4),
+                })
+            eq_realized.append(realized_cum)
+            prev_pos = env_obj.pos_qty
+            entry_eq_before = env_obj.prev_mtm
+        return np.array(eq_mtm), np.array(eq_realized), np.array(mid_p), np.array(acts), pd.DataFrame(trades_log)
+
+    eq_base_mtm, eq_base_real, mid_p, acts_base, df_base = _run_trace(base_model, base_env)
+    eq_ppo_mtm, eq_ppo_real, _, acts_ppo, df_ppo = _run_trace(model, test_env)
+    hours_x = np.arange(len(eq_ppo_mtm)) / 3600.0
+    n_win = int((df_ppo["net_pnl_usd"] > 0).sum()) if len(df_ppo) else 0
+    n_be = int((df_ppo["net_pnl_usd"] == 0).sum()) if len(df_ppo) else 0
+    n_loss = int((df_ppo["net_pnl_usd"] < 0).sum()) if len(df_ppo) else 0
+
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+
+    # Панель 1: Крупный план кривой капитала только нашего RL-агента (Зафиксированный PnL vs MTM)
+    ax1.plot(hours_x, eq_ppo_real, color="darkgreen", lw=2.4, label=f"Зафиксированный PnL ({eq_ppo_real[-1]:+.4f} USDT | {n_win} плюс / {n_be} безуб. / {n_loss} минус)")
+    ax1.plot(hours_x, eq_ppo_mtm, color="limegreen", lw=1.0, alpha=0.55, label="Плавающий MTM PnL (с учетом открытой позиции)")
+    if len(df_ppo) > 0:
+        exit_h = df_ppo["exit_step"].values / 3600.0
+        ax1.scatter(exit_h, df_ppo["cum_pnl_usd"].values, color="darkgreen", s=30, zorder=5, label="Закрытия сделок")
+    ax1.axhline(0.0, color="gray", ls="--", alpha=0.5)
+    ax1.set_title(f"1. Прибыль RL-агента v3 (Extremum + Inertia): {eq_ppo_mtm[-1]:+.4f} USDT (+{eq_ppo_mtm[-1]/test_env.order_usd*100:.2f}% к ордеру 15 USDT)")
+    ax1.set_ylabel("Прибыль PPO (USDT)"); ax1.legend(loc="upper left"); ax1.grid(alpha=0.3)
+
+    # Панель 2: Сравнение RL-агента v3 с Базовым эталоном v2 (+0.3779 USDT)
+    ax2.plot(hours_x, eq_ppo_real, color="forestgreen", lw=2.2, label=f"Maskable PPO v3 ({eq_ppo_mtm[-1]:+.4f} USDT, {len(df_ppo)} сделок)")
+    ax2.plot(hours_x, eq_base_real, color="crimson", lw=1.8, alpha=0.85, label=f"Базовый эталон v2 ({eq_base_mtm[-1]:+.4f} USDT, {len(df_base)} сделок)")
+    ax2.axhline(0.0, color="gray", ls="--", alpha=0.5)
+    ax2.set_title("2. Сравнение нового инерционного агента v3 с прошлым рекордом (Базовый эталон v2)")
+    ax2.set_ylabel("Чистый PnL (USDT)"); ax2.legend(loc="upper left"); ax2.grid(alpha=0.3)
+
+    # Панель 3: Цена монеты PRL/USDT и точки входов/выходов RL-агента
+    ax3.plot(hours_x, mid_p, color="steelblue", lw=1.2, label="Рыночная цена PRL/USDT (падающий рынок -3.6%)")
+    if len(df_ppo) > 0:
+        ent_idx = df_ppo["entry_step"].values.astype(int)
+        ext_idx = df_ppo["exit_step"].values.astype(int)
+        ax3.scatter(ent_idx / 3600.0, mid_p[np.clip(ent_idx, 0, len(mid_p)-1)], marker="^", color="lime", edgecolor="black", s=65, zorder=5, label="Вход PPO (Maker Bid)")
+        ax3.scatter(ext_idx / 3600.0, mid_p[np.clip(ext_idx, 0, len(mid_p)-1)], marker="v", color="gold", edgecolor="black", s=65, zorder=5, label="Выход PPO (Maker Ask)")
+    ax3.set_title("3. Рыночная цена PRL/USDT и точки сделок RL-агента")
+    ax3.set_xlabel("Часы слепого OOS (25.2 ч)"); ax3.set_ylabel("Цена PRL (USDT)"); ax3.legend(loc="upper right"); ax3.grid(alpha=0.3)
+    plt.tight_layout(); plt.show()
+
+    drop_cols = ["entry_step", "exit_step"]
+    return df_ppo.drop(columns=[c for c in drop_cols if c in df_ppo.columns]), df_base.drop(columns=[c for c in drop_cols if c in df_base.columns])
 
 
 if __name__ == "__main__":

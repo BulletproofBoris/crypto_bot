@@ -135,15 +135,23 @@ def generate_rolling_windows_reverse(segments: list, H: int, K: float, n_target:
     te0_start_pos = te0_end_pos - te0_len
     tr0_end_pos = te0_start_pos - buffer
 
-    # Привязка сетки H=5 к опорному якорю (2026-10-18 19:44:20+03:00, pos=678579),
-    # чтобы при добавлении новых данных окна сдвигались строго на целое число шагов step=37500,
+    # Привязка сеток H=5, 12, 25 к опорным якорям уже обученных окон (2026-10-20),
+    # чтобы при добавлении новых данных окна сдвигались строго на целое число шагов step,
     # сохраняя 100% совместимость уже обученных чекпоинтов нейросетей!
-    anchor_pos_h5 = 678579
-    if int(H) == 5 and n_clean > anchor_pos_h5 + step:
-        n_steps_shift = max(0, (tr0_end_pos - anchor_pos_h5) // step)
-        tr0_end_pos = anchor_pos_h5 + n_steps_shift * step
-        te0_start_pos = tr0_end_pos + buffer
-        te0_len = te0_end_pos - te0_start_pos
+    anchor_map = {5: 753429, 12: 764543, 25: 764530}
+    anchor_pos = anchor_map.get(int(H))
+    extra_edge_win = False
+    if anchor_pos is not None and n_clean > anchor_pos + step // 2:
+        n_steps_shift = max(0, (tr0_end_pos - anchor_pos) // step)
+        aligned_tr0_end = anchor_pos + n_steps_shift * step
+        # Для H=12, если справа от шага якоря осталось >80% полного шага (94.5k из 105k),
+        # добавляем самое свежее краевое окно win_00, а сетку якоря ставим с win_01!
+        if int(H) == 12 and (tr0_end_pos - aligned_tr0_end) >= int(0.8 * step):
+            extra_edge_win = True
+        else:
+            tr0_end_pos = aligned_tr0_end
+            te0_start_pos = tr0_end_pos + buffer
+            te0_len = te0_end_pos - te0_start_pos
 
     tr0_start_pos = tr0_end_pos - t_train
 
@@ -163,8 +171,11 @@ def generate_rolling_windows_reverse(segments: list, H: int, K: float, n_target:
             'H': H,
             'K': K
         })
-    max_wins = 14 if int(H) == 5 else 12
-    curr_tr_end = tr0_end_pos - step
+    max_wins = 24 if int(H) == 5 else 12
+    if extra_edge_win:
+        curr_tr_end = anchor_pos + max(0, (tr0_end_pos - anchor_pos) // step) * step
+    else:
+        curr_tr_end = tr0_end_pos - step
     while curr_tr_end - t_train >= 0 and len(windows) < max_wins:
         tr_e_pos = curr_tr_end
         tr_s_pos = tr_e_pos - t_train

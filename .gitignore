@@ -12,6 +12,7 @@ data
 data/
 *remote.csv
 *.log
+logs/
 __pycache__/
 */__pycache__/
 */*/__pycache__/

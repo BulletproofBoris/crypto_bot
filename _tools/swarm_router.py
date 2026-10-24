@@ -299,9 +299,14 @@ class SwarmRegimeRouter:
             X_nn = None
 
             for exp in self.neural_experts:
+                w_idx = min(exp.get("win_idx", 0), weights.shape[1] - 1)
+                reg_w = weights[:, w_idx] if multi_win else 1.0
                 sl = exp["seq_len"]
                 arch_clean = exp["arch"].replace("+", "_")
                 cache_file = cache_dir / f"nn_preds_{self.coin}_h{self.H}s_{arch_clean}_{n_samples}_{slice_hash}.npy"
+
+                if multi_win and not cache_file.exists() and float(np.mean(reg_w)) < 0.02:
+                    continue
 
                 if cache_file.exists():
                     p_raw = np.load(cache_file)
@@ -310,15 +315,16 @@ class SwarmRegimeRouter:
                         X_nn = self._sanitize_stale_bo_features(X, current_regime_df)
                     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
                     import tensorflow as tf
+                    print(f"  ⚡ [H={self.H}s] Инференс нейросети {exp['arch']} (mean_w={float(np.mean(reg_w)):.3f})...", flush=True)
                     model = tf.keras.models.load_model(exp["k_file"], compile=False)
                     x_norm = np.clip((X_nn - exp["mean"]) / exp["std"], -5.0, 5.0).astype(np.float32)
                     x_norm = np.nan_to_num(x_norm, nan=0.0, posinf=5.0, neginf=-5.0)
                     x_pad = np.vstack([np.repeat(x_norm[:1], sl - 1, axis=0), x_norm])
                     x_3d_view = np.lib.stride_tricks.sliding_window_view(x_pad, (sl, x_norm.shape[1]))[:, 0, :, :]
 
-                    # Пакетный инференс чанками по 8192 строк (экономит 7.5 ГБ RAM!)
+                    # Пакетный инференс чанками по 16384 строк
                     p_chunks = []
-                    chunk_sz = 8192
+                    chunk_sz = 16384
                     for start_i in range(0, n_samples, chunk_sz):
                         end_i = min(n_samples, start_i + chunk_sz)
                         x_batch = np.ascontiguousarray(x_3d_view[start_i:end_i], dtype=np.float32)
@@ -345,7 +351,7 @@ class SwarmRegimeRouter:
 
                 w_idx = min(exp.get("win_idx", 0), weights.shape[1] - 1)
                 reg_w = weights[:, w_idx] if multi_win else 1.0
-                w_exp = np.asarray(max(0.01, exp["ic"] ** 2) * reg_w, dtype=np.float32)
+                w_exp = np.broadcast_to(np.asarray(max(0.01, exp["ic"] ** 2) * reg_w, dtype=np.float32), (n_samples,))
                 nn_ez_num += w_exp * ez_scaled
                 nn_probs_num += w_exp[:, np.newaxis] * p_cal
                 nn_w_sum += w_exp

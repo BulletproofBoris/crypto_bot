@@ -1,0 +1,25 @@
+{
+  "coin": "PRL",
+  "H": 60,
+  "seq_len": 150,
+  "optimal_weights": {
+    "lightgbm": 0.85,
+    "conv1d+gru": 0.15
+  },
+  "ensemble_metrics_oos": {
+    "ic": 0.2568,
+    "auc": 0.7508,
+    "log_loss": 1.15,
+    "top2_pnl": 0.79
+  },
+  "class_weights": [
+    11.865688,
+    9.946083,
+    4.065611,
+    0.165958,
+    4.058659,
+    7.904436,
+    10.933076
+  ]
+}
+

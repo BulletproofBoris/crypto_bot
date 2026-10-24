@@ -1,0 +1,79 @@
+{
+  "baseline": {
+    "pnl_usd": 0.2414,
+    "pnl_pct": 1.61,
+    "trades": 11,
+    "hours": 25.2,
+    "exp_edge_ticks": 3.49,
+    "critic_v_ticks": -0.02,
+    "real_pnl_per_trade_usd": 0.0219
+  },
+  "history": [
+    {
+      "epoch": 0,
+      "pnl_usd": 2.6504,
+      "pnl_pct": 17.67,
+      "trades": 59,
+      "hours": 25.2,
+      "exp_edge_ticks": 4.26,
+      "critic_v_ticks": -0.06,
+      "real_pnl_per_trade_usd": 0.0449,
+      "best_pnl_usd": 2.6504
+    },
+    {
+      "epoch": 1,
+      "pnl_usd": 2.5603,
+      "pnl_pct": 17.07,
+      "trades": 65,
+      "hours": 25.2,
+      "exp_edge_ticks": 4.0,
+      "critic_v_ticks": -0.05,
+      "real_pnl_per_trade_usd": 0.0394,
+      "best_pnl_usd": 2.6504
+    },
+    {
+      "epoch": 2,
+      "pnl_usd": 3.0117,
+      "pnl_pct": 20.08,
+      "trades": 72,
+      "hours": 25.2,
+      "exp_edge_ticks": 3.74,
+      "critic_v_ticks": -0.15,
+      "real_pnl_per_trade_usd": 0.0418,
+      "best_pnl_usd": 3.0117
+    },
+    {
+      "epoch": 3,
+      "pnl_usd": 2.4656,
+      "pnl_pct": 16.44,
+      "trades": 67,
+      "hours": 25.2,
+      "exp_edge_ticks": 3.97,
+      "critic_v_ticks": -0.28,
+      "real_pnl_per_trade_usd": 0.0368,
+      "best_pnl_usd": 3.0117
+    },
+    {
+      "epoch": 4,
+      "pnl_usd": 2.8781,
+      "pnl_pct": 19.19,
+      "trades": 63,
+      "hours": 25.2,
+      "exp_edge_ticks": 4.04,
+      "critic_v_ticks": -0.43,
+      "real_pnl_per_trade_usd": 0.0457,
+      "best_pnl_usd": 3.0117
+    },
+    {
+      "epoch": 5,
+      "pnl_usd": 3.078,
+      "pnl_pct": 20.52,
+      "trades": 57,
+      "hours": 25.2,
+      "exp_edge_ticks": 4.08,
+      "critic_v_ticks": -0.48,
+      "real_pnl_per_trade_usd": 0.054,
+      "best_pnl_usd": 3.078
+    }
+  ]
+}
