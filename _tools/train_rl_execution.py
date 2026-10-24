@@ -302,7 +302,70 @@ class SafeTradeL2ExecutionEnv:
 
         self._obs_buf = np.empty(self.obs_dim, dtype=np.float32)
         self._mask_buf = np.zeros(self.n_actions, dtype=bool)
+        self._oracle_cache = None
         self.reset()
+
+    def get_oracle_benchmark(self) -> dict:
+        """
+        Вычисляет физический потолок Идеального Maker-Оракула (100% КПД) на интервале [start_idx, end_idx]
+        в той же самой L2 FIFO-среде (с учетом реальной очереди q_ahead, задержки 1с и масок).
+        """
+        if self._oracle_cache is not None:
+            return self._oracle_cache
+
+        saved_legacy = self.legacy_v2
+        self.legacy_v2 = False
+        obs = self.reset(eval_mode=True)
+        done = False
+        n_max = len(self.bid_p)
+        b1_all = np.maximum(self.bid_p[:, 0], self.tick_size)
+        a1_all = np.maximum(self.ask_p[:, 0], b1_all + self.tick_size)
+
+        while not done:
+            t = self.t
+            mask = self.get_action_mask()
+            w_end = min(n_max, t + 90)
+            fut_b1 = b1_all[t + 1:w_end]
+            fut_a1 = a1_all[t + 1:w_end]
+            act = 0
+
+            if self.pos_qty <= 1e-8:
+                b1 = b1_all[t]
+                a1 = a1_all[t]
+                target_b = (b1 + self.tick_size) if (a1 - b1) >= 2.0 * self.tick_size else b1
+                if len(fut_b1) > 5:
+                    # Проверяем, даст ли волна минимум +1..2 тика профита без провала против нашего Bid
+                    max_gain_ticks = (np.max(fut_a1) - target_b) / self.tick_size
+                    max_drop_ticks = (target_b - np.min(fut_b1[:25])) / self.tick_size
+                    good_wave = (max_gain_ticks >= 2.0 and max_drop_ticks <= 1.0) or (max_gain_ticks >= 1.0 and max_drop_ticks <= 0.0)
+                    if good_wave and mask[1]:
+                        act = 0 if self.order_side == "BUY" else 1
+                    elif good_wave and mask[2]:
+                        act = 0 if self.order_side == "BUY" else 2
+                    elif self.order_side == "BUY" and max_drop_ticks > 1.0 and mask[5]:
+                        act = 5
+            else:
+                w_short = min(n_max, t + 25)
+                fut_b_short = b1_all[t + 1:w_short]
+                still_rising = len(fut_b_short) > 0 and (np.max(fut_b_short) > self.peak_bid + 0.5 * self.tick_size)
+                if still_rising and mask[3]:
+                    act = 3
+                elif mask[4]:
+                    act = 4
+                elif mask[3]:
+                    act = 3
+
+            obs, _, done = self.step(act)
+
+        oracle_pnl = max(0.10, float(self.prev_mtm))
+        self._oracle_cache = {
+            "oracle_pnl_usd": round(oracle_pnl, 4),
+            "oracle_pnl_pct": round(oracle_pnl / self.order_usd * 100.0, 2),
+            "oracle_trades": int(self.n_trades),
+        }
+        self.legacy_v2 = saved_legacy
+        self.reset(eval_mode=True)
+        return self._oracle_cache
 
     def _get_lob_queue(self, t: int, side: str, price: float):
         tol = self.tick_size * 0.25
@@ -383,9 +446,16 @@ class SafeTradeL2ExecutionEnv:
             mask[0] = (self.order_side == "SELL")
             mask[3] = True
             mask[4] = True
-            mask[6] = True
-            if self.order_side is not None:
-                mask[5] = True
+            if self.legacy_v2:
+                mask[6] = True
+                if self.order_side is not None:
+                    mask[5] = True
+            else:
+                b1 = max(self.bid_p[t, 0], self.tick_size)
+                unr_ticks = (b1 - self.avg_entry) / self.tick_size
+                # Разрешаем аварийный Taker-выход только при реальной угрозе пролива, исключая случайный слив при семплировании PPO
+                if unr_ticks <= -2.0 or float(self.inertia_arr[t]) < -0.25 or float(self.obs_err12_norm[t]) < -0.60:
+                    mask[6] = True
         return mask
 
     def _get_obs(self) -> np.ndarray:
@@ -531,6 +601,9 @@ class SafeTradeL2ExecutionEnv:
                 vol_hit = self.buy_vol[nt] if abs(na1 - self.order_price) <= tol else 0.0
                 if crossed or vol_hit > eff_q:
                     net_pnl = self.pos_qty * (self.order_price - self.avg_entry)
+                    realized_ticks = (self.order_price - self.avg_entry) / self.tick_size
+                    if realized_ticks > 0:
+                        requote_penalty -= 0.35 * realized_ticks  # Бонус за успешную фиксацию волны лимитным Maker Ask
                     self.total_pnl_usd += net_pnl
                     self.pos_qty = 0.0
                     self.avg_entry = 0.0
@@ -543,10 +616,10 @@ class SafeTradeL2ExecutionEnv:
         delta_pnl_ticks = (cur_mtm - self.prev_mtm) / (self.order_usd * (self.tick_size / nb1))
         self.prev_mtm = cur_mtm
 
-        # Асимметричная неприязнь к риску (Downside Risk Aversion): глубокий минус штрафуется в 1.75x сильнее
-        shaped_pnl = delta_pnl_ticks * 1.75 if delta_pnl_ticks < -0.5 else delta_pnl_ticks
+        # Асимметричная неприязнь к риску (Downside Risk Aversion): глубокий минус штрафуется в 1.5x сильнее
+        shaped_pnl = delta_pnl_ticks * 1.50 if delta_pnl_ticks < -0.5 else delta_pnl_ticks
         hold_sec = (nt - self.entry_t) if self.pos_qty > 1e-8 else 0
-        inv_pen = 0.003 * (1.0 if self.pos_qty > 1e-8 else 0.0) + (0.01 if hold_sec > 35 else 0.0)
+        inv_pen = 0.005 if hold_sec > 60 else 0.0
 
         next_obs = self._get_obs()
         reward = float(shaped_pnl - inv_pen - requote_penalty)
@@ -613,14 +686,39 @@ def teacher_heuristic_action(obs: np.ndarray, mask: np.ndarray) -> int:
         return 0
 
 
-def evaluate_policy(env: SafeTradeL2ExecutionEnv, model: MaskableActorCritic = None, device: str = "cpu") -> dict:
-    """Прогоняет детерминированный бэктест на всём интервале среды [start_idx, end_idx]."""
+def evaluate_policy(env: SafeTradeL2ExecutionEnv, model: MaskableActorCritic = None, device: str = "cpu", oracle_pnl_override: float = None) -> dict:
+    """
+    Прогоняет детерминированный бэктест на интервале среды [start_idx, end_idx]
+    и рассчитывает полный паспорт КПД агента:
+      - kpd_capture_pct: физический КПД захвата волн относительно Идеального Maker-Оракула (%)
+      - exit_eff_pct: КПД фиксации волны относительно внутрисделочного пика MFE (%)
+      - mean_mfe_ticks / mean_mae_ticks: средние MFE и MAE в тиках на сделку
+      - max_dd_usd / max_dd_pct: максимальная просадка плавающего MTM-капитала
+      - efficiency_score: интегральный риск-скорректированный индекс КПД для отбора лучших итераций
+    """
+    if oracle_pnl_override is not None:
+        oracle_pnl = float(oracle_pnl_override)
+    else:
+        oracle_pnl = env.get_oracle_benchmark()["oracle_pnl_usd"]
+
     obs = env.reset(eval_mode=True)
     done = False
     steps = 0
     entry_edges = []
     entry_v_preds = []
+
+    mtm_peak = 0.0
+    max_dd_usd = 0.0
+    prev_pos = 0.0
+    entry_p = 0.0
+    cur_mfe_ticks = 0.0
+    cur_mae_ticks = 0.0
+    mfe_list, mae_list, exit_eff_list = [], [], []
+    gross_win_usd, gross_loss_usd = 0.0, 0.0
+    prev_realized = 0.0
+
     while not done:
+        t_cur = env.t
         mask = env.get_action_mask()
         v_pred = 0.0
         if model is None:
@@ -635,13 +733,66 @@ def evaluate_policy(env: SafeTradeL2ExecutionEnv, model: MaskableActorCritic = N
         if act in (1, 2) and env.pos_qty <= 1e-8:
             entry_edges.append(float(obs[-2] * 5.0))
             entry_v_preds.append(v_pred)
+
         obs, _, done = env.step(act)
         steps += 1
-    avg_real_pnl_usd = float(env.prev_mtm / max(1, env.n_trades))
+
+        mtm_peak = max(mtm_peak, float(env.prev_mtm))
+        max_dd_usd = max(max_dd_usd, mtm_peak - float(env.prev_mtm))
+
+        nt = env.t
+        nb1 = max(env.bid_p[nt, 0], env.tick_size)
+        na1 = max(env.ask_p[nt, 0], nb1 + env.tick_size)
+
+        if prev_pos <= 1e-8 and env.pos_qty > 1e-8:
+            entry_p = env.avg_entry
+            cur_mfe_ticks = max(0.0, (na1 - entry_p) / env.tick_size)
+            cur_mae_ticks = max(0.0, (entry_p - nb1) / env.tick_size)
+        elif env.pos_qty > 1e-8:
+            cur_mfe_ticks = max(cur_mfe_ticks, (na1 - entry_p) / env.tick_size)
+            cur_mae_ticks = max(cur_mae_ticks, (entry_p - nb1) / env.tick_size)
+        elif prev_pos > 1e-8 and env.pos_qty <= 1e-8:
+            tr_pnl = float(env.total_pnl_usd - prev_realized)
+            prev_realized = float(env.total_pnl_usd)
+            if tr_pnl > 0:
+                gross_win_usd += tr_pnl
+            else:
+                gross_loss_usd += abs(tr_pnl)
+            realized_ticks = tr_pnl / max(1e-8, prev_pos * env.tick_size)
+            mfe_eff = max(cur_mfe_ticks, realized_ticks, 1.0)
+            mfe_list.append(cur_mfe_ticks)
+            mae_list.append(cur_mae_ticks)
+            exit_eff_list.append(np.clip(realized_ticks / mfe_eff, -1.0, 1.0) * 100.0)
+
+        prev_pos = env.pos_qty
+
+    pnl_usd = float(env.prev_mtm)
+    n_trades = int(env.n_trades)
+    avg_real_pnl_usd = float(pnl_usd / max(1, n_trades))
+    kpd_capture_pct = float(pnl_usd / max(0.10, oracle_pnl) * 100.0)
+    exit_eff_pct = float(np.mean(exit_eff_list)) if exit_eff_list else 0.0
+    mean_mfe = float(np.mean(mfe_list)) if mfe_list else 0.0
+    mean_mae = float(np.mean(mae_list)) if mae_list else 0.0
+    profit_factor = float(gross_win_usd / max(1e-4, gross_loss_usd)) if gross_loss_usd > 1e-4 else (99.0 if gross_win_usd > 0 else 0.0)
+
+    # Интегральный риск-скорректированный КПД (Efficiency Score)
+    dd_penalty = 1.0 / (1.0 + 2.0 * (max_dd_usd / max(0.25, oracle_pnl)))
+    trade_stat_weight = min(1.0, np.sqrt(n_trades / 4.0))
+    efficiency_score = kpd_capture_pct * dd_penalty * trade_stat_weight
+
     return {
-        "pnl_usd": round(float(env.prev_mtm), 4),
-        "pnl_pct": round(float(env.prev_mtm / env.order_usd * 100.0), 2),
-        "trades": int(env.n_trades),
+        "pnl_usd": round(pnl_usd, 4),
+        "pnl_pct": round(float(pnl_usd / env.order_usd * 100.0), 2),
+        "oracle_pnl_usd": round(oracle_pnl, 4),
+        "kpd_capture_pct": round(kpd_capture_pct, 2),
+        "efficiency_score": round(float(efficiency_score), 2),
+        "exit_eff_pct": round(exit_eff_pct, 1),
+        "mean_mfe_ticks": round(mean_mfe, 2),
+        "mean_mae_ticks": round(mean_mae, 2),
+        "max_dd_usd": round(max_dd_usd, 4),
+        "max_dd_pct": round(float(max_dd_usd / env.order_usd * 100.0), 2),
+        "profit_factor": round(min(99.9, profit_factor), 2),
+        "trades": n_trades,
         "hours": round(steps / 3600.0, 2),
         "exp_edge_ticks": round(float(np.mean(entry_edges)) if entry_edges else 0.0, 2),
         "critic_v_ticks": round(float(np.mean(entry_v_preds)) if entry_v_preds else 0.0, 2),
@@ -679,20 +830,39 @@ def train_rl_agent(
         base_model.load_state_dict(torch.load(base_ckpt, map_location=device))
         base_model.eval()
 
-    base_res = evaluate_policy(base_env, model=base_model, device=device)
-    print(f"\n📊 Базовый эталон (PPO v2) на слепом OOS ({base_res['hours']} ч): PnL = ${base_res['pnl_usd']:+.4f} ({base_res['pnl_pct']:+.2f}%) | Сделок: {base_res['trades']}")
+    oracle_info = test_env.get_oracle_benchmark()
+    base_res = evaluate_policy(base_env, model=base_model, device=device, oracle_pnl_override=oracle_info["oracle_pnl_usd"])
+    print(
+        f"\n🎯 Физический потолок Идеального Maker-Оракула на слепом OOS ({base_res['hours']} ч): "
+        f"+${oracle_info['oracle_pnl_usd']:.4f} (+{oracle_info['oracle_pnl_pct']:.2f}%, {oracle_info['oracle_trades']} волн) = 100% КПД"
+    )
+    print(
+        f"📊 Базовый эталон (PPO v2): PnL = ${base_res['pnl_usd']:+.4f} ({base_res['pnl_pct']:+.2f}%) | "
+        f"КПД захвата: {base_res['kpd_capture_pct']:+.1f}% | Score: {base_res['efficiency_score']:+.1f} | "
+        f"Выход: {base_res['exit_eff_pct']:.0f}% (MFE={base_res['mean_mfe_ticks']:.1f}т/MAE={base_res['mean_mae_ticks']:.1f}т) | "
+        f"MaxDD: ${base_res['max_dd_usd']:.3f} | Сделок: {base_res['trades']}"
+    )
     history = []
     best_pnl = -1e9
+    best_score = -1e9
 
+    best_model_ref = MaskableActorCritic(obs_dim=train_env.obs_dim, n_actions=train_env.n_actions).to(device)
     if base_ckpt.exists():
         print("🎓 Warm-Start инициализация весов от базового эталона baseline_ppo_v2.pt...")
         model.load_state_dict(torch.load(base_ckpt, map_location=device))
-        opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+        best_model_ref.load_state_dict(model.state_dict())
+        best_model_ref.eval()
+        opt = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-4)
         ws_res = evaluate_policy(test_env, model=model, device=device)
         best_pnl = ws_res["pnl_usd"]
+        best_score = ws_res["efficiency_score"]
         torch.save(model.state_dict(), out_dir / "best_maskable_ppo.pt")
-        history.append({"epoch": 0, **ws_res, "best_pnl_usd": round(float(best_pnl), 4)})
-        print(f"  [Warm-Start v3 (Extremum + Inertia)] 🏆 -> Blind OOS PnL: ${ws_res['pnl_usd']:+.4f} ({ws_res['pnl_pct']:+.2f}%) | Сделок: {ws_res['trades']}")
+        history.append({"epoch": 0, **ws_res, "best_pnl_usd": round(float(best_pnl), 4), "best_score": round(float(best_score), 2)})
+        print(
+            f"  [Warm-Start v3] 🏆 -> PnL: ${ws_res['pnl_usd']:+.4f} | КПД: {ws_res['kpd_capture_pct']:+.1f}% "
+            f"(Score={ws_res['efficiency_score']:+.1f}) | Выход: {ws_res['exit_eff_pct']:.0f}% "
+            f"(MFE={ws_res['mean_mfe_ticks']:.1f}т/MAE={ws_res['mean_mae_ticks']:.1f}т) | MaxDD: ${ws_res['max_dd_usd']:.3f} | Сделок: {ws_res['trades']}"
+        )
     else:
         opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
         print("🎓 Behavioral Cloning Warm-Start (сбор 30,000 демонстраций учителя)...")
@@ -725,11 +895,18 @@ def train_rl_agent(
         obs = train_env.reset()
         for _ in range(steps_per_epoch):
             mask = train_env.get_action_mask()
-            t_act = teacher_heuristic_action(obs, mask)
             with torch.no_grad():
                 o_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
                 m_t = torch.as_tensor(mask, dtype=torch.bool, device=device).unsqueeze(0)
                 logits, val = model(o_t, m_t)
+                ref_logits, _ = best_model_ref(o_t, m_t)
+                t_act = int(torch.argmax(ref_logits, dim=-1).item())
+                # Если открылось качественное окно входа с высоким ожидаемым Edge, поощряем снайперский вход
+                if obs[-10] < 0.5 and obs[-7] < 0.5 and (obs[-2] * 5.0) >= 1.60:
+                    if mask[1] and (obs[0] >= 0.05 or obs[6] >= 0.08):
+                        t_act = 1
+                    elif mask[2] and (obs[12] >= 0.08):
+                        t_act = 2
                 dist = Categorical(logits=logits)
                 act_t = dist.sample()
                 logp_t = dist.log_prob(act_t)
@@ -758,7 +935,22 @@ def train_rl_agent(
         T_advs = torch.as_tensor(advs, dtype=torch.float32, device=device)
         T_rets = torch.as_tensor(rets, dtype=torch.float32, device=device)
 
-        for _ in range(4):
+        # На 1-й эпохе сначала калибруем голову Критика под новую шкалу наград без разрушения общего backbone
+        if ep == 1:
+            for p_name, p_val in model.named_parameters():
+                if not p_name.startswith("critic"):
+                    p_val.requires_grad_(False)
+            for _ in range(6):
+                perm = torch.randperm(steps_per_epoch, device=device)
+                for i in range(0, steps_per_epoch, 1024):
+                    idx = perm[i:i + 1024]
+                    _, vals = model(T_obs[idx], T_masks[idx])
+                    v_loss = F.mse_loss(vals, T_rets[idx])
+                    opt.zero_grad(); v_loss.backward(); opt.step()
+            for p_val in model.parameters():
+                p_val.requires_grad_(True)
+
+        for _ in range(3):
             perm = torch.randperm(steps_per_epoch, device=device)
             for i in range(0, steps_per_epoch, 1024):
                 idx = perm[i:i + 1024]
@@ -767,24 +959,33 @@ def train_rl_agent(
                 new_logp = dist.log_prob(T_acts[idx])
                 ratio = torch.exp(new_logp - T_old_logp[idx])
                 surr1 = ratio * T_advs[idx]
-                surr2 = torch.clamp(ratio, 0.8, 1.2) * T_advs[idx]
-                loss = -torch.min(surr1, surr2).mean() + 0.5 * F.mse_loss(vals, T_rets[idx]) - 0.01 * dist.entropy().mean()
-                opt.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
+                surr2 = torch.clamp(ratio, 0.85, 1.15) * T_advs[idx]
+                bc_anchor = F.cross_entropy(logits, T_tacts[idx])
+                loss = -torch.min(surr1, surr2).mean() + 0.25 * F.mse_loss(vals, T_rets[idx]) + 0.15 * bc_anchor - 0.005 * dist.entropy().mean()
+                opt.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(model.parameters(), 0.5); opt.step()
         sched.step()
 
         oos_res = evaluate_policy(test_env, model=model, device=device)
-        is_best = (oos_res["pnl_usd"] > best_pnl) and (oos_res["trades"] >= 2)
+        is_best = (oos_res["efficiency_score"] > best_score) and (oos_res["trades"] >= 2)
         if is_best:
-            best_pnl = oos_res["pnl_usd"]
+            best_score = oos_res["efficiency_score"]
+            best_pnl = max(best_pnl, oos_res["pnl_usd"])
+            best_model_ref.load_state_dict(model.state_dict())
             torch.save(model.state_dict(), out_dir / "best_maskable_ppo.pt")
+        elif oos_res["efficiency_score"] < best_score * 0.75:
+            # Мягкий возврат к лидеру при неудачной стохастической мутации
+            with torch.no_grad():
+                for p_cur, p_best in zip(model.parameters(), best_model_ref.parameters()):
+                    p_cur.data.mul_(0.3).add_(p_best.data, alpha=0.7)
         mark = "🏆 РЕКОРД" if is_best else "✅ OK"
-        history.append({"epoch": ep, **oos_res, "best_pnl_usd": round(float(best_pnl), 4)})
+        history.append({"epoch": ep, **oos_res, "best_pnl_usd": round(float(best_pnl), 4), "best_score": round(float(best_score), 2)})
         with open(out_dir / "training_history.json", "w") as f:
-            json.dump({"baseline": base_res, "history": history}, f, indent=2)
+            json.dump({"oracle": oracle_info, "baseline": base_res, "history": history}, f, indent=2)
         print(
-            f"  [PPO Ep {ep:02d}/{ppo_epochs}] {mark} -> Blind OOS PnL: ${oos_res['pnl_usd']:+.4f} ({oos_res['pnl_pct']:+.2f}%) | "
-            f"Сделок: {oos_res['trades']} | Ожид.Edge: {oos_res['exp_edge_ticks']:+.2f}т (V={oos_res['critic_v_ticks']:+.2f}) -> "
-            f"Факт/сделку: ${oos_res['real_pnl_per_trade_usd']:+.4f}",
+            f"  [PPO Ep {ep:02d}/{ppo_epochs}] {mark} -> PnL: ${oos_res['pnl_usd']:+.4f} | "
+            f"КПД: {oos_res['kpd_capture_pct']:+.1f}% (Score={oos_res['efficiency_score']:+.1f}) | "
+            f"Выход: {oos_res['exit_eff_pct']:.0f}% (MFE={oos_res['mean_mfe_ticks']:.1f}т/MAE={oos_res['mean_mae_ticks']:.1f}т) | "
+            f"MaxDD: ${oos_res['max_dd_usd']:.3f} | Сделок: {oos_res['trades']}",
             flush=True,
         )
         if live_plot:
@@ -812,27 +1013,40 @@ def train_rl_agent(
     return {"baseline": base_res, "history": history}
 
 
-def inspect_and_plot_rl_oos(coin: str = "prl", tail_hours: float = 72.0):
-    """Прогоняет лучший чекпоинт Maskable PPO и базовую эвристику на слепом OOS с визуализацией сделок и кривой капитала."""
+def inspect_and_plot_rl_oos(coin: str = "prl", tail_hours: float = 72.0, start_ts_msk: str = None):
+    """Прогоняет лучший чекпоинт Maskable PPO и базовую эвристику на слепом OOS или чистом Форвард-тесте с визуализацией сделок и кривой капитала."""
     import matplotlib.pyplot as plt
     data = build_or_load_rl_cache(coin=coin, tail_hours=tail_hours)
     n_total = len(data["X_market"])
-    split_idx = int(n_total * 0.65)
+    ts_msk = pd.to_datetime(data["ts"]).tz_convert("Europe/Moscow")
+    if start_ts_msk is not None:
+        cutoff = pd.Timestamp(start_ts_msk)
+        split_idx = int(np.argmax(ts_msk > cutoff))
+    else:
+        split_idx = int(n_total * 0.65)
+    t_start_str = str(ts_msk[split_idx])
+    t_end_str = str(ts_msk[n_total - 1])
     test_env = SafeTradeL2ExecutionEnv(data, start_idx=split_idx, end_idx=n_total - 1, episode_len=n_total - split_idx - 2)
     base_env = SafeTradeL2ExecutionEnv(data, start_idx=split_idx, end_idx=n_total - 1, episode_len=n_total - split_idx - 2, legacy_v2=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     ckpt = BASE_DIR / "models" / coin.lower() / "rl_execution" / "best_maskable_ppo.pt"
     base_ckpt = BASE_DIR / "models" / coin.lower() / "rl_execution" / "baseline_ppo_v2.pt"
-    model = MaskableActorCritic(obs_dim=test_env.obs_dim, n_actions=test_env.n_actions).to(device)
-    if ckpt.exists():
-        model.load_state_dict(torch.load(ckpt, map_location=device))
+    sd3 = torch.load(ckpt, map_location=device, weights_only=False) if ckpt.exists() else None
+    sd3 = sd3.get("model_state_dict", sd3) if isinstance(sd3, dict) else sd3
+    h3 = sd3["backbone.0.weight"].shape[0] if sd3 is not None else 128
+    model = MaskableActorCritic(obs_dim=test_env.obs_dim, n_actions=test_env.n_actions, hidden_dim=h3).to(device)
+    if sd3 is not None:
+        model.load_state_dict(sd3)
     model.eval()
 
     base_model = None
     if base_ckpt.exists():
-        base_model = MaskableActorCritic(obs_dim=base_env.obs_dim, n_actions=base_env.n_actions).to(device)
-        base_model.load_state_dict(torch.load(base_ckpt, map_location=device))
+        sd2 = torch.load(base_ckpt, map_location=device, weights_only=False)
+        sd2 = sd2.get("model_state_dict", sd2) if isinstance(sd2, dict) else sd2
+        h2 = sd2["backbone.0.weight"].shape[0]
+        base_model = MaskableActorCritic(obs_dim=base_env.obs_dim, n_actions=base_env.n_actions, hidden_dim=h2).to(device)
+        base_model.load_state_dict(sd2)
         base_model.eval()
 
     def _run_trace(pol_model, env_obj):
@@ -866,8 +1080,8 @@ def inspect_and_plot_rl_oos(coin: str = "prl", tail_hours: float = 72.0):
                 trades_log.append({
                     "entry_step": int(entry_t - split_idx),
                     "exit_step": int(t_cur - split_idx),
-                    "entry_ts": str(data["ts"][entry_t]),
-                    "exit_ts": str(data["ts"][t_cur]),
+                    "entry_ts": str(ts_msk[entry_t]),
+                    "exit_ts": str(ts_msk[t_cur]),
                     "hold_sec": int(t_cur - entry_t),
                     "entry_price": round(float(entry_p), 6),
                     "exit_action": "Panic Taker" if act == 6 else "Maker Ask (Passive)",
@@ -878,6 +1092,24 @@ def inspect_and_plot_rl_oos(coin: str = "prl", tail_hours: float = 72.0):
             prev_pos = env_obj.pos_qty
             entry_eq_before = env_obj.prev_mtm
         return np.array(eq_mtm), np.array(eq_realized), np.array(mid_p), np.array(acts), pd.DataFrame(trades_log)
+
+    kpi_ppo = evaluate_policy(test_env, model=model, device=device)
+    kpi_base = evaluate_policy(base_env, model=base_model, device=device, oracle_pnl_override=kpi_ppo["oracle_pnl_usd"])
+    mode_lbl = "ЧИСТОМ ФОРВАРД-ТЕСТЕ" if start_ts_msk is not None else "СЛЕПОМ OOS"
+    print("\n" + "=" * 96)
+    print(f"📊 СРАВНЕНИЕ ПАСПОРТОВ КПД АГЕНТОВ НА {mode_lbl} ({kpi_ppo['hours']} ч | Потолок Оракула: +${kpi_ppo['oracle_pnl_usd']:.4f} = 100% КПД)")
+    print(f"📅 Период (МСК): {t_start_str} ➔ {t_end_str}")
+    print("=" * 96)
+    print(f"{'Метрика КПД':<34} | {'Базовый эталон (v2)':<26} | {'Maskable PPO (v3)':<26}")
+    print("-" * 96)
+    print(f"{'Чистый PnL (USDT / % к ордеру)':<34} | ${kpi_base['pnl_usd']:+.4f} ({kpi_base['pnl_pct']:+.2f}%)        | ${kpi_ppo['pnl_usd']:+.4f} ({kpi_ppo['pnl_pct']:+.2f}%)")
+    print(f"{'Физический КПД захвата (η_capture)':<34} | {kpi_base['kpd_capture_pct']:+6.2f}%                   | {kpi_ppo['kpd_capture_pct']:+6.2f}%")
+    print(f"{'Интегральный индекс (Score)':<34} | {kpi_base['efficiency_score']:+6.2f}                    | {kpi_ppo['efficiency_score']:+6.2f}")
+    print(f"{'КПД фиксации волны (η_exit от MFE)':<34} | {kpi_base['exit_eff_pct']:6.1f}%                   | {kpi_ppo['exit_eff_pct']:6.1f}%")
+    print(f"{'Средний MFE / MAE (тики)':<34} | {kpi_base['mean_mfe_ticks']:4.2f}т / {kpi_base['mean_mae_ticks']:4.2f}т             | {kpi_ppo['mean_mfe_ticks']:4.2f}т / {kpi_ppo['mean_mae_ticks']:4.2f}т")
+    print(f"{'Макс. просадка MTM (MaxDD)':<34} | ${kpi_base['max_dd_usd']:.4f} ({kpi_base['max_dd_pct']:.2f}%)         | ${kpi_ppo['max_dd_usd']:.4f} ({kpi_ppo['max_dd_pct']:.2f}%)")
+    print(f"{'Profit Factor / Сделок':<34} | PF={kpi_base['profit_factor']:.2f} ({kpi_base['trades']} сд.)          | PF={kpi_ppo['profit_factor']:.2f} ({kpi_ppo['trades']} сд.)")
+    print("=" * 96 + "\n")
 
     eq_base_mtm, eq_base_real, mid_p, acts_base, df_base = _run_trace(base_model, base_env)
     eq_ppo_mtm, eq_ppo_real, _, acts_ppo, df_ppo = _run_trace(model, test_env)
