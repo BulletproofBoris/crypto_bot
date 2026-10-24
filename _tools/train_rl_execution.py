@@ -50,36 +50,74 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
     n_rows = min(total_rows, int(tail_hours * 3600))
     start_row = max(0, total_rows - n_rows)
 
-    print(f"📂 Чтение последних {n_rows:,} сек ({tail_hours:.1f} ч) из {parquet_path.name}...")
-    table = pf.read()
-    df = table.slice(start_row, n_rows).to_pandas()
+    horizons = [(5, 3.0), (12, 3.5), (25, 3.0)]
+    routers = [
+        (H, K, SwarmRegimeRouter(coin, H, K, temperature=0.5, use_neural=True, neural_weight=0.15))
+        for H, K in horizons
+    ]
+
+    schema_cols = set(pf.schema_arrow.names)
+    lob_and_meta_cols = [
+        "timestamp", "ST_best_bid", "ST_best_ask", "ST_bid_qty_1", "ST_ask_qty_1",
+        "ST_vol_300s_ticks", "ST_ofi_norm_300s", "ST_spread_pct", "ST_cvd_5m",
+        "BO_sec_since_tick", "ST_trade_vol", "ST_trade_vol_1s",
+        "ST_buy_vol", "ST_buy_vol_1s", "ST_sell_vol", "ST_sell_vol_1s", "ST_vwap_1s",
+    ]
+    for lvl in range(1, 11):
+        lob_and_meta_cols.extend([
+            f"ST_bid_{lvl}_price", f"ST_bid_{lvl}_qty",
+            f"ST_ask_{lvl}_price", f"ST_ask_{lvl}_qty",
+        ])
+    req_cols = list(dict.fromkeys(
+        [c for r in routers for c in r[2].feature_names if c in schema_cols]
+        + [c for c in lob_and_meta_cols if c in schema_cols]
+    ))
+
+    print(f"📂 Селективное чтение последних {n_rows:,} сек ({tail_hours:.1f} ч, {len(req_cols)} кол.) из {parquet_path.name}...")
+    rg_indices = []
+    cum_rows = 0
+    first_rg_offset = 0
+    for rg_i in range(pf.num_row_groups):
+        rg_n = pf.metadata.row_group(rg_i).num_rows
+        if cum_rows + rg_n > start_row:
+            if not rg_indices:
+                first_rg_offset = start_row - cum_rows
+            rg_indices.append(rg_i)
+        cum_rows += rg_n
+
+    table = pf.read_row_groups(rg_indices, columns=req_cols)
+    df = table.slice(first_rg_offset, n_rows).to_pandas()
     del table
 
-    horizons = [(5, 3.0), (12, 3.5), (25, 3.0)]
     triad_feats = []
+    cached_fnames = None
+    cached_X = None
 
-    for H, K in horizons:
+    for H, K, router in routers:
         print(f"\n🔮 Расчёт ансамбля H={H}s (K={K})...")
-        router = SwarmRegimeRouter(coin, H, K, temperature=0.5, use_neural=True, neural_weight=0.15)
-        X_cols = [
-            df[col].values.astype(np.float32) if col in df.columns else np.zeros(len(df), dtype=np.float32)
-            for col in router.feature_names
-        ]
-        X = np.nan_to_num(np.column_stack(X_cols), nan=0.0, posinf=0.0, neginf=0.0)
-        del X_cols
+        if cached_fnames != router.feature_names:
+            X_cols = [
+                df[col].values.astype(np.float32) if col in df.columns else np.zeros(len(df), dtype=np.float32)
+                for col in router.feature_names
+            ]
+            cached_X = np.nan_to_num(np.column_stack(X_cols), nan=0.0, posinf=0.0, neginf=0.0)
+            cached_fnames = list(router.feature_names)
+            del X_cols
 
-        ens_out = router.predict_ensemble(X, df, mode="router")
+        ens_out = router.predict_ensemble(cached_X, df, mode="router")
         probs = ens_out["probs"]
         ez = ens_out["expected_z"]
-        del X, router, ens_out
+        del router, ens_out
 
         p_up = probs[:, 4] + probs[:, 5] + probs[:, 6]
         p_down = probs[:, 0] + probs[:, 1] + probs[:, 2]
         p_tail_pos = probs[:, 5] + probs[:, 6]
         p_tail_neg = probs[:, 0] + probs[:, 1]
-        entropy = -np.sum(np.clip(probs, 1e-7, 1.0) * np.log(np.clip(probs, 1e-7, 1.0)), axis=1) / np.log(7.0)
+        p_clip = np.clip(probs, 1e-7, 1.0)
+        entropy = -np.sum(p_clip * np.log(p_clip), axis=1) / np.log(7.0)
 
         triad_feats.append(np.column_stack([ez, p_up, p_down, p_tail_pos, p_tail_neg, entropy]).astype(np.float32))
+    del cached_X, routers
 
     # 18 признаков триады (H=5,12,25s)
     X_triad = np.hstack(triad_feats[:3]).astype(np.float32)
@@ -214,6 +252,9 @@ class SafeTradeL2ExecutionEnv:
         self.reb_30 = ((self.bid_p[:, 0] - low_30) / self.tick_size).astype(np.float32)
 
         ez5, ez12, ez25 = self.X_market[:, 0], self.X_market[:, 6], self.X_market[:, 12]
+        p_tn_5 = self.X_market[:, 4]
+        p_dn_12 = self.X_market[:, 8]
+        spread_ticks = self.X_market[:, 18] * 10.0
         d_ez12 = ez12 - pd.Series(ez12).shift(5).bfill().values
         imb1, imb5 = self.X_market[:, 19], self.X_market[:, 20]
         self.inertia_arr = (
@@ -222,6 +263,45 @@ class SafeTradeL2ExecutionEnv:
             + 0.10 * np.clip(vel_b1_15, -3.0, 3.0)
         ).astype(np.float32)
 
+        # Векторный предрасчет не зависящих от позиции компонент наблюдения и масок входа (Zero-Allocation Step Loop)
+        b1_vec = np.maximum(self.bid_p[:, 0], self.tick_size)
+        idx_prev12 = np.maximum(0, np.arange(len(b1_vec)) - 12)
+        actual_dt_12 = (b1_vec - b1_vec[idx_prev12]) / self.tick_size
+        pred_dt_12 = ez12[idx_prev12] * 4.0
+        model_err_12 = np.clip(actual_dt_12 - pred_dt_12, -10.0, 10.0).astype(np.float32)
+        surprise_pen = np.maximum(0.0, -model_err_12) * 0.6
+
+        if self.legacy_v2:
+            exp_entry_edge = (0.5 * ez25 + 0.35 * ez12 + 0.15 * ez5) * 4.0 + 0.5 * spread_ticks - p_tn_5 * 3.0 - surprise_pen
+            exp_hold_edge = (0.6 * ez12 + 0.4 * ez5) * 4.0 - p_dn_12 * spread_ticks - surprise_pen * 0.8
+            in_dip_zone_vec = np.ones(len(b1_vec), dtype=bool)
+        else:
+            ext_pos = 0.35 * np.minimum(self.dd_900, 10.0) * np.maximum(0.0, 1.0 - 1.5 * self.pos_900)
+            ext_neg = -1.5 * np.maximum(0.0, self.pos_900 - 0.65)
+            extremum_bonus = np.where(self.inertia_arr > 0.25, ext_pos, ext_neg)
+            exp_entry_edge = (0.5 * ez25 + 0.35 * ez12 + 0.15 * ez5) * 4.0 + 0.5 * spread_ticks - p_tn_5 * 3.0 - surprise_pen + extremum_bonus
+            exp_hold_edge = self.inertia_arr * 3.0 - p_dn_12 * spread_ticks - surprise_pen * 0.6
+
+            bounce_ok_vec = np.where(self.dd_900 >= 6.0, (self.reb_30 >= 1.0) & (self.reb_30 <= 2.0), self.reb_30 <= 2.0)
+            dip_rev_vec = (
+                (self.pos_900 <= 0.35) & (self.pos_3600 <= 0.45)
+                & ((self.dd_300 >= 2.0) | (self.dd_900 >= 3.0))
+                & (self.vel_b1_10 >= 0.0) & bounce_ok_vec & (self.inertia_arr >= 0.28)
+            )
+            uptrend_vec = (
+                (self.vel_b1_180 >= 2.0) & (self.vel_b1_10 >= 0.0)
+                & (self.pos_3600 <= 0.72) & (self.dd_300 >= 1.0) & (self.inertia_arr >= 0.40)
+            )
+            in_dip_zone_vec = dip_rev_vec | uptrend_vec
+
+        self.obs_err12_norm = np.clip(model_err_12 / 5.0, -3.0, 3.0).astype(np.float32)
+        self.obs_entry_edge_norm = np.clip(exp_entry_edge / 5.0, -3.0, 3.0).astype(np.float32)
+        self.obs_hold_edge_norm = np.clip(exp_hold_edge / 5.0, -3.0, 3.0).astype(np.float32)
+        self.can_buy_passive_arr = in_dip_zone_vec
+        self.can_buy_best_arr = in_dip_zone_vec & (imb5 > -0.75)
+
+        self._obs_buf = np.empty(self.obs_dim, dtype=np.float32)
+        self._mask_buf = np.zeros(self.n_actions, dtype=bool)
         self.reset()
 
     def _get_lob_queue(self, t: int, side: str, price: float):
@@ -290,46 +370,31 @@ class SafeTradeL2ExecutionEnv:
         return self._get_obs()
 
     def get_action_mask(self) -> np.ndarray:
+        t = self.t
         mask = np.zeros(self.n_actions, dtype=bool)
-        mask[0] = True  # HOLD всегда разрешён
         if self.pos_qty <= 1e-8:
-            in_cooldown = self.t < self.cooldown_until
-            imb_l5 = float(self.X_market[self.t, 20])
-            pos900 = float(self.pos_900[self.t])
-            pos3600 = float(self.pos_3600[self.t])
-            dd300 = float(self.dd_300[self.t])
-            dd900 = float(self.dd_900[self.t])
-            vel10 = float(self.vel_b1_10[self.t])
-            vel180 = float(self.vel_b1_180[self.t])
-            reb30 = float(self.reb_30[self.t])
-            inertia = float(self.inertia_arr[self.t])
-            # Режим 1: Выкуп локального дна (при глубоком сливе dd900>=6т ждем первого реального тика отскока со дна reb30>=1т)
-            bounce_ok = (reb30 >= 1.0 and reb30 <= 2.0) if dd900 >= 6.0 else (reb30 <= 2.0)
-            dip_reversal = (pos900 <= 0.35) and (pos3600 <= 0.45) and (dd300 >= 2.0 or dd900 >= 3.0) and (vel10 >= 0.0) and bounce_ok and (inertia >= 0.28)
-            # Режим 2: Покупка по инерции восходящего тренда на микро-паузе (vel180 >= 2т, но ниже часового потолка pos3600 <= 0.72)
-            uptrend_cont = (vel180 >= 2.0) and (vel10 >= 0.0) and (pos3600 <= 0.72) and (dd300 >= 1.0) and (inertia >= 0.40)
-            in_dip_zone = True if self.legacy_v2 else (dip_reversal or uptrend_cont)
-            if not in_cooldown and in_dip_zone:
-                if imb_l5 > -0.75:
-                    mask[1] = True  # QUOTE_BID_BEST
-                mask[2] = True  # QUOTE_BID_PASSIVE
+            mask[0] = True
+            if t >= self.cooldown_until:
+                mask[1] = bool(self.can_buy_best_arr[t])
+                mask[2] = bool(self.can_buy_passive_arr[t])
             if self.order_side is not None:
-                mask[5] = True  # CANCEL_ORDERS
+                mask[5] = True
         else:
             mask[0] = (self.order_side == "SELL")
-            mask[3] = True  # QUOTE_ASK_BEST
-            mask[4] = True  # QUOTE_ASK_AGGRESSIVE
-            mask[6] = True  # PANIC_TAKER_EXIT
+            mask[3] = True
+            mask[4] = True
+            mask[6] = True
             if self.order_side is not None:
                 mask[5] = True
         return mask
 
     def _get_obs(self) -> np.ndarray:
-        b1 = max(self.bid_p[self.t, 0], self.tick_size)
-        a1 = max(self.ask_p[self.t, 0], b1 + self.tick_size)
+        t = self.t
+        b1 = max(self.bid_p[t, 0], self.tick_size)
+        a1 = max(self.ask_p[t, 0], b1 + self.tick_size)
         has_pos = 1.0 if self.pos_qty > 1e-8 else 0.0
         unr_ticks = ((b1 - self.avg_entry) / self.tick_size) if has_pos else 0.0
-        hold_ratio = min((self.t - self.entry_t) / 45.0, 2.0) if has_pos else 0.0
+        hold_ratio = min((t - self.entry_t) / 45.0, 2.0) if has_pos else 0.0
         has_bid = 1.0 if self.order_side == "BUY" else 0.0
         has_ask = 1.0 if self.order_side == "SELL" else 0.0
         if has_bid:
@@ -339,38 +404,20 @@ class SafeTradeL2ExecutionEnv:
         else:
             dist = 0.0
         q_ratio = self.q_ahead / (self.q_ahead + self.order_qty + 1e-6) if self.order_side else 0.0
-        xm = self.X_market[self.t]
-        ez_5, p_tn_5 = xm[0], xm[4]
-        ez_12, p_dn_12 = xm[6], xm[8]
-        ez_25 = xm[12]
-        spread_ticks = xm[18] * 10.0
 
-        # Индикатор ошибки прогноза ансамбля в реальном времени (Surprise / Model Forecast Error за последние 12с)
-        t_prev = max(0, self.t - 12)
-        b1_prev = max(self.bid_p[t_prev, 0], self.tick_size)
-        actual_dt_12 = (b1 - b1_prev) / self.tick_size
-        pred_dt_12 = float(self.X_market[t_prev, 6]) * 4.0
-        model_err_12 = np.clip(actual_dt_12 - pred_dt_12, -10.0, 10.0)
-        surprise_pen = max(0.0, -model_err_12) * 0.6
-
-        # Количественная оценка ожидаемой будущей выгоды с учетом глубины экстремума (15м) и рыночной инерции
-        if self.legacy_v2:
-            exp_entry_edge = (0.5 * ez_25 + 0.35 * ez_12 + 0.15 * ez_5) * 4.0 + 0.5 * spread_ticks - p_tn_5 * 3.0 - surprise_pen
-            exp_hold_edge = (0.6 * ez_12 + 0.4 * ez_5) * 4.0 - p_dn_12 * spread_ticks - surprise_pen * 0.8
-        else:
-            dd900 = float(self.dd_900[self.t])
-            pos900 = float(self.pos_900[self.t])
-            inertia = float(self.inertia_arr[self.t])
-            extremum_bonus = 0.35 * min(dd900, 10.0) * max(0.0, 1.0 - 1.5 * pos900) if inertia > 0.25 else -1.5 * max(0.0, pos900 - 0.65)
-            exp_entry_edge = (0.5 * ez_25 + 0.35 * ez_12 + 0.15 * ez_5) * 4.0 + 0.5 * spread_ticks - p_tn_5 * 3.0 - surprise_pen + extremum_bonus
-            exp_hold_edge = inertia * 3.0 - p_dn_12 * spread_ticks - surprise_pen * 0.6
-        state_vec = np.array([
-            has_pos, np.clip(unr_ticks / 10.0, -3.0, 3.0), hold_ratio,
-            has_bid, has_ask, np.clip(dist / 5.0, -2.0, 2.0), q_ratio,
-            np.clip(model_err_12 / 5.0, -3.0, 3.0),
-            np.clip(exp_entry_edge / 5.0, -3.0, 3.0), np.clip(exp_hold_edge / 5.0, -3.0, 3.0)
-        ], dtype=np.float32)
-        return np.concatenate([xm, state_vec])
+        buf = self._obs_buf
+        buf[:-10] = self.X_market[t]
+        buf[-10] = has_pos
+        buf[-9] = min(max(unr_ticks * 0.1, -3.0), 3.0)
+        buf[-8] = hold_ratio
+        buf[-7] = has_bid
+        buf[-6] = has_ask
+        buf[-5] = min(max(dist * 0.2, -2.0), 2.0)
+        buf[-4] = q_ratio
+        buf[-3] = self.obs_err12_norm[t]
+        buf[-2] = self.obs_entry_edge_norm[t]
+        buf[-1] = self.obs_hold_edge_norm[t]
+        return buf.copy()
 
     def step(self, action: int):
         t = self.t
@@ -723,6 +770,7 @@ def train_rl_agent(
                 surr2 = torch.clamp(ratio, 0.8, 1.2) * T_advs[idx]
                 loss = -torch.min(surr1, surr2).mean() + 0.5 * F.mse_loss(vals, T_rets[idx]) - 0.01 * dist.entropy().mean()
                 opt.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
+        sched.step()
 
         oos_res = evaluate_policy(test_env, model=model, device=device)
         is_best = (oos_res["pnl_usd"] > best_pnl) and (oos_res["trades"] >= 2)

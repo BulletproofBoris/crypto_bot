@@ -255,30 +255,33 @@ class SwarmRegimeRouter:
         else:
             raise ValueError(f"Неизвестный режим: {mode}")
 
-        # Ожидаемый импульс E[z] и калибровка исторических окон к эталонному окну win_00
+        # Ожидаемый импульс E[z] и векторизованная калибровка исторических окон к эталонному окну win_00
         class_values = np.array([-3, -2, -1, 0, 1, 2, 3], dtype=np.float32)
-        ref_probs = all_probs[0]
-        ref_ez = np.dot(ref_probs, class_values)
-        ref_mean = float(np.mean(ref_ez))
-        ref_std = float(np.std(ref_ez)) + 1e-6
-        ref_pb_mean = float(np.mean(ref_probs[:, 5] + ref_probs[:, 6])) + 1e-6
-        ref_ps_mean = float(np.mean(ref_probs[:, 0] + ref_probs[:, 1])) + 1e-6
+        ez_all = np.matmul(all_probs, class_values)  # (M, N)
+        pb_all = all_probs[:, :, 5] + all_probs[:, :, 6]
+        ps_all = all_probs[:, :, 0] + all_probs[:, :, 1]
 
-        cal_ez_all = np.zeros((self.num_models, n_samples), dtype=np.float32)
-        cal_pb_all = np.zeros((self.num_models, n_samples), dtype=np.float32)
-        cal_ps_all = np.zeros((self.num_models, n_samples), dtype=np.float32)
-        cal_ez_all[0] = ref_ez
-        cal_pb_all[0] = ref_probs[:, 5] + ref_probs[:, 6]
-        cal_ps_all[0] = ref_probs[:, 0] + ref_probs[:, 1]
+        ref_mean = float(np.mean(ez_all[0]))
+        ref_std = float(np.std(ez_all[0])) + 1e-6
+        ref_pb_mean = float(np.mean(pb_all[0])) + 1e-6
+        ref_ps_mean = float(np.mean(ps_all[0])) + 1e-6
 
-        for i in range(1, self.num_models):
-            p_i = all_probs[i]
-            ez_i = np.dot(p_i, class_values)
-            cal_ez_all[i] = (ez_i - float(np.mean(ez_i))) * (ref_std / (float(np.std(ez_i)) + 1e-6)) + ref_mean
-            pb_i = p_i[:, 5] + p_i[:, 6]
-            ps_i = p_i[:, 0] + p_i[:, 1]
-            cal_pb_all[i] = np.clip(pb_i * (ref_pb_mean / (float(np.mean(pb_i)) + 1e-6)), 0.0, 1.0)
-            cal_ps_all[i] = np.clip(ps_i * (ref_ps_mean / (float(np.mean(ps_i)) + 1e-6)), 0.0, 1.0)
+        if self.num_models > 1:
+            ez_means = np.mean(ez_all, axis=1, keepdims=True)
+            ez_stds = np.std(ez_all, axis=1, keepdims=True) + 1e-6
+            cal_ez_all = (ez_all - ez_means) * (ref_std / ez_stds) + ref_mean
+            cal_ez_all[0] = ez_all[0]
+
+            pb_means = np.mean(pb_all, axis=1, keepdims=True) + 1e-6
+            ps_means = np.mean(ps_all, axis=1, keepdims=True) + 1e-6
+            cal_pb_all = np.clip(pb_all * (ref_pb_mean / pb_means), 0.0, 1.0)
+            cal_ps_all = np.clip(ps_all * (ref_ps_mean / ps_means), 0.0, 1.0)
+            cal_pb_all[0] = pb_all[0]
+            cal_ps_all[0] = ps_all[0]
+        else:
+            cal_ez_all = ez_all
+            cal_pb_all = pb_all
+            cal_ps_all = ps_all
 
         expected_z = np.einsum('nm,mn->n', weights, cal_ez_all)
         expected_z = (expected_z - float(np.mean(expected_z))) * (ref_std / (float(np.std(expected_z)) + 1e-6)) + ref_mean
@@ -303,7 +306,11 @@ class SwarmRegimeRouter:
                 reg_w = weights[:, w_idx] if multi_win else 1.0
                 sl = exp["seq_len"]
                 arch_clean = exp["arch"].replace("+", "_")
-                cache_file = cache_dir / f"nn_preds_{self.coin}_h{self.H}s_{arch_clean}_{n_samples}_{slice_hash}.npy"
+                k_mtime = int(Path(exp["k_file"]).stat().st_mtime)
+                cache_file = cache_dir / f"nn_preds_{self.coin}_h{self.H}s_{arch_clean}_{n_samples}_{slice_hash}_{k_mtime}.npy"
+                legacy_cache = cache_dir / f"nn_preds_{self.coin}_h{self.H}s_{arch_clean}_{n_samples}_{slice_hash}.npy"
+                if not cache_file.exists() and legacy_cache.exists() and int(legacy_cache.stat().st_mtime) >= k_mtime:
+                    cache_file = legacy_cache
 
                 if multi_win and not cache_file.exists() and float(np.mean(reg_w)) < 0.02:
                     continue

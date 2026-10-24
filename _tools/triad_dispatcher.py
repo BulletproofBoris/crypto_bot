@@ -194,10 +194,10 @@ def run_triad_simulation(args):
     X_5 = val_df[dispatcher.router_5.feature_names].values
     preds_5 = dispatcher.router_5.predict_ensemble(X_5, val_df, mode=args.mode)
 
-    X_12 = val_df[dispatcher.router_12.feature_names].values
+    X_12 = X_5 if dispatcher.router_12.feature_names == dispatcher.router_5.feature_names else val_df[dispatcher.router_12.feature_names].values
     preds_12 = dispatcher.router_12.predict_ensemble(X_12, val_df, mode=args.mode)
 
-    X_25 = val_df[dispatcher.router_25.feature_names].values
+    X_25 = X_5 if dispatcher.router_25.feature_names == dispatcher.router_5.feature_names else val_df[dispatcher.router_25.feature_names].values
     preds_25 = dispatcher.router_25.predict_ensemble(X_25, val_df, mode=args.mode)
 
     print(f"⚡ Инференс {n_seconds:,} секунд по 3 масштабам завершен за {time.time()-t_inf_start:.2f}с")
