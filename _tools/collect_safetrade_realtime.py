@@ -52,7 +52,7 @@ except ImportError:
 
 # Периодичность фоновой ре-синхронизации стакана через REST (сек) и heartbeat-записи (сек)
 SNAPSHOT_RESYNC_INTERVAL = 900.0
-HEARTBEAT_WRITE_INTERVAL = 10.0
+HEARTBEAT_WRITE_INTERVAL = 1.0
 
 for m in MARKETS:
     os.makedirs(m["data_dir"], exist_ok=True)
@@ -377,7 +377,7 @@ async def periodic_maintenance(session, ws, market_ids, subscribe_msg):
     last_watchdog_ping = 0.0
 
     while True:
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(1.0)
         now = time.time()
         ws_silence = now - last_ws_msg_time
 

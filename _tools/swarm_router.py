@@ -414,26 +414,32 @@ class SwarmRegimeRouter:
             'weights': weights
         }
 
+    def preload_neural_models(self):
+        """Предзагружает все графы FastKerasModel в RAM для исключения чтения с диска в боевом цикле."""
+        from _tools.fast_neural_engine import FastKerasModel
+        for exp in self.neural_experts:
+            if exp.get("fast_model") is None:
+                exp["fast_model"] = FastKerasModel(exp["k_file"], exp["base_arch"])
+
     def predict_live_tick(self, X_seq_2d: np.ndarray, current_regime_1row: pd.DataFrame) -> dict:
         """
-        Мгновенный инференс 1 боевого тика (1 Гц) без обращения к диску и без TensorFlow.
+        Мгновенный инференс 1 боевого тика (1 Гц) по полному ансамблю окон без обращения к диску.
         X_seq_2d: массив последних >= 30 секунд формы (L, n_features) в порядке self.feature_names.
         current_regime_1row: 1-строчный DataFrame текущей секунды для расчета весов роутера.
         """
         import torch
         from _tools.fast_neural_engine import FastKerasModel
-        torch.set_num_threads(1)
+        torch.set_num_threads(2)
 
         x_last = X_seq_2d[-1:, :].astype(np.float32)
         weights = self.compute_routing_weights(current_regime_1row)[0]  # (num_models,)
         class_values = np.array([-3, -2, -1, 0, 1, 2, 3], dtype=np.float32)
-        top_wins = set(int(i) for i in np.argsort(weights)[-2:])
 
         all_probs = np.zeros((self.num_models, 7), dtype=np.float32)
         for i, booster in enumerate(self.models):
-            if weights[i] < 0.005 and i not in top_wins:
+            if weights[i] < 0.001:
                 continue
-            raw_p = booster.predict(x_last, num_threads=1)[0]
+            raw_p = booster.predict(x_last, num_threads=2)[0]
             all_probs[i, :min(7, len(raw_p))] = raw_p[:7]
 
         blend_probs = np.dot(weights, all_probs)  # (7,)
@@ -441,13 +447,15 @@ class SwarmRegimeRouter:
         expected_z = float(np.dot(weights, ez_models))
 
         if self.use_neural and self.neural_weight > 0.0 and self.neural_experts:
+            cw = np.array(self.alliance_cfg.get("class_weights", [1.0] * 7), dtype=np.float32) if self.alliance_cfg else np.ones(7, dtype=np.float32)
+            cw_pow = np.power(np.maximum(cw, 1e-3), 0.85)
             nn_ez_num = 0.0
             nn_probs_num = np.zeros(7, dtype=np.float32)
             nn_w_sum = 0.0
             for exp in self.neural_experts:
                 w_idx = min(exp.get("win_idx", 0), len(weights) - 1)
                 reg_w = float(weights[w_idx])
-                if w_idx not in top_wins or reg_w < 0.05:
+                if reg_w < 0.01:
                     continue
                 if exp.get("fast_model") is None:
                     exp["fast_model"] = FastKerasModel(exp["k_file"], exp["base_arch"])
@@ -462,9 +470,11 @@ class SwarmRegimeRouter:
                 p_raw = exp["fast_model"].predict_numpy(x_norm[np.newaxis, :, :])[0]
                 p_raw = np.clip(p_raw, 1e-7, 1.0 - 1e-7)
                 ez_raw = float(np.dot(p_raw, class_values))
+                p_cal = p_raw / cw_pow
+                p_cal = p_cal / float(np.sum(p_cal))
                 w_exp = max(0.01, exp["ic"] ** 2) * reg_w
                 nn_ez_num += w_exp * ez_raw
-                nn_probs_num += w_exp * p_raw
+                nn_probs_num += w_exp * p_cal
                 nn_w_sum += w_exp
 
             if nn_w_sum > 0:

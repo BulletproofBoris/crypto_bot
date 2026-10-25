@@ -13,6 +13,7 @@
 import os
 import sys
 import time
+import math
 import hmac
 import json
 import hashlib
@@ -156,8 +157,9 @@ class SafeTradePrivateClient:
             r = self.session.get(url, headers=self._auth_headers() if auth else None, timeout=6)
         else:
             r = self.session.post(url, headers=self._auth_headers(), data=json.dumps(body) if body else None, timeout=6)
-        r.raise_for_status()
-        return r.json()
+        if r.status_code >= 400:
+            raise RuntimeError(f"SafeTrade HTTP {r.status_code}: {r.text}")
+        return r.json() if r.text else {}
 
     def _auth_headers(self) -> dict:
         nonce = str(int(time.time() * 1000))
@@ -263,6 +265,10 @@ class LiveTriadRLTrader:
             (12, 3.5, SwarmRegimeRouter(self.coin, 12, 3.5, temperature=0.5, use_neural=use_neural, neural_weight=0.15)),
             (25, 3.0, SwarmRegimeRouter(self.coin, 25, 3.0, temperature=0.5, use_neural=use_neural, neural_weight=0.15)),
         ]
+        if use_neural:
+            for _, _, rtr in self.routers:
+                rtr.preload_neural_models()
+            print("⚡ Все 84 нейросетевые модели (FastKerasModel) предзагружены в RAM (0 обращений к диску на тиках).")
         self.feature_names = self.routers[0][2].feature_names
 
         ckpt_path = BASE_DIR / "models" / self.coin / "rl_execution" / "best_maskable_ppo.pt"
@@ -278,12 +284,23 @@ class LiveTriadRLTrader:
         self.bid_hist_1h = deque(maxlen=3600)
         self.ez12_hist = deque(maxlen=16)
 
-        # Изолированный субсчет бота ($50.00) и состояние активных заявок
+        # Изолированный субсчет бота ($50.00) и динамический учет резерва пользователя
+        self.base_currency = "pearl" if self.coin == "prl" else self.coin
         self.bot_cash_usd = float(self.initial_budget_usd)
         self.reserved_account_usdt = 0.0
+        self.user_reserved_coin = 0.0
+        self.ex_usdt_free = 0.0
+        self.ex_coin_free = 0.0
         self.pos_qty = 0.0
         self.avg_entry = 0.0
         self.hold_sec = 0
+        self.peak_bid = 0.0
+        self.ez25_entry = 0.0
+        self.last_ez25 = 0.0
+        self.last_inertia = 0.0
+        self.last_pos3600 = 0.0
+        self.last_vel10 = 0.0
+        self.last_imb5 = 0.0
         self.active_bid_p = 0.0
         self.active_bid_q = 0.0
         self.active_bid_id = None
@@ -300,8 +317,6 @@ class LiveTriadRLTrader:
             self._init_isolated_wallet()
 
     def _init_isolated_wallet(self):
-        bals = {b["currency"]: float(b.get("balance", 0.0)) + float(b.get("locked", 0.0)) for b in self.client.get_spot_balances()}
-        ex_usdt = bals.get("usdt", 0.0)
         if self.wallet_file.exists():
             st = json.loads(self.wallet_file.read_text(encoding="utf-8"))
             self.initial_budget_usd = float(st.get("initial_budget_usd", self.initial_budget_usd))
@@ -310,13 +325,19 @@ class LiveTriadRLTrader:
             self.avg_entry = float(st.get("avg_entry", 0.0))
             self.realized_pnl_usd = float(st.get("realized_pnl_usd", 0.0))
             self.n_trades = int(st.get("n_trades", 0))
-            self.reserved_account_usdt = float(st.get("reserved_account_usdt", max(0.0, ex_usdt - self.initial_budget_usd)))
-        else:
-            self.reserved_account_usdt = max(0.0, ex_usdt - self.initial_budget_usd)
-            self._save_wallet()
+            self.reserved_account_usdt = float(st.get("reserved_account_usdt", 0.0))
+            self.user_reserved_coin = float(st.get("user_reserved_coin", 0.0))
+            self.active_bid_id = st.get("active_bid_id")
+            self.active_bid_p = float(st.get("active_bid_p", 0.0))
+            self.active_bid_q = float(st.get("active_bid_q", 0.0))
+            self.active_ask_id = st.get("active_ask_id")
+            self.active_ask_p = float(st.get("active_ask_p", 0.0))
+            self.active_ask_q = float(st.get("active_ask_q", 0.0))
+        self.sync_live_orders(0.0)
+        self.sync_account_balances(0.0, init_mode=True)
         print(
-            f"🛡️ Изолированный субсчет бота: доступно боту=${self.bot_cash_usd:.2f} USDT | "
-            f"неприкосновенный резерв счета=${self.reserved_account_usdt:,.5f} USDT (из ${ex_usdt:,.5f})"
+            f"🛡️ Изолированный субсчет бота: кэш=${self.bot_cash_usd:.2f} USDT, поз={self.pos_qty:.4f} {self.coin.upper()} | "
+            f"личный резерв пользователя=${self.reserved_account_usdt:,.2f} USDT + {self.user_reserved_coin:,.4f} {self.coin.upper()}"
         )
 
     def _save_wallet(self):
@@ -329,6 +350,13 @@ class LiveTriadRLTrader:
             "realized_pnl_usd": round(self.realized_pnl_usd, 6),
             "n_trades": int(self.n_trades),
             "reserved_account_usdt": round(self.reserved_account_usdt, 6),
+            "user_reserved_coin": round(self.user_reserved_coin, 6),
+            "active_bid_id": self.active_bid_id,
+            "active_bid_p": round(self.active_bid_p, 4),
+            "active_bid_q": round(self.active_bid_q, 4),
+            "active_ask_id": self.active_ask_id,
+            "active_ask_p": round(self.active_ask_p, 4),
+            "active_ask_q": round(self.active_ask_q, 4),
         }
         try:
             self.wallet_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -340,41 +368,102 @@ class LiveTriadRLTrader:
             return
         if self.pos_qty > 1e-4:
             self.hold_sec += 1
+            if b1 > 0:
+                self.peak_bid = max(self.peak_bid, self.avg_entry, b1)
         if self.active_bid_id is not None:
-            o = self.client.get_order(self.active_bid_id)
-            filled = float(o.get("filled_amount", 0.0))
-            st = o.get("state", "")
-            if filled > 0 and st in ("done", "cancel"):
-                px = float(o.get("avg_price", 0.0)) or float(o.get("price", self.active_bid_p))
-                cost = filled * px * 1.001
-                self.bot_cash_usd = max(0.0, self.bot_cash_usd - cost)
-                self.avg_entry = (self.pos_qty * self.avg_entry + filled * px) / max(1e-6, self.pos_qty + filled)
-                self.pos_qty += filled
-                self.hold_sec = 0
-                self.active_bid_id, self.active_bid_p, self.active_bid_q = None, 0.0, 0.0
-                self._save_wallet()
-                print(f"  🟢 [FILL BUY] +{filled:.4f} PRL @ ${px:.2f} | Остаток кэша бота=${self.bot_cash_usd:.2f}")
-            elif st == "cancel":
-                self.active_bid_id, self.active_bid_p, self.active_bid_q = None, 0.0, 0.0
+            try:
+                o = self.client.get_order(self.active_bid_id)
+                filled = float(o.get("filled_amount", 0.0))
+                st = o.get("state", "")
+                if filled > 0 and st in ("done", "cancel"):
+                    px = float(o.get("avg_price", 0.0)) or float(o.get("price", self.active_bid_p))
+                    fee_rate = float(o.get("maker_fee", 0.001) or 0.001)
+                    cost = filled * px
+                    net_filled = math.floor(filled * (1.0 - fee_rate) * 10000.0) / 10000.0
+                    self.bot_cash_usd = max(0.0, self.bot_cash_usd - cost)
+                    self.avg_entry = (self.pos_qty * self.avg_entry + net_filled * px) / max(1e-6, self.pos_qty + net_filled)
+                    self.pos_qty = math.floor((self.pos_qty + net_filled) * 10000.0) / 10000.0
+                    self.hold_sec = 0
+                    self.peak_bid = max(px, b1 if b1 > 0 else px)
+                    self.ez25_entry = self.last_ez25
+                    self.q_ahead = 0.0
+                    self.active_bid_id, self.active_bid_p, self.active_bid_q = None, 0.0, 0.0
+                    self.sync_account_balances(b1)
+                    self._save_wallet()
+                    print(f"  🟢 [FILL BUY] +{net_filled:.4f} PRL (брутто {filled:.4f}) @ ${px:.2f} | Остаток кэша бота=${self.bot_cash_usd:.2f}")
+                elif st == "cancel":
+                    self.q_ahead = 0.0
+                    self.active_bid_id, self.active_bid_p, self.active_bid_q = None, 0.0, 0.0
+                    self._save_wallet()
+            except Exception as e:
+                print(f"  ⚠️ [SYNC BID WARN] id={self.active_bid_id}: {e}")
         if self.active_ask_id is not None:
-            o = self.client.get_order(self.active_ask_id)
-            filled = float(o.get("filled_amount", 0.0))
-            st = o.get("state", "")
-            if filled > 0 and st in ("done", "cancel"):
-                px = float(o.get("avg_price", 0.0)) or float(o.get("price", self.active_ask_p))
-                proceeds = filled * px * 0.999
-                pnl = proceeds - filled * self.avg_entry * 1.001
-                self.bot_cash_usd += proceeds
-                self.realized_pnl_usd += pnl
-                self.pos_qty = max(0.0, self.pos_qty - filled)
-                if self.pos_qty < 0.01:
-                    self.pos_qty, self.avg_entry, self.hold_sec = 0.0, 0.0, 0
-                self.n_trades += 1
-                self.active_ask_id, self.active_ask_p, self.active_ask_q = None, 0.0, 0.0
-                self._save_wallet()
-                print(f"  💰 [FILL SELL] -{filled:.4f} PRL @ ${px:.2f} | PnL={pnl:+.4f}$ | Баланс бота=${self.bot_cash_usd:.2f}")
-            elif st == "cancel":
-                self.active_ask_id, self.active_ask_p, self.active_ask_q = None, 0.0, 0.0
+            try:
+                o = self.client.get_order(self.active_ask_id)
+                filled = float(o.get("filled_amount", 0.0))
+                st = o.get("state", "")
+                if filled > 0 and st in ("done", "cancel"):
+                    px = float(o.get("avg_price", 0.0)) or float(o.get("price", self.active_ask_p))
+                    fee_rate = float(o.get("maker_fee", 0.001) or 0.001)
+                    proceeds = filled * px * (1.0 - fee_rate)
+                    cost_basis = (filled / max(1e-6, 1.0 - fee_rate)) * self.avg_entry
+                    pnl = proceeds - cost_basis
+                    self.bot_cash_usd += proceeds
+                    self.realized_pnl_usd += pnl
+                    self.pos_qty = max(0.0, math.floor((self.pos_qty - filled) * 10000.0) / 10000.0)
+                    if self.pos_qty < 2.0:
+                        self.pos_qty, self.avg_entry, self.hold_sec, self.peak_bid = 0.0, 0.0, 0, 0.0
+                    self.n_trades += 1
+                    self.q_ahead = 0.0
+                    self.active_ask_id, self.active_ask_p, self.active_ask_q = None, 0.0, 0.0
+                    self.sync_account_balances(b1)
+                    self._save_wallet()
+                    print(f"  💰 [FILL SELL] -{filled:.4f} PRL @ ${px:.2f} | PnL={pnl:+.4f}$ | Баланс бота=${self.bot_cash_usd:.2f}")
+                elif st == "cancel":
+                    self.q_ahead = 0.0
+                    self.active_ask_id, self.active_ask_p, self.active_ask_q = None, 0.0, 0.0
+                    self._save_wallet()
+            except Exception as e:
+                print(f"  ⚠️ [SYNC ASK WARN] id={self.active_ask_id}: {e}")
+
+    def sync_account_balances(self, b1: float = 0.0, init_mode: bool = False):
+        if self.mode != "live" or self.client is None:
+            return
+        try:
+            raw_bals = self.client.get_spot_balances()
+            b_map = {b["currency"]: (float(b.get("balance", 0.0)), float(b.get("locked", 0.0))) for b in raw_bals}
+            u_free, u_lock = b_map.get("usdt", (0.0, 0.0))
+            c_free, c_lock = b_map.get(self.base_currency, (0.0, 0.0))
+            u_tot, c_tot = u_free + u_lock, c_free + c_lock
+            self.ex_usdt_free, self.ex_coin_free = u_free, c_free
+
+            if self.pos_qty >= 2.0 and self.active_ask_id is None and c_tot < 2.0:
+                px_ref = b1 if b1 > 0 else (self.avg_entry if self.avg_entry > 0 else 1.82)
+                if self.bot_cash_usd < self.initial_budget_usd * 0.5:
+                    self.bot_cash_usd += self.pos_qty * px_ref * 0.999
+                    self.realized_pnl_usd = self.bot_cash_usd - self.initial_budget_usd
+                print(f"  🔄 [BALANCE SYNC] Позиция бота ({self.pos_qty:.4f} PRL) закрыта извне. Кэш бота=${self.bot_cash_usd:.2f}")
+                self.pos_qty, self.avg_entry, self.hold_sec = 0.0, 0.0, 0
+            elif self.pos_qty >= 2.0 and self.active_ask_id is None and c_free < self.pos_qty:
+                clamped = math.floor(c_free * 10000.0) / 10000.0
+                if clamped != self.pos_qty:
+                    print(f"  🔧 [POS SYNC] Уточнен объем позиции бота по споту: {self.pos_qty:.4f} -> {clamped:.4f} PRL")
+                    self.pos_qty = clamped if clamped >= 2.0 else 0.0
+
+            new_res_u = max(0.0, u_tot - self.bot_cash_usd)
+            new_res_c = max(0.0, c_tot - self.pos_qty)
+            if not init_mode and (abs(new_res_u - self.reserved_account_usdt) >= 0.50 or abs(new_res_c - self.user_reserved_coin) >= 0.50):
+                du = new_res_u - self.reserved_account_usdt
+                dc = new_res_c - self.user_reserved_coin
+                print(
+                    f"  🔄 [USER TRADE SYNC] Движение личного резерва счета: USDT=${new_res_u:,.2f} ({du:+.2f}$), "
+                    f"личные монеты={new_res_c:,.4f} {self.coin.upper()} ({dc:+.4f}) | Бот изолирован: кэш=${self.bot_cash_usd:.2f}, поз={self.pos_qty:.4f}"
+                )
+            self.reserved_account_usdt = new_res_u
+            self.user_reserved_coin = new_res_c
+            self._save_wallet()
+        except Exception as e:
+            print(f"  ⚠️ [BALANCE SYNC WARN] {e}")
 
     def compute_obs_and_mask(self, X_seq_2d: np.ndarray, row_df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
         triad_vec = []
@@ -440,6 +529,11 @@ class LiveTriadRLTrader:
             + 0.25 * d_ez12 + 0.35 * imb_l5 + 0.15 * imb_l1
             + 0.10 * np.clip(vel_15, -3.0, 3.0)
         )
+        self.last_ez25 = ez_25
+        self.last_inertia = inertia
+        self.last_pos3600 = pos_3600
+        self.last_vel10 = vel_10
+        self.last_imb5 = imb_l5
 
         b_prev12 = b_arr[-13] if len(b_arr) >= 13 else b_arr[0]
         ez12_prev12 = self.ez12_hist[-13] if len(self.ez12_hist) >= 13 else self.ez12_hist[0]
@@ -461,9 +555,37 @@ class LiveTriadRLTrader:
         hold_ratio = min(self.hold_sec / 45.0, 2.0) if has_pos else 0.0
         has_bid = 1.0 if self.active_bid_q > 0 else 0.0
         has_ask = 1.0 if self.active_ask_q > 0 else 0.0
+        tol = self.tick_size * 0.25
+        if has_bid:
+            q_at, q_better = 0.0, 0.0
+            for k in range(1, 11):
+                lp = float(r.get(f"ST_bid_{k}_price", 0.0))
+                lq = float(r.get(f"ST_bid_{k}_qty", 0.0))
+                if abs(lp - self.active_bid_p) <= tol:
+                    q_at += max(0.0, lq - self.active_bid_q)
+                elif lp > self.active_bid_p + tol:
+                    q_better += lq
+            self.q_ahead = q_at if self.q_ahead < 0.0 else min(self.q_ahead, q_at)
+            if abs(b1 - self.active_bid_p) <= tol:
+                self.q_ahead = max(0.0, self.q_ahead - max(0.0, float(r.get("ST_sell_vol", 0.0)) - q_better))
+        elif has_ask:
+            q_at, q_better = 0.0, 0.0
+            for k in range(1, 11):
+                lp = float(r.get(f"ST_ask_{k}_price", 0.0))
+                lq = float(r.get(f"ST_ask_{k}_qty", 0.0))
+                if abs(lp - self.active_ask_p) <= tol:
+                    q_at += max(0.0, lq - self.active_ask_q)
+                elif 0.0 < lp < self.active_ask_p - tol:
+                    q_better += lq
+            self.q_ahead = q_at if self.q_ahead < 0.0 else min(self.q_ahead, q_at)
+            if abs(a1 - self.active_ask_p) <= tol:
+                self.q_ahead = max(0.0, self.q_ahead - max(0.0, float(r.get("ST_buy_vol", 0.0)) - q_better))
+        else:
+            self.q_ahead = 0.0
         dist = ((b1 - self.active_bid_p) / self.tick_size) if has_bid else (((self.active_ask_p - a1) / self.tick_size) if has_ask else 0.0)
         ord_q = self.active_bid_q if has_bid else self.active_ask_q
-        q_ratio = self.q_ahead / (self.q_ahead + ord_q + 1e-6) if (has_bid or has_ask) else 0.0
+        q_val = max(0.0, self.q_ahead)
+        q_ratio = q_val / (q_val + ord_q + 1e-6) if (has_bid or has_ask) else 0.0
 
         obs = np.array(
             triad_vec + lob_vec + [
@@ -474,9 +596,12 @@ class LiveTriadRLTrader:
             dtype=np.float32,
         )
 
+        vel_3 = (b1 - (b_arr[-4] if len(b_arr) >= 4 else b_arr[0])) / self.tick_size
+        self.last_vel3 = vel_3
         bounce_ok = (1.0 <= reb_30 <= 2.0) if dd_900 >= 6.0 else (reb_30 <= 2.0)
-        dip_rev = (pos_900 <= 0.35) and (pos_3600 <= 0.45) and (dd_300 >= 2.0 or dd_900 >= 3.0) and (vel_10 >= 0.0) and bounce_ok and (inertia >= 0.28)
-        uptrend = (vel_180 >= 2.0) and (vel_10 >= 0.0) and (pos_3600 <= 0.72) and (dd_300 >= 1.0) and (inertia >= 0.40)
+        dip_ok = (dd_300 >= 1.0 and inertia >= 0.45 and exp_entry_edge >= 1.5) or ((dd_300 >= 2.0 or dd_900 >= 2.0) and inertia >= 0.28)
+        dip_rev = (pos_900 <= 0.48) and (pos_3600 <= 0.68) and dip_ok and (vel_3 >= 0.0) and bounce_ok
+        uptrend = (pos_3600 <= 0.72) and (vel_3 >= 0.0) and (inertia >= 0.40) and ((vel_180 >= 1.0 and dd_300 >= 1.0) or (spread_ticks >= 2.0 and exp_entry_edge >= 2.0))
         in_dip_zone = dip_rev or uptrend
 
         mask = np.zeros(7, dtype=bool)
@@ -508,48 +633,94 @@ class LiveTriadRLTrader:
         if self.mode != "live":
             return
         tol = self.tick_size * 0.25
+        if self.pos_qty <= 1e-4 and self.active_bid_id is not None and act == 0:
+            if self.last_pos3600 > 0.72 or getattr(self, "last_vel3", 0.0) < 0.0 or self.last_inertia < 0.05 or self.last_imb5 < -0.20:
+                act = 5
+            elif self.last_inertia > 0.40 and self.last_pos3600 <= 0.68 and b1 > self.active_bid_p + tol:
+                act = 1
+
         if act in (1, 2) and self.pos_qty <= 1e-4:
             target_p = round(((b1 + self.tick_size if (a1 - b1) >= 2.0 * self.tick_size else b1) if act == 1 else max(self.tick_size, b1 - self.tick_size)) / self.tick_size) * self.tick_size
-            usable_usd = min(self.order_usd, self.bot_cash_usd * 0.996)
-            qty = round(usable_usd / max(target_p, self.tick_size), 4)
-            if qty < 2.0:
-                return
             if self.active_bid_id is not None and abs(self.active_bid_p - target_p) <= tol:
                 return
             if self.active_bid_id is not None:
-                self.client.cancel_order(self.active_bid_id)
+                try:
+                    self.client.cancel_order(self.active_bid_id)
+                except Exception as e:
+                    print(f"  ⚠️ [CANCEL BUY WARN] id={self.active_bid_id}: {e}")
+                self.sync_live_orders(b1)
                 self.active_bid_id, self.active_bid_p, self.active_bid_q = None, 0.0, 0.0
-            bals = {b["currency"]: float(b.get("balance", 0.0)) for b in self.client.get_spot_balances()}
-            if bals.get("usdt", 0.0) - (qty * target_p) < self.reserved_account_usdt - 0.05:
-                print(f"  ⚠️ [GUARD] Защита резерва счета: свободно ${bals.get('usdt', 0.0):.2f} < резерва ${self.reserved_account_usdt:.2f}")
+                if self.pos_qty > 1e-4:
+                    return
+            self.sync_account_balances(b1)
+            usable_usd = min(self.order_usd, self.bot_cash_usd * 0.998, self.ex_usdt_free * 0.998)
+            qty = math.floor((usable_usd / max(target_p, self.tick_size)) * 10000.0) / 10000.0
+            if qty < 2.0:
                 return
-            res = self.client.place_limit_order(self.market, "buy", qty, target_p)
-            self.active_bid_id = res.get("id")
-            self.active_bid_p = float(res.get("price", target_p))
-            self.active_bid_q = float(res.get("origin_amount", qty))
-            print(f"  📥 [LIVE ORDER BUY] id={self.active_bid_id} | {self.active_bid_q:.4f} PRL @ ${self.active_bid_p:.2f} (${self.active_bid_q*self.active_bid_p:.2f})")
+            try:
+                res = self.client.place_limit_order(self.market, "buy", qty, target_p)
+                self.active_bid_id = res.get("id")
+                self.active_bid_p = float(res.get("price", target_p))
+                self.active_bid_q = float(res.get("origin_amount", qty))
+                self.q_ahead = -1.0
+                self._save_wallet()
+                print(f"  📥 [LIVE ORDER BUY] id={self.active_bid_id} | {self.active_bid_q:.4f} PRL @ ${self.active_bid_p:.2f} (${self.active_bid_q*self.active_bid_p:.2f})")
+            except Exception as e:
+                print(f"  ⚠️ [ORDER BUY ERROR] qty={qty:.4f} @ ${target_p:.2f}: {e}")
         elif act == 5 and self.active_bid_id is not None:
-            self.client.cancel_order(self.active_bid_id)
-            print(f"  ✖️ [LIVE CANCEL BUY] id={self.active_bid_id}")
+            old_id = self.active_bid_id
+            try:
+                self.client.cancel_order(old_id)
+                print(f"  ✖️ [LIVE CANCEL BUY] id={old_id}")
+            except Exception as e:
+                print(f"  ⚠️ [CANCEL BUY WARN] id={old_id}: {e}")
+            self.sync_live_orders(b1)
             self.active_bid_id, self.active_bid_p, self.active_bid_q = None, 0.0, 0.0
+            self.q_ahead = 0.0
+            self._save_wallet()
         elif act in (3, 4, 6) and self.pos_qty >= 2.0:
-            if act == 3:
-                target_p = a1
-            elif act == 4:
-                target_p = max(b1, a1 - self.tick_size)
-            else:
+            if act == 6:
                 target_p = max(self.tick_size, b1 - self.tick_size)
+            else:
+                peak_b = max(self.peak_bid, self.avg_entry, b1)
+                trend_ticks = int(np.clip(round(max(self.ez25_entry, self.last_ez25, self.last_inertia) * 6.0), 2, 8))
+                if self.hold_sec > 90 and self.last_inertia < -0.15:
+                    target_p = a1
+                elif act == 3 or (self.last_inertia > 0.55 and self.hold_sec < 45):
+                    if self.last_inertia > 0.35:
+                        target_p = max(a1 + self.tick_size, peak_b + 2.0 * self.tick_size, self.avg_entry + trend_ticks * self.tick_size)
+                    else:
+                        target_p = max(a1, peak_b, self.avg_entry + 2.0 * self.tick_size)
+                else:
+                    min_p = max(peak_b, self.avg_entry + self.tick_size) if self.hold_sec < 60 else max(peak_b, self.avg_entry)
+                    target_p = max(a1, min_p)
             target_p = round(target_p / self.tick_size) * self.tick_size
             if self.active_ask_id is not None and abs(self.active_ask_p - target_p) <= tol:
                 return
             if self.active_ask_id is not None:
-                self.client.cancel_order(self.active_ask_id)
+                try:
+                    self.client.cancel_order(self.active_ask_id)
+                except Exception as e:
+                    print(f"  ⚠️ [CANCEL SELL WARN] id={self.active_ask_id}: {e}")
+                self.sync_live_orders(b1)
                 self.active_ask_id, self.active_ask_p, self.active_ask_q = None, 0.0, 0.0
-            res = self.client.place_limit_order(self.market, "sell", self.pos_qty, target_p)
-            self.active_ask_id = res.get("id")
-            self.active_ask_p = float(res.get("price", target_p))
-            self.active_ask_q = float(res.get("origin_amount", self.pos_qty))
-            print(f"  📤 [LIVE ORDER SELL] id={self.active_ask_id} | {self.active_ask_q:.4f} PRL @ ${self.active_ask_p:.2f}")
+                if self.pos_qty < 2.0:
+                    return
+            self.sync_account_balances(b1)
+            sell_qty = math.floor(min(self.pos_qty, self.ex_coin_free) * 10000.0) / 10000.0
+            if sell_qty < 2.0:
+                return
+            try:
+                res = self.client.place_limit_order(self.market, "sell", sell_qty, target_p)
+                self.active_ask_id = res.get("id")
+                self.active_ask_p = float(res.get("price", target_p))
+                self.active_ask_q = float(res.get("origin_amount", sell_qty))
+                self.q_ahead = -1.0
+                self._save_wallet()
+                print(f"  📤 [LIVE ORDER SELL] id={self.active_ask_id} | {self.active_ask_q:.4f} PRL @ ${self.active_ask_p:.2f}")
+            except Exception as e:
+                print(f"  ⚠️ [ORDER SELL ERROR] qty={sell_qty:.4f} @ ${target_p:.2f}: {e}")
+                self.sync_account_balances(b1)
 
 
 def run_replay_test(coin: str = "prl", steps: int = 30, use_neural: bool = True):
@@ -582,39 +753,48 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
             trader.bid_hist_1h.append(float(b_val))
 
     local_depth = Path("/opt/crypto_bot/data/realtime/prlusdt/depth.csv")
+    raw_d_lines = []
     if local_depth.exists():
-        lines = subprocess.run(["tail", "-n", "3600", str(local_depth)], capture_output=True, text=True).stdout.splitlines()
-        for line in lines:
-            parts = line.split(",")
-            if len(parts) > 2:
-                try:
-                    bp = float(parts[1])
-                    if bp > 0:
-                        trader.bid_hist_1h.append(bp)
-                except ValueError:
-                    pass
+        raw_d_lines = subprocess.run(["tail", "-n", "3600", str(local_depth)], capture_output=True, text=True).stdout.splitlines()
     elif trader.client and trader.client._ssh is not None:
         try:
             _, out, _ = trader.client._ssh.exec_command("tail -n 3600 /opt/crypto_bot/data/realtime/prlusdt/depth.csv")
-            for line in out.read().decode("utf-8", errors="ignore").splitlines():
-                parts = line.split(",")
-                if len(parts) > 2:
-                    try:
-                        bp = float(parts[1])
-                        if bp > 0:
-                            trader.bid_hist_1h.append(bp)
-                    except ValueError:
-                        pass
+            raw_d_lines = out.read().decode("utf-8", errors="ignore").splitlines()
         except Exception:
             pass
+    sec_bp = []
+    for line in raw_d_lines:
+        parts = line.split(",")
+        if len(parts) > 2:
+            try:
+                ts_v = float(parts[0])
+                sec_i = int(ts_v // 1000) if ts_v > 1e11 else int(ts_v)
+                bp = float(parts[1])
+                if sec_i > 1000 and bp > 0:
+                    sec_bp.append((sec_i, bp))
+            except ValueError:
+                pass
+    if sec_bp:
+        trader.bid_hist_1h.clear()
+        end_s = sec_bp[-1][0]
+        cur_bp = sec_bp[0][1]
+        idx_p = 0
+        for s in range(end_s - 3599, end_s + 1):
+            while idx_p < len(sec_bp) and sec_bp[idx_p][0] <= s:
+                cur_bp = sec_bp[idx_p][1]
+                idx_p += 1
+            trader.bid_hist_1h.append(cur_bp)
 
-    X_tail = df_sub.reindex(columns=trader.feature_names, fill_value=0.0).to_numpy(dtype=np.float32)
+    from _tools.live_feature_updater import LiveFeatureStreamer
+    streamer = LiveFeatureStreamer(df_sub, trader.feature_names, coin=coin)
+    df_init = streamer.get_recent_window(60)
+    X_tail = df_init.reindex(columns=trader.feature_names, fill_value=0.0).to_numpy(dtype=np.float32)
     X_buf = deque(X_tail, maxlen=60)
-    last_row = df_sub.iloc[-1:].copy()
-    for w_i in range(45, len(X_tail)):
-        res12 = trader.routers[1][2].predict_live_tick(X_tail[:w_i + 1], df_sub.iloc[w_i:w_i + 1])
+    last_row = df_init.iloc[-1:].copy()
+    for w_i in range(max(0, len(X_tail) - 15), len(X_tail)):
+        res12 = trader.routers[1][2].predict_live_tick(X_tail[:w_i + 1], df_init.iloc[w_i:w_i + 1])
         trader.ez12_hist.append(float(res12["expected_z"]))
-    print(f"✅ Прогрет 1-часовой буфер стакана ({len(trader.bid_hist_1h)} сек, диапазон Bid=[${min(trader.bid_hist_1h):.2f}..${max(trader.bid_hist_1h):.2f}]) и история инерции ({len(trader.ez12_hist)} сек)")
+    print(f"✅ Прогрет 1-часовой буфер стакана ({len(trader.bid_hist_1h)} сек, диапазон Bid=[${min(trader.bid_hist_1h):.2f}..${max(trader.bid_hist_1h):.2f}]), потоковый банк 299 признаков и история инерции ({len(trader.ez12_hist)} сек)")
 
     from datetime import timedelta
     msk_tz = timezone(timedelta(hours=3))
@@ -630,19 +810,11 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
         now_msk = now_utc.astimezone(msk_tz)
         ts_msk_str = now_msk.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
-        depth = trader.client.get_depth(trader.market, limit=15)
-        bids = depth.get("bids", [])
-        asks = depth.get("asks", [])
-        if bids and asks:
-            for lvl in range(1, 11):
-                if lvl <= len(bids):
-                    last_row[f"ST_bid_{lvl}_price"] = float(bids[lvl - 1][0])
-                    last_row[f"ST_bid_{lvl}_qty"] = float(bids[lvl - 1][1])
-                if lvl <= len(asks):
-                    last_row[f"ST_ask_{lvl}_price"] = float(asks[lvl - 1][0])
-                    last_row[f"ST_ask_{lvl}_qty"] = float(asks[lvl - 1][1])
-            last_row["ST_best_bid"] = float(bids[0][0])
-            last_row["ST_best_ask"] = float(asks[0][0])
+        if local_depth.exists() and (time.time() - local_depth.stat().st_mtime) < 2.5:
+            depth = None
+        else:
+            depth = trader.client.get_depth(trader.market, limit=50)
+        last_row = streamer.step(depth, now_utc)
 
         b1 = float(last_row["ST_best_bid"].iloc[0])
         a1 = float(last_row["ST_best_ask"].iloc[0])
@@ -735,7 +907,7 @@ def show_live_status(tail_lines: int = 25):
             print(
                 f"💼 Субсчет бота: Кэш=${w.get('bot_cash_usd', 50.0):.2f} | Позиция={w.get('pos_qty', 0.0):.4f} PRL "
                 f"(вход=${w.get('avg_entry', 0.0):.2f}) | Реализ. PnL={w.get('realized_pnl_usd', 0.0):+.4f}$ | "
-                f"Сделок={w.get('n_trades', 0)} | Неприкосновенный резерв=${w.get('reserved_account_usdt', 0.0):,.5f}"
+                f"Сделок={w.get('n_trades', 0)} | Личный резерв=${w.get('reserved_account_usdt', 0.0):,.2f} + {w.get('user_reserved_coin', 0.0):,.4f} PRL"
             )
     except Exception:
         pass
@@ -767,7 +939,7 @@ def stream_live_log(duration_sec: int = 30):
 
 
 def stop_live_daemon(cancel_open_orders: bool = True):
-    """Останавливает фоновый демон бота (и локально, и на VPS) и при необходимости снимает все открытые ордера на SafeTrade."""
+    """Останавливает фоновый демон бота (и локально, и на VPS) и при необходимости снимает активные ордера бота на SafeTrade."""
     pid_file = BASE_DIR / "data" / "logs" / "live_rl_trader.pid"
     if pid_file.exists():
         try:
@@ -785,13 +957,23 @@ def stop_live_daemon(cancel_open_orders: bool = True):
     print(f"🛑 Статус остановки демона на VPS: {res_str}")
     if cancel_open_orders:
         client = SafeTradePrivateClient(use_vps_bridge=True)
-        for st in ("wait", "pending"):
-            for o in client._private_req("GET", f"/trade/market/orders?state={st}&limit=50"):
-                oid = o.get("id")
-                if oid:
-                    client.cancel_order(oid)
-                    print(f"✖️ Снят открытый ордер id={oid} ({o.get('side')} {o.get('origin_amount')} @ ${o.get('price')})")
-        print("✅ Все открытые заявки на бирже проверены и сняты.")
+        w_file = BASE_DIR / "models" / "prl" / "rl_execution" / "live_wallet_state.json"
+        bot_oids = set()
+        if w_file.exists():
+            try:
+                w_st = json.loads(w_file.read_text(encoding="utf-8"))
+                for k in ("active_bid_id", "active_ask_id"):
+                    if w_st.get(k):
+                        bot_oids.add(w_st[k])
+            except Exception:
+                pass
+        for oid in bot_oids:
+            try:
+                client.cancel_order(oid)
+                print(f"✖️ Снят активный ордер бота id={oid}")
+            except Exception:
+                pass
+        print("✅ Открытые заявки бота проверены и сняты (ручные ордера пользователя не затронуты).")
 
 
 def sync_and_inspect_telemetry(last_n: int = 20) -> pd.DataFrame:
@@ -828,10 +1010,22 @@ def sync_and_inspect_telemetry(last_n: int = 20) -> pd.DataFrame:
 
 
 def start_live_daemon(budget_usd: float = 50.0, order_usd: float = 50.0, steps: int = 86400):
-    """Запускает / перезапускает автономный фоновый демон бота непосредственно на VPS (81.19.137.18)."""
+    """Запускает / перезапускает автономный фоновый демон бота непосредственно на VPS (81.19.137.18) с авто-синхронизацией кода и кошелька."""
     stop_live_daemon(cancel_open_orders=False)
     from _tools.vps_config import create_ssh_client
     ssh = create_ssh_client()
+    try:
+        sftp = ssh.open_sftp()
+        for mod_name in ("live_rl_trader.py", "live_feature_updater.py", "microstructure_features.py", "swarm_router.py"):
+            loc_mod = BASE_DIR / "_tools" / mod_name
+            if loc_mod.exists():
+                sftp.put(str(loc_mod), f"/opt/crypto_bot/_tools/{mod_name}")
+        w_local = BASE_DIR / "models" / "prl" / "rl_execution" / "live_wallet_state.json"
+        if w_local.exists():
+            sftp.put(str(w_local), "/opt/crypto_bot/models/prl/rl_execution/live_wallet_state.json")
+        sftp.close()
+    except Exception as e:
+        print(f"⚠️ SFTP sync warning: {e}")
     cmd = (
         f"cd /opt/crypto_bot && /opt/crypto_bot/venv/bin/python -m _tools.live_rl_trader "
         f"--mode live --budget-usd {float(budget_usd)} --order-usd {float(order_usd)} --steps {int(steps)} --daemon"
