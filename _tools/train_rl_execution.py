@@ -282,23 +282,21 @@ class SafeTradeL2ExecutionEnv:
             exp_entry_edge = (0.5 * ez25 + 0.35 * ez12 + 0.15 * ez5) * 4.0 + 0.5 * spread_ticks - p_tn_5 * 3.0 - surprise_pen + extremum_bonus
             exp_hold_edge = self.inertia_arr * 3.0 - p_dn_12 * spread_ticks - surprise_pen * 0.6
 
-            bounce_ok_vec = np.where(self.dd_900 >= 6.0, (self.reb_30 >= 1.0) & (self.reb_30 <= 2.0), self.reb_30 <= 2.0)
-            dip_rev_vec = (
-                (self.pos_900 <= 0.35) & (self.pos_3600 <= 0.45)
-                & ((self.dd_300 >= 2.0) | (self.dd_900 >= 3.0))
-                & (self.vel_b1_10 >= 0.0) & bounce_ok_vec & (self.inertia_arr >= 0.28)
+            # Освобождаем PPO от жестких эвристик: разрешаем входы по сигналам нейросетевого роя,
+            # отсекая только физически опасные зоны (покупка на хаях часа pos_3600 > 0.80 или в отвесном обвале)
+            in_dip_zone_vec = (
+                (self.pos_3600 <= 0.80)
+                & (self.vel_b1_10 >= -1.0)
+                & (self.inertia_arr >= 0.15)
+                & (exp_entry_edge >= 0.60)
+                & ((self.dd_300 >= 1.0) | (spread_ticks >= 2.0) | (self.inertia_arr >= 0.35))
             )
-            uptrend_vec = (
-                (self.vel_b1_180 >= 2.0) & (self.vel_b1_10 >= 0.0)
-                & (self.pos_3600 <= 0.72) & (self.dd_300 >= 1.0) & (self.inertia_arr >= 0.40)
-            )
-            in_dip_zone_vec = dip_rev_vec | uptrend_vec
 
         self.obs_err12_norm = np.clip(model_err_12 / 5.0, -3.0, 3.0).astype(np.float32)
         self.obs_entry_edge_norm = np.clip(exp_entry_edge / 5.0, -3.0, 3.0).astype(np.float32)
         self.obs_hold_edge_norm = np.clip(exp_hold_edge / 5.0, -3.0, 3.0).astype(np.float32)
         self.can_buy_passive_arr = in_dip_zone_vec
-        self.can_buy_best_arr = in_dip_zone_vec & (imb5 > -0.75)
+        self.can_buy_best_arr = in_dip_zone_vec & (imb5 > -0.65)
 
         self._obs_buf = np.empty(self.obs_dim, dtype=np.float32)
         self._mask_buf = np.zeros(self.n_actions, dtype=bool)
@@ -500,21 +498,18 @@ class SafeTradeL2ExecutionEnv:
         if self.pos_qty > 1e-8:
             self.peak_bid = max(self.peak_bid, b1)
 
-        # 1. Обработка выбранного действия агента + подтягивание ордеров по рыночной инерции
-        vel10 = float(self.vel_b1_10[t])
+        # 1. Обработка выбранного действия агента (прямое исполнение решений PPO без скрытых переопределений)
         pos3600 = float(self.pos_3600[t])
         if not self.legacy_v2 and self.pos_qty <= 1e-8 and self.order_side == "BUY" and action == 0:
-            # Если началась отрицательная инерция падения (vel10 < 0 или inertia < 0.05) или цена ушла к часовым хаям — снимаем Bid!
-            if pos3600 > 0.72 or vel10 < 0.0 or inertia < 0.05 or float(self.X_market[t, 20]) < -0.20:
+            # Только физический предохранитель: снимаем Bid на экстремальном хае часа или при резком развороте вниз
+            if pos3600 > 0.85 or inertia < -0.20:
                 action = 5
-            elif inertia > 0.40 and pos3600 <= 0.65 and b1 > self.order_price + tol:
-                action = 1
 
         if action in (1, 2) and self.pos_qty <= 1e-8:
-            target_p = (b1 + self.tick_size if (a1 - b1) >= 2.0 * self.tick_size else b1) if action == 1 else max(self.tick_size, b1 - self.tick_size)
+            step_in = (a1 - b1) >= 2.0 * self.tick_size and (self.legacy_v2 or inertia >= 0.35)
+            target_p = (b1 + self.tick_size if step_in else b1) if action == 1 else max(self.tick_size, b1 - self.tick_size)
             if self.order_side != "BUY" or abs(self.order_price - target_p) > tol:
-                if self.order_side is not None:
-                    requote_penalty = 0.01
+                requote_penalty = 0.025 if self.order_side is not None else 0.005
                 self.order_side = "BUY"
                 self.order_price = round(target_p / self.tick_size) * self.tick_size
                 self.order_qty = self.order_usd / self.order_price
@@ -522,8 +517,8 @@ class SafeTradeL2ExecutionEnv:
                 self.active_after = t + 1
         elif action in (3, 4) and self.pos_qty > 1e-8:
             hold_s = t - self.entry_t
-            ez25_entry = float(self.X_market[self.entry_t, 12])
             if self.legacy_v2:
+                ez25_entry = float(self.X_market[self.entry_t, 12])
                 trend_ticks = int(np.clip(round(max(ez25_entry, float(self.X_market[t, 12])) * 6.0), 2, 6))
                 if action == 3:
                     target_p = max(a1, self.avg_entry + trend_ticks * self.tick_size)
@@ -531,23 +526,19 @@ class SafeTradeL2ExecutionEnv:
                     min_p = (self.avg_entry + self.tick_size) if hold_s < 45 else self.avg_entry
                     target_p = max(b1 + self.tick_size, min_p, a1 - self.tick_size)
             else:
-                trend_ticks = int(np.clip(round(max(ez25_entry, float(self.X_market[t, 12]), inertia) * 6.0), 2, 8))
-                if hold_s > 90 and inertia < -0.15:
-                    # Быстрый сброс неверного входа по Ask (a1), пока цена не ушла в глубокий обвал
-                    target_p = a1
-                elif action == 3 or (inertia > 0.55 and hold_s < 45):
-                    # RIDE_WAVE_INERTIA: пока инерция положительная, держим Ask высоко и двигаем пол за растущим peak_bid
-                    if inertia > 0.35:
-                        target_p = max(a1 + self.tick_size, self.peak_bid + 2.0 * self.tick_size, self.avg_entry + trend_ticks * self.tick_size)
-                    else:
-                        target_p = max(a1, self.peak_bid, self.avg_entry + 2.0 * self.tick_size)
+                floor_p = round((self.avg_entry + self.tick_size) / self.tick_size) * self.tick_size
+                if action == 3:
+                    # Волновой выход (>= +2 тика): без прыжков на +8 тиков в космос
+                    target_p = max(a1, self.peak_bid, self.avg_entry + 2.0 * self.tick_size)
                 else:
-                    # TRAILING_PROFIT_SCALP: фиксация накопленного движения peak_bid строго по Ask (a1) или выше
-                    min_p = max(self.peak_bid, self.avg_entry + self.tick_size) if hold_s < 60 else max(self.peak_bid, self.avg_entry)
-                    target_p = max(a1, min_p)
+                    # Скальперский выход (>= +1 тик): жестко держим место в очереди FIFO на floor_p (+1 тик)
+                    if self.order_side == "SELL" and abs(self.order_price - floor_p) <= tol and a1 >= floor_p - tol:
+                        target_p = floor_p
+                    else:
+                        target_p = max(a1, floor_p)
             if self.order_side != "SELL" or abs(self.order_price - target_p) > tol:
                 if self.order_side is not None:
-                    requote_penalty = 0.01
+                    requote_penalty = 0.025
                 self.order_side = "SELL"
                 self.order_price = round(target_p / self.tick_size) * self.tick_size
                 self.order_qty = self.pos_qty
@@ -556,7 +547,7 @@ class SafeTradeL2ExecutionEnv:
         elif action == 5:
             if self.order_side is not None:
                 self.order_side = None
-                requote_penalty = 0.01
+                requote_penalty = 0.025
         elif action == 6 and self.pos_qty > 1e-8:
             exec_p = self._sweep_taker(t, self.pos_qty)
             net_pnl = self.pos_qty * (exec_p * (1.0 - 0.001) - self.avg_entry)
@@ -594,16 +585,19 @@ class SafeTradeL2ExecutionEnv:
                         self.entry_t = nt
                         self.order_side = None
                         self.n_trades += 1
+                        if not self.legacy_v2:
+                            self.total_pnl_usd -= self.pos_qty * self.avg_entry * 0.001  # Реальная комиссия SafeTrade Maker Buy (0.10%)
                 elif vol_hit > 0:
                     self.q_ahead = max(0.0, self.q_ahead - max(0.0, vol_hit - q_better))
             elif self.order_side == "SELL":
                 crossed = (nb1 >= self.order_price - tol)
                 vol_hit = self.buy_vol[nt] if abs(na1 - self.order_price) <= tol else 0.0
                 if crossed or vol_hit > eff_q:
-                    net_pnl = self.pos_qty * (self.order_price - self.avg_entry)
+                    sell_fee = 0.0 if self.legacy_v2 else (self.pos_qty * self.order_price * 0.001)
+                    net_pnl = self.pos_qty * (self.order_price - self.avg_entry) - sell_fee
                     realized_ticks = (self.order_price - self.avg_entry) / self.tick_size
-                    if realized_ticks > 0:
-                        requote_penalty -= 0.35 * realized_ticks  # Бонус за успешную фиксацию волны лимитным Maker Ask
+                    if realized_ticks >= 1.0:
+                        requote_penalty -= 0.45 * realized_ticks  # Бонус за чистую фиксацию профитной волны лимитным Maker Ask
                     self.total_pnl_usd += net_pnl
                     self.pos_qty = 0.0
                     self.avg_entry = 0.0
@@ -653,10 +647,11 @@ class MaskableActorCritic(nn.Module):
 
 
 def teacher_heuristic_action(obs: np.ndarray, mask: np.ndarray) -> int:
-    """Эвристическая политика для Behavioral Cloning Warm-Start перед запуском PPO."""
+    """Селективная нейросетевая политика-учитель (с учетом 0.20% round-trip комиссий Maker) для Warm-Start PPO."""
     ez_5, p_up_5, p_dn_5, p_tp_5, p_tn_5 = obs[0], obs[1], obs[2], obs[3], obs[4]
     ez_12, p_up_12, p_dn_12 = obs[6], obs[7], obs[8]
     ez_25 = obs[12]
+    imb5 = obs[20]
     has_pos = obs[-10] > 0.5
     unr_ticks = obs[-9] * 10.0
     hold_ratio = obs[-8]
@@ -667,19 +662,31 @@ def teacher_heuristic_action(obs: np.ndarray, mask: np.ndarray) -> int:
     exp_hold_edge = obs[-1] * 5.0
 
     if not has_pos:
-        strong_buy = (exp_entry_edge > 0.65 and model_err_12 > -2.5 and ez_12 > 0.08 and ez_5 > 0.04 and p_tn_5 < 0.25)
-        dip_buy = (exp_entry_edge > 0.55 and model_err_12 > -2.5 and ez_25 > 0.10 and ez_12 > 0.06 and ez_5 < 0.02)
+        strong_buy = (
+            exp_entry_edge >= 1.35 and model_err_12 > -1.5
+            and ez_25 >= 0.12 and ez_12 >= 0.08 and ez_5 >= 0.03
+            and p_tn_5 < 0.22 and imb5 > -0.35
+        )
+        dip_buy = (
+            exp_entry_edge >= 1.15 and model_err_12 > -1.5
+            and ez_25 >= 0.15 and ez_12 >= 0.06 and ez_5 >= -0.02
+            and p_tn_5 < 0.22
+        )
         if strong_buy and mask[1]:
             return 0 if has_bid else 1
         if dip_buy and mask[2]:
             return 0 if has_bid else 2
-        if has_bid and (exp_entry_edge < 0.10 or model_err_12 < -2.0 or ez_12 < -0.04 or p_tn_5 > 0.35) and mask[5]:
-            return 5
+        if has_bid:
+            if (exp_entry_edge < 0.35 or model_err_12 < -2.0 or ez_12 < -0.05 or p_tn_5 > 0.32) and mask[5]:
+                return 5
+            return 0
         return 0
     else:
-        if (unr_ticks <= -3.0 or model_err_12 < -3.5 or (ez_12 < -0.15 and ez_5 < -0.15)) and mask[6]:
+        if (unr_ticks <= -3.0 and (model_err_12 < -3.0 or (ez_12 < -0.18 and ez_5 < -0.15))) and mask[6]:
             return 6
-        if (hold_ratio > 0.8 or exp_hold_edge < -0.25 or ez_12 < -0.05) and mask[4]:
+        if exp_hold_edge >= 0.90 and ez_25 >= 0.15 and ez_12 >= 0.08 and hold_ratio < 0.50 and mask[3]:
+            return 3
+        if mask[4]:
             return 4
         if mask[3]:
             return 0 if has_ask else 3
@@ -859,50 +866,58 @@ def train_rl_agent(
     best_score = -1e9
 
     best_model_ref = MaskableActorCritic(obs_dim=train_env.obs_dim, n_actions=train_env.n_actions).to(device)
+    print("🎓 Behavioral Cloning Warm-Start (сбор 40,000 демонстраций селективного нейро-учителя)...")
+    bc_obs, bc_masks, bc_acts = [], [], []
+    obs = train_env.reset()
+    for _ in range(40000):
+        mask = train_env.get_action_mask()
+        act = teacher_heuristic_action(obs, mask)
+        bc_obs.append(obs); bc_masks.append(mask); bc_acts.append(act)
+        obs, _, done = train_env.step(act)
+        if done:
+            obs = train_env.reset()
+    t_obs = torch.as_tensor(np.array(bc_obs), dtype=torch.float32, device=device)
+    t_masks = torch.as_tensor(np.array(bc_masks), dtype=torch.bool, device=device)
+    t_acts = torch.as_tensor(np.array(bc_acts), dtype=torch.long, device=device)
+    ce_w = torch.tensor([1.0, 20.0, 20.0, 3.0, 3.0, 8.0, 10.0], dtype=torch.float32, device=device)
+    bc_opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    for _ in range(12):
+        perm = torch.randperm(len(t_obs), device=device)
+        for i in range(0, len(t_obs), 1024):
+            idx = perm[i:i + 1024]
+            logits, _ = model(t_obs[idx], t_masks[idx])
+            loss = F.cross_entropy(logits, t_acts[idx], weight=ce_w)
+            bc_opt.zero_grad(); loss.backward(); bc_opt.step()
+    del bc_obs, bc_masks, bc_acts, t_obs, t_masks, t_acts, bc_opt
+
+    ws_res = evaluate_policy(test_env, model=model, device=device)
     if warm_ckpt.exists():
-        print(f"🎓 Warm-Start инициализация весов от {warm_ckpt.name}...")
+        cand_model = MaskableActorCritic(obs_dim=train_env.obs_dim, n_actions=train_env.n_actions).to(device)
         sd_w = torch.load(warm_ckpt, map_location=device, weights_only=False)
         sd_w = sd_w.get("model_state_dict", sd_w) if isinstance(sd_w, dict) else sd_w
-        model.load_state_dict(sd_w)
-        best_model_ref.load_state_dict(model.state_dict())
-        best_model_ref.eval()
-        opt = torch.optim.AdamW(model.parameters(), lr=4e-5, weight_decay=1e-4)
-        ws_res = evaluate_policy(test_env, model=model, device=device)
-        best_pnl = ws_res["pnl_usd"]
-        best_score = ws_res["efficiency_score"]
-        torch.save(model.state_dict(), out_dir / "best_maskable_ppo.pt")
-        history.append({"epoch": 0, **ws_res, "best_pnl_usd": round(float(best_pnl), 4), "best_score": round(float(best_score), 2)})
-        print(
-            f"  [Warm-Start v3] 🏆 -> PnL: ${ws_res['pnl_usd']:+.4f} | КПД: {ws_res['kpd_capture_pct']:+.1f}% "
-            f"(Score={ws_res['efficiency_score']:+.1f}) | Выход: {ws_res['exit_eff_pct']:.0f}% "
-            f"(MFE={ws_res['mean_mfe_ticks']:.1f}т/MAE={ws_res['mean_mae_ticks']:.1f}т) | MaxDD: ${ws_res['max_dd_usd']:.3f} | Сделок: {ws_res['trades']}"
-        )
-    else:
-        opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
-        print("🎓 Behavioral Cloning Warm-Start (сбор 30,000 демонстраций учителя)...")
-        bc_obs, bc_masks, bc_acts = [], [], []
-        obs = train_env.reset()
-        for _ in range(30000):
-            mask = train_env.get_action_mask()
-            act = teacher_heuristic_action(obs, mask)
-            bc_obs.append(obs); bc_masks.append(mask); bc_acts.append(act)
-            obs, _, done = train_env.step(act)
-            if done:
-                obs = train_env.reset()
-        t_obs = torch.as_tensor(np.array(bc_obs), dtype=torch.float32, device=device)
-        t_masks = torch.as_tensor(np.array(bc_masks), dtype=torch.bool, device=device)
-        t_acts = torch.as_tensor(np.array(bc_acts), dtype=torch.long, device=device)
-        for _ in range(8):
-            perm = torch.randperm(len(t_obs), device=device)
-            for i in range(0, len(t_obs), 1024):
-                idx = perm[i:i + 1024]
-                logits, _ = model(t_obs[idx], t_masks[idx])
-                loss = F.cross_entropy(logits, t_acts[idx])
-                opt.zero_grad(); loss.backward(); opt.step()
+        cand_model.load_state_dict(sd_w)
+        cand_res = evaluate_policy(test_env, model=cand_model, device=device)
+        if cand_res["efficiency_score"] > ws_res["efficiency_score"] and cand_res["trades"] >= 2:
+            print(f"🎓 Выбран существующий чекпоинт {warm_ckpt.name} (Score={cand_res['efficiency_score']:+.1f} vs BC={ws_res['efficiency_score']:+.1f})")
+            model.load_state_dict(cand_model.state_dict())
+            ws_res = cand_res
 
-    # 2. Обучение Maskable PPO v3 в L2 FIFO среде с инерционным трейлингом и охотой за экстремумами
-    print(f"🚀 Запуск Maskable PPO v3 ({ppo_epochs} эпох по {steps_per_epoch:,} шагов, Extremum + Inertia Trailing)...")
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=ppo_epochs, eta_min=2e-5)
+    best_model_ref.load_state_dict(model.state_dict())
+    best_model_ref.eval()
+    opt = torch.optim.AdamW(model.parameters(), lr=8e-5, weight_decay=1e-4)
+    best_pnl = ws_res["pnl_usd"]
+    best_score = ws_res["efficiency_score"]
+    torch.save(model.state_dict(), out_dir / "best_maskable_ppo.pt")
+    history.append({"epoch": 0, **ws_res, "best_pnl_usd": round(float(best_pnl), 4), "best_score": round(float(best_score), 2)})
+    print(
+        f"  [Warm-Start v3] 🏆 -> PnL: ${ws_res['pnl_usd']:+.4f} | КПД: {ws_res['kpd_capture_pct']:+.1f}% "
+        f"(Score={ws_res['efficiency_score']:+.1f}) | Выход: {ws_res['exit_eff_pct']:.0f}% "
+        f"(MFE={ws_res['mean_mfe_ticks']:.1f}т/MAE={ws_res['mean_mae_ticks']:.1f}т) | MaxDD: ${ws_res['max_dd_usd']:.3f} | Сделок: {ws_res['trades']}"
+    )
+
+    # 2. Обучение Maskable PPO v3 в L2 FIFO среде с реальными комиссиями 0.10% Maker
+    print(f"🚀 Запуск Maskable PPO v3 ({ppo_epochs} эпох по {steps_per_epoch:,} шагов, с учетом реальных комиссий SafeTrade)...")
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=ppo_epochs, eta_min=1.5e-5)
 
     for ep in range(1, ppo_epochs + 1):
         b_obs, b_masks, b_acts, b_tacts, b_logp, b_rews, b_vals, b_dones = [], [], [], [], [], [], [], []
@@ -915,12 +930,6 @@ def train_rl_agent(
                 logits, val = model(o_t, m_t)
                 ref_logits, _ = best_model_ref(o_t, m_t)
                 t_act = int(torch.argmax(ref_logits, dim=-1).item())
-                # Если открылось качественное окно входа с высоким ожидаемым Edge, поощряем снайперский вход
-                if obs[-10] < 0.5 and obs[-7] < 0.5 and (obs[-2] * 5.0) >= 1.60:
-                    if mask[1] and (obs[0] >= 0.05 or obs[6] >= 0.08):
-                        t_act = 1
-                    elif mask[2] and (obs[12] >= 0.08):
-                        t_act = 2
                 dist = Categorical(logits=logits)
                 act_t = dist.sample()
                 logp_t = dist.log_prob(act_t)
@@ -974,7 +983,7 @@ def train_rl_agent(
                 ratio = torch.exp(new_logp - T_old_logp[idx])
                 surr1 = ratio * T_advs[idx]
                 surr2 = torch.clamp(ratio, 0.85, 1.15) * T_advs[idx]
-                bc_anchor = F.cross_entropy(logits, T_tacts[idx])
+                bc_anchor = F.cross_entropy(logits, T_tacts[idx], weight=ce_w)
                 loss = -torch.min(surr1, surr2).mean() + 0.25 * F.mse_loss(vals, T_rets[idx]) + 0.15 * bc_anchor - 0.005 * dist.entropy().mean()
                 opt.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(model.parameters(), 0.5); opt.step()
         sched.step()
@@ -1169,7 +1178,15 @@ def inspect_and_plot_rl_oos(coin: str = "prl", tail_hours: float = 72.0, start_t
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--coin", type=str, default="prl")
-    parser.add_argument("--tail-hours", type=float, default=115.0)
+    parser.add_argument("--tail-hours", type=float, default=396.0)
     parser.add_argument("--epochs", type=int, default=25)
+    parser.add_argument("--steps", type=int, default=16384)
+    parser.add_argument("--split-ts", type=str, default="2026-10-24 12:00:00+03:00")
     args = parser.parse_args()
-    train_rl_agent(coin=args.coin, tail_hours=args.tail_hours, ppo_epochs=args.epochs)
+    train_rl_agent(
+        coin=args.coin,
+        tail_hours=args.tail_hours,
+        ppo_epochs=args.epochs,
+        steps_per_epoch=args.steps,
+        split_ts_msk=args.split_ts,
+    )

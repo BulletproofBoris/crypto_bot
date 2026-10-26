@@ -57,6 +57,7 @@ class SwarmRegimeRouter:
         self.models = []
         self.model_ids = []
         self.regime_fingerprints = []
+        self.train_end_sec = []
         
         print(f"📦 Загрузка пула экспертов {self.coin.upper()} (H={H}с, K={K})...")
         for item in self.manifest:
@@ -66,6 +67,10 @@ class SwarmRegimeRouter:
                 self.models.append(booster)
                 self.model_ids.append(item['window_id'])
                 self.regime_fingerprints.append(item['regime_fingerprint_train'])
+                t_range = item.get('train_ts_range', ['1970-01-01', '1970-01-01'])
+                t_end_str = t_range[1] if isinstance(t_range, list) and len(t_range) > 1 else '1970-01-01'
+                self.train_end_sec.append(int(pd.Timestamp(t_end_str, tz='UTC').timestamp()))
+        self.train_end_sec = np.array(self.train_end_sec, dtype=np.int64)
 
         self.num_models = len(self.models)
         if self.models and hasattr(self.models[0], 'feature_name'):
@@ -102,7 +107,7 @@ class SwarmRegimeRouter:
                             with open(m_file) as mf:
                                 n_meta = json.load(mf)
                             ic_val = float(n_meta.get("metrics_oos", {}).get("ic_dt_ticks", 0.1))
-                            if ic_val >= 0.10:
+                            if ic_val >= 0.05:
                                 self.neural_experts.append({
                                     "arch": arch_key if win_idx == 0 else f"{arch_key}_{win_tag}",
                                     "base_arch": arch_key,
@@ -165,8 +170,19 @@ class SwarmRegimeRouter:
         diff = np.clip(diff, -3.0, 3.0)
         dist_sq = np.mean(diff ** 2, axis=-1)
 
-        # Приор свежести: win_00 получает приоритет при сопоставимом рыночном режиме
-        recency_bonus = -1.0 * np.arange(self.num_models, dtype=np.float32)[np.newaxis, :]
+        # Приор свежести + каузальная Walk-Forward маскировка (исключает утечку будущих окон на истории)
+        if "timestamp" in current_regime_df.columns and n_samples > 10 and len(self.train_end_sec) == self.num_models:
+            ts_sec = pd.to_datetime(current_regime_df["timestamp"], utc=True).dt.as_unit("s").astype("int64").values
+            avail = ts_sec[:, np.newaxis] > self.train_end_sec[np.newaxis, :]
+            no_avail = ~np.any(avail, axis=1)
+            if np.any(no_avail):
+                avail[no_avail, -1] = True
+            causal_rank = (np.cumsum(avail, axis=1) - 1).astype(np.float32)
+            self._last_causal_rank = np.where(avail, causal_rank, 999.0).astype(np.float32)
+            recency_bonus = np.where(avail, -1.0 * causal_rank, -1e9).astype(np.float32)
+        else:
+            self._last_causal_rank = None
+            recency_bonus = -1.0 * np.arange(self.num_models, dtype=np.float32)[np.newaxis, :]
         logits = (-dist_sq / max(0.5, self.temperature)) + recency_bonus
         logits_max = np.max(logits, axis=-1, keepdims=True)
         exp_logits = np.exp(logits - logits_max)
@@ -219,6 +235,30 @@ class SwarmRegimeRouter:
         manifest_mtime = int((self.model_dir / "manifest.json").stat().st_mtime)
         lgb_cache_file = cache_dir / f"lgb_probs_{self.coin}_h{self.H}s_k{self.K:g}_{n_samples}_{slice_hash}_{manifest_mtime}.npy"
 
+        if mode == "latest":
+            weights = np.zeros((n_samples, self.num_models), dtype=np.float32)
+            weights[:, 0] = 1.0
+        elif mode == "uniform":
+            weights = np.full((n_samples, self.num_models), 1.0 / self.num_models, dtype=np.float32)
+        elif mode == "router":
+            weights = self.compute_routing_weights(current_regime_df)
+        else:
+            raise ValueError(f"Неизвестный режим: {mode}")
+
+        act_slices = []
+        c_rank = getattr(self, "_last_causal_rank", None)
+        for i in range(self.num_models):
+            if mode == "router" and n_samples > 300000 and c_rank is not None:
+                idx_w = np.where(c_rank[:, i] <= 3.5)[0]
+                if len(idx_w) > 0:
+                    act_slices.append((int(idx_w[0]), int(idx_w[-1]) + 1))
+                elif i == 0:
+                    act_slices.append((max(0, n_samples - 100000), n_samples))
+                else:
+                    act_slices.append((0, 0))
+            else:
+                act_slices.append((0, n_samples))
+
         if getattr(self, "_lgb_cache_sig", None) == (slice_hash, manifest_mtime):
             all_probs = self._lgb_cache_probs
         elif lgb_cache_file.exists():
@@ -229,31 +269,24 @@ class SwarmRegimeRouter:
             X_inf = self._sanitize_stale_bo_features(X, current_regime_df)
             all_probs = np.zeros((self.num_models, n_samples, 7), dtype=np.float32)
             for i, booster in enumerate(self.models):
-                raw_p = booster.predict(X_inf)
+                s_l, e_l = act_slices[i]
+                if e_l <= s_l:
+                    continue
+                raw_p = booster.predict(X_inf[s_l:e_l])
                 if raw_p.shape[1] == 7:
-                    all_probs[i] = raw_p
+                    all_probs[i, s_l:e_l] = raw_p
                 else:
                     for col_idx in range(min(7, raw_p.shape[1])):
-                        all_probs[i, :, col_idx] = raw_p[:, col_idx]
+                        all_probs[i, s_l:e_l, col_idx] = raw_p[:, col_idx]
             self._lgb_cache_sig = (slice_hash, manifest_mtime)
             self._lgb_cache_probs = all_probs
-            try:
-                np.save(lgb_cache_file, all_probs)
-            except Exception:
-                pass
+            if n_samples <= 350000:
+                try:
+                    np.save(lgb_cache_file, all_probs)
+                except Exception:
+                    pass
 
-        if mode == "latest":
-            blend_probs = all_probs[0].copy()
-            weights = np.zeros((n_samples, self.num_models), dtype=np.float32)
-            weights[:, 0] = 1.0
-        elif mode == "uniform":
-            blend_probs = np.mean(all_probs, axis=0)
-            weights = np.full((n_samples, self.num_models), 1.0 / self.num_models, dtype=np.float32)
-        elif mode == "router":
-            weights = self.compute_routing_weights(current_regime_df)
-            blend_probs = np.einsum('nm,mnc->nc', weights, all_probs)
-        else:
-            raise ValueError(f"Неизвестный режим: {mode}")
+        blend_probs = np.einsum('nm,mnc->nc', weights, all_probs)
 
         # Ожидаемый импульс E[z] и векторизованная калибровка исторических окон к эталонному окну win_00
         class_values = np.array([-3, -2, -1, 0, 1, 2, 3], dtype=np.float32)
@@ -261,23 +294,30 @@ class SwarmRegimeRouter:
         pb_all = all_probs[:, :, 5] + all_probs[:, :, 6]
         ps_all = all_probs[:, :, 0] + all_probs[:, :, 1]
 
-        ref_mean = float(np.mean(ez_all[0]))
-        ref_std = float(np.std(ez_all[0])) + 1e-6
-        ref_pb_mean = float(np.mean(pb_all[0])) + 1e-6
-        ref_ps_mean = float(np.mean(ps_all[0])) + 1e-6
+        s0, e0 = act_slices[0] if act_slices[0][1] > act_slices[0][0] else (0, n_samples)
+        ref_mean = float(np.mean(ez_all[0, s0:e0]))
+        ref_std = float(np.std(ez_all[0, s0:e0])) + 1e-6
+        ref_pb_mean = float(np.mean(pb_all[0, s0:e0])) + 1e-6
+        ref_ps_mean = float(np.mean(ps_all[0, s0:e0])) + 1e-6
 
         if self.num_models > 1:
-            ez_means = np.mean(ez_all, axis=1, keepdims=True)
-            ez_stds = np.std(ez_all, axis=1, keepdims=True) + 1e-6
-            cal_ez_all = (ez_all - ez_means) * (ref_std / ez_stds) + ref_mean
+            cal_ez_all = np.zeros_like(ez_all)
+            cal_pb_all = np.zeros_like(pb_all)
+            cal_ps_all = np.zeros_like(ps_all)
             cal_ez_all[0] = ez_all[0]
-
-            pb_means = np.mean(pb_all, axis=1, keepdims=True) + 1e-6
-            ps_means = np.mean(ps_all, axis=1, keepdims=True) + 1e-6
-            cal_pb_all = np.clip(pb_all * (ref_pb_mean / pb_means), 0.0, 1.0)
-            cal_ps_all = np.clip(ps_all * (ref_ps_mean / ps_means), 0.0, 1.0)
             cal_pb_all[0] = pb_all[0]
             cal_ps_all[0] = ps_all[0]
+            for i in range(1, self.num_models):
+                s_l, e_l = act_slices[i]
+                if e_l <= s_l:
+                    continue
+                ez_m = float(np.mean(ez_all[i, s_l:e_l]))
+                ez_s = float(np.std(ez_all[i, s_l:e_l])) + 1e-6
+                pb_m = float(np.mean(pb_all[i, s_l:e_l])) + 1e-6
+                ps_m = float(np.mean(ps_all[i, s_l:e_l])) + 1e-6
+                cal_ez_all[i, s_l:e_l] = (ez_all[i, s_l:e_l] - ez_m) * (ref_std / ez_s) + ref_mean
+                cal_pb_all[i, s_l:e_l] = np.clip(pb_all[i, s_l:e_l] * (ref_pb_mean / pb_m), 0.0, 1.0)
+                cal_ps_all[i, s_l:e_l] = np.clip(ps_all[i, s_l:e_l] * (ref_ps_mean / ps_m), 0.0, 1.0)
         else:
             cal_ez_all = ez_all
             cal_pb_all = pb_all
@@ -312,54 +352,55 @@ class SwarmRegimeRouter:
                 if not cache_file.exists() and legacy_cache.exists() and int(legacy_cache.stat().st_mtime) >= k_mtime:
                     cache_file = legacy_cache
 
-                if multi_win and not cache_file.exists() and float(np.mean(reg_w)) < 0.02:
-                    continue
+                if multi_win and not cache_file.exists():
+                    if n_samples > 300000 and c_rank is not None:
+                        act_idx = np.where(c_rank[:, w_idx] == 0.0)[0]
+                    else:
+                        act_idx = np.where(reg_w >= 0.08)[0]
+                    if len(act_idx) == 0:
+                        continue
+                    s_act, e_act = int(act_idx[0]), int(act_idx[-1]) + 1
+                else:
+                    s_act, e_act = 0, n_samples
 
                 if cache_file.exists():
                     p_raw = np.load(cache_file)
+                    s_act, e_act = 0, n_samples
                 else:
                     if X_nn is None:
                         X_nn = self._sanitize_stale_bo_features(X, current_regime_df)
                     from _tools.fast_neural_engine import FastKerasModel
-                    print(f"  ⚡ [H={self.H}s] Инференс нейросети {exp['arch']} (mean_w={float(np.mean(reg_w)):.3f})...", flush=True)
+                    print(
+                        f"  ⚡ [H={self.H}s] Инференс {exp['arch']} [{s_act}:{e_act}] ({(e_act-s_act)/3600:.1f}ч, mean_w={float(np.mean(reg_w[s_act:e_act])):.2f})...",
+                        flush=True,
+                    )
                     model = FastKerasModel(exp["k_file"], exp["base_arch"])
-                    x_norm = np.clip((X_nn - exp["mean"]) / exp["std"], -5.0, 5.0).astype(np.float32)
-                    x_norm = np.nan_to_num(x_norm, nan=0.0, posinf=5.0, neginf=-5.0)
-                    x_pad = np.vstack([np.repeat(x_norm[:1], sl - 1, axis=0), x_norm])
-                    x_3d_view = np.lib.stride_tricks.sliding_window_view(x_pad, (sl, x_norm.shape[1]))[:, 0, :, :]
-
-                    # Пакетный инференс чанками по 16384 строк (Pure PyTorch без TensorFlow)
-                    p_chunks = []
-                    chunk_sz = 16384
-                    for start_i in range(0, n_samples, chunk_sz):
-                        end_i = min(n_samples, start_i + chunk_sz)
-                        x_batch = np.ascontiguousarray(x_3d_view[start_i:end_i], dtype=np.float32)
-                        p_batch = model.predict_numpy(x_batch)
-                        p_chunks.append(np.asarray(p_batch, dtype=np.float32))
-                    p_raw = np.vstack(p_chunks)
-                    del model, x_norm, x_pad, x_3d_view, p_chunks
-                    try:
-                        np.save(cache_file, p_raw)
-                    except Exception:
-                        pass
+                    s_pad = max(0, s_act - (sl - 1))
+                    x_sub = np.clip((X_nn[s_pad:e_act] - exp["mean"]) / exp["std"], -5.0, 5.0).astype(np.float32)
+                    x_sub = np.nan_to_num(x_sub, nan=0.0, posinf=5.0, neginf=-5.0)
+                    p_sub = model.predict_sequence_2d(x_sub, sl)
+                    p_raw = p_sub[s_act - s_pad:]
+                    del model, x_sub, p_sub
+                    if s_act == 0 and e_act == n_samples:
+                        try:
+                            np.save(cache_file, p_raw)
+                        except Exception:
+                            pass
 
                 p_raw = np.clip(p_raw, 1e-7, 1.0 - 1e-7)
-
-                # 1. Сохраняем максимальный IC сырого нейросетевого прогноза, приводя дисперсию к шкале роутера
                 ez_raw = np.dot(p_raw, class_values)
                 ez_std = float(np.std(ez_raw)) + 1e-6
-                ez_scaled = (ez_raw - float(np.mean(ez_raw))) * (lgb_ez_std / ez_std) + float(np.mean(expected_z))
-
-                # 2. Байесовская калибровка вероятностей для совместимости с порогами p_buy / p_sell
+                sub_ez = expected_z[s_act:e_act]
+                sub_lgb_std = float(np.std(sub_ez)) + 1e-6
+                ez_scaled = (ez_raw - float(np.mean(ez_raw))) * (sub_lgb_std / ez_std) + float(np.mean(sub_ez))
                 p_cal = p_raw / cw_pow
                 p_cal = p_cal / np.sum(p_cal, axis=1, keepdims=True)
 
-                w_idx = min(exp.get("win_idx", 0), weights.shape[1] - 1)
-                reg_w = weights[:, w_idx] if multi_win else 1.0
-                w_exp = np.broadcast_to(np.asarray(max(0.01, exp["ic"] ** 2) * reg_w, dtype=np.float32), (n_samples,))
-                nn_ez_num += w_exp * ez_scaled
-                nn_probs_num += w_exp[:, np.newaxis] * p_cal
-                nn_w_sum += w_exp
+                reg_w_sub = reg_w[s_act:e_act] if multi_win else 1.0
+                w_exp = np.broadcast_to(np.asarray(max(0.01, exp["ic"] ** 2) * reg_w_sub, dtype=np.float32), (e_act - s_act,))
+                nn_ez_num[s_act:e_act] += w_exp * ez_scaled
+                nn_probs_num[s_act:e_act] += w_exp[:, np.newaxis] * p_cal
+                nn_w_sum[s_act:e_act] += w_exp
                 del p_raw, ez_raw, ez_scaled, p_cal
 
             if np.any(nn_w_sum > 0):
@@ -367,19 +408,20 @@ class SwarmRegimeRouter:
                 nn_ez_blend = nn_ez_num * inv_w
                 nn_probs_blend = nn_probs_num * inv_w[:, np.newaxis]
 
-                w_nn = np.clip(self.neural_weight, 0.0, 1.0)
+                w_nn = float(np.clip(self.neural_weight, 0.0, 1.0))
+                w_nn_vec = np.where(nn_w_sum > 1e-6, w_nn, 0.0).astype(np.float32)
                 lgb_mean = float(np.mean(expected_z))
-                raw_blend_ez = (1.0 - w_nn) * expected_z + w_nn * nn_ez_blend
+                raw_blend_ez = (1.0 - w_nn_vec) * expected_z + w_nn_vec * nn_ez_blend
                 blend_std = float(np.std(raw_blend_ez)) + 1e-6
                 # Сохраняем амплитуду дисперсии сигнала, чтобы пороги диспетчера (trend_gate, threshold_core) не размывались
                 expected_z = (raw_blend_ez - float(np.mean(raw_blend_ez))) * (lgb_ez_std / blend_std) + lgb_mean
-                blend_probs = (1.0 - w_nn) * blend_probs + w_nn * nn_probs_blend
+                blend_probs = (1.0 - w_nn_vec[:, np.newaxis]) * blend_probs + w_nn_vec[:, np.newaxis] * nn_probs_blend
                 nn_pb = nn_probs_blend[:, 5] + nn_probs_blend[:, 6]
                 nn_ps = nn_probs_blend[:, 0] + nn_probs_blend[:, 1]
                 nn_pb = np.clip(nn_pb * (ref_pb_mean / (float(np.mean(nn_pb)) + 1e-6)), 0.0, 1.0)
                 nn_ps = np.clip(nn_ps * (ref_ps_mean / (float(np.mean(nn_ps)) + 1e-6)), 0.0, 1.0)
-                p_buy = (1.0 - w_nn) * p_buy + w_nn * nn_pb
-                p_sell = (1.0 - w_nn) * p_sell + w_nn * nn_ps
+                p_buy = (1.0 - w_nn_vec) * p_buy + w_nn_vec * nn_pb
+                p_sell = (1.0 - w_nn_vec) * p_sell + w_nn_vec * nn_ps
 
         # Защита ML-инференса от зависания коллектора второй биржи (BO_sec_since_tick > 60s):
         # когда 135 признаков BO_*/LL_* замирают, дисперсия прогноза сжимается на 30-35% и возникает ложный сдвиг среднего.
@@ -415,10 +457,10 @@ class SwarmRegimeRouter:
         }
 
     def preload_neural_models(self):
-        """Предзагружает все графы FastKerasModel в RAM для исключения чтения с диска в боевом цикле."""
+        """Предзагружает активные графы FastKerasModel (win_00..win_06) в RAM для исключения чтения с диска в боевом цикле."""
         from _tools.fast_neural_engine import FastKerasModel
         for exp in self.neural_experts:
-            if exp.get("fast_model") is None:
+            if exp.get("win_idx", 0) <= 6 and exp.get("fast_model") is None:
                 exp["fast_model"] = FastKerasModel(exp["k_file"], exp["base_arch"])
 
     def predict_live_tick(self, X_seq_2d: np.ndarray, current_regime_1row: pd.DataFrame) -> dict:

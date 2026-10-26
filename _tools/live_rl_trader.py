@@ -153,10 +153,15 @@ class SafeTradePrivateClient:
                     raise
                 self._init_vps_bridge()
                 raise
-        if method == "GET":
-            r = self.session.get(url, headers=self._auth_headers() if auth else None, timeout=6)
-        else:
-            r = self.session.post(url, headers=self._auth_headers(), data=json.dumps(body) if body else None, timeout=6)
+        for attempt in range(2):
+            if method == "GET":
+                r = self.session.get(url, headers=self._auth_headers() if auth else None, timeout=6)
+            else:
+                r = self.session.post(url, headers=self._auth_headers(), data=json.dumps(body) if body else None, timeout=6)
+            if r.status_code == 403 and attempt == 0:
+                time.sleep(0.35)
+                continue
+            break
         if r.status_code >= 400:
             raise RuntimeError(f"SafeTrade HTTP {r.status_code}: {r.text}")
         return r.json() if r.text else {}
@@ -363,10 +368,10 @@ class LiveTriadRLTrader:
         except Exception:
             pass
 
-    def sync_live_orders(self, b1: float):
+    def sync_live_orders(self, b1: float, count_hold: bool = True):
         if self.mode != "live":
             return
-        if self.pos_qty > 1e-4:
+        if count_hold and self.pos_qty > 1e-4:
             self.hold_sec += 1
             if b1 > 0:
                 self.peak_bid = max(self.peak_bid, self.avg_entry, b1)
@@ -436,6 +441,31 @@ class LiveTriadRLTrader:
             c_free, c_lock = b_map.get(self.base_currency, (0.0, 0.0))
             u_tot, c_tot = u_free + u_lock, c_free + c_lock
             self.ex_usdt_free, self.ex_coin_free = u_free, c_free
+
+            # На выделенном аккаунте (reserved_account_usdt == 0 и user_reserved_coin == 0)
+            # 100% спотового баланса биржи (USDT + PRL) является прямым источником истины для бота!
+            if self.reserved_account_usdt <= 1e-4 and self.user_reserved_coin <= 1e-4:
+                prev_pos = self.pos_qty
+                real_pos = math.floor(c_tot * 10000.0) / 10000.0 if c_tot >= 2.0 else 0.0
+                self.bot_cash_usd = u_free
+                if real_pos >= 2.0 and prev_pos < 2.0:
+                    px_ref = self.active_bid_p if self.active_bid_p > 0 else (b1 if b1 > 0 else 1.80)
+                    self.avg_entry = self.avg_entry if self.avg_entry > 0 else px_ref
+                    self.peak_bid = max(self.peak_bid, self.avg_entry, b1 if b1 > 0 else px_ref)
+                    if not init_mode:
+                        print(f"  🔄 [SPOT SYNC] Обнаружена позиция на споте: {real_pos:.4f} PRL (вход=${self.avg_entry:.2f}) | Свободный USDT=${u_free:.2f}")
+                elif real_pos < 2.0 and prev_pos >= 2.0:
+                    self.avg_entry, self.hold_sec, self.peak_bid = 0.0, 0, 0.0
+                    self.n_trades += 1
+                    self.realized_pnl_usd = u_tot - self.initial_budget_usd
+                    if not init_mode:
+                        print(f"  🔄 [SPOT SYNC] Позиция полностью продана в USDT: баланс=${u_tot:.2f} (PnL={self.realized_pnl_usd:+.4f}$)")
+                self.pos_qty = real_pos
+                if init_mode and self.initial_budget_usd <= 0.0:
+                    px_init = b1 if b1 > 0 else (self.avg_entry if self.avg_entry > 0 else 1.80)
+                    self.initial_budget_usd = round(u_tot + real_pos * px_init, 4)
+                self._save_wallet()
+                return
 
             if self.pos_qty >= 2.0 and self.active_ask_id is None and c_tot < 2.0:
                 px_ref = b1 if b1 > 0 else (self.avg_entry if self.avg_entry > 0 else 1.82)
@@ -598,18 +628,20 @@ class LiveTriadRLTrader:
 
         vel_3 = (b1 - (b_arr[-4] if len(b_arr) >= 4 else b_arr[0])) / self.tick_size
         self.last_vel3 = vel_3
-        bounce_ok = (1.0 <= reb_30 <= 2.0) if dd_900 >= 6.0 else (reb_30 <= 2.0)
-        dip_ok = (dd_300 >= 1.0 and inertia >= 0.45 and exp_entry_edge >= 1.5) or ((dd_300 >= 2.0 or dd_900 >= 2.0) and inertia >= 0.28)
-        dip_rev = (pos_900 <= 0.48) and (pos_3600 <= 0.68) and dip_ok and (vel_3 >= 0.0) and bounce_ok
-        uptrend = (pos_3600 <= 0.72) and (vel_3 >= 0.0) and (inertia >= 0.40) and ((vel_180 >= 1.0 and dd_300 >= 1.0) or (spread_ticks >= 2.0 and exp_entry_edge >= 2.0))
-        in_dip_zone = dip_rev or uptrend
+        in_dip_zone = (
+            (pos_3600 <= 0.80)
+            and (vel_10 >= -1.0)
+            and (inertia >= 0.15)
+            and (exp_entry_edge >= 0.60)
+            and ((dd_300 >= 1.0) or (spread_ticks >= 2.0) or (inertia >= 0.35))
+        )
 
         mask = np.zeros(7, dtype=bool)
         if not has_pos:
             mask[0] = True
             if in_dip_zone:
                 mask[2] = True
-                if imb_l5 > -0.75:
+                if imb_l5 > -0.65:
                     mask[1] = True
             if has_bid:
                 mask[5] = True
@@ -634,13 +666,12 @@ class LiveTriadRLTrader:
             return
         tol = self.tick_size * 0.25
         if self.pos_qty <= 1e-4 and self.active_bid_id is not None and act == 0:
-            if self.last_pos3600 > 0.72 or getattr(self, "last_vel3", 0.0) < 0.0 or self.last_inertia < 0.05 or self.last_imb5 < -0.20:
+            if self.last_pos3600 > 0.85 or self.last_inertia < -0.20:
                 act = 5
-            elif self.last_inertia > 0.40 and self.last_pos3600 <= 0.68 and b1 > self.active_bid_p + tol:
-                act = 1
 
         if act in (1, 2) and self.pos_qty <= 1e-4:
-            target_p = round(((b1 + self.tick_size if (a1 - b1) >= 2.0 * self.tick_size else b1) if act == 1 else max(self.tick_size, b1 - self.tick_size)) / self.tick_size) * self.tick_size
+            step_in = (a1 - b1) >= 2.0 * self.tick_size and self.last_inertia >= 0.35
+            target_p = round(((b1 + self.tick_size if step_in else b1) if act == 1 else max(self.tick_size, b1 - self.tick_size)) / self.tick_size) * self.tick_size
             if self.active_bid_id is not None and abs(self.active_bid_p - target_p) <= tol:
                 return
             if self.active_bid_id is not None:
@@ -650,10 +681,12 @@ class LiveTriadRLTrader:
                     print(f"  ⚠️ [CANCEL BUY WARN] id={self.active_bid_id}: {e}")
                 self.sync_live_orders(b1)
                 self.active_bid_id, self.active_bid_p, self.active_bid_q = None, 0.0, 0.0
+                self.sync_account_balances(b1)
                 if self.pos_qty > 1e-4:
                     return
             self.sync_account_balances(b1)
-            usable_usd = min(self.order_usd, self.bot_cash_usd * 0.998, self.ex_usdt_free * 0.998)
+            max_cap = self.ex_usdt_free if (self.reserved_account_usdt <= 1e-4 and self.user_reserved_coin <= 1e-4) else self.order_usd
+            usable_usd = min(max_cap, self.bot_cash_usd * 0.998, self.ex_usdt_free * 0.998)
             qty = math.floor((usable_usd / max(target_p, self.tick_size)) * 10000.0) / 10000.0
             if qty < 2.0:
                 return
@@ -677,23 +710,21 @@ class LiveTriadRLTrader:
             self.sync_live_orders(b1)
             self.active_bid_id, self.active_bid_p, self.active_bid_q = None, 0.0, 0.0
             self.q_ahead = 0.0
+            self.sync_account_balances(b1)
             self._save_wallet()
         elif act in (3, 4, 6) and self.pos_qty >= 2.0:
+            min_profit_p = round((self.avg_entry + self.tick_size) / self.tick_size) * self.tick_size
             if act == 6:
                 target_p = max(self.tick_size, b1 - self.tick_size)
+            elif act == 3:
+                target_p = max(a1 + self.tick_size, self.avg_entry + 2.0 * self.tick_size)
             else:
-                peak_b = max(self.peak_bid, self.avg_entry, b1)
-                trend_ticks = int(np.clip(round(max(self.ez25_entry, self.last_ez25, self.last_inertia) * 6.0), 2, 8))
-                if self.hold_sec > 90 and self.last_inertia < -0.15:
-                    target_p = a1
-                elif act == 3 or (self.last_inertia > 0.55 and self.hold_sec < 45):
-                    if self.last_inertia > 0.35:
-                        target_p = max(a1 + self.tick_size, peak_b + 2.0 * self.tick_size, self.avg_entry + trend_ticks * self.tick_size)
-                    else:
-                        target_p = max(a1, peak_b, self.avg_entry + 2.0 * self.tick_size)
-                else:
-                    min_p = max(peak_b, self.avg_entry + self.tick_size) if self.hold_sec < 60 else max(peak_b, self.avg_entry)
-                    target_p = max(a1, min_p)
+                allow_scratch = self.hold_sec > 600 and self.last_inertia < -0.35
+                floor_p = round(self.avg_entry / self.tick_size) * self.tick_size if allow_scratch else min_profit_p
+                # Сохраняем приоритет очереди на уровне +1 тик (floor_p), не дергая ордер при временном расширении спреда вверх
+                if self.active_ask_id is not None and abs(self.active_ask_p - floor_p) <= tol and a1 >= floor_p - tol:
+                    return
+                target_p = max(a1, floor_p)
             target_p = round(target_p / self.tick_size) * self.tick_size
             if self.active_ask_id is not None and abs(self.active_ask_p - target_p) <= tol:
                 return
@@ -818,7 +849,12 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
 
         b1 = float(last_row["ST_best_bid"].iloc[0])
         a1 = float(last_row["ST_best_ask"].iloc[0])
-        trader.sync_live_orders(b1)
+        if trader.pos_qty > 1e-4:
+            trader.hold_sec += 1
+            if b1 > 0:
+                trader.peak_bid = max(trader.peak_bid, trader.avg_entry, b1)
+        if step_idx % 3 == 1:
+            trader.sync_live_orders(b1, count_hold=False)
 
         x_new = last_row.reindex(columns=trader.feature_names, fill_value=0.0).to_numpy(dtype=np.float32)[0]
         X_buf.append(x_new)
@@ -867,9 +903,10 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
 
 
 def show_live_status(tail_lines: int = 25):
-    """Онлайн-запрос статуса фонового демона на VPS (81.19.137.18), ресурсов сервера, субсчета $50 и хвоста лога."""
+    """Онлайн-запрос статуса фонового демона на VPS (81.19.137.18), ресурсов сервера, субсчета и хвоста лога."""
     from _tools.vps_config import create_ssh_client
-    ssh = create_ssh_client()
+    print("⏳ Запрос статуса демона на VPS (81.19.137.18)...", flush=True)
+    ssh = create_ssh_client(timeout=12.0)
     cmd = (
         "PID=$(cat /opt/crypto_bot/data/logs/live_rl_trader.pid 2>/dev/null); "
         "if [ -n \"$PID\" ] && kill -0 \"$PID\" 2>/dev/null; then "
@@ -878,7 +915,7 @@ def show_live_status(tail_lines: int = 25):
         "echo '---WALLET---'; cat /opt/crypto_bot/models/prl/rl_execution/live_wallet_state.json 2>/dev/null || echo '{}'; "
         f"echo '---LOG---'; tail -n {int(tail_lines)} /opt/crypto_bot/data/logs/live_rl_trader.log 2>/dev/null || true"
     )
-    _, out, _ = ssh.exec_command(cmd)
+    _, out, _ = ssh.exec_command(cmd, timeout=12.0)
     raw = out.read().decode("utf-8", errors="ignore")
     ssh.close()
 
@@ -897,7 +934,7 @@ def show_live_status(tail_lines: int = 25):
             rss_mb = float(parts[2]) / 1024.0
             res_info = f" | CPU={parts[0]}% | RAM={rss_mb:.0f} МБ ({parts[1]}%) | Uptime={parts[3]}"
 
-    print(f"📡 Статус демона на VPS (81.19.137.18): {'🟢 РАБОТАЕТ НА СЕРВЕРЕ (PID=' + str(pid) + ')' + res_info if running else '🔴 ОСТАНОВЛЕН'}")
+    print(f"📡 Статус демона на VPS (81.19.137.18): {'🟢 РАБОТАЕТ НА СЕРВЕРЕ (PID=' + str(pid) + ')' + res_info if running else '🔴 ОСТАНОВЛЕН'}", flush=True)
     try:
         w = json.loads(w_part.strip() or "{}")
         if w:
@@ -905,15 +942,16 @@ def show_live_status(tail_lines: int = 25):
                 json.dumps(w, indent=2), encoding="utf-8"
             )
             print(
-                f"💼 Субсчет бота: Кэш=${w.get('bot_cash_usd', 50.0):.2f} | Позиция={w.get('pos_qty', 0.0):.4f} PRL "
+                f"💼 Счет бота: Кэш=${w.get('bot_cash_usd', 0.0):.2f} | Позиция={w.get('pos_qty', 0.0):.4f} PRL "
                 f"(вход=${w.get('avg_entry', 0.0):.2f}) | Реализ. PnL={w.get('realized_pnl_usd', 0.0):+.4f}$ | "
-                f"Сделок={w.get('n_trades', 0)} | Личный резерв=${w.get('reserved_account_usdt', 0.0):,.2f} + {w.get('user_reserved_coin', 0.0):,.4f} PRL"
+                f"Сделок={w.get('n_trades', 0)}",
+                flush=True,
             )
     except Exception:
         pass
-    print(f"\n📜 Онлайн-лог с сервера VPS (/opt/crypto_bot/data/logs/live_rl_trader.log, последние {tail_lines} строк):")
-    print("-" * 100)
-    print(log_part.strip())
+    print(f"\n📜 Онлайн-лог с сервера VPS (/opt/crypto_bot/data/logs/live_rl_trader.log, последние {tail_lines} строк):", flush=True)
+    print("-" * 100, flush=True)
+    print(log_part.strip(), flush=True)
 
 
 def stream_live_log(duration_sec: int = 30):
@@ -977,51 +1015,54 @@ def stop_live_daemon(cancel_open_orders: bool = True):
 
 
 def sync_and_inspect_telemetry(last_n: int = 20) -> pd.DataFrame:
-    """Онлайн-синхронизация горячей телеметрии RL и лога с VPS (81.19.137.18), сохранение в Parquet и вывод сводки."""
+    """Молниеносная онлайн-синхронизация горячей телеметрии RL с VPS (81.19.137.18) через gzip-поток (~1 сек вместо 85 МБ SFTP)."""
+    import io
+    import gzip
     from _tools.vps_config import create_ssh_client
     hot_dir = BASE_DIR / "data" / "vps_hot"
     proc_dir = BASE_DIR / "data" / "processed" / "prl"
-    log_dir = BASE_DIR / "data" / "logs"
     hot_dir.mkdir(parents=True, exist_ok=True)
     proc_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
     local_csv = hot_dir / "prl_rl_telemetry_hot.csv"
     pq_file = proc_dir / "rl_telemetry.parquet"
 
-    ssh = create_ssh_client()
-    sftp = ssh.open_sftp()
-    sftp.get("/opt/crypto_bot/data/realtime/prlusdt/rl_telemetry.csv", str(local_csv))
-    try:
-        sftp.get("/opt/crypto_bot/data/logs/live_rl_trader.log", str(log_dir / "live_rl_trader.log"))
-        sftp.get("/opt/crypto_bot/data/logs/live_rl_telemetry.jsonl", str(log_dir / "live_rl_telemetry.jsonl"))
-    except Exception:
-        pass
-    sftp.close()
+    print("⏳ Сжатая выгрузка горячей телеметрии с VPS (81.19.137.18)...", flush=True)
+    ssh = create_ssh_client(timeout=12.0)
+    _, out, _ = ssh.exec_command("gzip -1 -c /opt/crypto_bot/data/realtime/prlusdt/rl_telemetry.csv", timeout=20.0)
+    gz_bytes = out.read()
     ssh.close()
 
-    df = pd.read_csv(local_csv)
+    raw_bytes = gzip.decompress(gz_bytes)
+    local_csv.write_bytes(raw_bytes)
+    df = pd.read_csv(io.BytesIO(raw_bytes))
     df.to_parquet(pq_file, index=False)
-    print(f"✅ Онлайн-синхронизация с VPS (81.19.137.18): {len(df):,} тиков телеметрии -> {pq_file.relative_to(BASE_DIR)}")
+    print(f"✅ Онлайн-синхронизация с VPS (81.19.137.18): {len(df):,} тиков ({len(gz_bytes)/1024:.0f} КБ gzip) -> {pq_file.relative_to(BASE_DIR)}", flush=True)
     if len(df) > 0:
-        print(f"⏱️ Интервал: {df['ts_msk'].iloc[0]} MSK ➔ {df['ts_msk'].iloc[-1]} MSK | Средняя задержка на VPS: {df['latency_ms'].tail(100).mean():.1f} мс")
-        print("📊 Распределение действий агента:", df["act_name"].value_counts().to_dict())
+        print(f"⏱️ Интервал: {df['ts_msk'].iloc[0]} MSK ➔ {df['ts_msk'].iloc[-1]} MSK | Средняя задержка на VPS: {df['latency_ms'].tail(100).mean():.1f} мс", flush=True)
+        print("📊 Распределение действий агента:", df["act_name"].value_counts().to_dict(), flush=True)
     cols_show = [c for c in ["ts_msk", "step", "b1", "a1", "act_name", "v_pred", "pos_qty", "bot_cash_usd", "equity_usd", "latency_ms"] if c in df.columns]
     return df[cols_show].tail(last_n)
 
 
-def start_live_daemon(budget_usd: float = 50.0, order_usd: float = 50.0, steps: int = 86400):
-    """Запускает / перезапускает автономный фоновый демон бота непосредственно на VPS (81.19.137.18) с авто-синхронизацией кода и кошелька."""
+def start_live_daemon(budget_usd: float = 54.0, order_usd: float = 54.0, steps: int = 86400, push_wallet: bool = False):
+    """Запускает / перезапускает автономный фоновый демон бота непосредственно на VPS (81.19.137.18) с авто-синхронизацией кода и .env."""
     stop_live_daemon(cancel_open_orders=False)
     from _tools.vps_config import create_ssh_client
-    ssh = create_ssh_client()
+    ssh = create_ssh_client(timeout=12.0)
     try:
         sftp = ssh.open_sftp()
-        for mod_name in ("live_rl_trader.py", "live_feature_updater.py", "microstructure_features.py", "swarm_router.py"):
+        env_local = BASE_DIR / ".env"
+        if env_local.exists():
+            sftp.put(str(env_local), "/opt/crypto_bot/.env")
+        for mod_name in ("live_rl_trader.py", "live_feature_updater.py", "microstructure_features.py", "swarm_router.py", "fast_neural_engine.py", "train_rl_execution.py"):
             loc_mod = BASE_DIR / "_tools" / mod_name
             if loc_mod.exists():
                 sftp.put(str(loc_mod), f"/opt/crypto_bot/_tools/{mod_name}")
+        ppo_local = BASE_DIR / "models" / "prl" / "rl_execution" / "best_maskable_ppo.pt"
+        if ppo_local.exists():
+            sftp.put(str(ppo_local), "/opt/crypto_bot/models/prl/rl_execution/best_maskable_ppo.pt")
         w_local = BASE_DIR / "models" / "prl" / "rl_execution" / "live_wallet_state.json"
-        if w_local.exists():
+        if push_wallet and w_local.exists():
             sftp.put(str(w_local), "/opt/crypto_bot/models/prl/rl_execution/live_wallet_state.json")
         sftp.close()
     except Exception as e:

@@ -77,7 +77,7 @@ def ensure_mmap_cache(npz_path: str) -> str:
         return str(p)
     cache_dir = p.parent / "_mmap_cache"
     marker = cache_dir / "ready.txt"
-    if marker.exists():
+    if marker.exists() and marker.stat().st_mtime >= p.stat().st_mtime:
         return str(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     print("⚡ Подготовка memory-mapped кэша на диске (экономит ~4 ГБ RAM)...")

@@ -83,6 +83,11 @@ def export_prl_colab_dataset(upload_gdrive=False):
 
     out_file = BASE_DIR / "data" / "prl_neural_colab_data.npz"
     out_file.parent.mkdir(parents=True, exist_ok=True)
+    mmap_cache_dir = out_file.parent / "_mmap_cache"
+    if mmap_cache_dir.exists():
+        import shutil
+        shutil.rmtree(mmap_cache_dir, ignore_errors=True)
+        print("🧹 Очищен устаревший кэш data/_mmap_cache перед экспортом нового датасета.")
 
     print(f"💾 Упаковка в сжатый NPZ: {out_file.relative_to(BASE_DIR)}...")
     np.savez_compressed(
