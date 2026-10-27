@@ -595,9 +595,12 @@ class LiveTriadRLTrader:
                     q_at += max(0.0, lq - self.active_bid_q)
                 elif lp > self.active_bid_p + tol:
                     q_better += lq
-            self.q_ahead = q_at if self.q_ahead < 0.0 else min(self.q_ahead, q_at)
-            if abs(b1 - self.active_bid_p) <= tol:
-                self.q_ahead = max(0.0, self.q_ahead - max(0.0, float(r.get("ST_sell_vol", 0.0)) - q_better))
+            if self.q_ahead < 0.0:
+                self.q_ahead = q_at
+            else:
+                if abs(b1 - self.active_bid_p) <= tol:
+                    self.q_ahead = max(0.0, self.q_ahead - max(0.0, float(r.get("ST_sell_vol", 0.0)) - q_better))
+                self.q_ahead = min(self.q_ahead, q_at)
         elif has_ask:
             q_at, q_better = 0.0, 0.0
             for k in range(1, 11):
@@ -607,9 +610,12 @@ class LiveTriadRLTrader:
                     q_at += max(0.0, lq - self.active_ask_q)
                 elif 0.0 < lp < self.active_ask_p - tol:
                     q_better += lq
-            self.q_ahead = q_at if self.q_ahead < 0.0 else min(self.q_ahead, q_at)
-            if abs(a1 - self.active_ask_p) <= tol:
-                self.q_ahead = max(0.0, self.q_ahead - max(0.0, float(r.get("ST_buy_vol", 0.0)) - q_better))
+            if self.q_ahead < 0.0:
+                self.q_ahead = q_at
+            else:
+                if abs(a1 - self.active_ask_p) <= tol:
+                    self.q_ahead = max(0.0, self.q_ahead - max(0.0, float(r.get("ST_buy_vol", 0.0)) - q_better))
+                self.q_ahead = min(self.q_ahead, q_at)
         else:
             self.q_ahead = 0.0
         dist = ((b1 - self.active_bid_p) / self.tick_size) if has_bid else (((self.active_ask_p - a1) / self.tick_size) if has_ask else 0.0)
@@ -639,12 +645,19 @@ class LiveTriadRLTrader:
         mask = np.zeros(7, dtype=bool)
         if not has_pos:
             mask[0] = True
-            if in_dip_zone:
+            if has_bid:
+                drift_limit = self.tick_size * 1.25 if getattr(self, "active_bid_act", 1) == 2 else tol
+                need_cancel = (inertia < -0.10) or (pos_3600 > 0.82) or (imb_l5 < -0.55) or (b1 > self.active_bid_p + drift_limit)
+                if need_cancel:
+                    mask[5] = True
+                    if in_dip_zone:
+                        mask[2] = True
+                        if imb_l5 > -0.65:
+                            mask[1] = True
+            elif in_dip_zone:
                 mask[2] = True
                 if imb_l5 > -0.65:
                     mask[1] = True
-            if has_bid:
-                mask[5] = True
         else:
             mask[0] = bool(has_ask)
             mask[3] = True
@@ -695,6 +708,7 @@ class LiveTriadRLTrader:
                 self.active_bid_id = res.get("id")
                 self.active_bid_p = float(res.get("price", target_p))
                 self.active_bid_q = float(res.get("origin_amount", qty))
+                self.active_bid_act = int(act)
                 self.q_ahead = -1.0
                 self._save_wallet()
                 print(f"  📥 [LIVE ORDER BUY] id={self.active_bid_id} | {self.active_bid_q:.4f} PRL @ ${self.active_bid_p:.2f} (${self.active_bid_q*self.active_bid_p:.2f})")

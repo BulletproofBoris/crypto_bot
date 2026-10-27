@@ -92,38 +92,80 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
     triad_feats = []
     cached_fnames = None
     cached_X = None
+    ts_str_all = df["timestamp"].astype(str).values
+    prev_cache_path = cache_dir / f"rl_triad_lob_cache_{coin}_396h.npz"
+    X_triad_Incremental = None
 
-    for H, K, router in routers:
-        print(f"\n🔮 Расчёт ансамбля H={H}s (K={K})...")
-        if cached_fnames != router.feature_names:
-            X_cols = [
-                df[col].values.astype(np.float32) if col in df.columns else np.zeros(len(df), dtype=np.float32)
-                for col in router.feature_names
-            ]
-            cached_X = np.nan_to_num(np.column_stack(X_cols), nan=0.0, posinf=0.0, neginf=0.0)
-            cached_fnames = list(router.feature_names)
-            del X_cols
+    if prev_cache_path.exists() and not force_rebuild:
+        try:
+            prev_c = np.load(prev_cache_path, allow_pickle=True)
+            prev_ts = prev_c["ts"].astype(str)
+            prev_triad = prev_c["X_market"][:, :18].astype(np.float32)
+            ts_to_idx = {s: i for i, s in enumerate(prev_ts)}
+            matched_idx = np.array([ts_to_idx.get(s, -1) for s in ts_str_all], dtype=np.int64)
+            valid_mask = matched_idx >= 0
+            if np.any(valid_mask):
+                last_match_pos = int(np.where(valid_mask)[0][-1])
+                if last_match_pos >= len(df) - 120000 and np.all(valid_mask[:last_match_pos + 1]):
+                    n_tail = len(df) - (last_match_pos + 1)
+                    print(f"⚡ Инкрементальное обновление кэша: переиспользуем {last_match_pos + 1:,} сек из 396h кэша, досчитываем хвост {n_tail:,} сек ({n_tail/3600:.2f} ч)...")
+                    X_triad_head = prev_triad[matched_idx[:last_match_pos + 1]]
+                    if n_tail > 0:
+                        pad = min(360, last_match_pos + 1)
+                        df_tail = df.iloc[last_match_pos + 1 - pad:].reset_index(drop=True)
+                        tail_triad_list = []
+                        for H, K, router in routers:
+                            X_cols = [df_tail[col].values.astype(np.float32) if col in df_tail.columns else np.zeros(len(df_tail), dtype=np.float32) for col in router.feature_names]
+                            X_tail_in = np.nan_to_num(np.column_stack(X_cols), nan=0.0, posinf=0.0, neginf=0.0)
+                            ens_out = router.predict_ensemble(X_tail_in, df_tail, mode="router")
+                            probs = ens_out["probs"][pad:]
+                            ez = ens_out["expected_z"][pad:]
+                            p_up = probs[:, 4] + probs[:, 5] + probs[:, 6]
+                            p_down = probs[:, 0] + probs[:, 1] + probs[:, 2]
+                            p_tp = probs[:, 5] + probs[:, 6]
+                            p_tn = probs[:, 0] + probs[:, 1]
+                            p_clip = np.clip(probs, 1e-7, 1.0)
+                            ent = -np.sum(p_clip * np.log(p_clip), axis=1) / np.log(7.0)
+                            tail_triad_list.append(np.column_stack([ez, p_up, p_down, p_tp, p_tn, ent]).astype(np.float32))
+                        X_triad_Incremental = np.vstack([X_triad_head, np.hstack(tail_triad_list[:3])]).astype(np.float32)
+                    else:
+                        X_triad_Incremental = X_triad_head
+        except Exception as e:
+            print(f"⚠️ Не удалось применить инкрементальный кэш ({e}), выполняем полный расчёт...")
 
-        ens_out = router.predict_ensemble(cached_X, df, mode="router")
-        probs = ens_out["probs"]
-        ez = ens_out["expected_z"]
-        del router, ens_out
+    if X_triad_Incremental is not None:
+        X_triad = X_triad_Incremental
+        del routers
+    else:
+        for H, K, router in routers:
+            print(f"\n🔮 Расчёт ансамбля H={H}s (K={K})...")
+            if cached_fnames != router.feature_names:
+                X_cols = [
+                    df[col].values.astype(np.float32) if col in df.columns else np.zeros(len(df), dtype=np.float32)
+                    for col in router.feature_names
+                ]
+                cached_X = np.nan_to_num(np.column_stack(X_cols), nan=0.0, posinf=0.0, neginf=0.0)
+                cached_fnames = list(router.feature_names)
+                del X_cols
 
-        p_up = probs[:, 4] + probs[:, 5] + probs[:, 6]
-        p_down = probs[:, 0] + probs[:, 1] + probs[:, 2]
-        p_tail_pos = probs[:, 5] + probs[:, 6]
-        p_tail_neg = probs[:, 0] + probs[:, 1]
-        p_clip = np.clip(probs, 1e-7, 1.0)
-        entropy = -np.sum(p_clip * np.log(p_clip), axis=1) / np.log(7.0)
+            ens_out = router.predict_ensemble(cached_X, df, mode="router")
+            probs = ens_out["probs"]
+            ez = ens_out["expected_z"]
+            del router, ens_out
 
-        triad_feats.append(np.column_stack([ez, p_up, p_down, p_tail_pos, p_tail_neg, entropy]).astype(np.float32))
-    del cached_X, routers
+            p_up = probs[:, 4] + probs[:, 5] + probs[:, 6]
+            p_down = probs[:, 0] + probs[:, 1] + probs[:, 2]
+            p_tail_pos = probs[:, 5] + probs[:, 6]
+            p_tail_neg = probs[:, 0] + probs[:, 1]
+            p_clip = np.clip(probs, 1e-7, 1.0)
+            entropy = -np.sum(p_clip * np.log(p_clip), axis=1) / np.log(7.0)
 
-    # 18 признаков триады (H=5,12,25s)
-    X_triad = np.hstack(triad_feats[:3]).astype(np.float32)
+            triad_feats.append(np.column_stack([ez, p_up, p_down, p_tail_pos, p_tail_neg, entropy]).astype(np.float32))
+        del cached_X, routers
+        X_triad = np.hstack(triad_feats[:3]).astype(np.float32)
 
-    # 10 уровней стакана SafeTrade
-    tick_size = float(COIN_CONFIG[coin]["tick_size"])
+    # 10 уровней стакана SafeTrade (реальный биржевой шаг цены PRL = 0.01 USDT)
+    tick_size = 0.01 if coin == "prl" else float(COIN_CONFIG[coin]["tick_size"])
     bid_p = np.zeros((len(df), 10), dtype=np.float64)
     bid_q = np.zeros((len(df), 10), dtype=np.float64)
     ask_p = np.zeros((len(df), 10), dtype=np.float64)
@@ -420,6 +462,7 @@ class SafeTradeL2ExecutionEnv:
         self.peak_bid = 0.0
         self.entry_t = 0
         self.order_side = None
+        self.order_act = 0
         self.order_price = 0.0
         self.order_qty = 0.0
         self.q_ahead = 0.0
@@ -435,11 +478,26 @@ class SafeTradeL2ExecutionEnv:
         mask = np.zeros(self.n_actions, dtype=bool)
         if self.pos_qty <= 1e-8:
             mask[0] = True
-            if t >= self.cooldown_until:
-                mask[1] = bool(self.can_buy_best_arr[t])
-                mask[2] = bool(self.can_buy_passive_arr[t])
-            if self.order_side is not None:
-                mask[5] = True
+            if self.order_side == "BUY" and not self.legacy_v2:
+                b1 = max(self.bid_p[t, 0], self.tick_size)
+                drift_limit = self.tick_size * 1.25 if self.order_act == 2 else self.tick_size * 0.25
+                need_cancel = (
+                    (float(self.inertia_arr[t]) < -0.10)
+                    or (float(self.pos_3600[t]) > 0.82)
+                    or (float(self.X_market[t, 20]) < -0.55)
+                    or (b1 > self.order_price + drift_limit)
+                )
+                if need_cancel:
+                    mask[5] = True
+                    if t >= self.cooldown_until:
+                        mask[1] = bool(self.can_buy_best_arr[t])
+                        mask[2] = bool(self.can_buy_passive_arr[t])
+            else:
+                if t >= self.cooldown_until:
+                    mask[1] = bool(self.can_buy_best_arr[t])
+                    mask[2] = bool(self.can_buy_passive_arr[t])
+                if self.order_side is not None:
+                    mask[5] = True
         else:
             mask[0] = (self.order_side == "SELL")
             mask[3] = True
@@ -511,9 +569,11 @@ class SafeTradeL2ExecutionEnv:
             if self.order_side != "BUY" or abs(self.order_price - target_p) > tol:
                 requote_penalty = 0.025 if self.order_side is not None else 0.005
                 self.order_side = "BUY"
+                self.order_act = int(action)
                 self.order_price = round(target_p / self.tick_size) * self.tick_size
                 self.order_qty = self.order_usd / self.order_price
-                self.q_ahead = -1.0
+                q_at_t, _ = self._get_lob_queue(t, "BUY", self.order_price)
+                self.q_ahead = q_at_t
                 self.active_after = t + 1
         elif action in (3, 4) and self.pos_qty > 1e-8:
             hold_s = t - self.entry_t
@@ -526,7 +586,8 @@ class SafeTradeL2ExecutionEnv:
                     min_p = (self.avg_entry + self.tick_size) if hold_s < 45 else self.avg_entry
                     target_p = max(b1 + self.tick_size, min_p, a1 - self.tick_size)
             else:
-                floor_p = round((self.avg_entry + self.tick_size) / self.tick_size) * self.tick_size
+                allow_scratch = (hold_s > 600) and (float(self.inertia_arr[t]) < -0.35)
+                floor_p = round((self.avg_entry + (0.0 if allow_scratch else self.tick_size)) / self.tick_size) * self.tick_size
                 if action == 3:
                     # Волновой выход (>= +2 тика): без прыжков на +8 тиков в космос
                     target_p = max(a1, self.peak_bid, self.avg_entry + 2.0 * self.tick_size)
@@ -540,13 +601,16 @@ class SafeTradeL2ExecutionEnv:
                 if self.order_side is not None:
                     requote_penalty = 0.025
                 self.order_side = "SELL"
+                self.order_act = int(action)
                 self.order_price = round(target_p / self.tick_size) * self.tick_size
                 self.order_qty = self.pos_qty
-                self.q_ahead = -1.0
+                q_at_t, _ = self._get_lob_queue(t, "SELL", self.order_price)
+                self.q_ahead = q_at_t
                 self.active_after = t + 1
         elif action == 5:
             if self.order_side is not None:
                 self.order_side = None
+                self.order_act = 0
                 requote_penalty = 0.025
         elif action == 6 and self.pos_qty > 1e-8:
             exec_p = self._sweep_taker(t, self.pos_qty)
@@ -555,10 +619,11 @@ class SafeTradeL2ExecutionEnv:
             self.pos_qty = 0.0
             self.avg_entry = 0.0
             self.order_side = None
+            self.order_act = 0
             if net_pnl < 0:
                 self.cooldown_until = t + 30  # 30с защита от повторного входа на падающем ноже
 
-        # 2. Переход к следующей секунде t+1 и симуляция очереди L2 FIFO
+        # 2. Переход к следующей секунде t+1 и симуляция очереди L2 FIFO (с учетом ~200мс REST-латентности)
         self.t += 1
         nt = self.t
         nb1 = max(self.bid_p[nt, 0], self.tick_size)
@@ -566,10 +631,8 @@ class SafeTradeL2ExecutionEnv:
 
         if self.order_side is not None and nt >= self.active_after:
             q_at, q_better = self._get_lob_queue(nt, self.order_side, self.order_price)
-            if self.q_ahead < 0.0:
-                self.q_ahead = q_at
-            else:
-                self.q_ahead = min(self.q_ahead, q_at)
+            if nt == self.active_after and not self.legacy_v2:
+                self.q_ahead = max(self.q_ahead, q_at)
             eff_q = self.q_ahead + q_better
 
             if self.order_side == "BUY":
@@ -587,8 +650,10 @@ class SafeTradeL2ExecutionEnv:
                         self.n_trades += 1
                         if not self.legacy_v2:
                             self.total_pnl_usd -= self.pos_qty * self.avg_entry * 0.001  # Реальная комиссия SafeTrade Maker Buy (0.10%)
-                elif vol_hit > 0:
-                    self.q_ahead = max(0.0, self.q_ahead - max(0.0, vol_hit - q_better))
+                else:
+                    if vol_hit > 0:
+                        self.q_ahead = max(0.0, self.q_ahead - max(0.0, vol_hit - q_better))
+                    self.q_ahead = min(self.q_ahead, q_at)
             elif self.order_side == "SELL":
                 crossed = (nb1 >= self.order_price - tol)
                 vol_hit = self.buy_vol[nt] if abs(na1 - self.order_price) <= tol else 0.0
@@ -603,8 +668,10 @@ class SafeTradeL2ExecutionEnv:
                     self.avg_entry = 0.0
                     self.peak_bid = 0.0
                     self.order_side = None
-                elif vol_hit > 0:
-                    self.q_ahead = max(0.0, self.q_ahead - max(0.0, vol_hit - q_better))
+                else:
+                    if vol_hit > 0:
+                        self.q_ahead = max(0.0, self.q_ahead - max(0.0, vol_hit - q_better))
+                    self.q_ahead = min(self.q_ahead, q_at)
 
         cur_mtm = self.total_pnl_usd + (self.pos_qty * (nb1 - self.avg_entry) if self.pos_qty > 1e-8 else 0.0)
         delta_pnl_ticks = (cur_mtm - self.prev_mtm) / (self.order_usd * (self.tick_size / nb1))
@@ -807,6 +874,45 @@ def evaluate_policy(env: SafeTradeL2ExecutionEnv, model: MaskableActorCritic = N
     }
 
 
+def load_live_telemetry_experiences(obs_dim: int = 38) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Загружает реальный опыт боевой торговли из data/processed/prl_rl_telemetry.parquet
+    (сессия с 5/5 плюсовыми сделками +$0.96 USDT), устраняя 1-секундные ложные отмены QUOTE_BID_2
+    и усиливая вес реальных траекторий удержания очереди FIFO и профитных выходов.
+    """
+    tel_path = BASE_DIR / "data" / "processed" / "prl_rl_telemetry.parquet"
+    if not tel_path.exists():
+        return np.empty((0, obs_dim), dtype=np.float32), np.empty((0, 7), dtype=bool), np.empty((0,), dtype=np.int64)
+    try:
+        df_t = pd.read_parquet(tel_path)
+        df_t["ts_msk"] = pd.to_datetime(df_t["timestamp"], utc=True).dt.tz_convert("Europe/Moscow")
+        s15 = df_t[df_t["ts_msk"] >= pd.Timestamp("2026-10-26 20:47:20+03:00")].copy().reset_index(drop=True)
+        if len(s15) == 0:
+            return np.empty((0, obs_dim), dtype=np.float32), np.empty((0, 7), dtype=bool), np.empty((0,), dtype=np.int64)
+        obs_arr = np.array([json.loads(x) for x in s15["obs_json"]], dtype=np.float32)
+        mask_arr = np.array([json.loads(x) for x in s15["mask_json"]], dtype=bool)
+        act_arr = s15["act"].values.astype(np.int64)
+        if obs_arr.shape[1] != obs_dim:
+            return np.empty((0, obs_dim), dtype=np.float32), np.empty((0, 7), dtype=bool), np.empty((0,), dtype=np.int64)
+
+        # Исправляем 1-секундный баг отмены QUOTE_BID_2: если dist == 1 тик (0.2) и hold_edge >= -0.05, учим держать (act=0)
+        false_cancel = (act_arr == 5) & (obs_arr[:, -5] <= 0.25) & (obs_arr[:, -1] >= -0.05)
+        act_arr[false_cancel] = 0
+        mask_arr[false_cancel, 5] = False
+
+        # Усиливаем реальные траектории работы с ордерами и позицией (входы, удержание очереди и фиксация профита)
+        active_idx = np.where((obs_arr[:, -10] > 0.5) | (obs_arr[:, -7] > 0.5) | (act_arr > 0))[0]
+        idle_idx = np.where((obs_arr[:, -10] <= 0.5) & (obs_arr[:, -7] <= 0.5) & (act_arr == 0))[0]
+        if len(idle_idx) > 8000:
+            idle_idx = np.random.choice(idle_idx, size=8000, replace=False)
+        sel_idx = np.concatenate([np.repeat(active_idx, 3), idle_idx])
+        print(f"📡 Подключен реальный опыт живой торговли: {len(sel_idx):,} переходов (из {len(s15):,} сек боевой телеметрии, исправлено {int(false_cancel.sum())} ложных отмен QUOTE_BID_2)")
+        return obs_arr[sel_idx], mask_arr[sel_idx], act_arr[sel_idx]
+    except Exception as e:
+        print(f"⚠️ Не удалось загрузить боевую телеметрию: {e}")
+        return np.empty((0, obs_dim), dtype=np.float32), np.empty((0, 7), dtype=bool), np.empty((0,), dtype=np.int64)
+
+
 def train_rl_agent(
     coin: str = "prl",
     tail_hours: float = 72.0,
@@ -866,7 +972,7 @@ def train_rl_agent(
     best_score = -1e9
 
     best_model_ref = MaskableActorCritic(obs_dim=train_env.obs_dim, n_actions=train_env.n_actions).to(device)
-    print("🎓 Behavioral Cloning Warm-Start (сбор 40,000 демонстраций селективного нейро-учителя)...")
+    print("🎓 Behavioral Cloning Warm-Start (сбор 40,000 демонстраций селективного нейро-учителя + реальный опыт торговли)...")
     bc_obs, bc_masks, bc_acts = [], [], []
     obs = train_env.reset()
     for _ in range(40000):
@@ -876,9 +982,21 @@ def train_rl_agent(
         obs, _, done = train_env.step(act)
         if done:
             obs = train_env.reset()
-    t_obs = torch.as_tensor(np.array(bc_obs), dtype=torch.float32, device=device)
-    t_masks = torch.as_tensor(np.array(bc_masks), dtype=torch.bool, device=device)
-    t_acts = torch.as_tensor(np.array(bc_acts), dtype=torch.long, device=device)
+    live_obs, live_masks, live_acts = load_live_telemetry_experiences(obs_dim=train_env.obs_dim)
+    if len(live_obs) > 0:
+        bc_obs_np = np.vstack([np.array(bc_obs, dtype=np.float32), live_obs])
+        bc_masks_np = np.vstack([np.array(bc_masks, dtype=bool), live_masks])
+        bc_acts_np = np.concatenate([np.array(bc_acts, dtype=np.int64), live_acts])
+    else:
+        bc_obs_np = np.array(bc_obs, dtype=np.float32)
+        bc_masks_np = np.array(bc_masks, dtype=bool)
+        bc_acts_np = np.array(bc_acts, dtype=np.int64)
+    t_obs = torch.as_tensor(bc_obs_np, dtype=torch.float32, device=device)
+    t_masks = torch.as_tensor(bc_masks_np, dtype=torch.bool, device=device)
+    t_acts = torch.as_tensor(bc_acts_np, dtype=torch.long, device=device)
+    T_live_obs = torch.as_tensor(live_obs, dtype=torch.float32, device=device) if len(live_obs) > 0 else None
+    T_live_masks = torch.as_tensor(live_masks, dtype=torch.bool, device=device) if len(live_obs) > 0 else None
+    T_live_acts = torch.as_tensor(live_acts, dtype=torch.long, device=device) if len(live_obs) > 0 else None
     ce_w = torch.tensor([1.0, 20.0, 20.0, 3.0, 3.0, 8.0, 10.0], dtype=torch.float32, device=device)
     bc_opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     for _ in range(12):
@@ -888,7 +1006,7 @@ def train_rl_agent(
             logits, _ = model(t_obs[idx], t_masks[idx])
             loss = F.cross_entropy(logits, t_acts[idx], weight=ce_w)
             bc_opt.zero_grad(); loss.backward(); bc_opt.step()
-    del bc_obs, bc_masks, bc_acts, t_obs, t_masks, t_acts, bc_opt
+    del bc_obs, bc_masks, bc_acts, bc_obs_np, bc_masks_np, bc_acts_np, t_obs, t_masks, t_acts, bc_opt
 
     ws_res = evaluate_policy(test_env, model=model, device=device)
     if warm_ckpt.exists():
@@ -984,6 +1102,11 @@ def train_rl_agent(
                 surr1 = ratio * T_advs[idx]
                 surr2 = torch.clamp(ratio, 0.85, 1.15) * T_advs[idx]
                 bc_anchor = F.cross_entropy(logits, T_tacts[idx], weight=ce_w)
+                if T_live_obs is not None and len(T_live_obs) >= 512:
+                    l_idx = torch.randint(0, len(T_live_obs), (512,), device=device)
+                    l_logits, _ = model(T_live_obs[l_idx], T_live_masks[l_idx])
+                    live_bc_loss = F.cross_entropy(l_logits, T_live_acts[l_idx], weight=ce_w)
+                    bc_anchor = 0.65 * bc_anchor + 0.35 * live_bc_loss
                 loss = -torch.min(surr1, surr2).mean() + 0.25 * F.mse_loss(vals, T_rets[idx]) + 0.15 * bc_anchor - 0.005 * dist.entropy().mean()
                 opt.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(model.parameters(), 0.5); opt.step()
         sched.step()
@@ -1178,10 +1301,10 @@ def inspect_and_plot_rl_oos(coin: str = "prl", tail_hours: float = 72.0, start_t
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--coin", type=str, default="prl")
-    parser.add_argument("--tail-hours", type=float, default=396.0)
+    parser.add_argument("--tail-hours", type=float, default=413.0)
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--steps", type=int, default=16384)
-    parser.add_argument("--split-ts", type=str, default="2026-10-24 12:00:00+03:00")
+    parser.add_argument("--split-ts", type=str, default="2026-10-24 21:00:00+03:00")
     args = parser.parse_args()
     train_rl_agent(
         coin=args.coin,
