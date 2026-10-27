@@ -1075,6 +1075,22 @@ def start_live_daemon(budget_usd: float = 54.0, order_usd: float = 54.0, steps: 
         ppo_local = BASE_DIR / "models" / "prl" / "rl_execution" / "best_maskable_ppo.pt"
         if ppo_local.exists():
             sftp.put(str(ppo_local), "/opt/crypto_bot/models/prl/rl_execution/best_maskable_ppo.pt")
+        for h_dir in (BASE_DIR / "models" / "prl").glob("h*s_k*"):
+            if not h_dir.is_dir():
+                continue
+            for root, _, files in os.walk(h_dir):
+                rel_r = Path(root).relative_to(BASE_DIR / "models" / "prl")
+                rem_d = f"/opt/crypto_bot/models/prl/{rel_r}"
+                try:
+                    rem_attrs = {a.filename: a.st_size for a in sftp.listdir_attr(rem_d)}
+                except Exception:
+                    ssh.exec_command(f"mkdir -p {rem_d}")[1].read()
+                    rem_attrs = {}
+                for fn in files:
+                    lf = Path(root) / fn
+                    if rem_attrs.get(fn) == lf.stat().st_size and not fn.endswith(".json"):
+                        continue
+                    sftp.put(str(lf), f"{rem_d}/{fn}")
         w_local = BASE_DIR / "models" / "prl" / "rl_execution" / "live_wallet_state.json"
         if push_wallet and w_local.exists():
             sftp.put(str(w_local), "/opt/crypto_bot/models/prl/rl_execution/live_wallet_state.json")
