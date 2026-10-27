@@ -45,12 +45,90 @@ def _trim_memory():
 
 def get_horizon_defaults(horizon: int) -> tuple[float, int]:
     if int(horizon) >= 50:
-        return 2.5, int(round(horizon * 2.5))
+        return 3.0, int(round(horizon * 3.0))
     elif int(horizon) == 25:
         return 3.0, 75
     elif int(horizon) in (12, 13, 14, 15):
         return 3.5, int(round(horizon * 3.5))
     return 3.0, int(round(horizon * 3.0))
+
+
+def _sync_pack_after_run(
+    pack_dir: str,
+    horizon: int,
+    arch: str,
+    win_tag: str,
+    run_idx: int,
+    runs_per_arch: int,
+    sync_bucket: str = None,
+    sync_cloud: bool = None,
+):
+    """Упаковывает текущие модели, метаданные, прогресс и лог после каждого рана и выгружает в облако / Google Drive."""
+    try:
+        zip_path = shutil.make_archive(pack_dir, "zip", root_dir=".", base_dir=pack_dir)
+        zip_name = os.path.basename(zip_path)
+        size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+        urls = []
+
+        gdrive_dir = "/content/drive/MyDrive"
+        if os.path.isdir(gdrive_dir):
+            dst_gd = os.path.join(gdrive_dir, zip_name)
+            shutil.copy2(zip_path, dst_gd)
+            urls.append(f"GDrive:{dst_gd}")
+
+        do_cloud = sync_cloud if sync_cloud is not None else os.path.exists("/content")
+        if do_cloud:
+            bucket = sync_bucket or f"prl_h{int(horizon)}s_k3_ckpt"
+            fb_url = f"https://filebin.net/{bucket}/{zip_name}"
+            r_fb = subprocess.run(
+                ["curl", "-s", "--max-time", "25", "-H", "Accept: application/json", "-T", zip_path, fb_url],
+                capture_output=True, text=True, check=False,
+            )
+            if r_fb.returncode == 0 and ("\"filename\"" in r_fb.stdout or "created_at" in r_fb.stdout):
+                urls.append(fb_url)
+            r_x0 = subprocess.run(
+                ["curl", "-s", "--max-time", "25", "-F", f"file=@{zip_path}", "https://x0.at/"],
+                capture_output=True, text=True, check=False,
+            )
+            x0_out = r_x0.stdout.strip()
+            if r_x0.returncode == 0 and x0_out.startswith("http"):
+                urls.append(x0_out)
+
+        loc_str = " | ".join(urls) if urls else f"локально: {zip_name}"
+        print(f"    💾 [Auto-Save {arch.upper()} {win_tag} r{run_idx:02d}/{runs_per_arch}] Архив ({size_mb:.2f} MB) -> {loc_str}", flush=True)
+    except Exception as e:
+        print(f"    ⚠️ [Auto-Save Warn] {e}", flush=True)
+
+
+def _auto_restore_pack(pack_dir: str, horizon: int, sync_bucket: str = None, resume_url: str = None):
+    """Автоматически подтягивает ранее сохраненный прогресс с Google Drive или облачного бакета при старте на новом сервере."""
+    if os.path.isdir(pack_dir) and any(Path(pack_dir).rglob("*.keras")):
+        return
+    zip_name = f"{pack_dir}.zip"
+    gdrive_zip = f"/content/drive/MyDrive/{zip_name}"
+    if not os.path.exists(zip_name) and os.path.exists(gdrive_zip):
+        shutil.copy2(gdrive_zip, zip_name)
+        print(f"🔄 Восстановлен архив чекпоинтов с Google Drive: {gdrive_zip}", flush=True)
+
+    bucket = sync_bucket or f"prl_h{int(horizon)}s_k3_ckpt"
+    candidates = [u for u in [resume_url, f"https://filebin.net/{bucket}/{zip_name}"] if u]
+    if not os.path.exists(zip_name):
+        for url in candidates:
+            r = subprocess.run(["curl", "-sL", "--max-time", "30", "-o", zip_name, url], check=False)
+            if r.returncode == 0 and os.path.exists(zip_name) and os.path.getsize(zip_name) > 5000:
+                try:
+                    shutil.unpack_archive(zip_name, ".")
+                    print(f"☁️ Авто-восстановление прогресса с предыдущего сервера: {url}", flush=True)
+                    return
+                except Exception:
+                    if os.path.exists(zip_name):
+                        os.remove(zip_name)
+    elif os.path.exists(zip_name) and os.path.getsize(zip_name) > 5000:
+        try:
+            shutil.unpack_archive(zip_name, ".")
+            print(f"📦 Распакован локальный архив прогресса: {zip_name}", flush=True)
+        except Exception:
+            pass
 
 
 def evaluate_oos_probs(probs: np.ndarray, y_true: np.ndarray, dt_ticks: np.ndarray) -> dict:
@@ -156,7 +234,8 @@ def train_window_swarm(
         arch_dir = os.path.join(pack_dir, f"{arch.replace('+', '_')}_h{horizon}s")
         k_file = os.path.join(arch_dir, f"model_{win_tag}.keras")
         m_file = os.path.join(arch_dir, f"meta_{win_tag}.json")
-        if not force_retrain and os.path.exists(k_file) and os.path.exists(m_file):
+        p_file = os.path.join(arch_dir, f"progress_{win_tag}.json")
+        if not force_retrain and os.path.exists(k_file) and os.path.exists(m_file) and not os.path.exists(p_file):
             with open(m_file) as f:
                 m_data = json.load(f)
             mo = m_data.get("metrics_oos", {})
@@ -274,7 +353,26 @@ def train_window_swarm(
                 model.save(final_keras_path)
 
             mark = "🏆 РЕКОРД" if is_best else ("🔪 PRUNED" if profiler.pruned else "✅ OK")
-            print(f"  [{arch.upper()} | {win_tag} | r{run_idx:02d}/{runs_per_arch}] {mark} ({elapsed}с) -> Loss: {metrics['log_loss']:.4f} | IC: {metrics['ic']:+.4f} | AUC: {metrics['auc']:.4f} | Top-2%: {metrics['top2_pnl']:+.2f}", flush=True)
+            log_line = (
+                f"  [{arch.upper()} | {win_tag} | r{run_idx:02d}/{runs_per_arch}] {mark} ({elapsed}с) -> "
+                f"Loss: {metrics['log_loss']:.4f} | IC: {metrics['ic']:+.4f} | AUC: {metrics['auc']:.4f} | Top-2%: {metrics['top2_pnl']:+.2f}"
+            )
+            print(log_line, flush=True)
+            with open(os.path.join(pack_dir, f"training_log_h{horizon}s.txt"), "a", encoding="utf-8") as lf:
+                lf.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {log_line.strip()}\n")
+
+            if is_best and best_m is not None:
+                meta_cur = {
+                    "window_id": win_tag, "model_type": arch, "coin": "PRL", "H": int(horizon), "seq_len": seq_len,
+                    "train_ts_range": [str(ts_tr[0])[:19], str(ts_tr[-1])[:19]],
+                    "test_ts_range": [str(ts_te[0])[:19], str(ts_te[-1])[:19]],
+                    "metrics_oos": {"ic_dt_ticks": round(best_m["ic"], 4), "roc_auc_ovr": round(best_m["auc"], 4), "log_loss": round(best_m["log_loss"], 4), "top2pct_mean_ticks": round(best_m["top2_pnl"], 2)},
+                    "feature_norm": {"mean": mean.tolist(), "std": std.tolist()},
+                    "weights_file": f"model_{win_tag}.keras",
+                }
+                with open(os.path.join(arch_dir, f"meta_{win_tag}.json"), "w") as f:
+                    json.dump(meta_cur, f, indent=2)
+
             with open(prog_path, "w") as pf:
                 json.dump(
                     {
@@ -289,6 +387,8 @@ def train_window_swarm(
                 )
             del model, opt, cbs, profiler
             _trim_memory()
+            if run_idx < runs_per_arch:
+                _sync_pack_after_run(pack_dir, int(horizon), arch, win_tag, run_idx, runs_per_arch)
 
         meta = {
             "window_id": win_tag, "model_type": arch, "coin": "PRL", "H": int(horizon), "seq_len": seq_len,
@@ -307,6 +407,7 @@ def train_window_swarm(
             os.makedirs(canon_dir, exist_ok=True)
             shutil.copy2(final_keras_path, os.path.join(canon_dir, f"model_{win_tag}.keras"))
             shutil.copy2(os.path.join(arch_dir, f"meta_{win_tag}.json"), os.path.join(canon_dir, f"meta_{win_tag}.json"))
+        _sync_pack_after_run(pack_dir, int(horizon), arch, win_tag, runs_per_arch, runs_per_arch)
         leaderboard.append({"window": win_tag, "model": f"{arch} (r{best_r})", "params": best_params, **best_m})
 
     del train_ds, val_ds, X_tr_norm, X_te_norm, y_tr_oh, y_te_oh
@@ -317,7 +418,7 @@ def train_window_swarm(
 
 def run_colab_pipeline(
     data_file: str = "prl_neural_colab_data.npz",
-    file_id: str = "1XnalYuDXB8ywwPw9siVNWlFKH1bbjT7O",
+    file_id: str = "1DVHqdiHBw2_2Iqpo6K0fvr3a49HqVDD_",
     horizon: int = 12,
     windows: str = "all",
     archs: str = "conv1d+gru,causal_cnn,attention,mlp_bottleneck",
@@ -330,8 +431,13 @@ def run_colab_pipeline(
     l2_reg: float = 1e-4,
     isolate_windows: bool = True,
     force_retrain: bool = False,
+    resume_url: str = None,
+    sync_bucket: str = None,
 ):
     """Запускает полный цикл загрузки данных, обучения выбранных окон (с изоляцией RAM/VRAM между окнами) и упаковки архива."""
+    pack_dir = f"prl_ensemble_pack_h{horizon}s"
+    if not force_retrain:
+        _auto_restore_pack(pack_dir, int(horizon), sync_bucket=sync_bucket, resume_url=resume_url)
     for cand in [data_file, f"data/{data_file}", f"/content/{data_file}", f"/content/drive/MyDrive/{data_file}"]:
         if os.path.exists(cand):
             data_file = cand
@@ -413,8 +519,8 @@ def run_colab_pipeline(
 def main():
     parser = argparse.ArgumentParser(description="Colab Neural Swarm Trainer (Walk-Forward Windows)")
     parser.add_argument("--data-file", type=str, default="prl_neural_colab_data.npz")
-    parser.add_argument("--file-id", type=str, default="1XnalYuDXB8ywwPw9siVNWlFKH1bbjT7O")
-    parser.add_argument("--horizon", type=int, default=12, help="Горизонт H: 5, 12 или 25")
+    parser.add_argument("--file-id", type=str, default="1DVHqdiHBw2_2Iqpo6K0fvr3a49HqVDD_")
+    parser.add_argument("--horizon", type=int, default=12, help="Горизонт H: 5, 12, 25 или 60")
     parser.add_argument("--windows", type=str, default="all", help="Окна через запятую (0,1,2) или all")
     parser.add_argument("--archs", type=str, default="conv1d+gru,causal_cnn,attention,mlp_bottleneck")
     parser.add_argument("--runs", type=int, default=10, help="Ранов на архитектуру")

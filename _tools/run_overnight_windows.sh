@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Ночной конвейер последовательного обучения всех новых Walk-Forward окон (100% OOS)
+# Конвейер последовательного обучения 3 новых строгих Walk-Forward окон (100% OOS)
 #   1. Идемпотентный сдвиг уже обученных нейросетевых чекпоинтов:
-#        - H=5s:  win_00..win_27 -> win_04..win_31 (+4 новых окна win_00..win_03)
-#        - H=12s: win_00..win_08 -> win_01..win_09 (+1 новое окно win_00)
-#        - H=25s: win_00..win_03 -> win_01..win_04 (+1 новое окно win_00 со 100% OOS)
+#        - H=5s:  win_00..win_31 -> win_02..win_33 (+2 новых окна win_00, win_01)
+#        - H=12s: win_00..win_09 -> win_01..win_10 (+1 новое окно win_00)
+#        - H=25s: без сдвига (сохраняются 5 строгих 100%-OOS окон win_00..win_04)
 #   2. Экспорт актуального архива признаков data/prl_neural_colab_data.npz
-#   3. Обучение ансамбля LightGBM (H=5: 32 окна, H=12: 10 окон, H=25: 5 окон)
+#   3. Обучение ансамбля LightGBM (H=5: 34 окна, H=12: 11 окон, H=25: 5 окон)
 #   4. Последовательное обучение нейросетей (Conv1D+GRU, Causal CNN, Attention, MLP):
-#        - H=5s  (4 новых окна: win_00, win_01, win_02, win_03)
+#        - H=5s  (2 новых окна: win_00, win_01)
 #        - H=12s (1 новое окно: win_00)
-#        - H=25s (1 новое окно: win_00, сдвинутое под 100% OOS = 187,500с)
-#   5. Пересборка каузального кэша Триады (396ч) и дообучение Maskable PPO агента
+#   5. Пересборка каузального кэша Триады (415ч) и дообучение Maskable PPO агента
 #
-# Запуск на ночь в фоне:
+# Запуск в фоне:
 #   nohup bash _tools/run_overnight_windows.sh > /dev/null 2>&1 &
 # Мониторинг лога:
 #   tail -f logs/overnight_windows.log
@@ -31,7 +30,7 @@ export TF_CPP_MIN_LOG_LEVEL="2"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "========================================================================================"
-echo "🌙 СТАРТ НОЧНОГО КОНВЕЙЕРА WALK-FORWARD ОБУЧЕНИЯ (100% OOS): $(date '+%Y-%m-%d %H:%M:%S')"
+echo "🚀 СТАРТ КОНВЕЙЕРА WALK-FORWARD ОБУЧЕНИЯ (3 НОВЫХ СТРОГИХ ОКНА 100% OOS): $(date '+%Y-%m-%d %H:%M:%S')"
 echo "========================================================================================"
 
 echo ""
@@ -46,9 +45,8 @@ archs = ["conv1d_gru", "causal_cnn", "attention", "mlp_bottleneck"]
 
 # (horizon, shift_by, old_count, expected_win00_train_end_prefix)
 shift_plan = [
-    (5,  4, 28, "2026-10-24 03:12"),
-    (12, 1,  9, "2026-10-23 12:41"),
-    (25, 1,  4, "2026-10-22 12:37"),
+    (5,  2, 32, "2026-10-25 23:52"),
+    (12, 1, 10, "2026-10-24 20:51"),
 ]
 
 for H, shift, old_cnt, ts_prefix in shift_plan:
@@ -90,19 +88,23 @@ for H, shift, old_cnt, ts_prefix in shift_plan:
 '
 
 echo ""
-echo "📦 [Этап 2/5] Экспорт сжатого архива признаков data/prl_neural_colab_data.npz ($(date '+%H:%M:%S'))..."
-"$PYTHON_BIN" -u _tools/export_colab_dataset.py
+echo "📦 [Этап 2/5] Проверка сжатого архива признаков data/prl_neural_colab_data.npz ($(date '+%H:%M:%S'))..."
+if [ -f "data/prl_neural_colab_data.npz" ] && [ "data/prl_neural_colab_data.npz" -nt "data/labeled/prl/prl_labeled.parquet" ]; then
+    echo "  ⏩ Свежий архив data/prl_neural_colab_data.npz уже собран (пропуск повторной упаковки)."
+else
+    "$PYTHON_BIN" -u _tools/export_colab_dataset.py
+fi
 
 echo ""
-echo "🌲 [Этап 3/5] Обучение роя LightGBM по всем окнам H=5 (32), H=12 (10), H=25 (5) ($(date '+%H:%M:%S'))..."
-"$PYTHON_BIN" -u _tools/train_rolling_swarm.py --coins prl --horizons 5,12,25
+echo "🌲 [Этап 3/5] Обучение роя LightGBM по всем окнам H=5 (34), H=12 (11), H=25 (5), H=60 (1) ($(date '+%H:%M:%S'))..."
+"$PYTHON_BIN" -u _tools/train_rolling_swarm.py --coins prl --horizons 5,12,25,60
 
 echo ""
-echo "🧬 [Этап 4.1/5] Обучение нейросетей H=5s: 4 новых окна win_00..win_03 ($(date '+%H:%M:%S'))..."
+echo "🧬 [Этап 4.1/5] Обучение нейросетей H=5s: 2 новых окна win_00, win_01 ($(date '+%H:%M:%S'))..."
 "$PYTHON_BIN" -u -m _tools.colab_neural_trainer \
     --data-file data/prl_neural_colab_data.npz \
     --horizon 5 \
-    --windows 0,1,2,3 \
+    --windows 0,1 \
     --runs 10 \
     --epochs 10 \
     --prune-epoch 5
@@ -118,25 +120,15 @@ echo "🧬 [Этап 4.2/5] Обучение нейросетей H=12s: 1 но�
     --prune-epoch 5
 
 echo ""
-echo "🧬 [Этап 4.3/5] Обучение нейросетей H=25s: 1 новое окно win_00 со 100% OOS ($(date '+%H:%M:%S'))..."
-"$PYTHON_BIN" -u -m _tools.colab_neural_trainer \
-    --data-file data/prl_neural_colab_data.npz \
-    --horizon 25 \
-    --windows 0 \
-    --runs 10 \
-    --epochs 10 \
-    --prune-epoch 5
-
-echo ""
-echo "🤖 [Этап 5/5] Пересборка каузального кэша Триады (396ч) и обучение Maskable PPO ($(date '+%H:%M:%S'))..."
+echo "🤖 [Этап 5/5] Пересборка каузального кэша Триады (415ч) и обучение Maskable PPO ($(date '+%H:%M:%S'))..."
 "$PYTHON_BIN" -u _tools/train_rl_execution.py \
     --coin prl \
-    --tail-hours 396.0 \
+    --tail-hours 415.0 \
     --epochs 25 \
     --steps 16384 \
-    --split-ts "2026-10-24 12:00:00+03:00"
+    --split-ts "2026-10-25 00:00:00+03:00"
 
 echo ""
 echo "========================================================================================"
-echo "✅ НОЧНОЙ КОНВЕЙЕР УСПЕШНО ЗАВЕРШЕН: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "✅ КОНВЕЙЕР ОБУЧЕНИЯ 3 НОВЫХ ОКОН УСПЕШНО ЗАВЕРШЕН: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "========================================================================================"

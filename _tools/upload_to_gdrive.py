@@ -1,6 +1,9 @@
 import os
 import sys
 import argparse
+import certifi
+os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+os.environ.setdefault("HTTPLIB2_CA_CERTS", certifi.where())
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload

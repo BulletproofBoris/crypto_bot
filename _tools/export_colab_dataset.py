@@ -39,7 +39,7 @@ def export_prl_colab_dataset(upload_gdrive=False):
         'target_class_7_h5_k3', 'target_dt_ticks_h5_k3',
         'target_class_7_h12_k3.5', 'target_dt_ticks_h12_k3.5',
         'target_class_7_h25_k3', 'target_dt_ticks_h25_k3',
-        'target_class_7_h60_k2.5', 'target_dt_ticks_h60_k2.5'
+        'target_class_7_h60_k3', 'target_dt_ticks_h60_k3'
     ]
 
     print(f"📥 Чтение Parquet ({len(feature_cols)} признаков + мета-колонки)...")
@@ -65,12 +65,12 @@ def export_prl_colab_dataset(upload_gdrive=False):
     wins_h5, _, _, _, _ = generate_rolling_windows_reverse(segs, H=5, K=3.0)
     wins_h12, _, _, _, _ = generate_rolling_windows_reverse(segs, H=12, K=3.5)
     wins_h25, _, _, _, _ = generate_rolling_windows_reverse(segs, H=25, K=3.0)
-    wins_h60, _, _, _, _ = generate_rolling_windows_reverse(segs, H=60, K=2.5)
+    wins_h60, _, _, _, _ = generate_rolling_windows_reverse(segs, H=60, K=3.0)
     w0 = wins_h12[0]
     tr_idx = w0['tr_idx']
     te_idx = w0['te_idx']
 
-    print(f"⏱️ Сетка асинхронных окон: H=5 ({len(wins_h5)} окон по 75k), H=12 ({len(wins_h12)} окон по 210k), H=25 ({len(wins_h25)} окон по 375k), H=60 ({len(wins_h60)} окон по 750k)")
+    print(f"⏱️ Сетка асинхронных окон: H=5 ({len(wins_h5)} окон по 75k), H=12 ({len(wins_h12)} окон по 210k), H=25 ({len(wins_h25)} окон по 375k), H=60 ({len(wins_h60)} окон по 900k)")
     print(f"⏱️ Train win_00 (H=12) TS: {df['timestamp'].iloc[tr_idx[0]]} ➔ {df['timestamp'].iloc[tr_idx[-1]]} ({len(tr_idx):,} строк)")
     print(f"⏱️ Test  win_00 (OOS)  TS: {df['timestamp'].iloc[te_idx[0]]} ➔ {df['timestamp'].iloc[te_idx[-1]]} ({len(te_idx):,} строк)")
 
@@ -97,11 +97,11 @@ def export_prl_colab_dataset(upload_gdrive=False):
         y_all_h5=(df['target_class_7_h5_k3'].fillna(0).values + 3).astype(np.int8),
         y_all_h12=(df['target_class_7_h12_k3.5'].fillna(0).values + 3).astype(np.int8),
         y_all_h25=(df['target_class_7_h25_k3'].fillna(0).values + 3).astype(np.int8),
-        y_all_h60=(df['target_class_7_h60_k2.5'].fillna(0).values + 3).astype(np.int8) if 'target_class_7_h60_k2.5' in df.columns else np.zeros(len(df), dtype=np.int8),
+        y_all_h60=(df['target_class_7_h60_k3'].fillna(0).values + 3).astype(np.int8) if 'target_class_7_h60_k3' in df.columns else np.zeros(len(df), dtype=np.int8),
         dt_all_h5=df['target_dt_ticks_h5_k3'].fillna(0).values.astype(np.float16),
         dt_all_h12=df['target_dt_ticks_h12_k3.5'].fillna(0).values.astype(np.float16),
         dt_all_h25=df['target_dt_ticks_h25_k3'].fillna(0).values.astype(np.float16),
-        dt_all_h60=df['target_dt_ticks_h60_k2.5'].fillna(0).values.astype(np.float16) if 'target_dt_ticks_h60_k2.5' in df.columns else np.zeros(len(df), dtype=np.float16),
+        dt_all_h60=df['target_dt_ticks_h60_k3'].fillna(0).values.astype(np.float16) if 'target_dt_ticks_h60_k3' in df.columns else np.zeros(len(df), dtype=np.float16),
         features=np.array(feature_cols),
         n_windows=np.int32(len(wins_h12)),
         **windows_spec

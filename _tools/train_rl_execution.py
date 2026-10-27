@@ -93,7 +93,8 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
     cached_fnames = None
     cached_X = None
     ts_str_all = df["timestamp"].astype(str).values
-    prev_cache_path = cache_dir / f"rl_triad_lob_cache_{coin}_396h.npz"
+    cand_caches = [p for p in cache_dir.glob(f"rl_triad_lob_cache_{coin}_*h.npz") if p != rl_cache_path]
+    prev_cache_path = max(cand_caches, key=lambda p: p.stat().st_mtime) if cand_caches else (cache_dir / f"rl_triad_lob_cache_{coin}_413h.npz")
     X_triad_Incremental = None
 
     if prev_cache_path.exists() and not force_rebuild:
@@ -108,7 +109,7 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
                 last_match_pos = int(np.where(valid_mask)[0][-1])
                 if last_match_pos >= len(df) - 120000 and np.all(valid_mask[:last_match_pos + 1]):
                     n_tail = len(df) - (last_match_pos + 1)
-                    print(f"⚡ Инкрементальное обновление кэша: переиспользуем {last_match_pos + 1:,} сек из 396h кэша, досчитываем хвост {n_tail:,} сек ({n_tail/3600:.2f} ч)...")
+                    print(f"⚡ Инкрементальное обновление кэша: переиспользуем {last_match_pos + 1:,} сек из {prev_cache_path.name}, досчитываем хвост {n_tail:,} сек ({n_tail/3600:.2f} ч)...")
                     X_triad_head = prev_triad[matched_idx[:last_match_pos + 1]]
                     if n_tail > 0:
                         pad = min(360, last_match_pos + 1)
