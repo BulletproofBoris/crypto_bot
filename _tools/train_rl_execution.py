@@ -274,7 +274,7 @@ class SafeTradeL2ExecutionEnv:
       6: PANIC_TAKER_EXIT (мгновенный выход по рынку через 10 уровней стакана)
     """
 
-    def __init__(self, data: dict, start_idx: int, end_idx: int, episode_len: int = 3600, order_usd: float = 15.0, legacy_v2: bool = False):
+    def __init__(self, data: dict, start_idx: int, end_idx: int, episode_len: int = 3600, order_usd: float = 95.5, legacy_v2: bool = False):
         self.X_market = data["X_market"]
         self.bid_p = data["bid_p"]
         self.bid_q = data["bid_q"]
@@ -303,19 +303,19 @@ class SafeTradeL2ExecutionEnv:
         high_14400 = s_bid.rolling(14400, min_periods=1).max().values
         low_14400 = s_bid.rolling(14400, min_periods=1).min().values
         low_30 = s_bid.rolling(30, min_periods=1).min().values
-        vel_b1_10 = (self.bid_p[:, 0] - s_bid.shift(10).bfill().values) / self.tick_size
-        vel_b1_15 = (self.bid_p[:, 0] - s_bid.shift(15).bfill().values) / self.tick_size
-        vel_b1_180 = (self.bid_p[:, 0] - s_bid.shift(180).bfill().values) / self.tick_size
+        vel_b1_10 = np.round((self.bid_p[:, 0] - s_bid.shift(10).bfill().values) / self.tick_size, 4)
+        vel_b1_15 = np.round((self.bid_p[:, 0] - s_bid.shift(15).bfill().values) / self.tick_size, 4)
+        vel_b1_180 = np.round((self.bid_p[:, 0] - s_bid.shift(180).bfill().values) / self.tick_size, 4)
 
-        self.dd_300 = ((high_300 - self.bid_p[:, 0]) / self.tick_size).astype(np.float32)
-        self.dd_900 = ((high_900 - self.bid_p[:, 0]) / self.tick_size).astype(np.float32)
-        self.pos_900 = ((self.bid_p[:, 0] - low_900) / np.maximum(high_900 - low_900, self.tick_size)).astype(np.float32)
-        self.pos_3600 = ((self.bid_p[:, 0] - low_3600) / np.maximum(high_3600 - low_3600, self.tick_size)).astype(np.float32)
-        self.rng_14400 = ((high_14400 - low_14400) / self.tick_size).astype(np.float32)
+        self.dd_300 = np.round((high_300 - self.bid_p[:, 0]) / self.tick_size, 4).astype(np.float32)
+        self.dd_900 = np.round((high_900 - self.bid_p[:, 0]) / self.tick_size, 4).astype(np.float32)
+        self.pos_900 = np.where(high_900 > low_900 + 1e-6, (self.bid_p[:, 0] - low_900) / np.maximum(high_900 - low_900, self.tick_size), 1.0).astype(np.float32)
+        self.pos_3600 = np.where(high_3600 > low_3600 + 1e-6, (self.bid_p[:, 0] - low_3600) / np.maximum(high_3600 - low_3600, self.tick_size), 1.0).astype(np.float32)
+        self.rng_14400 = np.round((high_14400 - low_14400) / self.tick_size, 4).astype(np.float32)
         self.pos_14400 = ((self.bid_p[:, 0] - low_14400) / np.maximum(high_14400 - low_14400, self.tick_size)).astype(np.float32)
         self.vel_b1_10 = vel_b1_10.astype(np.float32)
         self.vel_b1_180 = vel_b1_180.astype(np.float32)
-        self.reb_30 = ((self.bid_p[:, 0] - low_30) / self.tick_size).astype(np.float32)
+        self.reb_30 = np.round((self.bid_p[:, 0] - low_30) / self.tick_size, 4).astype(np.float32)
 
         ez5, ez12, ez25 = self.X_market[:, 0], self.X_market[:, 6], self.X_market[:, 12]
         p_tn_5 = self.X_market[:, 4]
@@ -354,7 +354,7 @@ class SafeTradeL2ExecutionEnv:
             in_dip_zone_vec = (
                 (self.pos_3600 <= 0.80)
                 & safe_macro_4h
-                & (self.vel_b1_10 >= -1.0)
+                & (self.vel_b1_10 >= -0.5)
                 & (self.inertia_arr >= 0.15)
                 & (exp_entry_edge >= 0.60)
                 & ((self.dd_300 >= 1.0) | (spread_ticks >= 2.0) | (self.inertia_arr >= 0.35))
@@ -390,7 +390,7 @@ class SafeTradeL2ExecutionEnv:
         while not done:
             t = self.t
             mask = self.get_action_mask()
-            w_end = min(n_max, t + 90)
+            w_end = min(n_max, t + 1800)
             fut_b1 = b1_all[t + 1:w_end]
             fut_a1 = a1_all[t + 1:w_end]
             act = 0
@@ -402,24 +402,25 @@ class SafeTradeL2ExecutionEnv:
                 if len(fut_b1) > 5:
                     # Проверяем, даст ли волна минимум +1..2 тика профита без провала против нашего Bid
                     max_gain_ticks = (np.max(fut_a1) - target_b) / self.tick_size
-                    max_drop_ticks = (target_b - np.min(fut_b1[:25])) / self.tick_size
+                    max_drop_ticks = (target_b - np.min(fut_b1[:60])) / self.tick_size
                     good_wave = (max_gain_ticks >= 2.0 and max_drop_ticks <= 1.0) or (max_gain_ticks >= 1.0 and max_drop_ticks <= 0.0)
                     if good_wave and mask[1]:
-                        act = 0 if self.order_side == "BUY" else 1
+                        act = 1 if (self.order_side != "BUY" or self.order_act == 2) else 0
                     elif good_wave and mask[2]:
                         act = 0 if self.order_side == "BUY" else 2
                     elif self.order_side == "BUY" and max_drop_ticks > 1.0 and mask[5]:
                         act = 5
             else:
-                w_short = min(n_max, t + 25)
-                fut_b_short = b1_all[t + 1:w_short]
-                still_rising = len(fut_b_short) > 0 and (np.max(fut_b_short) > self.peak_bid + 0.5 * self.tick_size)
-                if still_rising and mask[3]:
-                    act = 3
-                elif mask[4]:
-                    act = 4
-                elif mask[3]:
-                    act = 3
+                if self.order_side == "SELL":
+                    act = 0
+                else:
+                    can_reach_2 = len(fut_b1) > 0 and ((np.max(fut_b1) - self.avg_entry) / self.tick_size >= 2.0)
+                    if can_reach_2 and mask[3]:
+                        act = 3
+                    elif mask[4]:
+                        act = 4
+                    elif mask[3]:
+                        act = 3
 
             obs, _, done = self.step(act)
 
@@ -518,6 +519,8 @@ class SafeTradeL2ExecutionEnv:
                     if t >= self.cooldown_until:
                         mask[1] = bool(self.can_buy_best_arr[t])
                         mask[2] = bool(self.can_buy_passive_arr[t])
+                elif self.order_act == 2 and t >= self.cooldown_until:
+                    mask[1] = bool(self.can_buy_best_arr[t])
             else:
                 if t >= self.cooldown_until:
                     mask[1] = bool(self.can_buy_best_arr[t])
@@ -612,14 +615,13 @@ class SafeTradeL2ExecutionEnv:
                     min_p = (self.avg_entry + self.tick_size) if hold_s < 45 else self.avg_entry
                     target_p = max(b1 + self.tick_size, min_p, a1 - self.tick_size)
             else:
-                allow_scratch = (hold_s > 600) and (float(self.inertia_arr[t]) < -0.35)
-                floor_p = round((self.avg_entry + (0.0 if allow_scratch else self.tick_size)) / self.tick_size) * self.tick_size
+                floor_p = round((self.avg_entry + self.tick_size) / self.tick_size) * self.tick_size
                 if action == 3:
-                    # Волновой выход (>= +2 тика): без прыжков на +8 тиков в космос
-                    target_p = max(a1, self.peak_bid, self.avg_entry + 2.0 * self.tick_size)
+                    # Волновой выход (>= +2 тика): синхронно с live_rl_trader.py
+                    target_p = max(a1 + self.tick_size, self.avg_entry + 2.0 * self.tick_size)
                 else:
                     # Скальперский выход (>= +1 тик): жестко держим место в очереди FIFO на floor_p (+1 тик)
-                    if self.order_side == "SELL" and abs(self.order_price - floor_p) <= tol and a1 >= floor_p - tol:
+                    if self.order_side == "SELL" and abs(self.order_price - floor_p) <= tol and b1 < floor_p - tol:
                         target_p = floor_p
                     else:
                         target_p = max(a1, floor_p)
@@ -657,14 +659,17 @@ class SafeTradeL2ExecutionEnv:
 
         if self.order_side is not None and nt >= self.active_after:
             q_at, q_better = self._get_lob_queue(nt, self.order_side, self.order_price)
+            q_at_prev, q_better_prev = self._get_lob_queue(nt - 1, self.order_side, self.order_price)
             if nt == self.active_after and not self.legacy_v2:
                 self.q_ahead = max(self.q_ahead, q_at)
-            eff_q = self.q_ahead + q_better
+            q_better_eff = max(q_better, q_better_prev)
+            eff_q = self.q_ahead + q_better_eff
 
             if self.order_side == "BUY":
                 crossed = (na1 <= self.order_price + tol)
                 price_ok = (abs(nb1 - self.order_price) <= tol) if self.legacy_v2 else (nb1 <= self.order_price + tol and na1 > self.order_price + tol)
                 vol_hit = self.sell_vol[nt] if price_ok else 0.0
+                vol_at_px = max(0.0, vol_hit - q_better_eff)
                 if crossed or vol_hit > eff_q:
                     fill_q = self.order_qty if crossed else min(self.order_qty, max(0.0, vol_hit - eff_q))
                     if fill_q >= self.order_qty * 0.25:
@@ -677,12 +682,16 @@ class SafeTradeL2ExecutionEnv:
                         if not self.legacy_v2:
                             self.total_pnl_usd -= self.pos_qty * self.avg_entry * 0.001  # Реальная комиссия SafeTrade Maker Buy (0.10%)
                 else:
-                    if vol_hit > 0:
-                        self.q_ahead = max(0.0, self.q_ahead - max(0.0, vol_hit - q_better))
+                    if vol_at_px > 0:
+                        self.q_ahead = max(0.0, self.q_ahead - vol_at_px)
+                    if not self.legacy_v2 and q_at < q_at_prev - vol_at_px and q_at_prev > 1e-6:
+                        net_cancel = (q_at_prev - vol_at_px) - q_at
+                        self.q_ahead = max(0.0, self.q_ahead - net_cancel * min(1.0, 0.35 * self.q_ahead / q_at_prev))
                     self.q_ahead = min(self.q_ahead, q_at)
             elif self.order_side == "SELL":
                 crossed = (nb1 >= self.order_price - tol)
                 vol_hit = self.buy_vol[nt] if abs(na1 - self.order_price) <= tol else 0.0
+                vol_at_px = max(0.0, vol_hit - q_better_eff)
                 if crossed or vol_hit > eff_q:
                     sell_fee = 0.0 if self.legacy_v2 else (self.pos_qty * self.order_price * 0.001)
                     net_pnl = self.pos_qty * (self.order_price - self.avg_entry) - sell_fee
@@ -695,8 +704,11 @@ class SafeTradeL2ExecutionEnv:
                     self.peak_bid = 0.0
                     self.order_side = None
                 else:
-                    if vol_hit > 0:
-                        self.q_ahead = max(0.0, self.q_ahead - max(0.0, vol_hit - q_better))
+                    if vol_at_px > 0:
+                        self.q_ahead = max(0.0, self.q_ahead - vol_at_px)
+                    if not self.legacy_v2 and q_at < q_at_prev - vol_at_px and q_at_prev > 1e-6:
+                        net_cancel = (q_at_prev - vol_at_px) - q_at
+                        self.q_ahead = max(0.0, self.q_ahead - net_cancel * min(1.0, 0.35 * self.q_ahead / q_at_prev))
                     self.q_ahead = min(self.q_ahead, q_at)
 
         cur_mtm = self.total_pnl_usd + (self.pos_qty * (nb1 - self.avg_entry) if self.pos_qty > 1e-8 else 0.0)
@@ -756,27 +768,31 @@ def teacher_heuristic_action(obs: np.ndarray, mask: np.ndarray) -> int:
 
     if not has_pos:
         strong_buy = (
-            exp_entry_edge >= 1.35 and model_err_12 > -1.5
-            and ez_25 >= 0.12 and ez_12 >= 0.08 and ez_5 >= 0.03
-            and p_tn_5 < 0.22 and imb5 > -0.35
+            exp_entry_edge >= 0.80 and model_err_12 > -1.5 and p_tn_5 < 0.26 and imb5 > -0.45
+            and (
+                (ez_25 >= 0.08 and ez_12 >= 0.04 and ez_5 >= -0.02)
+                or (exp_entry_edge >= 1.35 and ez_12 >= 0.08 and ez_5 >= 0.35 and imb5 >= 0.50)
+            )
         )
         dip_buy = (
-            exp_entry_edge >= 1.15 and model_err_12 > -1.5
-            and ez_25 >= 0.15 and ez_12 >= 0.06 and ez_5 >= -0.02
-            and p_tn_5 < 0.22
+            exp_entry_edge >= 0.65 and model_err_12 > -1.5
+            and ez_25 >= 0.10 and ez_12 >= 0.03 and ez_5 >= -0.04
+            and p_tn_5 < 0.26
         )
         if strong_buy and mask[1]:
-            return 0 if has_bid else 1
+            return 1
         if dip_buy and mask[2]:
             return 0 if has_bid else 2
         if has_bid:
-            if (exp_entry_edge < 0.35 or model_err_12 < -2.0 or ez_12 < -0.05 or p_tn_5 > 0.32) and mask[5]:
+            if (obs[-5] >= 0.22 or exp_entry_edge < 0.20 or model_err_12 < -2.5 or ez_12 < -0.15 or p_tn_5 > 0.35) and mask[5]:
                 return 5
             return 0
         return 0
     else:
-        if (unr_ticks <= -3.0 and (model_err_12 < -3.0 or (ez_12 < -0.18 and ez_5 < -0.15))) and mask[6]:
+        if (unr_ticks <= -6.0 and model_err_12 < -4.0 and ez_25 < -0.25 and ez_12 < -0.25) and mask[6]:
             return 6
+        if has_ask:
+            return 0
         if exp_hold_edge >= 0.90 and ez_25 >= 0.15 and ez_12 >= 0.08 and hold_ratio < 0.50 and mask[3]:
             return 3
         if mask[4]:
@@ -921,18 +937,20 @@ def load_live_telemetry_experiences(obs_dim: int = 38) -> tuple[np.ndarray, np.n
         if obs_arr.shape[1] != obs_dim:
             return np.empty((0, obs_dim), dtype=np.float32), np.empty((0, 7), dtype=bool), np.empty((0,), dtype=np.int64)
 
-        # Исправляем 1-секундный баг отмены QUOTE_BID_2: если dist == 1 тик (0.2) и hold_edge >= -0.05, учим держать (act=0)
-        false_cancel = (act_arr == 5) & (obs_arr[:, -5] <= 0.25) & (obs_arr[:, -1] >= -0.05)
-        act_arr[false_cancel] = 0
-        mask_arr[false_cancel, 5] = False
+        # Разрешаем подтягивание пассивного бида (act=2 -> act=1) в маске и размечаем эталонным нейро-учителем
+        passive_bid_upgrade = (obs_arr[:, -10] <= 0.5) & (obs_arr[:, -7] > 0.5) & (obs_arr[:, -5] >= 0.15) & (obs_arr[:, 20] > -0.65)
+        mask_arr[passive_bid_upgrade, 1] = True
+        act_arr = np.array([teacher_heuristic_action(obs_arr[i], mask_arr[i]) for i in range(len(obs_arr))], dtype=np.int64)
+        n_fixed = int((act_arr != s15["act"].values).sum())
 
-        # Усиливаем реальные траектории работы с ордерами и позицией (входы, удержание очереди и фиксация профита)
+        # Усиливаем реальные траектории работы с ордерами и позицией и отдельно доучиваем входы act=1 на разворотах
         active_idx = np.where((obs_arr[:, -10] > 0.5) | (obs_arr[:, -7] > 0.5) | (act_arr > 0))[0]
+        buy1_idx = np.where(act_arr == 1)[0]
         idle_idx = np.where((obs_arr[:, -10] <= 0.5) & (obs_arr[:, -7] <= 0.5) & (act_arr == 0))[0]
         if len(idle_idx) > 8000:
             idle_idx = np.random.choice(idle_idx, size=8000, replace=False)
-        sel_idx = np.concatenate([np.repeat(active_idx, 3), idle_idx])
-        print(f"📡 Подключен реальный опыт живой торговли: {len(sel_idx):,} переходов (из {len(s15):,} сек боевой телеметрии, исправлено {int(false_cancel.sum())} ложных отмен QUOTE_BID_2)")
+        sel_idx = np.concatenate([np.repeat(active_idx, 3), np.repeat(buy1_idx, 8), idle_idx])
+        print(f"📡 Подключен реальный опыт живой торговли: {len(sel_idx):,} переходов (из {len(s15):,} сек телеметрии, скорректировано {n_fixed:,} действий)")
         return obs_arr[sel_idx], mask_arr[sel_idx], act_arr[sel_idx]
     except Exception as e:
         print(f"⚠️ Не удалось загрузить боевую телеметрию: {e}")
@@ -948,6 +966,7 @@ def train_rl_agent(
     seed: int = 3,
     split_ts_msk: str = None,
 ):
+    torch.set_num_threads(1)
     np.random.seed(seed)
     torch.manual_seed(seed)
     data = build_or_load_rl_cache(coin=coin, tail_hours=tail_hours)
@@ -965,7 +984,7 @@ def train_rl_agent(
     test_env = SafeTradeL2ExecutionEnv(data, start_idx=split_idx, end_idx=n_total - 1, episode_len=n_total - split_idx - 2)
     base_env = SafeTradeL2ExecutionEnv(data, start_idx=split_idx, end_idx=n_total - 1, episode_len=n_total - split_idx - 2, legacy_v2=True)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu"
     out_dir = BASE_DIR / "models" / coin.lower() / "rl_execution"
     out_dir.mkdir(parents=True, exist_ok=True)
     base_ckpt = out_dir / "baseline_ppo_v2.pt"
@@ -1151,8 +1170,11 @@ def train_rl_agent(
                     p_cur.data.mul_(0.3).add_(p_best.data, alpha=0.7)
         mark = "🏆 РЕКОРД" if is_best else "✅ OK"
         history.append({"epoch": ep, **oos_res, "best_pnl_usd": round(float(best_pnl), 4), "best_score": round(float(best_score), 2)})
-        with open(out_dir / "training_history.json", "w") as f:
-            json.dump({"oracle": oracle_info, "baseline": base_res, "history": history}, f, indent=2)
+        try:
+            with open(out_dir / "training_history.json", "w") as f:
+                json.dump({"oracle": oracle_info, "baseline": base_res, "history": history}, f, indent=2)
+        except OSError:
+            pass
         print(
             f"  [PPO Ep {ep:02d}/{ppo_epochs}] {mark} -> PnL: ${oos_res['pnl_usd']:+.4f} | "
             f"КПД: {oos_res['kpd_capture_pct']:+.1f}% (Score={oos_res['efficiency_score']:+.1f}) | "

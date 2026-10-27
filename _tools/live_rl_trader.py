@@ -605,16 +605,16 @@ class LiveTriadRLTrader:
         l_14400 = min(b_arr)
         l_30 = min(b_arr[-30:])
 
-        dd_300 = (h_300 - b1) / self.tick_size
-        dd_900 = (h_900 - b1) / self.tick_size
-        pos_900 = (b1 - l_900) / max(h_900 - l_900, self.tick_size)
-        pos_3600 = (b1 - l_3600) / max(h_3600 - l_3600, self.tick_size)
-        rng_14400 = (h_14400 - l_14400) / self.tick_size
+        dd_300 = round((h_300 - b1) / self.tick_size, 4)
+        dd_900 = round((h_900 - b1) / self.tick_size, 4)
+        pos_900 = ((b1 - l_900) / max(h_900 - l_900, self.tick_size)) if h_900 > l_900 + 1e-6 else 1.0
+        pos_3600 = ((b1 - l_3600) / max(h_3600 - l_3600, self.tick_size)) if h_3600 > l_3600 + 1e-6 else 1.0
+        rng_14400 = round((h_14400 - l_14400) / self.tick_size, 4)
         pos_14400 = (b1 - l_14400) / max(h_14400 - l_14400, self.tick_size)
-        reb_30 = (b1 - l_30) / self.tick_size
-        vel_10 = (b1 - (b_arr[-11] if len(b_arr) >= 11 else b_arr[0])) / self.tick_size
-        vel_15 = (b1 - (b_arr[-16] if len(b_arr) >= 16 else b_arr[0])) / self.tick_size
-        vel_180 = (b1 - (b_arr[-181] if len(b_arr) >= 181 else b_arr[0])) / self.tick_size
+        reb_30 = round((b1 - l_30) / self.tick_size, 4)
+        vel_10 = round((b1 - (b_arr[-11] if len(b_arr) >= 11 else b_arr[0])) / self.tick_size, 4)
+        vel_15 = round((b1 - (b_arr[-16] if len(b_arr) >= 16 else b_arr[0])) / self.tick_size, 4)
+        vel_180 = round((b1 - (b_arr[-181] if len(b_arr) >= 181 else b_arr[0])) / self.tick_size, 4)
 
         d_ez12 = ez_12 - (self.ez12_hist[-6] if len(self.ez12_hist) >= 6 else self.ez12_hist[0])
         inertia = float(
@@ -661,9 +661,17 @@ class LiveTriadRLTrader:
             if self.q_ahead < 0.0:
                 self.q_ahead = q_at
             else:
-                if abs(b1 - self.active_bid_p) <= tol:
-                    self.q_ahead = max(0.0, self.q_ahead - max(0.0, float(r.get("ST_sell_vol", 0.0)) - q_better))
+                q_better_eff = max(q_better, getattr(self, "_prev_q_better", q_better))
+                q_at_prev = getattr(self, "_prev_q_at", q_at)
+                vol_hit = float(r.get("ST_sell_vol", 0.0)) if abs(b1 - self.active_bid_p) <= tol else 0.0
+                vol_at_px = max(0.0, vol_hit - q_better_eff)
+                if vol_at_px > 0.0:
+                    self.q_ahead = max(0.0, self.q_ahead - vol_at_px)
+                if q_at < q_at_prev - vol_at_px and q_at_prev > 1e-6:
+                    net_cancel = (q_at_prev - vol_at_px) - q_at
+                    self.q_ahead = max(0.0, self.q_ahead - net_cancel * min(1.0, 0.35 * self.q_ahead / q_at_prev))
                 self.q_ahead = min(self.q_ahead, q_at)
+            self._prev_q_at, self._prev_q_better = q_at, q_better
         elif has_ask:
             q_at, q_better = 0.0, 0.0
             for k in range(1, 11):
@@ -676,11 +684,20 @@ class LiveTriadRLTrader:
             if self.q_ahead < 0.0:
                 self.q_ahead = q_at
             else:
-                if abs(a1 - self.active_ask_p) <= tol:
-                    self.q_ahead = max(0.0, self.q_ahead - max(0.0, float(r.get("ST_buy_vol", 0.0)) - q_better))
+                q_better_eff = max(q_better, getattr(self, "_prev_q_better", q_better))
+                q_at_prev = getattr(self, "_prev_q_at", q_at)
+                vol_hit = float(r.get("ST_buy_vol", 0.0)) if abs(a1 - self.active_ask_p) <= tol else 0.0
+                vol_at_px = max(0.0, vol_hit - q_better_eff)
+                if vol_at_px > 0.0:
+                    self.q_ahead = max(0.0, self.q_ahead - vol_at_px)
+                if q_at < q_at_prev - vol_at_px and q_at_prev > 1e-6:
+                    net_cancel = (q_at_prev - vol_at_px) - q_at
+                    self.q_ahead = max(0.0, self.q_ahead - net_cancel * min(1.0, 0.35 * self.q_ahead / q_at_prev))
                 self.q_ahead = min(self.q_ahead, q_at)
+            self._prev_q_at, self._prev_q_better = q_at, q_better
         else:
             self.q_ahead = 0.0
+            self._prev_q_at, self._prev_q_better = 0.0, 0.0
         dist = ((b1 - self.active_bid_p) / self.tick_size) if has_bid else (((self.active_ask_p - a1) / self.tick_size) if has_ask else 0.0)
         ord_q = self.active_bid_q if has_bid else self.active_ask_q
         q_val = max(0.0, self.q_ahead)
@@ -701,7 +718,7 @@ class LiveTriadRLTrader:
         in_dip_zone = (
             (pos_3600 <= 0.80)
             and safe_macro_4h
-            and (vel_10 >= -1.0)
+            and (vel_10 >= -0.5)
             and (inertia >= 0.15)
             and (exp_entry_edge >= 0.60)
             and ((dd_300 >= 1.0) or (spread_ticks >= 2.0) or (inertia >= 0.35))
@@ -719,6 +736,8 @@ class LiveTriadRLTrader:
                         mask[2] = True
                         if imb_l5 > -0.65:
                             mask[1] = True
+                elif getattr(self, "active_bid_act", 1) == 2 and in_dip_zone and imb_l5 > -0.65:
+                    mask[1] = True
             elif in_dip_zone:
                 mask[2] = True
                 if imb_l5 > -0.65:
@@ -798,10 +817,9 @@ class LiveTriadRLTrader:
             elif act == 3:
                 target_p = max(a1 + self.tick_size, self.avg_entry + 2.0 * self.tick_size)
             else:
-                allow_scratch = self.hold_sec > 600 and self.last_inertia < -0.35
-                floor_p = round(self.avg_entry / self.tick_size) * self.tick_size if allow_scratch else min_profit_p
-                # Сохраняем приоритет очереди на уровне +1 тик (floor_p), не дергая ордер при временном расширении спреда вверх
-                if self.active_ask_id is not None and abs(self.active_ask_p - floor_p) <= tol and a1 >= floor_p - tol:
+                floor_p = min_profit_p
+                # Сохраняем приоритет очереди на уровне +1 тик (floor_p), не дергая ордер при колебаниях спреда и инерции
+                if self.active_ask_id is not None and abs(self.active_ask_p - floor_p) <= tol and b1 < floor_p - tol:
                     return
                 target_p = max(a1, floor_p)
             target_p = round(target_p / self.tick_size) * self.tick_size

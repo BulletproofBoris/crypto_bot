@@ -506,7 +506,9 @@ class LiveFeatureStreamer:
         bo_tail = self._tail_lines(self.bo_depth_path, n=1)
         if bo_tail:
             self._parse_50lvl_line(bo_tail[-1], "BO", d)
-            d["BO_sec_since_tick"] = 0.0
+            bo_sec = self._extract_ts_sec(bo_tail[-1].split(",", 1)[0])
+            now_s = int(now_utc.timestamp())
+            d["BO_sec_since_tick"] = float(max(0, now_s - bo_sec)) if bo_sec > 0 else 0.0
         m_tail = self._tail_lines(self.macro_path, n=1)
         if m_tail:
             self._parse_macro_line(m_tail[-1], d)
