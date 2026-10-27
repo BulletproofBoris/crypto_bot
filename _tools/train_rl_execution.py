@@ -41,9 +41,14 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
         data = np.load(rl_cache_path, allow_pickle=True)
         return {k: data[k] for k in data.files}
 
-    parquet_path = BASE_DIR / "data" / "labeled" / coin / f"{coin}_labeled.parquet"
-    if not parquet_path.exists():
-        parquet_path = BASE_DIR / "data" / "features" / f"{coin}_1s_features.parquet"
+    labeled_path = BASE_DIR / "data" / "labeled" / coin / f"{coin}_labeled.parquet"
+    feat_path = BASE_DIR / "data" / "features" / f"{coin}_1s_features.parquet"
+    if feat_path.exists() and labeled_path.exists():
+        n_feat = pq.ParquetFile(feat_path).metadata.num_rows
+        n_lab = pq.ParquetFile(labeled_path).metadata.num_rows
+        parquet_path = feat_path if n_feat >= n_lab else labeled_path
+    else:
+        parquet_path = feat_path if feat_path.exists() else labeled_path
 
     pf = pq.ParquetFile(parquet_path)
     total_rows = pf.metadata.num_rows
@@ -51,11 +56,6 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
     start_row = max(0, total_rows - n_rows)
 
     horizons = [(5, 3.0), (12, 3.5), (25, 3.0)]
-    routers = [
-        (H, K, SwarmRegimeRouter(coin, H, K, temperature=0.5, use_neural=True, neural_weight=0.15))
-        for H, K in horizons
-    ]
-
     schema_cols = set(pf.schema_arrow.names)
     lob_and_meta_cols = [
         "timestamp", "ST_best_bid", "ST_best_ask", "ST_bid_qty_1", "ST_ask_qty_1",
@@ -68,12 +68,8 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
             f"ST_bid_{lvl}_price", f"ST_bid_{lvl}_qty",
             f"ST_ask_{lvl}_price", f"ST_ask_{lvl}_qty",
         ])
-    req_cols = list(dict.fromkeys(
-        [c for r in routers for c in r[2].feature_names if c in schema_cols]
-        + [c for c in lob_and_meta_cols if c in schema_cols]
-    ))
+    base_cols = [c for c in lob_and_meta_cols if c in schema_cols]
 
-    print(f"📂 Селективное чтение последних {n_rows:,} сек ({tail_hours:.1f} ч, {len(req_cols)} кол.) из {parquet_path.name}...")
     rg_indices = []
     cum_rows = 0
     first_rg_offset = 0
@@ -85,9 +81,13 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
             rg_indices.append(rg_i)
         cum_rows += rg_n
 
-    table = pf.read_row_groups(rg_indices, columns=req_cols)
+    print(f"📂 Селективное чтение стакана L2 ({n_rows:,} сек, {len(base_cols)} кол.) из {parquet_path.name}...")
+    table = pf.read_row_groups(rg_indices, columns=base_cols)
     df = table.slice(first_rg_offset, n_rows).to_pandas()
     del table
+    if "timestamp" not in df.columns:
+        df["timestamp"] = df.index
+    df = df.reset_index(drop=True)
 
     triad_feats = []
     cached_fnames = None
@@ -113,12 +113,26 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
                     X_triad_head = prev_triad[matched_idx[:last_match_pos + 1]]
                     if n_tail > 0:
                         pad = min(360, last_match_pos + 1)
-                        df_tail = df.iloc[last_match_pos + 1 - pad:].reset_index(drop=True)
+                        tail_start_abs = start_row + last_match_pos + 1 - pad
+                        t_rgs, t_cum, t_off = [], 0, 0
+                        for rg_i in range(pf.num_row_groups):
+                            rg_n = pf.metadata.row_group(rg_i).num_rows
+                            if t_cum + rg_n > tail_start_abs:
+                                if not t_rgs:
+                                    t_off = tail_start_abs - t_cum
+                                t_rgs.append(rg_i)
+                            t_cum += rg_n
+                        df_tail = pf.read_row_groups(t_rgs).slice(t_off, n_tail + pad).to_pandas()
+                        if "timestamp" not in df_tail.columns:
+                            df_tail["timestamp"] = df_tail.index
+                        df_tail = df_tail.reset_index(drop=True)
                         tail_triad_list = []
-                        for H, K, router in routers:
+                        for H, K in horizons:
+                            router = SwarmRegimeRouter(coin, H, K, temperature=0.5, use_neural=True, neural_weight=0.15)
                             X_cols = [df_tail[col].values.astype(np.float32) if col in df_tail.columns else np.zeros(len(df_tail), dtype=np.float32) for col in router.feature_names]
                             X_tail_in = np.nan_to_num(np.column_stack(X_cols), nan=0.0, posinf=0.0, neginf=0.0)
                             ens_out = router.predict_ensemble(X_tail_in, df_tail, mode="router")
+                            del router, X_cols, X_tail_in
                             probs = ens_out["probs"][pad:]
                             ez = ens_out["expected_z"][pad:]
                             p_up = probs[:, 4] + probs[:, 5] + probs[:, 6]
@@ -128,6 +142,7 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
                             p_clip = np.clip(probs, 1e-7, 1.0)
                             ent = -np.sum(p_clip * np.log(p_clip), axis=1) / np.log(7.0)
                             tail_triad_list.append(np.column_stack([ez, p_up, p_down, p_tp, p_tn, ent]).astype(np.float32))
+                        del df_tail
                         X_triad_Incremental = np.vstack([X_triad_head, np.hstack(tail_triad_list[:3])]).astype(np.float32)
                     else:
                         X_triad_Incremental = X_triad_head
@@ -136,20 +151,24 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
 
     if X_triad_Incremental is not None:
         X_triad = X_triad_Incremental
-        del routers
     else:
-        for H, K, router in routers:
+        df_full = pf.read_row_groups(rg_indices).slice(first_rg_offset, n_rows).to_pandas()
+        if "timestamp" not in df_full.columns:
+            df_full["timestamp"] = df_full.index
+        df_full = df_full.reset_index(drop=True)
+        for H, K in horizons:
+            router = SwarmRegimeRouter(coin, H, K, temperature=0.5, use_neural=True, neural_weight=0.15)
             print(f"\n🔮 Расчёт ансамбля H={H}s (K={K})...")
             if cached_fnames != router.feature_names:
                 X_cols = [
-                    df[col].values.astype(np.float32) if col in df.columns else np.zeros(len(df), dtype=np.float32)
+                    df_full[col].values.astype(np.float32) if col in df_full.columns else np.zeros(len(df_full), dtype=np.float32)
                     for col in router.feature_names
                 ]
                 cached_X = np.nan_to_num(np.column_stack(X_cols), nan=0.0, posinf=0.0, neginf=0.0)
                 cached_fnames = list(router.feature_names)
                 del X_cols
 
-            ens_out = router.predict_ensemble(cached_X, df, mode="router")
+            ens_out = router.predict_ensemble(cached_X, df_full, mode="router")
             probs = ens_out["probs"]
             ez = ens_out["expected_z"]
             del router, ens_out
@@ -162,7 +181,7 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
             entropy = -np.sum(p_clip * np.log(p_clip), axis=1) / np.log(7.0)
 
             triad_feats.append(np.column_stack([ez, p_up, p_down, p_tail_pos, p_tail_neg, entropy]).astype(np.float32))
-        del cached_X, routers
+        del cached_X, df_full
         X_triad = np.hstack(triad_feats[:3]).astype(np.float32)
 
     # 10 уровней стакана SafeTrade (реальный биржевой шаг цены PRL = 0.01 USDT)
@@ -281,6 +300,8 @@ class SafeTradeL2ExecutionEnv:
         low_900 = s_bid.rolling(900, min_periods=1).min().values
         high_3600 = s_bid.rolling(3600, min_periods=1).max().values
         low_3600 = s_bid.rolling(3600, min_periods=1).min().values
+        high_14400 = s_bid.rolling(14400, min_periods=1).max().values
+        low_14400 = s_bid.rolling(14400, min_periods=1).min().values
         low_30 = s_bid.rolling(30, min_periods=1).min().values
         vel_b1_10 = (self.bid_p[:, 0] - s_bid.shift(10).bfill().values) / self.tick_size
         vel_b1_15 = (self.bid_p[:, 0] - s_bid.shift(15).bfill().values) / self.tick_size
@@ -290,6 +311,8 @@ class SafeTradeL2ExecutionEnv:
         self.dd_900 = ((high_900 - self.bid_p[:, 0]) / self.tick_size).astype(np.float32)
         self.pos_900 = ((self.bid_p[:, 0] - low_900) / np.maximum(high_900 - low_900, self.tick_size)).astype(np.float32)
         self.pos_3600 = ((self.bid_p[:, 0] - low_3600) / np.maximum(high_3600 - low_3600, self.tick_size)).astype(np.float32)
+        self.rng_14400 = ((high_14400 - low_14400) / self.tick_size).astype(np.float32)
+        self.pos_14400 = ((self.bid_p[:, 0] - low_14400) / np.maximum(high_14400 - low_14400, self.tick_size)).astype(np.float32)
         self.vel_b1_10 = vel_b1_10.astype(np.float32)
         self.vel_b1_180 = vel_b1_180.astype(np.float32)
         self.reb_30 = ((self.bid_p[:, 0] - low_30) / self.tick_size).astype(np.float32)
@@ -326,9 +349,11 @@ class SafeTradeL2ExecutionEnv:
             exp_hold_edge = self.inertia_arr * 3.0 - p_dn_12 * spread_ticks - surprise_pen * 0.6
 
             # Освобождаем PPO от жестких эвристик: разрешаем входы по сигналам нейросетевого роя,
-            # отсекая только физически опасные зоны (покупка на хаях часа pos_3600 > 0.80 или в отвесном обвале)
+            # отсекая только физически опасные зоны (покупка на хаях часа pos_3600 > 0.80, вершине 4ч пампа pos_14400 > 0.72 или в отвесном обвале)
+            safe_macro_4h = (self.rng_14400 < 6.0) | (self.pos_14400 <= 0.72)
             in_dip_zone_vec = (
                 (self.pos_3600 <= 0.80)
+                & safe_macro_4h
                 & (self.vel_b1_10 >= -1.0)
                 & (self.inertia_arr >= 0.15)
                 & (exp_entry_edge >= 0.60)

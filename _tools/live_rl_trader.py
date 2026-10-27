@@ -286,7 +286,7 @@ class LiveTriadRLTrader:
         self.agent.eval()
         print(f"✅ Загружен чекпоинт RL-агента: {ckpt_path.name} (obs_dim={obs_dim}, hidden={h_dim})")
 
-        self.bid_hist_1h = deque(maxlen=3600)
+        self.bid_hist_1h = deque(maxlen=14400)
         self.ez12_hist = deque(maxlen=16)
 
         # Изолированный субсчет бота ($50.00) и динамический учет резерва пользователя
@@ -508,7 +508,7 @@ class LiveTriadRLTrader:
                             f"База капитала бота: ${self.initial_budget_usd:.2f} (чистый торговый PnL сохранен)"
                         )
 
-                self.bot_cash_usd = u_tot if self.active_bid_id is not None else u_free
+                self.bot_cash_usd = u_tot
                 if real_pos >= 2.0 and prev_pos < 2.0:
                     self.avg_entry = self.avg_entry if self.avg_entry > 0 else px_ref
                     self.peak_bid = max(self.peak_bid, self.avg_entry, px_ref)
@@ -599,14 +599,18 @@ class LiveTriadRLTrader:
         h_300 = max(b_arr[-300:])
         h_900 = max(b_arr[-900:])
         l_900 = min(b_arr[-900:])
-        h_3600 = max(b_arr)
-        l_3600 = min(b_arr)
+        h_3600 = max(b_arr[-3600:])
+        l_3600 = min(b_arr[-3600:])
+        h_14400 = max(b_arr)
+        l_14400 = min(b_arr)
         l_30 = min(b_arr[-30:])
 
         dd_300 = (h_300 - b1) / self.tick_size
         dd_900 = (h_900 - b1) / self.tick_size
         pos_900 = (b1 - l_900) / max(h_900 - l_900, self.tick_size)
         pos_3600 = (b1 - l_3600) / max(h_3600 - l_3600, self.tick_size)
+        rng_14400 = (h_14400 - l_14400) / self.tick_size
+        pos_14400 = (b1 - l_14400) / max(h_14400 - l_14400, self.tick_size)
         reb_30 = (b1 - l_30) / self.tick_size
         vel_10 = (b1 - (b_arr[-11] if len(b_arr) >= 11 else b_arr[0])) / self.tick_size
         vel_15 = (b1 - (b_arr[-16] if len(b_arr) >= 16 else b_arr[0])) / self.tick_size
@@ -693,8 +697,10 @@ class LiveTriadRLTrader:
 
         vel_3 = (b1 - (b_arr[-4] if len(b_arr) >= 4 else b_arr[0])) / self.tick_size
         self.last_vel3 = vel_3
+        safe_macro_4h = (rng_14400 < 6.0) or (pos_14400 <= 0.72)
         in_dip_zone = (
             (pos_3600 <= 0.80)
+            and safe_macro_4h
             and (vel_10 >= -1.0)
             and (inertia >= 0.15)
             and (exp_entry_edge >= 0.60)
@@ -859,10 +865,10 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
     local_depth = Path("/opt/crypto_bot/data/realtime/prlusdt/depth.csv")
     raw_d_lines = []
     if local_depth.exists():
-        raw_d_lines = subprocess.run(["tail", "-n", "3600", str(local_depth)], capture_output=True, text=True).stdout.splitlines()
+        raw_d_lines = subprocess.run(["tail", "-n", "14400", str(local_depth)], capture_output=True, text=True).stdout.splitlines()
     elif trader.client and trader.client._ssh is not None:
         try:
-            _, out, _ = trader.client._ssh.exec_command("tail -n 3600 /opt/crypto_bot/data/realtime/prlusdt/depth.csv")
+            _, out, _ = trader.client._ssh.exec_command("tail -n 14400 /opt/crypto_bot/data/realtime/prlusdt/depth.csv")
             raw_d_lines = out.read().decode("utf-8", errors="ignore").splitlines()
         except Exception:
             pass
@@ -883,7 +889,7 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
         end_s = sec_bp[-1][0]
         cur_bp = sec_bp[0][1]
         idx_p = 0
-        for s in range(end_s - 3599, end_s + 1):
+        for s in range(end_s - 14399, end_s + 1):
             while idx_p < len(sec_bp) and sec_bp[idx_p][0] <= s:
                 cur_bp = sec_bp[idx_p][1]
                 idx_p += 1
@@ -1136,22 +1142,23 @@ def start_live_daemon(budget_usd: float = 54.0, order_usd: float = 54.0, steps: 
         ppo_local = BASE_DIR / "models" / "prl" / "rl_execution" / "best_maskable_ppo.pt"
         if ppo_local.exists():
             sftp.put(str(ppo_local), "/opt/crypto_bot/models/prl/rl_execution/best_maskable_ppo.pt")
-        for h_dir in (BASE_DIR / "models" / "prl").glob("h*s_k*"):
-            if not h_dir.is_dir():
-                continue
-            for root, _, files in os.walk(h_dir):
-                rel_r = Path(root).relative_to(BASE_DIR / "models" / "prl")
-                rem_d = f"/opt/crypto_bot/models/prl/{rel_r}"
-                try:
-                    rem_attrs = {a.filename: a.st_size for a in sftp.listdir_attr(rem_d)}
-                except Exception:
-                    ssh.exec_command(f"mkdir -p {rem_d}")[1].read()
-                    rem_attrs = {}
-                for fn in files:
-                    lf = Path(root) / fn
-                    if rem_attrs.get(fn) == lf.stat().st_size and not fn.endswith(".json"):
-                        continue
-                    sftp.put(str(lf), f"{rem_d}/{fn}")
+        for pat in ("h*s_k*", "*_h*s"):
+            for h_dir in (BASE_DIR / "models" / "prl").glob(pat):
+                if not h_dir.is_dir():
+                    continue
+                for root, _, files in os.walk(h_dir):
+                    rel_r = Path(root).relative_to(BASE_DIR / "models" / "prl")
+                    rem_d = f"/opt/crypto_bot/models/prl/{rel_r}"
+                    try:
+                        rem_attrs = {a.filename: a.st_size for a in sftp.listdir_attr(rem_d)}
+                    except Exception:
+                        ssh.exec_command(f"mkdir -p {rem_d}")[1].read()
+                        rem_attrs = {}
+                    for fn in files:
+                        lf = Path(root) / fn
+                        if rem_attrs.get(fn) == lf.stat().st_size and not fn.endswith(".json"):
+                            continue
+                        sftp.put(str(lf), f"{rem_d}/{fn}")
         w_local = BASE_DIR / "models" / "prl" / "rl_execution" / "live_wallet_state.json"
         if push_wallet and w_local.exists():
             sftp.put(str(w_local), "/opt/crypto_bot/models/prl/rl_execution/live_wallet_state.json")

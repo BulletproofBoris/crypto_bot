@@ -36,6 +36,14 @@ for _var in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROX
     if '127.0.0.1:2080' in os.environ.get(_var, ''):
         del os.environ[_var]
 
+try:
+    import certifi
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+    os.environ.setdefault("HTTPLIB2_CA_CERTS", certifi.where())
+except ImportError:
+    pass
+
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,

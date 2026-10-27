@@ -271,10 +271,39 @@ def process_exchange_l2(depth_df, trades_df, prefix):
     df_1s.columns = [f"{prefix}_{c}" for c in df_1s.columns]
     return df_1s
 
-def build_features_for_coin(coin_name, macro_df=None):
+def build_features_for_coin(coin_name, macro_df=None, force_full=False):
     coin = coin_name.lower()
     print(f"\n{Fore.CYAN}--- Генерация признаков для {coin.upper()} ---{Style.RESET_ALL}")
+    out_dir = os.path.join(BASE_DIR, 'data', 'features')
+    os.makedirs(out_dir, exist_ok=True)
+    out_file = os.path.join(out_dir, f"{coin}_1s_features.parquet")
+
+    last_ts = None
+    last_cvd = {}
+    if not force_full and os.path.exists(out_file):
+        try:
+            import pyarrow.parquet as pq
+            pf_prev = pq.ParquetFile(out_file)
+            if pf_prev.metadata.num_rows > 50000:
+                last_rg = pf_prev.read_row_group(pf_prev.num_row_groups - 1)
+                last_df = last_rg.slice(last_rg.num_rows - 1, 1).to_pandas()
+                last_ts = last_df.index[0]
+                for c_cvd in ['ST_cvd_total', 'BO_cvd_total']:
+                    if c_cvd in last_df.columns:
+                        last_cvd[c_cvd] = float(last_df[c_cvd].iloc[0])
+                print(f"  ⚡ Инкрементальный режим: базовая матрица ({pf_prev.metadata.num_rows:,} сек до {last_ts}), досчитываем только новый хвост...")
+        except Exception as e:
+            print(f"  ⚠️ Не удалось прочитать хвост существующего файла ({e}), пересборка с нуля...")
+            last_ts = None
+
     cdata = load_coin(coin)
+    if last_ts is not None:
+        cut_utc = (last_ts - pd.Timedelta(hours=2, minutes=15)).tz_convert('UTC')
+        for k_df in ['safetrade_depth', 'safetrade_trades', 'bigone_depth', 'bigone_trades', 'rhea_price', 'onchain']:
+            if k_df in cdata and cdata[k_df] is not None and not cdata[k_df].empty and 'timestamp' in cdata[k_df].columns:
+                ts_s = cdata[k_df]['timestamp']
+                c_cut = cut_utc.tz_localize(None) if ts_s.dt.tz is None else cut_utc
+                setattr(cdata, k_df, cdata[k_df][ts_s >= c_cut].copy())
 
     parts = []
 
@@ -496,10 +525,31 @@ def build_features_for_coin(coin_name, macro_df=None):
     if f64_to_f32:
         merged[f64_to_f32] = merged[f64_to_f32].astype(np.float32)
 
+    if last_ts is not None:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        for c_cvd, val_prev in last_cvd.items():
+            if c_cvd in merged.columns and last_ts in merged.index:
+                offset = val_prev - float(merged.loc[last_ts, c_cvd])
+                merged[c_cvd] = (merged[c_cvd] + offset).astype(merged[c_cvd].dtype)
+        tail_df = merged[merged.index > last_ts]
+        if len(tail_df) == 0:
+            print(f"{Fore.GREEN}✅ [{coin.upper()}] Новых секунд после {last_ts} нет — файл уже актуален.{Style.RESET_ALL}")
+            return True
+        prev_tab = pq.read_table(out_file)
+        tail_tab = pa.Table.from_pandas(tail_df).cast(prev_tab.schema)
+        full_tab = pa.concat_tables([prev_tab, tail_tab])
+        tmp_file = out_file + ".tmp"
+        pq.write_table(full_tab, tmp_file, compression='zstd')
+        os.replace(tmp_file, out_file)
+        size_mb = os.path.getsize(out_file) / (1024 * 1024)
+        print(f"{Fore.GREEN}✅ [{coin.upper()}] Досчитано +{len(tail_df):,} сек -> итого {full_tab.num_rows:,} строк ({size_mb:.2f} MB, до {tail_df.index.max()}){Style.RESET_ALL}")
+        del prev_tab, tail_tab, full_tab, tail_df, merged
+        import gc
+        gc.collect()
+        return True
+
     # Сохранение в data/features/{coin}_1s_features.parquet (zstd компрессия)
-    out_dir = os.path.join(BASE_DIR, 'data', 'features')
-    os.makedirs(out_dir, exist_ok=True)
-    out_file = os.path.join(out_dir, f"{coin}_1s_features.parquet")
     merged.to_parquet(out_file, compression='zstd')
     size_mb = os.path.getsize(out_file) / (1024 * 1024)
 
@@ -527,6 +577,7 @@ def main():
     parser = argparse.ArgumentParser(description="Синхронизация и построение 1-секундного базового датасета (PRL, QUANTUS).")
     parser.add_argument("--coin", type=str, default="all", choices=["prl", "quantus", "all"], help="Монета для генерации (по умолчанию all).")
     parser.add_argument("--sync", action="store_true", help="Сначала выполнить синхронизацию с Google Drive и VPS.")
+    parser.add_argument("--full", action="store_true", help="Принудительная полная пересборка с нуля.")
     args = parser.parse_args()
 
     if args.sync:
@@ -542,7 +593,7 @@ def main():
 
     import gc
     for c in coins:
-        build_features_for_coin(c, macro_df=macro_df)
+        build_features_for_coin(c, macro_df=macro_df, force_full=args.full)
         gc.collect()
 
     print(f"\n{Fore.GREEN}🎉 Построение 1-секундных датасетов успешно завершено!{Style.RESET_ALL}\n")
