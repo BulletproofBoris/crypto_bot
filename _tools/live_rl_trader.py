@@ -804,7 +804,7 @@ class LiveTriadRLTrader:
             and (vel_10 >= -0.5)
             and (inertia >= 0.15)
             and (exp_entry_edge >= 0.60)
-            and ((dd_300 >= 1.0) or (spread_ticks >= 2.0) or (dd_900 >= 2.0 and inertia >= 0.35))
+            and ((dd_300 >= 1.0) or (spread_ticks >= 2.0))
         )
 
         mask = np.zeros(7, dtype=bool)
@@ -840,6 +840,10 @@ class LiveTriadRLTrader:
         q_a1 = float(self.last_q_a1)
         q_a2 = float(self.last_q_a2)
         own_ask_share = self.pos_qty / (q_a1 + self.pos_qty + 1e-6)
+        if self.last_pos3600 >= 0.65 and q_a2 > 3000.0:
+            return 0.0
+        if q_a2 > 15000.0 and q_a1 < 500.0:
+            return 0.50
         if (hold_edge >= 0.90 and ez25 >= 0.15 and ez12 >= 0.08) or (hold_edge >= 0.80 and q_a2 < 250.0 and q_a1 > 500.0):
             return 1.0
         if (hold_edge >= 0.45 and ez25 >= 0.08) or (ez25 >= 0.14 and hold_edge >= 0.20) or (own_ask_share > 0.15 and ez25 >= 0.08 and hold_edge >= 0.10):
@@ -863,6 +867,8 @@ class LiveTriadRLTrader:
             if self.last_pos3600 > 0.85 or self.last_inertia < -0.20:
                 act = 5
             elif self.last_dd300 < 0.5 and self.last_dd900 <= 1.0 and self.last_sp_ticks < 1.5 and self.last_ez12 < 0.30:
+                act = 5
+            elif self.last_sp_ticks < 1.5 and self.last_ez25 < -0.15 and self.last_inertia < 0.08 and self.last_q_a1 > 4000.0:
                 act = 5
 
         if act in (1, 2) and self.pos_qty <= 1e-4:
@@ -912,10 +918,15 @@ class LiveTriadRLTrader:
         elif act in (3, 4, 6) and self.pos_qty >= 2.0:
             floor_p = round((self.avg_entry + self.tick_size) / self.tick_size) * self.tick_size
             wave_p = round((self.avg_entry + 2.0 * self.tick_size) / self.tick_size) * self.tick_size
+            super_p = round((self.avg_entry + 3.0 * self.tick_size) / self.tick_size) * self.tick_size
             if act in (3, 4):
                 w2 = self._compute_adaptive_wave_weight()
+                q_a2 = float(self.last_q_a2)
+                is_super = (self.last_dd300 >= 4.0 and self.last_sp_ticks < 1.5 and self.last_ez25 >= 0.20 and self.last_hold_edge >= 1.50 and q_a2 < 800.0) or (
+                    self.last_dd900 >= 3.0 and self.last_pos3600 <= 0.05 and self.last_ez25 >= 0.65 and self.last_hold_edge >= 4.0 and q_a2 < 300.0
+                )
                 if self.active_ask_id is not None and self.slot2_ask_id is not None:
-                    if w2 <= 0.05 and a1 <= floor_p + tol:
+                    if w2 <= 0.05 and a1 <= floor_p + tol and q_a2 <= 15000.0:
                         try:
                             self.client.cancel_order(self.slot2_ask_id)
                         except Exception as e:
@@ -938,18 +949,19 @@ class LiveTriadRLTrader:
                 elif self.active_ask_id is not None and self.slot2_ask_id is None:
                     if abs(self.active_ask_p - floor_p) <= tol:
                         return
-                    elif w2 >= 0.30 and abs(self.active_ask_p - wave_p) <= tol:
+                    elif (w2 >= 0.30 or q_a2 > 15000.0) and self.active_ask_p >= wave_p - tol:
                         return
                     else:
                         act = 4
-                elif self.active_ask_id is None and 0.15 <= w2 <= 0.85 and not self.split_done_for_pos:
+                elif self.active_ask_id is None and (is_super or 0.15 <= w2 <= 0.85) and not self.split_done_for_pos:
                     self.sync_account_balances(b1)
                     tot_sell = math.floor(min(self.pos_qty, self.ex_coin_free) * 10000.0) / 10000.0
-                    q2 = math.floor((tot_sell * w2) * 10000.0) / 10000.0
+                    eff_w2 = 0.50 if is_super else w2
+                    q2 = math.floor((tot_sell * eff_w2) * 10000.0) / 10000.0
                     q1 = math.floor((tot_sell - q2) * 10000.0) / 10000.0
                     if q1 >= 2.0 and q2 >= 2.0:
-                        p1 = round(max(a1, floor_p) / self.tick_size) * self.tick_size
-                        p2 = round(max(a1 + self.tick_size, wave_p) / self.tick_size) * self.tick_size
+                        p1 = round((max(a1 + self.tick_size, wave_p) if is_super else max(a1, floor_p)) / self.tick_size) * self.tick_size
+                        p2 = round((max(a1 + 2.0 * self.tick_size, super_p) if is_super else max(a1 + self.tick_size, wave_p)) / self.tick_size) * self.tick_size
                         try:
                             res1 = self.client.place_limit_order(self.market, "sell", q1, p1)
                             self.active_ask_id = res1.get("id")
@@ -964,12 +976,14 @@ class LiveTriadRLTrader:
                             self._save_wallet()
                             print(
                                 f"  📤 [LIVE 2-SLOT SELL] Slot1(id={self.active_ask_id}): {self.active_ask_q:.4f} PRL @ ${self.active_ask_p:.2f} | "
-                                f"Slot2(id={self.slot2_ask_id}, w2={w2:.0%}): {self.slot2_ask_q:.4f} PRL @ ${self.slot2_ask_p:.2f}"
+                                f"Slot2(id={self.slot2_ask_id}, w2={eff_w2:.0%}): {self.slot2_ask_q:.4f} PRL @ ${self.slot2_ask_p:.2f}"
                             )
                             return
                         except Exception as e:
                             print(f"  ⚠️ [2-SLOT SELL ERROR]: {e}")
                             self.sync_account_balances(b1)
+                elif self.active_ask_id is None and w2 < 0.15:
+                    act = 4
 
             if act == 6:
                 target_p = max(self.tick_size, b1 - self.tick_size)

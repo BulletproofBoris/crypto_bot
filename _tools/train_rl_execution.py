@@ -357,7 +357,7 @@ class SafeTradeL2ExecutionEnv:
                 & (self.vel_b1_10 >= -0.5)
                 & (self.inertia_arr >= 0.15)
                 & (exp_entry_edge >= 0.60)
-                & ((self.dd_300 >= 1.0) | (spread_ticks >= 2.0) | ((self.dd_900 >= 2.0) & (self.inertia_arr >= 0.35)))
+                & ((self.dd_300 >= 1.0) | (spread_ticks >= 2.0))
             )
 
         self.obs_err12_norm = np.clip(model_err_12 / 5.0, -3.0, 3.0).astype(np.float32)
@@ -522,6 +522,11 @@ class SafeTradeL2ExecutionEnv:
         q_a2, _ = self._get_lob_queue(t, "SELL", wave_p)
         own_ask_share = self.pos_qty / (q_a1 + self.pos_qty + 1e-6)
 
+        if max(float(self.pos_3600[t]), float(self.pos_3600[self.entry_t])) >= 0.65 and q_a2 > 3000.0:
+            return 0.0
+        if q_a2 > 15000.0 and q_a1 < 500.0:
+            return 0.50
+
         if (hold_edge >= 0.90 and ez25 >= 0.15 and ez12 >= 0.08) or (hold_edge >= 0.80 and q_a2 < 250.0 and q_a1 > 500.0):
             return 1.0
         if (hold_edge >= 0.45 and ez25 >= 0.08) or (ez25 >= 0.14 and hold_edge >= 0.20) or (own_ask_share > 0.15 and ez25 >= 0.08 and hold_edge >= 0.10):
@@ -617,18 +622,45 @@ class SafeTradeL2ExecutionEnv:
         # 1. Обработка выбранного действия агента (прямое исполнение решений PPO без скрытых переопределений)
         pos3600 = float(self.pos_3600[t])
         sp = float(self.X_market[t, 18] * 10.0)
+        ez25 = float(self.X_market[t, 12])
+        hold_edge = float(self.obs_hold_edge_norm[t] * 5.0)
         if not self.legacy_v2 and self.pos_qty <= 1e-8 and self.order_side == "BUY":
             if pos3600 > 0.85 or inertia < -0.20:
                 action = 5
             elif self.dd_300[t] < 0.5 and self.dd_900[t] <= 1.0 and sp < 1.5 and self.X_market[t, 6] < 0.30:
                 action = 5
+            elif sp < 1.5 and ez25 < -0.15 and inertia < 0.08 and self.ask_q[t, 0] > 4000.0:
+                action = 5
 
         if not self.legacy_v2 and self.pos_qty > 1e-8 and action in (3, 4):
             floor_p = round((self.avg_entry + self.tick_size) / self.tick_size) * self.tick_size
             wave_p = round((self.avg_entry + 2.0 * self.tick_size) / self.tick_size) * self.tick_size
+            super_p = round((self.avg_entry + 3.0 * self.tick_size) / self.tick_size) * self.tick_size
+            q_a2, _ = self._get_lob_queue(t, "SELL", wave_p)
             w2 = self._compute_adaptive_wave_weight(t, floor_p, wave_p)
-            if self.order_side == "SELL" and self.slot2_side == "SELL":
-                if w2 <= 0.05 and a1 <= floor_p + tol:
+            e_t = self.entry_t
+            is_super = (self.dd_300[t] >= 4.0 and sp < 1.5 and ez25 >= 0.20 and hold_edge >= 1.50 and q_a2 < 800.0) or (
+                self.dd_900[e_t] >= 3.0 and self.pos_3600[e_t] <= 0.05 and float(self.X_market[e_t, 12]) >= 0.65 and float(self.obs_hold_edge_norm[e_t] * 5.0) >= 4.0 and q_a2 < 300.0
+            )
+            if self.order_side != "SELL" and is_super and not self.split_done_for_pos:
+                q2 = round(self.pos_qty * 0.50, 4)
+                q1 = round(self.pos_qty - q2, 4)
+                self.order_side = "SELL"
+                self.order_act = 3
+                self.order_price = max(a1 + self.tick_size, wave_p)
+                self.order_qty = q1
+                self.q_ahead, _ = self._get_lob_queue(t, "SELL", self.order_price)
+                self.active_after = t + 1
+                self.slot2_side = "SELL"
+                self.slot2_price = max(a1 + 2.0 * self.tick_size, super_p)
+                self.slot2_qty = q2
+                self.slot2_q_ahead, _ = self._get_lob_queue(t, "SELL", self.slot2_price)
+                self.slot2_active_after = t + 1
+                self.split_done_for_pos = True
+                requote_penalty = 0.005
+                action = 0
+            elif self.order_side == "SELL" and self.slot2_side == "SELL":
+                if w2 <= 0.05 and a1 <= floor_p + tol and q_a2 <= 15000.0:
                     self.order_qty = self.pos_qty
                     self.slot2_side = None
                     self.slot2_qty = 0.0
@@ -636,7 +668,7 @@ class SafeTradeL2ExecutionEnv:
             elif self.order_side == "SELL" and self.slot2_side is None:
                 if abs(self.order_price - floor_p) <= tol:
                     action = 0
-                elif w2 >= 0.30 and abs(self.order_price - wave_p) <= tol:
+                elif (w2 >= 0.30 or q_a2 > 15000.0) and self.order_price >= wave_p - tol:
                     action = 0
                 else:
                     action = 4
@@ -657,6 +689,8 @@ class SafeTradeL2ExecutionEnv:
                 self.split_done_for_pos = True
                 requote_penalty = 0.005
                 action = 0
+            elif self.order_side != "SELL" and w2 < 0.15:
+                action = 4
 
         if action in (1, 2) and self.pos_qty <= 1e-8:
             step_in = (a1 - b1) >= 2.0 * self.tick_size and (self.legacy_v2 or inertia >= 0.35)
