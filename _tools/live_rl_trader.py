@@ -314,6 +314,8 @@ class LiveTriadRLTrader:
         self.active_ask_id = None
         self.q_ahead = 0.0
         self.realized_pnl_usd = 0.0
+        self.net_deposits_usd = 0.0
+        self.deposits_log = []
         self.n_trades = 0
         self.wallet_file = BASE_DIR / "models" / self.coin / "rl_execution" / "live_wallet_state.json"
         on_vps = str(BASE_DIR).startswith("/opt/crypto_bot")
@@ -329,6 +331,8 @@ class LiveTriadRLTrader:
             self.pos_qty = float(st.get("pos_qty", 0.0))
             self.avg_entry = float(st.get("avg_entry", 0.0))
             self.realized_pnl_usd = float(st.get("realized_pnl_usd", 0.0))
+            self.net_deposits_usd = float(st.get("net_deposits_usd", 0.0))
+            self.deposits_log = list(st.get("deposits_log", []))
             self.n_trades = int(st.get("n_trades", 0))
             self.reserved_account_usdt = float(st.get("reserved_account_usdt", 0.0))
             self.user_reserved_coin = float(st.get("user_reserved_coin", 0.0))
@@ -338,10 +342,19 @@ class LiveTriadRLTrader:
             self.active_ask_id = st.get("active_ask_id")
             self.active_ask_p = float(st.get("active_ask_p", 0.0))
             self.active_ask_q = float(st.get("active_ask_q", 0.0))
-        self.sync_live_orders(0.0)
-        self.sync_account_balances(0.0, init_mode=True)
+        b1_init = 0.0
+        try:
+            d_init = self.client.get_depth(self.market, limit=5)
+            bids_init = d_init.get("bids", [])
+            if bids_init:
+                b1_init = float(bids_init[0][0])
+        except Exception:
+            pass
+        self.sync_live_orders(b1_init)
+        self.sync_account_balances(b1_init, init_mode=True)
         print(
-            f"🛡️ Изолированный субсчет бота: кэш=${self.bot_cash_usd:.2f} USDT, поз={self.pos_qty:.4f} {self.coin.upper()} | "
+            f"🛡️ Изолированный субсчет бота: кэш=${self.bot_cash_usd:.2f} USDT, поз={self.pos_qty:.4f} {self.coin.upper()} "
+            f"(база капитала=${self.initial_budget_usd:.2f}, пополнения=${self.net_deposits_usd:+.2f}) | "
             f"личный резерв пользователя=${self.reserved_account_usdt:,.2f} USDT + {self.user_reserved_coin:,.4f} {self.coin.upper()}"
         )
 
@@ -353,6 +366,8 @@ class LiveTriadRLTrader:
             "pos_qty": round(self.pos_qty, 6),
             "avg_entry": round(self.avg_entry, 6),
             "realized_pnl_usd": round(self.realized_pnl_usd, 6),
+            "net_deposits_usd": round(self.net_deposits_usd, 6),
+            "deposits_log": self.deposits_log[-50:],
             "n_trades": int(self.n_trades),
             "reserved_account_usdt": round(self.reserved_account_usdt, 6),
             "user_reserved_coin": round(self.user_reserved_coin, 6),
@@ -393,7 +408,7 @@ class LiveTriadRLTrader:
                     self.ez25_entry = self.last_ez25
                     self.q_ahead = 0.0
                     self.active_bid_id, self.active_bid_p, self.active_bid_q = None, 0.0, 0.0
-                    self.sync_account_balances(b1)
+                    self.sync_account_balances(b1, from_trade_fill=True)
                     self._save_wallet()
                     print(f"  🟢 [FILL BUY] +{net_filled:.4f} PRL (брутто {filled:.4f}) @ ${px:.2f} | Остаток кэша бота=${self.bot_cash_usd:.2f}")
                 elif st == "cancel":
@@ -421,7 +436,7 @@ class LiveTriadRLTrader:
                     self.n_trades += 1
                     self.q_ahead = 0.0
                     self.active_ask_id, self.active_ask_p, self.active_ask_q = None, 0.0, 0.0
-                    self.sync_account_balances(b1)
+                    self.sync_account_balances(b1, from_trade_fill=True)
                     self._save_wallet()
                     print(f"  💰 [FILL SELL] -{filled:.4f} PRL @ ${px:.2f} | PnL={pnl:+.4f}$ | Баланс бота=${self.bot_cash_usd:.2f}")
                 elif st == "cancel":
@@ -431,7 +446,7 @@ class LiveTriadRLTrader:
             except Exception as e:
                 print(f"  ⚠️ [SYNC ASK WARN] id={self.active_ask_id}: {e}")
 
-    def sync_account_balances(self, b1: float = 0.0, init_mode: bool = False):
+    def sync_account_balances(self, b1: float = 0.0, init_mode: bool = False, from_trade_fill: bool = False):
         if self.mode != "live" or self.client is None:
             return
         try:
@@ -446,14 +461,59 @@ class LiveTriadRLTrader:
             # 100% спотового баланса биржи (USDT + PRL) является прямым источником истины для бота!
             if self.reserved_account_usdt <= 1e-4 and self.user_reserved_coin <= 1e-4:
                 prev_pos = self.pos_qty
+                prev_cash_tot = self.bot_cash_usd
                 real_pos = math.floor(c_tot * 10000.0) / 10000.0 if c_tot >= 2.0 else 0.0
-                self.bot_cash_usd = u_free
+                px_ref = b1 if b1 > 0 else (self.avg_entry if self.avg_entry > 0 else (self.active_bid_p if self.active_bid_p > 0 else 1.77))
+
+                # Автоматический учет внешних пополнений монетами (PRL) или кэшем (USDT) без искажения PnL
+                if not from_trade_fill and self.initial_budget_usd > 0.0:
+                    dc_ext = real_pos - prev_pos
+                    du_ext = u_tot - prev_cash_tot
+                    if dc_ext >= 1.0 and du_ext >= -1.0:
+                        dep_usd = round(dc_ext * px_ref, 6)
+                        self.net_deposits_usd = round(self.net_deposits_usd + dep_usd, 6)
+                        self.initial_budget_usd = round(self.initial_budget_usd + dep_usd, 6)
+                        if prev_pos < 2.0:
+                            self.avg_entry = px_ref
+                            self.hold_sec = 0
+                            self.peak_bid = px_ref
+                        else:
+                            self.avg_entry = round((prev_pos * self.avg_entry + dc_ext * px_ref) / real_pos, 6)
+                            self.peak_bid = max(self.peak_bid, self.avg_entry, px_ref)
+                        self.deposits_log.append({
+                            "ts_utc": datetime.now(timezone.utc).isoformat(),
+                            "asset": self.coin.upper(),
+                            "qty": round(dc_ext, 6),
+                            "price_usd": round(px_ref, 4),
+                            "usd_equiv": round(dep_usd, 4),
+                            "new_budget_usd": round(self.initial_budget_usd, 4),
+                        })
+                        print(
+                            f"  🏦 [DEPOSIT SYNC] Внешнее пополнение: +{dc_ext:.4f} {self.coin.upper()} (~${dep_usd:.2f} по Bid=${px_ref:.2f}) | "
+                            f"База капитала бота: ${self.initial_budget_usd:.2f} (чистый торговый PnL сохранен)"
+                        )
+                    if du_ext >= 1.0 and dc_ext >= -0.5:
+                        self.net_deposits_usd = round(self.net_deposits_usd + du_ext, 6)
+                        self.initial_budget_usd = round(self.initial_budget_usd + du_ext, 6)
+                        self.deposits_log.append({
+                            "ts_utc": datetime.now(timezone.utc).isoformat(),
+                            "asset": "USDT",
+                            "qty": round(du_ext, 4),
+                            "price_usd": 1.0,
+                            "usd_equiv": round(du_ext, 4),
+                            "new_budget_usd": round(self.initial_budget_usd, 4),
+                        })
+                        print(
+                            f"  🏦 [DEPOSIT SYNC] Внешнее пополнение: +${du_ext:.2f} USDT | "
+                            f"База капитала бота: ${self.initial_budget_usd:.2f} (чистый торговый PnL сохранен)"
+                        )
+
+                self.bot_cash_usd = u_tot if self.active_bid_id is not None else u_free
                 if real_pos >= 2.0 and prev_pos < 2.0:
-                    px_ref = self.active_bid_p if self.active_bid_p > 0 else (b1 if b1 > 0 else 1.80)
                     self.avg_entry = self.avg_entry if self.avg_entry > 0 else px_ref
-                    self.peak_bid = max(self.peak_bid, self.avg_entry, b1 if b1 > 0 else px_ref)
+                    self.peak_bid = max(self.peak_bid, self.avg_entry, px_ref)
                     if not init_mode:
-                        print(f"  🔄 [SPOT SYNC] Обнаружена позиция на споте: {real_pos:.4f} PRL (вход=${self.avg_entry:.2f}) | Свободный USDT=${u_free:.2f}")
+                        print(f"  🔄 [SPOT SYNC] Позиция на споте активна: {real_pos:.4f} PRL (вход=${self.avg_entry:.2f}) | Свободный USDT=${u_free:.2f}")
                 elif real_pos < 2.0 and prev_pos >= 2.0:
                     self.avg_entry, self.hold_sec, self.peak_bid = 0.0, 0, 0.0
                     self.n_trades += 1
@@ -462,8 +522,7 @@ class LiveTriadRLTrader:
                         print(f"  🔄 [SPOT SYNC] Позиция полностью продана в USDT: баланс=${u_tot:.2f} (PnL={self.realized_pnl_usd:+.4f}$)")
                 self.pos_qty = real_pos
                 if init_mode and self.initial_budget_usd <= 0.0:
-                    px_init = b1 if b1 > 0 else (self.avg_entry if self.avg_entry > 0 else 1.80)
-                    self.initial_budget_usd = round(u_tot + real_pos * px_init, 4)
+                    self.initial_budget_usd = round(u_tot + real_pos * px_ref, 4)
                 self._save_wallet()
                 return
 
@@ -869,6 +928,8 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
                 trader.peak_bid = max(trader.peak_bid, trader.avg_entry, b1)
         if step_idx % 3 == 1:
             trader.sync_live_orders(b1, count_hold=False)
+        if step_idx % 15 == 1:
+            trader.sync_account_balances(b1)
 
         x_new = last_row.reindex(columns=trader.feature_names, fill_value=0.0).to_numpy(dtype=np.float32)[0]
         X_buf.append(x_new)
