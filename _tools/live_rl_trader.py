@@ -697,6 +697,10 @@ class LiveTriadRLTrader:
         self.last_ez12 = ez_12
         self.last_inertia = inertia
         self.last_pos3600 = pos_3600
+        self.last_rng14400 = rng_14400
+        self.last_pos14400 = pos_14400
+        self.last_b1_q = b1_q
+        self.last_a1_q = a1_q
         self.last_vel10 = vel_10
         self.last_imb5 = imb_l5
         self.last_dd300 = dd_300
@@ -864,11 +868,20 @@ class LiveTriadRLTrader:
             return
         tol = self.tick_size * 0.25
         if self.pos_qty <= 1e-4 and self.active_bid_id is not None:
-            if self.last_pos3600 > 0.85 or self.last_inertia < -0.20:
+            at_b1 = abs(self.active_bid_p - b1) <= tol
+            compressed_4h_floor = (4.8 <= getattr(self, "last_rng14400", 10.0) <= 5.5 and getattr(self, "last_pos14400", 0.5) <= 0.05 and self.last_dd900 <= 1.0)
+            pre_dump = (self.last_sp_ticks < 1.5 and self.last_ez25 < -0.15 and self.last_inertia < 0.08 and getattr(self, "last_a1_q", self.last_q_a1) > 4000.0) and not compressed_4h_floor
+            v14_hold_q = at_b1 and ((self.last_pos3600 <= 0.25 and not pre_dump and getattr(self, "last_b1_q", 0.0) >= 5000.0) or compressed_4h_floor)
+            if self.active_bid_p > b1 + tol and self.last_vel10 <= -1.0 and self.last_hold_edge < 0.0 and getattr(self, "last_a1_q", self.last_q_a1) > 500.0:
+                act = 5
+            elif v14_hold_q:
+                if act == 5:
+                    act = 0
+            elif self.last_pos3600 > 0.85 or self.last_inertia < -0.20:
                 act = 5
             elif self.last_dd300 < 0.5 and self.last_dd900 <= 1.0 and self.last_sp_ticks < 1.5 and self.last_ez12 < 0.30:
                 act = 5
-            elif self.last_sp_ticks < 1.5 and self.last_ez25 < -0.15 and self.last_inertia < 0.08 and self.last_q_a1 > 4000.0:
+            elif pre_dump:
                 act = 5
 
         if act in (1, 2) and self.pos_qty <= 1e-4:
@@ -921,11 +934,27 @@ class LiveTriadRLTrader:
             super_p = round((self.avg_entry + 3.0 * self.tick_size) / self.tick_size) * self.tick_size
             if act in (3, 4):
                 w2 = self._compute_adaptive_wave_weight()
+                q_a1 = float(self.last_q_a1)
                 q_a2 = float(self.last_q_a2)
-                is_super = (self.last_dd300 >= 4.0 and self.last_sp_ticks < 1.5 and self.last_ez25 >= 0.20 and self.last_hold_edge >= 1.50 and q_a2 < 800.0) or (
-                    self.last_dd900 >= 3.0 and self.last_pos3600 <= 0.05 and self.last_ez25 >= 0.65 and self.last_hold_edge >= 4.0 and q_a2 < 300.0
+                triad_super = (
+                    self.last_sp_ticks < 1.5
+                    and self.last_ez12 >= 0.70
+                    and self.last_ez25 >= 0.70
+                    and self.last_hold_edge >= 3.10
+                    and (self.last_ez25 >= 0.85 or self.last_hold_edge >= 3.80)
+                    and self.last_inertia >= 1.25
+                    and q_a1 < 1000.0
+                    and q_a2 < 4500.0
+                    and self.last_dd900 >= 2.0
                 )
-                if self.active_ask_id is not None and self.slot2_ask_id is not None:
+                is_super = (
+                    (self.last_dd300 >= 4.0 and self.last_sp_ticks < 1.5 and self.last_ez25 >= 0.20 and self.last_hold_edge >= 1.50 and q_a2 < 800.0)
+                    or (self.last_dd900 >= 3.0 and self.last_pos3600 <= 0.05 and self.last_ez25 >= 0.65 and self.last_hold_edge >= 4.0 and q_a2 < 300.0)
+                    or triad_super
+                )
+                if self.active_ask_id is not None and self.active_ask_p >= wave_p - tol and self.split_done_for_pos:
+                    return
+                elif self.active_ask_id is not None and self.slot2_ask_id is not None:
                     if w2 <= 0.05 and a1 <= floor_p + tol and q_a2 <= 15000.0:
                         try:
                             self.client.cancel_order(self.slot2_ask_id)
@@ -956,7 +985,23 @@ class LiveTriadRLTrader:
                 elif self.active_ask_id is None and (is_super or 0.15 <= w2 <= 0.85) and not self.split_done_for_pos:
                     self.sync_account_balances(b1)
                     tot_sell = math.floor(min(self.pos_qty, self.ex_coin_free) * 10000.0) / 10000.0
-                    eff_w2 = 0.50 if is_super else w2
+                    eff_w2 = 1.00 if is_super else w2
+                    if is_super and eff_w2 >= 0.99 and tot_sell >= 2.0:
+                        p_sup = round(max(a1 + 2.0 * self.tick_size, super_p) / self.tick_size) * self.tick_size
+                        try:
+                            res_s = self.client.place_limit_order(self.market, "sell", tot_sell, p_sup)
+                            self.active_ask_id = res_s.get("id")
+                            self.active_ask_p = float(res_s.get("price", p_sup))
+                            self.active_ask_q = float(res_s.get("origin_amount", tot_sell))
+                            self.q_ahead = -1.0
+                            self.slot2_ask_id, self.slot2_ask_p, self.slot2_ask_q = None, 0.0, 0.0
+                            self.split_done_for_pos = True
+                            self._save_wallet()
+                            print(f"  🚀 [LIVE SUPER-WAVE +3t] id={self.active_ask_id} | {self.active_ask_q:.4f} PRL @ ${self.active_ask_p:.2f}")
+                            return
+                        except Exception as e:
+                            print(f"  ⚠️ [SUPER-WAVE SELL ERROR]: {e}")
+                            self.sync_account_balances(b1)
                     q2 = math.floor((tot_sell * eff_w2) * 10000.0) / 10000.0
                     q1 = math.floor((tot_sell - q2) * 10000.0) / 10000.0
                     if q1 >= 2.0 and q2 >= 2.0:

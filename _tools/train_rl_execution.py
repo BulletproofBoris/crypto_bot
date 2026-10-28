@@ -625,39 +625,60 @@ class SafeTradeL2ExecutionEnv:
         ez25 = float(self.X_market[t, 12])
         hold_edge = float(self.obs_hold_edge_norm[t] * 5.0)
         if not self.legacy_v2 and self.pos_qty <= 1e-8 and self.order_side == "BUY":
-            if pos3600 > 0.85 or inertia < -0.20:
+            at_b1 = abs(self.order_price - b1) <= tol
+            compressed_4h_floor = (4.8 <= self.rng_14400[t] <= 5.5 and self.pos_14400[t] <= 0.05 and self.dd_900[t] <= 1.0)
+            pre_dump = (sp < 1.5 and ez25 < -0.15 and inertia < 0.08 and self.ask_q[t, 0] > 4000.0) and not compressed_4h_floor
+            v14_hold_q = at_b1 and ((pos3600 <= 0.25 and not pre_dump and self.bid_q[t, 0] >= 5000.0) or compressed_4h_floor)
+            if self.order_price > b1 + tol and self.vel_b1_10[t] <= -1.0 and hold_edge < 0.0 and self.ask_q[t, 0] > 500.0:
+                action = 5
+            elif v14_hold_q:
+                if action == 5:
+                    action = 0
+            elif pos3600 > 0.85 or inertia < -0.20:
                 action = 5
             elif self.dd_300[t] < 0.5 and self.dd_900[t] <= 1.0 and sp < 1.5 and self.X_market[t, 6] < 0.30:
                 action = 5
-            elif sp < 1.5 and ez25 < -0.15 and inertia < 0.08 and self.ask_q[t, 0] > 4000.0:
+            elif pre_dump:
                 action = 5
 
         if not self.legacy_v2 and self.pos_qty > 1e-8 and action in (3, 4):
             floor_p = round((self.avg_entry + self.tick_size) / self.tick_size) * self.tick_size
             wave_p = round((self.avg_entry + 2.0 * self.tick_size) / self.tick_size) * self.tick_size
             super_p = round((self.avg_entry + 3.0 * self.tick_size) / self.tick_size) * self.tick_size
+            q_a1, _ = self._get_lob_queue(t, "SELL", floor_p)
             q_a2, _ = self._get_lob_queue(t, "SELL", wave_p)
             w2 = self._compute_adaptive_wave_weight(t, floor_p, wave_p)
             e_t = self.entry_t
-            is_super = (self.dd_300[t] >= 4.0 and sp < 1.5 and ez25 >= 0.20 and hold_edge >= 1.50 and q_a2 < 800.0) or (
-                self.dd_900[e_t] >= 3.0 and self.pos_3600[e_t] <= 0.05 and float(self.X_market[e_t, 12]) >= 0.65 and float(self.obs_hold_edge_norm[e_t] * 5.0) >= 4.0 and q_a2 < 300.0
+            ez12 = float(self.X_market[t, 6])
+            triad_super = (
+                sp < 1.5
+                and ez12 >= 0.70
+                and ez25 >= 0.70
+                and hold_edge >= 3.10
+                and (ez25 >= 0.85 or hold_edge >= 3.80)
+                and inertia >= 1.25
+                and q_a1 < 1000.0
+                and q_a2 < 4500.0
+                and self.dd_900[t] >= 2.0
+            )
+            is_super = (
+                (self.dd_300[t] >= 4.0 and sp < 1.5 and ez25 >= 0.20 and hold_edge >= 1.50 and q_a2 < 800.0)
+                or (self.dd_900[e_t] >= 3.0 and self.pos_3600[e_t] <= 0.05 and float(self.X_market[e_t, 12]) >= 0.65 and float(self.obs_hold_edge_norm[e_t] * 5.0) >= 4.0 and q_a2 < 300.0)
+                or triad_super
             )
             if self.order_side != "SELL" and is_super and not self.split_done_for_pos:
-                q2 = round(self.pos_qty * 0.50, 4)
-                q1 = round(self.pos_qty - q2, 4)
                 self.order_side = "SELL"
                 self.order_act = 3
-                self.order_price = max(a1 + self.tick_size, wave_p)
-                self.order_qty = q1
+                self.order_price = max(a1 + 2.0 * self.tick_size, super_p)
+                self.order_qty = self.pos_qty
                 self.q_ahead, _ = self._get_lob_queue(t, "SELL", self.order_price)
                 self.active_after = t + 1
-                self.slot2_side = "SELL"
-                self.slot2_price = max(a1 + 2.0 * self.tick_size, super_p)
-                self.slot2_qty = q2
-                self.slot2_q_ahead, _ = self._get_lob_queue(t, "SELL", self.slot2_price)
-                self.slot2_active_after = t + 1
+                self.slot2_side = None
+                self.slot2_qty = 0.0
                 self.split_done_for_pos = True
                 requote_penalty = 0.005
+                action = 0
+            elif self.order_side == "SELL" and self.order_price >= wave_p - tol and self.split_done_for_pos:
                 action = 0
             elif self.order_side == "SELL" and self.slot2_side == "SELL":
                 if w2 <= 0.05 and a1 <= floor_p + tol and q_a2 <= 15000.0:
