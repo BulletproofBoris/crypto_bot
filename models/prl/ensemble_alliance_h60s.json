@@ -1,25 +1,55 @@
 {
   "coin": "PRL",
   "H": 60,
-  "seq_len": 150,
+  "seq_len": 180,
   "optimal_weights": {
-    "lightgbm": 0.85,
-    "conv1d+gru": 0.15
+    "lightgbm": 0.55,
+    "mlp_bottleneck": 0.2,
+    "conv1d+gru": 0.15,
+    "attention": 0.05,
+    "causal_cnn": 0.05
   },
   "ensemble_metrics_oos": {
-    "ic": 0.2568,
-    "auc": 0.7508,
-    "log_loss": 1.15,
-    "top2_pnl": 0.79
+    "ic": 0.2745,
+    "auc": 0.778,
+    "log_loss": 1.12,
+    "top2_pnl": 0.82
   },
-  "class_weights": [
-    11.865688,
-    9.946083,
-    4.065611,
-    0.165958,
-    4.058659,
-    7.904436,
-    10.933076
+  "leaderboard": [
+    {
+      "model": "lightgbm",
+      "ic": 0.3124,
+      "auc": 0.7885,
+      "log_loss": 1.18,
+      "top2_pnl": 0.43
+    },
+    {
+      "model": "attention",
+      "ic": 0.069,
+      "auc": 0.6672,
+      "log_loss": 1.9735,
+      "top2_pnl": 0.07
+    },
+    {
+      "model": "causal_cnn",
+      "ic": 0.0617,
+      "auc": 0.6345,
+      "log_loss": 1.9976,
+      "top2_pnl": 0.04
+    },
+    {
+      "model": "conv1d+gru",
+      "ic": 0.1646,
+      "auc": 0.7061,
+      "log_loss": 1.8613,
+      "top2_pnl": 0.1
+    },
+    {
+      "model": "mlp_bottleneck",
+      "ic": 0.1956,
+      "auc": 0.7369,
+      "log_loss": 1.7683,
+      "top2_pnl": 0.15
+    }
   ]
 }
-

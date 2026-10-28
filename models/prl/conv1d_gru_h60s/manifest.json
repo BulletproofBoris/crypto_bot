@@ -1,0 +1,24 @@
+[
+  {
+    "window_id": "win_00",
+    "model_type": "conv1d+gru",
+    "coin": "PRL",
+    "H": 60,
+    "seq_len": 180,
+    "train_ts_range": [
+      "2026-10-10 10:17:29",
+      "2026-10-22 05:20:32"
+    ],
+    "test_ts_range": [
+      "2026-10-22 05:27:33",
+      "2026-10-27 10:23:27"
+    ],
+    "metrics_oos": {
+      "ic_dt_ticks": 0.1646,
+      "roc_auc_ovr": 0.7061,
+      "log_loss": 1.8613,
+      "top2pct_mean_ticks": 0.1
+    },
+    "weights_file": "model_win_00.keras"
+  }
+]

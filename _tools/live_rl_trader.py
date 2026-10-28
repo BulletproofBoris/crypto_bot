@@ -273,8 +273,10 @@ class LiveTriadRLTrader:
             (12, 3.5, SwarmRegimeRouter(self.coin, 12, 3.5, temperature=0.5, use_neural=use_neural, neural_weight=0.15)),
             (25, 3.0, SwarmRegimeRouter(self.coin, 25, 3.0, temperature=0.5, use_neural=use_neural, neural_weight=0.15)),
         ]
+        self.router_60 = SwarmRegimeRouter(self.coin, 60, 3.0, temperature=0.5, use_neural=use_neural, neural_weight=0.15)
         if use_neural:
             list(self._triad_pool.map(lambda r_item: r_item[2].preload_neural_models(), self.routers))
+            self.router_60.preload_neural_models()
             torch.set_num_threads(2)
             print(f"⚡ Все активные нейросетевые модели (FastKerasModel, пул={SAFE_WORKERS} потоков) предзагружены в RAM (0 обращений к диску на тиках).")
         self.feature_names = self.routers[0][2].feature_names
@@ -683,6 +685,9 @@ class LiveTriadRLTrader:
             p_tn = float(p[0] + p[1])
             triad_vec.extend([ez, p_up, p_down, p_tp, p_tn, float(res["entropy"])])
         self.last_triad_probs = triad_probs
+        res60 = self.router_60.predict_live_tick(X_seq_2d, row_df)
+        self.last_ez60 = float(res60["expected_z"])
+        self.last_p60 = np.asarray(res60["probs"], dtype=np.float32)
 
         r = row_df.iloc[-1]
         tol = self.tick_size * 0.25
@@ -923,6 +928,7 @@ class LiveTriadRLTrader:
         return obs, mask
 
     def _compute_adaptive_wave_weight(self) -> float:
+        ez60 = float(getattr(self, "last_ez60", 0.0))
         ez25 = float(self.last_ez25)
         ez12 = float(self.last_ez12)
         hold_edge = float(self.last_hold_edge)
@@ -939,25 +945,26 @@ class LiveTriadRLTrader:
             or getattr(self, "last_in_breakout", False)
             or (self.avg_entry > 0 and b1_cur >= self.avg_entry + self.tick_size * 0.75 and inertia >= 0.0)
             or (imb5 >= 0.22 and inertia >= 0.25 and ez12 >= 0.15)
+            or (ez60 >= 0.28 and ez25 >= 0.15 and inertia >= 0.20)
         ):
             return 1.0
         q_a1 = float(self.last_q_a1)
         q_a2 = float(self.last_q_a2)
         own_ask_share = self.pos_qty / (q_a1 + self.pos_qty + 1e-6)
-        if self.last_pos3600 >= 0.65 and q_a2 > 3000.0 and vel10 <= 0.0 and inertia < 0.25:
+        if self.last_pos3600 >= 0.65 and q_a2 > 3000.0 and vel10 <= 0.0 and inertia < 0.25 and ez60 < 0.20:
             return 0.0
         if q_a2 > 15000.0 and q_a1 < 500.0:
             return 0.50
         if (hold_edge >= 0.90 and ez25 >= 0.15 and ez12 >= 0.08) or (hold_edge >= 0.80 and q_a2 < 250.0 and q_a1 > 500.0):
             return 1.0
-        if (hold_edge >= 0.45 and ez25 >= 0.08) or (ez25 >= 0.14 and hold_edge >= 0.20) or (own_ask_share > 0.15 and ez25 >= 0.08 and hold_edge >= 0.10):
+        if (hold_edge >= 0.45 and (ez25 >= 0.08 or ez60 >= 0.15)) or (ez25 >= 0.14 and hold_edge >= 0.20) or (own_ask_share > 0.15 and ez25 >= 0.08 and hold_edge >= 0.10):
             q_adv = q_a1 / (q_a1 + q_a2 + 200.0)
             return float(np.clip(0.35 + 0.12 * max(0.0, hold_edge) + 0.25 * q_adv, 0.30, 0.65))
         return 0.0
 
     def _mc_lookahead_refine(self, obs: np.ndarray, mask: np.ndarray, act: int) -> int:
         """
-        15-секундный векторный Lookahead-фильтр стакана по распределениям Триады probs[-3..+3] (H=5, 12, 25с):
+        15-секундный векторный Lookahead-фильтр стакана по распределениям Триады probs[-3..+3] (H=5, 12, 25, 60с):
         оценивает математическое ожидание E[PnL] и вероятность исполнения P(fill) для QUOTE_BID_1 vs QUOTE_BID_2
         перед выставлением ордера в стакан.
         """
@@ -967,6 +974,7 @@ class LiveTriadRLTrader:
         if not probs_list or len(probs_list) < 3:
             return act
         p5, p12, p25 = probs_list[0], probs_list[1], probs_list[2]
+        p60 = getattr(self, "last_p60", p25)
         k_vals = np.array([-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0], dtype=np.float32)
 
         b1_q = float(getattr(self, "last_b1_q", 500.0))
@@ -980,9 +988,9 @@ class LiveTriadRLTrader:
         # Вероятность исполнения при перешагивании в спред (QUOTE_BID_1, впереди очереди q_ahead=0)
         p_fill_b1 = float(np.clip(p5[0] + p5[1] + p5[2] + p5[3] * 0.82, 0.15, 0.98)) if sp >= 2.0 else p_fill_b2
 
-        # Ожидаемый профит после входа (на горизонте 12-25с) за вычетом риска токсичного пробоя (-2..-3 тика)
-        ez_post = 0.45 * float(np.dot(p12, k_vals)) + 0.55 * float(np.dot(p25, k_vals))
-        tail_crash_prob = 0.5 * float(p5[0] + p5[1]) + 0.5 * float(p12[0] + p12[1])
+        # Ожидаемый профит после входа (на горизонте 12-60с) за вычетом риска токсичного пробоя (-2..-3 тика)
+        ez_post = 0.35 * float(np.dot(p12, k_vals)) + 0.40 * float(np.dot(p25, k_vals)) + 0.25 * float(np.dot(p60, k_vals))
+        tail_crash_prob = 0.45 * float(p5[0] + p5[1]) + 0.35 * float(p12[0] + p12[1]) + 0.20 * float(p60[0] + p60[1])
         adverse_pen = tail_crash_prob * 2.4
 
         # E[PnL] в тиках для пассивного бида b1 (захват полного спреда) и агрессивного b1+1 (минус 1 тик спреда)
@@ -1399,9 +1407,9 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
 
     from _tools.live_feature_updater import LiveFeatureStreamer
     streamer = LiveFeatureStreamer(df_sub, trader.feature_names, coin=coin)
-    df_init = streamer.get_recent_window(60)
+    df_init = streamer.get_recent_window(180)
     X_tail = df_init.reindex(columns=trader.feature_names, fill_value=0.0).to_numpy(dtype=np.float32)
-    X_buf = deque(X_tail, maxlen=60)
+    X_buf = deque(X_tail, maxlen=180)
     last_row = df_init.iloc[-1:].copy()
     for w_i in range(max(0, len(X_tail) - 15), len(X_tail)):
         res12 = trader.routers[1][2].predict_live_tick(X_tail[:w_i + 1], df_init.iloc[w_i:w_i + 1])
@@ -1671,6 +1679,8 @@ def start_live_daemon(budget_usd: float = 54.0, order_usd: float = 54.0, steps: 
         ppo_local = BASE_DIR / "models" / "prl" / "rl_execution" / "best_maskable_ppo.pt"
         if ppo_local.exists():
             sftp.put(str(ppo_local), "/opt/crypto_bot/models/prl/rl_execution/best_maskable_ppo.pt")
+        for af in (BASE_DIR / "models" / "prl").glob("ensemble_alliance_h*.json"):
+            sftp.put(str(af), f"/opt/crypto_bot/models/prl/{af.name}")
         for pat in ("h*s_k*", "*_h*s"):
             for h_dir in (BASE_DIR / "models" / "prl").glob(pat):
                 if not h_dir.is_dir():
