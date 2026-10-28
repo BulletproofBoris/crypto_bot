@@ -1,6 +1,6 @@
 [
   {
-    "window_id": "win_00",
+    "window_id": "win_01",
     "model_type": "attention",
     "coin": "PRL",
     "H": 25,
@@ -19,6 +19,6 @@
       "log_loss": 1.6615,
       "top2pct_mean_ticks": -0.07
     },
-    "weights_file": "model_win_00.keras"
+    "weights_file": "model_win_01.keras"
   }
 ]

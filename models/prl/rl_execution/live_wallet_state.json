@@ -1,13 +1,13 @@
 {
-  "updated_at": "2026-10-28T12:01:30.289726+00:00",
+  "updated_at": "2026-10-28T12:45:31.445900+00:00",
   "initial_budget_usd": 94.794594,
-  "bot_cash_usd": 94.943465,
+  "bot_cash_usd": 94.563931,
   "pos_qty": 0.0,
   "avg_entry": 0.0,
-  "realized_pnl_usd": 0.338348,
+  "realized_pnl_usd": 0.745432,
   "net_deposits_usd": 0.0,
   "deposits_log": [],
-  "n_trades": 1,
+  "n_trades": 4,
   "reserved_account_usdt": 0.0,
   "user_reserved_coin": 0.0,
   "active_bid_id": null,
@@ -20,7 +20,7 @@
   "slot2_ask_p": 0.0,
   "slot2_ask_q": 0.0,
   "split_done_for_pos": false,
-  "car_state": 0,
-  "car_sell_px": 0.0,
-  "car_cycles": 0
+  "car_state": 2,
+  "car_sell_px": 1.77,
+  "car_cycles": 1
 }

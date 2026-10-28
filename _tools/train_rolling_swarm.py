@@ -140,19 +140,19 @@ def generate_rolling_windows_reverse(segments: list, H: int, K: float, n_target:
     # H=60: 1 строгое 100%-OOS окно (936560, win_00) = 1 окно
     fixed_tr_ends_map = {
         5: [
-            1385979,
-            1348479, 1310979, 1273479, 1235979, 1198479, 1160979, 1123479, 1085979,
-            1048479, 1010979, 973479, 935979, 898479, 860979, 823479, 785979,
-            748479, 689744, 673479, 635979, 598479, 560979, 523479, 485979,
-            442356, 410904, 373404, 335904, 298404, 260904, 223404, 185904,
-            148404, 110904,
+            1434279, 1396779,
+            1359279, 1321779, 1284279, 1246779, 1209279, 1171779, 1134279, 1096779,
+            1059279, 1021779, 984279, 946779, 909279, 871779, 834279, 796779,
+            759279, 700544, 678734, 646779, 609279, 571779, 534279, 496779,
+            453156, 421704, 384204, 346704, 309204, 271704, 234204, 196704,
+            159204, 121704,
         ],
         12: [
-            1281203,
+            1376636, 1281203,
             1176203, 1071203, 996663, 902093, 797093, 689744, 587093, 482093, 377018, 272018,
         ],
         25: [
-            1141694, 984580, 797080, 609580, 422005,
+            1294123, 1141694, 984580, 797080, 609580, 422005,
         ],
         60: [
             936560,
@@ -394,6 +394,20 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
         ts_tr_end = str(df['timestamp'].iloc[min(tr_e - 1, len(df)-1)])[:19]
         ts_te_start = str(df['timestamp'].iloc[min(te_s, len(df)-1)])[:19]
         ts_te_end = str(df['timestamp'].iloc[min(te_e - 1, len(df)-1)])[:19]
+
+        model_path = out_dir / f"model_{win_id}.txt"
+        meta_path = out_dir / f"meta_{win_id}.json"
+        if model_path.exists() and meta_path.exists():
+            try:
+                old_meta = json.loads(meta_path.read_text())
+                if old_meta.get("train_ts_range") == [ts_tr_start, ts_tr_end]:
+                    manifest.append(old_meta)
+                    mo = old_meta.get("metrics_oos", {})
+                    ic, auc, top2_pnl = mo.get("ic_dt_ticks", 0.0), mo.get("roc_auc_ovr", 0.5), mo.get("top2pct_mean_ticks", 0.0)
+                    print(f"{win_id:<6} | {ts_tr_start} -> {ts_tr_end} | {ts_te_start} -> {ts_te_end} | {ic:+6.4f}  | {auc:6.4f}   | {top2_pnl:+6.2f} тиков | ⏩ КЭШ     ")
+                    continue
+            except Exception:
+                pass
 
         X_train = X_all[tr_idx]
         y_train = df['target_class'].iloc[tr_idx].values + 3  # Сдвиг [-3..3] -> [0..6]
