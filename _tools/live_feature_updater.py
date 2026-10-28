@@ -477,9 +477,54 @@ class LiveFeatureStreamer:
                 except Exception:
                     pass
 
-    def step(self, rest_depth: dict, now_utc: datetime) -> pd.DataFrame:
+    def _strip_own_l2(self, d: dict, own_orders: dict):
+        tol = float(own_orders.get("tick_size", 0.01)) * 0.25
+        bid_p = float(own_orders.get("bid_p", 0.0) or 0.0)
+        bid_q = float(own_orders.get("bid_q", 0.0) or 0.0)
+        asks_own = own_orders.get("asks", [])
+        if bid_q <= 0.0 and not any(q > 0.0 for _, q in asks_own):
+            return
+        bp = [float(d.get(f"ST_bid_{i}_price", 0.0)) for i in range(1, 51)]
+        bq = [float(d.get(f"ST_bid_{i}_qty", 0.0)) for i in range(1, 51)]
+        ap = [float(d.get(f"ST_ask_{i}_price", 0.0)) for i in range(1, 51)]
+        aq = [float(d.get(f"ST_ask_{i}_qty", 0.0)) for i in range(1, 51)]
+        b_clean = []
+        for p, q in zip(bp, bq):
+            if p <= 0:
+                continue
+            if bid_q > 0 and abs(p - bid_p) <= tol:
+                q = max(0.0, q - bid_q)
+            if q > 1e-4:
+                b_clean.append((p, q))
+        a_clean = []
+        for p, q in zip(ap, aq):
+            if p <= 0:
+                continue
+            for op, oq in asks_own:
+                if oq > 0 and abs(p - op) <= tol:
+                    q = max(0.0, q - oq)
+            if q > 1e-4:
+                a_clean.append((p, q))
+        if not b_clean or not a_clean:
+            return
+        bp_arr = np.zeros(50, dtype=np.float64)
+        bq_arr = np.zeros(50, dtype=np.float64)
+        ap_arr = np.zeros(50, dtype=np.float64)
+        aq_arr = np.zeros(50, dtype=np.float64)
+        for i, (p, q) in enumerate(b_clean[:50]):
+            bp_arr[i], bq_arr[i] = p, q
+        for i, (p, q) in enumerate(a_clean[:50]):
+            ap_arr[i], aq_arr[i] = p, q
+        for i in range(50):
+            d[f"ST_bid_{i+1}_price"], d[f"ST_bid_{i+1}_qty"] = bp_arr[i], bq_arr[i]
+            d[f"ST_ask_{i+1}_price"], d[f"ST_ask_{i+1}_qty"] = ap_arr[i], aq_arr[i]
+        self._recalc_l2_Book_scalars(d, "ST", bp_arr, bq_arr, ap_arr, aq_arr)
+        d["_l2_cleaned"] = 1.0
+
+    def step(self, rest_depth: dict, now_utc: datetime, own_orders: dict = None) -> pd.DataFrame:
         d = dict(self.raw_rows[-1])
         d["_ts"] = pd.Timestamp(now_utc)
+        d["_l2_cleaned"] = 0.0
 
         # 1. Полный 50-уровневый стакан ST из горячего CSV + свежий BBO из REST
         st_tail = self._tail_lines(self.st_depth_path, n=1)
@@ -501,6 +546,8 @@ class LiveFeatureStreamer:
             ap = np.array([float(d.get(f"ST_ask_{i}_price", 0.0)) for i in range(1, 51)], dtype=np.float64)
             aq = np.array([float(d.get(f"ST_ask_{i}_qty", 0.0)) for i in range(1, 51)], dtype=np.float64)
             self._recalc_l2_Book_scalars(d, "ST", bp, bq, ap, aq)
+        if own_orders:
+            self._strip_own_l2(d, own_orders)
 
         # 2. Горячий стакан BigONE + макро Binance + живые сделки
         bo_tail = self._tail_lines(self.bo_depth_path, n=1)
@@ -570,8 +617,10 @@ class LiveFeatureStreamer:
         """Субсекундное чтение (<0.3 мс) лучших цен/объемов ST и BO для внутрисекундного сторожа очереди."""
         last_d = self.raw_rows[-1] if self.raw_rows else {}
         b1 = float(last_d.get("ST_bid_1_price", last_d.get("ST_best_bid", 0.0)))
+        b2 = float(last_d.get("ST_bid_2_price", 0.0))
         a1 = float(last_d.get("ST_ask_1_price", last_d.get("ST_best_ask", 0.0)))
         b1_q = float(last_d.get("ST_bid_1_qty", 0.0))
+        b2_q = float(last_d.get("ST_bid_2_qty", 0.0))
         a1_q = float(last_d.get("ST_ask_1_qty", 0.0))
         bo_b1 = float(last_d.get("BO_bid_1_price", 0.0))
 
@@ -582,6 +631,8 @@ class LiveFeatureStreamer:
                 try:
                     b1 = float(parts[1] or b1)
                     b1_q = float(parts[2] or b1_q)
+                    b2 = float(parts[3] or b2)
+                    b2_q = float(parts[4] or b2_q)
                     a1 = float(parts[101] or a1)
                     a1_q = float(parts[102] or a1_q)
                 except ValueError:
@@ -592,6 +643,8 @@ class LiveFeatureStreamer:
             if bids and asks:
                 try:
                     b1, b1_q = float(bids[0][0]), float(bids[0][1])
+                    if len(bids) > 1:
+                        b2, b2_q = float(bids[1][0]), float(bids[1][1])
                     a1, a1_q = float(asks[0][0]), float(asks[0][1])
                 except (ValueError, IndexError):
                     pass
@@ -603,6 +656,7 @@ class LiveFeatureStreamer:
                     bo_b1 = float(b_parts[1] or bo_b1)
                 except ValueError:
                     pass
-        return {"b1": b1, "a1": a1, "b1_q": b1_q, "a1_q": a1_q, "bo_b1": bo_b1}
+        return {"b1": b1, "b2": b2, "a1": a1, "b1_q": b1_q, "b2_q": b2_q, "a1_q": a1_q, "bo_b1": bo_b1}
+
 
 

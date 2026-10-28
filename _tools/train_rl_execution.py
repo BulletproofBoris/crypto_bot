@@ -672,7 +672,7 @@ class SafeTradeL2ExecutionEnv:
         if not self.legacy_v2 and self.pos_qty <= 1e-8 and self.order_side is None and action == 0 and brk_now and t >= self.cooldown_until:
             action = 1 if self.can_buy_best_arr[t] else 2
         if not self.legacy_v2 and self.pos_qty <= 1e-8 and self.order_side == "BUY":
-            at_b1 = abs(self.order_price - b1) <= tol
+            at_b1 = (self.order_price >= b1 - tol) and (self.order_price <= b1 + self.tick_size + tol)
             compressed_4h_floor = (4.8 <= self.rng_14400[t] <= 5.5 and self.pos_14400[t] <= 0.05 and self.dd_900[t] <= 1.0)
             pre_dump = (sp < 1.5 and ez25 < -0.15 and inertia < 0.08 and self.ask_q[t, 0] > 4000.0) and not compressed_4h_floor
             front_q_hold = at_b1 and (self.q_ahead < 600.0) and not pre_dump and pos3600 <= 0.65 and inertia >= -0.10

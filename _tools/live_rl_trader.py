@@ -691,26 +691,37 @@ class LiveTriadRLTrader:
 
         r = row_df.iloc[-1]
         tol = self.tick_size * 0.25
-        b1 = float(max(r.get("ST_bid_1_price", r.get("ST_best_bid", 0.0)), self.tick_size))
-        a1 = float(max(r.get("ST_ask_1_price", r.get("ST_best_ask", b1 + self.tick_size)), b1 + self.tick_size))
+        already_cleaned = float(r.get("_l2_cleaned", 0.0)) > 0.5
+        b1_raw = float(max(r.get("ST_bid_1_price", r.get("ST_best_bid", 0.0)), self.tick_size))
+        a1_raw = float(max(r.get("ST_ask_1_price", r.get("ST_best_ask", b1_raw + self.tick_size)), b1_raw + self.tick_size))
 
-        # Вычитаем собственный импакт (наши активные лимитные заявки Slot 1 / Slot 2) из 10 уровней стакана L2
-        bid_qs_clean, ask_qs_clean, ask_ps = [], [], []
-        for i in range(1, 11):
-            bp = float(r.get(f"ST_bid_{i}_price", b1 if i == 1 else 0.0))
+        # Вычитаем собственный импакт (наши активные лимитные заявки Slot 1 / Slot 2) из 10 уровней стакана L2 со сдвигом пустых уровней
+        bid_ps, bid_qs_clean, ask_ps, ask_qs_clean = [], [], [], []
+        for i in range(1, 12):
+            bp = float(r.get(f"ST_bid_{i}_price", b1_raw if i == 1 else 0.0))
             bq = max(0.0, float(r.get(f"ST_bid_{i}_qty", r.get("ST_bid_qty_1", 0.0) if i == 1 else 0.0)))
-            if self.active_bid_q > 0 and abs(bp - self.active_bid_p) <= tol:
+            if not already_cleaned and self.active_bid_q > 0 and abs(bp - self.active_bid_p) <= tol:
                 bq = max(0.0, bq - self.active_bid_q)
-            bid_qs_clean.append(bq)
+            if bp > 0 and (bq > 1e-4 or i == 11):
+                bid_ps.append(bp)
+                bid_qs_clean.append(bq)
 
-            ap = float(r.get(f"ST_ask_{i}_price", a1 if i == 1 else 0.0))
+            ap = float(r.get(f"ST_ask_{i}_price", a1_raw if i == 1 else 0.0))
             aq = max(0.0, float(r.get(f"ST_ask_{i}_qty", r.get("ST_ask_qty_1", 0.0) if i == 1 else 0.0)))
-            if self.active_ask_q > 0 and abs(ap - self.active_ask_p) <= tol:
+            if not already_cleaned and self.active_ask_q > 0 and abs(ap - self.active_ask_p) <= tol:
                 aq = max(0.0, aq - self.active_ask_q)
-            if self.slot2_ask_q > 0 and abs(ap - self.slot2_ask_p) <= tol:
+            if not already_cleaned and self.slot2_ask_q > 0 and abs(ap - self.slot2_ask_p) <= tol:
                 aq = max(0.0, aq - self.slot2_ask_q)
-            ask_qs_clean.append(aq)
-            ask_ps.append(ap)
+            if ap > 0 and (aq > 1e-4 or i == 11):
+                ask_ps.append(ap)
+                ask_qs_clean.append(aq)
+
+        bid_ps = (bid_ps + [b1_raw] * 10)[:10]
+        bid_qs_clean = (bid_qs_clean + [0.0] * 10)[:10]
+        ask_ps = (ask_ps + [a1_raw] * 10)[:10]
+        ask_qs_clean = (ask_qs_clean + [0.0] * 10)[:10]
+        b1 = float(max(bid_ps[0], self.tick_size))
+        a1 = float(max(ask_ps[0], b1 + self.tick_size))
 
         b1_q, a1_q = bid_qs_clean[0], ask_qs_clean[0]
         b5_q, a5_q = sum(bid_qs_clean[:5]), sum(ask_qs_clean[:5])
@@ -815,11 +826,9 @@ class LiveTriadRLTrader:
         tol = self.tick_size * 0.25
         if has_bid:
             q_at, q_better = 0.0, 0.0
-            for k in range(1, 11):
-                lp = float(r.get(f"ST_bid_{k}_price", 0.0))
-                lq = float(r.get(f"ST_bid_{k}_qty", 0.0))
+            for lp, lq in zip(bid_ps, bid_qs_clean):
                 if abs(lp - self.active_bid_p) <= tol:
-                    q_at += max(0.0, lq - self.active_bid_q)
+                    q_at += max(0.0, lq)
                 elif lp > self.active_bid_p + tol:
                     q_better += lq
             if self.q_ahead < 0.0:
@@ -827,7 +836,7 @@ class LiveTriadRLTrader:
             else:
                 q_better_eff = max(q_better, getattr(self, "_prev_q_better", q_better))
                 q_at_prev = getattr(self, "_prev_q_at", q_at)
-                vol_hit = float(r.get("ST_sell_vol", 0.0)) if abs(b1 - self.active_bid_p) <= tol else 0.0
+                vol_hit = float(r.get("ST_sell_vol", 0.0)) if self.active_bid_p >= b1 - tol else 0.0
                 vol_at_px = max(0.0, vol_hit - q_better_eff)
                 if vol_at_px > 0.0:
                     self.q_ahead = max(0.0, self.q_ahead - vol_at_px)
@@ -838,11 +847,9 @@ class LiveTriadRLTrader:
             self._prev_q_at, self._prev_q_better = q_at, q_better
         elif has_ask:
             q_at, q_better = 0.0, 0.0
-            for k in range(1, 11):
-                lp = float(r.get(f"ST_ask_{k}_price", 0.0))
-                lq = float(r.get(f"ST_ask_{k}_qty", 0.0))
+            for lp, lq in zip(ask_ps, ask_qs_clean):
                 if abs(lp - self.active_ask_p) <= tol:
-                    q_at += max(0.0, lq - self.active_ask_q)
+                    q_at += max(0.0, lq)
                 elif 0.0 < lp < self.active_ask_p - tol:
                     q_better += lq
             if self.q_ahead < 0.0:
@@ -850,7 +857,7 @@ class LiveTriadRLTrader:
             else:
                 q_better_eff = max(q_better, getattr(self, "_prev_q_better", q_better))
                 q_at_prev = getattr(self, "_prev_q_at", q_at)
-                vol_hit = float(r.get("ST_buy_vol", 0.0)) if abs(a1 - self.active_ask_p) <= tol else 0.0
+                vol_hit = float(r.get("ST_buy_vol", 0.0)) if self.active_ask_p <= a1 + tol else 0.0
                 vol_at_px = max(0.0, vol_hit - q_better_eff)
                 if vol_at_px > 0.0:
                     self.q_ahead = max(0.0, self.q_ahead - vol_at_px)
@@ -1028,7 +1035,7 @@ class LiveTriadRLTrader:
             return
         tol = self.tick_size * 0.25
         if self.pos_qty <= 1e-4 and self.active_bid_id is not None:
-            at_b1 = abs(self.active_bid_p - b1) <= tol
+            at_b1 = (self.active_bid_p >= b1 - tol) and (self.active_bid_p <= b1 + self.tick_size + tol)
             compressed_4h_floor = (4.8 <= getattr(self, "last_rng14400", 10.0) <= 5.5 and getattr(self, "last_pos14400", 0.5) <= 0.05 and self.last_dd900 <= 1.0)
             pre_dump = (self.last_sp_ticks < 1.5 and self.last_ez25 < -0.15 and self.last_inertia < 0.08 and getattr(self, "last_a1_q", self.last_q_a1) > 4000.0) and not compressed_4h_floor
             front_q_hold = at_b1 and ((0.0 <= self.q_ahead < 600.0) or getattr(self, "bid_partial_filled", 0.0) > 0.0) and not pre_dump and self.last_pos3600 <= 0.65 and self.last_inertia >= -0.10
@@ -1325,15 +1332,18 @@ class LiveTriadRLTrader:
             # Случай Б: Мы стоим на лучшем биде b1, но внешняя защита очереди рухнула под лавиной аска или пробоем BigONE
             if abs(self.active_bid_p - b1) <= tol:
                 ext_b1_q = max(0.0, b1_q - self.active_bid_q)
+                b2 = float(snap.get("b2", 0.0))
+                b2_q = float(snap.get("b2_q", 0.0))
+                ext_sup_q = b2_q if (ext_b1_q <= 1e-4 and b2 >= self.active_bid_p - self.tick_size - tol) else ext_b1_q
                 bo_crash = (bo_b1 > 0.0) and (bo_b1 < self.active_bid_p - 2.5 * self.tick_size)
-                book_collapse = (ext_b1_q < 35.0) and (a1_q > 5.0 * max(10.0, ext_b1_q))
+                book_collapse = (ext_sup_q < 35.0) and (a1_q > 5.0 * max(10.0, ext_sup_q))
                 if bo_crash or book_collapse:
                     oid = self.active_bid_id
                     try:
                         self.client.cancel_order(oid)
                         print(
                             f"  🛡️ [SUB-SEC GUARDIAN] Экстренное снятие бида id={oid} @ ${self.active_bid_p:.2f} за <320 мс "
-                            f"(ext_b1_q={ext_b1_q:.1f}, a1_q={a1_q:.1f}, BO_bid=${bo_b1:.3f})"
+                            f"(ext_sup_q={ext_sup_q:.1f}, a1_q={a1_q:.1f}, BO_bid=${bo_b1:.3f})"
                         )
                     except Exception:
                         pass
@@ -1450,7 +1460,13 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
         ts_msk_str = now_msk.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
         depth = shared_depth["data"] if (time.time() - shared_depth["ts"]) < 3.0 else None
-        last_row = streamer.step(depth, now_utc)
+        own_orders = {
+            "bid_p": trader.active_bid_p,
+            "bid_q": trader.active_bid_q,
+            "asks": [(trader.active_ask_p, trader.active_ask_q), (trader.slot2_ask_p, trader.slot2_ask_q)],
+            "tick_size": trader.tick_size,
+        }
+        last_row = streamer.step(depth, now_utc, own_orders=own_orders)
 
         b1 = float(last_row["ST_best_bid"].iloc[0])
         a1 = float(last_row["ST_best_ask"].iloc[0])
