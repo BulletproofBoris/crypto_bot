@@ -472,7 +472,8 @@ class LiveTriadRLTrader:
                     px = float(o.get("avg_price", 0.0)) or float(o.get("price", self.active_ask_p))
                     fee_rate = float(o.get("maker_fee", 0.001) or 0.001)
                     proceeds = filled * px * (1.0 - fee_rate)
-                    cost_basis = (filled / max(1e-6, 1.0 - fee_rate)) * self.avg_entry
+                    eff_entry = self.avg_entry if self.avg_entry > 0.0 else px
+                    cost_basis = (filled / max(1e-6, 1.0 - fee_rate)) * eff_entry
                     pnl = proceeds - cost_basis
                     self.bot_cash_usd += proceeds
                     self.realized_pnl_usd += pnl
@@ -508,7 +509,8 @@ class LiveTriadRLTrader:
                     px2 = float(o2.get("avg_price", 0.0)) or float(o2.get("price", self.slot2_ask_p))
                     fee_rate2 = float(o2.get("maker_fee", 0.001) or 0.001)
                     proceeds2 = filled2 * px2 * (1.0 - fee_rate2)
-                    cost_basis2 = (filled2 / max(1e-6, 1.0 - fee_rate2)) * self.avg_entry
+                    eff_entry2 = self.avg_entry if self.avg_entry > 0.0 else px2
+                    cost_basis2 = (filled2 / max(1e-6, 1.0 - fee_rate2)) * eff_entry2
                     pnl2 = proceeds2 - cost_basis2
                     self.bot_cash_usd += proceeds2
                     self.realized_pnl_usd += pnl2
