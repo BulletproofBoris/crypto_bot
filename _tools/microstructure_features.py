@@ -4,8 +4,10 @@
 обеспечивающую статистическую достаточность (N_eff >= 4000 на микроструктурных окнах <= 60с)
 и ортогональность полосовых фильтров (Band-Pass).
 """
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pandas as pd
+from _tools.system_resources import SAFE_WORKERS
 
 # Геометрическая сетка частотных полос (в секундах):
 # 5s  = Горизонт исполнения H (Impulse band)
@@ -193,16 +195,20 @@ def add_exchange_filter_bank(df_1s, prefix, coin="prl"):
     rolls_spread = 2.0 * np.sqrt(np.maximum(0.0, -cov_60s.fillna(0.0)))
     new_cols[f"{prefix}_rolls_spread_proxy"] = rolls_spread
 
-    for w in FILTER_WINDOWS:
-        # Нормированная скорость изменения цены (тиков в секунду за окно W) и импульс в тиках
-        new_cols[f"{prefix}_ret_{w}s_ticks"] = (mid - mid.shift(w)).fillna(0.0) / tick
-        new_cols[f"{prefix}_vol_{w}s_ticks"] = ret_1s_ticks.rolling(w, min_periods=1).std().fillna(0.0)
-        # Нормированный поток ордеров OFI (уровень 1 и многоуровневый) и CVD
-        new_cols[f"{prefix}_ofi_norm_{w}s"] = (ofi_1s.rolling(w, min_periods=1).mean() / depth_scale).fillna(0.0)
-        new_cols[f"{prefix}_ofi_top5_norm_{w}s"] = (ofi_top5_1s.rolling(w, min_periods=1).mean() / depth_scale).fillna(0.0)
-        new_cols[f"{prefix}_cvd_norm_{w}s"] = (delta_vol.rolling(w, min_periods=1).mean() / depth_scale).fillna(0.0)
-        new_cols[f"{prefix}_vol_intensity_{w}s"] = (trade_vol.rolling(w, min_periods=1).mean() / depth_scale).fillna(0.0)
-        new_cols[f"{prefix}_imbalance_ema_{w}s"] = df_1s[f"{prefix}_imbalance_top5"].ewm(span=w, adjust=False).mean()
+    def _calc_window_bank(w):
+        return {
+            f"{prefix}_ret_{w}s_ticks": (mid - mid.shift(w)).fillna(0.0) / tick,
+            f"{prefix}_vol_{w}s_ticks": ret_1s_ticks.rolling(w, min_periods=1).std().fillna(0.0),
+            f"{prefix}_ofi_norm_{w}s": (ofi_1s.rolling(w, min_periods=1).mean() / depth_scale).fillna(0.0),
+            f"{prefix}_ofi_top5_norm_{w}s": (ofi_top5_1s.rolling(w, min_periods=1).mean() / depth_scale).fillna(0.0),
+            f"{prefix}_cvd_norm_{w}s": (delta_vol.rolling(w, min_periods=1).mean() / depth_scale).fillna(0.0),
+            f"{prefix}_vol_intensity_{w}s": (trade_vol.rolling(w, min_periods=1).mean() / depth_scale).fillna(0.0),
+            f"{prefix}_imbalance_ema_{w}s": df_1s[f"{prefix}_imbalance_top5"].ewm(span=w, adjust=False).mean(),
+        }
+
+    with ThreadPoolExecutor(max_workers=min(len(FILTER_WINDOWS), SAFE_WORKERS)) as pool:
+        for w_dict in pool.map(_calc_window_bank, FILTER_WINDOWS):
+            new_cols.update(w_dict)
 
     # 3. Ортогональные полосовые фильтры (Band-Pass разности между соседними частотами)
     new_cols[f"{prefix}_ofi_band_5_20"] = new_cols[f"{prefix}_ofi_norm_5s"] - new_cols[f"{prefix}_ofi_norm_20s"]

@@ -14,6 +14,7 @@
 import sys
 import os
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pandas as pd
 from colorama import init, Fore, Style
@@ -306,16 +307,19 @@ def build_features_for_coin(coin_name, macro_df=None, force_full=False):
                 setattr(cdata, k_df, cdata[k_df][ts_s >= c_cut].copy())
 
     parts = []
-
-    # 1. SafeTrade L2
+    l2_tasks = []
     if 'safetrade_depth' in cdata and not cdata.safetrade_depth.empty:
-        df_st = process_exchange_l2(cdata.safetrade_depth, cdata.get('safetrade_trades'), 'ST')
-        parts.append(('ST', df_st))
-
-    # 2. BigONE L2
+        l2_tasks.append(('ST', cdata.safetrade_depth, cdata.get('safetrade_trades')))
     if 'bigone_depth' in cdata and not cdata.bigone_depth.empty:
-        df_bo = process_exchange_l2(cdata.bigone_depth, cdata.get('bigone_trades'), 'BO')
-        parts.append(('BO', df_bo))
+        l2_tasks.append(('BO', cdata.bigone_depth, cdata.get('bigone_trades')))
+
+    if len(l2_tasks) > 1:
+        with ThreadPoolExecutor(max_workers=min(len(l2_tasks), SAFE_WORKERS)) as pool:
+            l2_res = list(pool.map(lambda t: (t[0], process_exchange_l2(t[1], t[2], t[0])), l2_tasks))
+        parts.extend(l2_res)
+    elif len(l2_tasks) == 1:
+        t0 = l2_tasks[0]
+        parts.append((t0[0], process_exchange_l2(t0[1], t0[2], t0[0])))
 
     # 3. Rhea Finance (Quantus)
     if 'rhea_price' in cdata and not cdata.rhea_price.empty:

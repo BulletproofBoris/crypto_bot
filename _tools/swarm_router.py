@@ -20,6 +20,7 @@ import sys
 import json
 import time
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -30,7 +31,10 @@ from sklearn.metrics import roc_auc_score
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
+from _tools.system_resources import SAFE_WORKERS
 from _tools.data_labeler import compute_single_horizon_labels, COIN_CONFIG
+
+_SWARM_POOL = ThreadPoolExecutor(max_workers=SAFE_WORKERS)
 
 class SwarmRegimeRouter:
     """Контекстный роутер и блендер экспертов пула моделей."""
@@ -148,6 +152,12 @@ class SwarmRegimeRouter:
         self.regime_mean = np.mean(self.regime_matrix, axis=0, keepdims=True)
         self.regime_std = np.mean(self.regime_stds, axis=0, keepdims=True) + 1e-6
         self.norm_regime_matrix = (self.regime_matrix - self.regime_mean) / self.regime_std
+        from collections import deque
+        self.online_lgb_scores = np.ones(max(1, self.num_models), dtype=np.float32)
+        self.online_nn_scores = np.ones(max(1, len(self.neural_experts)), dtype=np.float32)
+        self._live_pred_ring = deque(maxlen=max(64, self.H + 5))
+        self._live_win0_var = 0.25
+        self._live_blend_var = 0.20
 
     def compute_routing_weights(self, current_regime_df: pd.DataFrame) -> np.ndarray:
         """
@@ -170,7 +180,7 @@ class SwarmRegimeRouter:
         diff = np.clip(diff, -3.0, 3.0)
         dist_sq = np.mean(diff ** 2, axis=-1)
 
-        # Приор свежести + каузальная Walk-Forward маскировка (исключает утечку будущих окон на истории)
+        # Приор свежести (-0.30*rank вместо жесткого -1.0*rank, чтобы задействовать релевантные окна пула) + каузальная маскировка
         if "timestamp" in current_regime_df.columns and n_samples > 10 and len(self.train_end_sec) == self.num_models:
             ts_sec = pd.to_datetime(current_regime_df["timestamp"], utc=True).dt.as_unit("s").astype("int64").values
             avail = ts_sec[:, np.newaxis] > self.train_end_sec[np.newaxis, :]
@@ -179,11 +189,12 @@ class SwarmRegimeRouter:
                 avail[no_avail, -1] = True
             causal_rank = (np.cumsum(avail, axis=1) - 1).astype(np.float32)
             self._last_causal_rank = np.where(avail, causal_rank, 999.0).astype(np.float32)
-            recency_bonus = np.where(avail, -1.0 * causal_rank, -1e9).astype(np.float32)
+            recency_bonus = np.where(avail, -0.30 * causal_rank, -1e9).astype(np.float32)
         else:
             self._last_causal_rank = None
-            recency_bonus = -1.0 * np.arange(self.num_models, dtype=np.float32)[np.newaxis, :]
-        logits = (-dist_sq / max(0.5, self.temperature)) + recency_bonus
+            recency_bonus = -0.30 * np.arange(self.num_models, dtype=np.float32)[np.newaxis, :]
+        online_log_bonus = np.log(np.maximum(self.online_lgb_scores, 0.25))[np.newaxis, :]
+        logits = (-dist_sq / max(0.5, self.temperature)) + recency_bonus + online_log_bonus
         logits_max = np.max(logits, axis=-1, keepdims=True)
         exp_logits = np.exp(logits - logits_max)
         weights = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
@@ -268,11 +279,18 @@ class SwarmRegimeRouter:
         else:
             X_inf = self._sanitize_stale_bo_features(X, current_regime_df)
             all_probs = np.zeros((self.num_models, n_samples, 7), dtype=np.float32)
-            for i, booster in enumerate(self.models):
+
+            def _pred_booster_slice(idx_b):
+                i, booster = idx_b
                 s_l, e_l = act_slices[i]
                 if e_l <= s_l:
+                    return i, s_l, e_l, None
+                raw_p = booster.predict(X_inf[s_l:e_l], num_threads=max(1, SAFE_WORKERS // 3))
+                return i, s_l, e_l, raw_p
+
+            for i, s_l, e_l, raw_p in _SWARM_POOL.map(_pred_booster_slice, enumerate(self.models)):
+                if raw_p is None:
                     continue
-                raw_p = booster.predict(X_inf[s_l:e_l])
                 if raw_p.shape[1] == 7:
                     all_probs[i, s_l:e_l] = raw_p
                 else:
@@ -457,64 +475,99 @@ class SwarmRegimeRouter:
         }
 
     def preload_neural_models(self):
-        """Предзагружает активные графы FastKerasModel (win_00..win_06) в RAM для исключения чтения с диска в боевом цикле."""
+        """Предзагружает активные графы FastKerasModel (win_00..win_14) в RAM в многопоточном режиме (_SWARM_POOL)."""
         from _tools.fast_neural_engine import FastKerasModel
-        for exp in self.neural_experts:
-            if exp.get("win_idx", 0) <= 6 and exp.get("fast_model") is None:
+
+        def _load_one(exp):
+            if exp.get("win_idx", 0) <= 14 and exp.get("fast_model") is None:
                 exp["fast_model"] = FastKerasModel(exp["k_file"], exp["base_arch"])
+
+        list(_SWARM_POOL.map(_load_one, self.neural_experts))
 
     def predict_live_tick(self, X_seq_2d: np.ndarray, current_regime_1row: pd.DataFrame) -> dict:
         """
-        Мгновенный инференс 1 боевого тика (1 Гц) по полному ансамблю окон без обращения к диску.
-        X_seq_2d: массив последних >= 30 секунд формы (L, n_features) в порядке self.feature_names.
-        current_regime_1row: 1-строчный DataFrame текущей секунды для расчета весов роутера.
+        Мгновенный многопоточный инференс 1 боевого тика (1 Гц) по полному ансамблю окон без обращения к диску,
+        с защитой от зависания BigONE, Online-Hedge адаптацией весов экспертов и сохранением дисперсии E[z].
         """
-        import torch
         from _tools.fast_neural_engine import FastKerasModel
-        torch.set_num_threads(2)
 
-        x_last = X_seq_2d[-1:, :].astype(np.float32)
+        # 1. Защита от зависания второй биржи (BO_sec_since_tick > 60s) идентично батчевому predict_ensemble
+        X_clean = X_seq_2d
+        if "BO_sec_since_tick" in current_regime_1row.columns and float(current_regime_1row["BO_sec_since_tick"].iloc[-1]) > 60.0:
+            X_clean = X_seq_2d.copy()
+            zero_prefixes = ("LL_", "BO_ofi_", "BO_cvd_", "BO_imb_", "BO_obi_", "BO_micro_", "BO_ret_", "BO_vol_intensity_")
+            zero_cols = [idx for idx, fname in enumerate(self.feature_names) if fname.startswith(zero_prefixes)]
+            if zero_cols:
+                X_clean[:, zero_cols] = 0.0
+
+        # 2. Online-Hedge обновление весов экспертов по фактическому движению цены за последние H секунд
+        cur_mid = 0.0
+        if "ST_mid_price" in current_regime_1row.columns:
+            cur_mid = float(current_regime_1row["ST_mid_price"].iloc[-1])
+        elif "ST_bid_1_price" in current_regime_1row.columns and "ST_ask_1_price" in current_regime_1row.columns:
+            cur_mid = 0.5 * (float(current_regime_1row["ST_bid_1_price"].iloc[-1]) + float(current_regime_1row["ST_ask_1_price"].iloc[-1]))
+        if cur_mid > 0 and len(self._live_pred_ring) >= self.H:
+            past_mid, past_lgb_ez, past_nn_ez = self._live_pred_ring[-self.H]
+            if past_mid > 0:
+                real_dt_ticks = float(np.clip((cur_mid - past_mid) / 0.01, -3.0, 3.0))
+                if abs(real_dt_ticks) >= 0.25:
+                    lgb_gain = np.exp(np.clip(0.20 * past_lgb_ez * real_dt_ticks, -0.40, 0.40))
+                    self.online_lgb_scores = np.clip(0.985 * self.online_lgb_scores + 0.015 * lgb_gain, 0.35, 2.50)
+                    if len(past_nn_ez) == len(self.online_nn_scores):
+                        nn_gain = np.exp(np.clip(0.20 * past_nn_ez * real_dt_ticks, -0.40, 0.40))
+                        self.online_nn_scores = np.clip(0.985 * self.online_nn_scores + 0.015 * nn_gain, 0.35, 2.50)
+
+        x_last = X_clean[-1:, :].astype(np.float32)
         weights = self.compute_routing_weights(current_regime_1row)[0]  # (num_models,)
         class_values = np.array([-3, -2, -1, 0, 1, 2, 3], dtype=np.float32)
 
         all_probs = np.zeros((self.num_models, 7), dtype=np.float32)
         for i, booster in enumerate(self.models):
-            if weights[i] < 0.001:
+            if weights[i] < 0.002 and i > 0:
                 continue
-            raw_p = booster.predict(x_last, num_threads=2)[0]
+            raw_p = booster.predict(x_last, num_threads=1)[0]
             all_probs[i, :min(7, len(raw_p))] = raw_p[:7]
 
         blend_probs = np.dot(weights, all_probs)  # (7,)
         ez_models = np.dot(all_probs, class_values)  # (num_models,)
         expected_z = float(np.dot(weights, ez_models))
 
+        nn_ez_vec = np.zeros(len(self.neural_experts), dtype=np.float32)
         if self.use_neural and self.neural_weight > 0.0 and self.neural_experts:
             cw = np.array(self.alliance_cfg.get("class_weights", [1.0] * 7), dtype=np.float32) if self.alliance_cfg else np.ones(7, dtype=np.float32)
             cw_pow = np.power(np.maximum(cw, 1e-3), 0.85)
             nn_ez_num = 0.0
             nn_probs_num = np.zeros(7, dtype=np.float32)
             nn_w_sum = 0.0
-            for exp in self.neural_experts:
+            norm_cache = {}
+            for idx_e, exp in enumerate(self.neural_experts):
                 w_idx = min(exp.get("win_idx", 0), len(weights) - 1)
                 reg_w = float(weights[w_idx])
-                if reg_w < 0.01:
+                if reg_w < 0.004:
                     continue
                 if exp.get("fast_model") is None:
                     exp["fast_model"] = FastKerasModel(exp["k_file"], exp["base_arch"])
                 sl = int(exp["seq_len"])
-                if len(X_seq_2d) >= sl:
-                    x_win = X_seq_2d[-sl:, :]
-                else:
-                    pad = np.repeat(X_seq_2d[:1, :], sl - len(X_seq_2d), axis=0)
-                    x_win = np.vstack([pad, X_seq_2d])
-                x_norm = np.clip((x_win - exp["mean"]) / exp["std"], -5.0, 5.0).astype(np.float32)
-                x_norm = np.nan_to_num(x_norm, nan=0.0, posinf=5.0, neginf=-5.0)
-                p_raw = exp["fast_model"].predict_numpy(x_norm[np.newaxis, :, :])[0]
+                cache_key = (w_idx, sl)
+                x_batch = norm_cache.get(cache_key)
+                if x_batch is None:
+                    if len(X_clean) >= sl:
+                        x_win = X_clean[-sl:, :]
+                    else:
+                        pad = np.repeat(X_clean[:1, :], sl - len(X_clean), axis=0)
+                        x_win = np.vstack([pad, X_clean])
+                    x_norm = np.clip((x_win - exp["mean"]) / exp["std"], -5.0, 5.0).astype(np.float32)
+                    x_norm = np.nan_to_num(x_norm, nan=0.0, posinf=5.0, neginf=-5.0)
+                    x_batch = x_norm[np.newaxis, :, :]
+                    norm_cache[cache_key] = x_batch
+                p_raw = exp["fast_model"].predict_numpy(x_batch)[0]
                 p_raw = np.clip(p_raw, 1e-7, 1.0 - 1e-7)
                 ez_raw = float(np.dot(p_raw, class_values))
+                nn_ez_vec[idx_e] = ez_raw
                 p_cal = p_raw / cw_pow
                 p_cal = p_cal / float(np.sum(p_cal))
-                w_exp = max(0.01, exp["ic"] ** 2) * reg_w
+                onl_mult = float(self.online_nn_scores[idx_e]) if idx_e < len(self.online_nn_scores) else 1.0
+                w_exp = max(0.01, exp["ic"] ** 2) * reg_w * onl_mult
                 nn_ez_num += w_exp * ez_raw
                 nn_probs_num += w_exp * p_cal
                 nn_w_sum += w_exp
@@ -522,9 +575,21 @@ class SwarmRegimeRouter:
             if nn_w_sum > 0:
                 nn_ez_blend = nn_ez_num / nn_w_sum
                 nn_probs_blend = nn_probs_num / nn_w_sum
-                w_nn = float(np.clip(self.neural_weight, 0.0, 1.0))
+                # Адаптивный вес нейросетевого альянса (от 0.15 до 0.30 в зависимости от онлайн-точности против LGBM)
+                rel_nn_skill = float(np.mean(self.online_nn_scores) / max(0.35, float(np.mean(self.online_lgb_scores))))
+                w_nn = float(np.clip(self.neural_weight * 1.35 * rel_nn_skill, 0.15, 0.32))
                 expected_z = (1.0 - w_nn) * expected_z + w_nn * nn_ez_blend
                 blend_probs = (1.0 - w_nn) * blend_probs + w_nn * nn_probs_blend
+
+        # 3. Сохранение дисперсии ансамблевого сигнала к эталонному окну win_00 (устраняет 25-35% сжатие амплитуды при блендинге)
+        ez_w0 = float(ez_models[0]) if len(ez_models) > 0 else expected_z
+        self._live_win0_var = 0.995 * self._live_win0_var + 0.005 * max(0.02, ez_w0 * ez_w0)
+        self._live_blend_var = 0.995 * self._live_blend_var + 0.005 * max(0.02, expected_z * expected_z)
+        var_scale = float(np.clip(np.sqrt(self._live_win0_var / max(1e-4, self._live_blend_var)), 1.0, 1.45))
+        expected_z = float(expected_z * var_scale)
+
+        if cur_mid > 0:
+            self._live_pred_ring.append((cur_mid, ez_models.copy(), nn_ez_vec.copy()))
 
         p_safe = np.clip(blend_probs, 1e-7, 1.0)
         p_safe = p_safe / np.sum(p_safe)

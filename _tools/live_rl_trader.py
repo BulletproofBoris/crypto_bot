@@ -19,6 +19,7 @@ import json
 import hashlib
 import argparse
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 import numpy as np
@@ -26,6 +27,7 @@ import pandas as pd
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
+from _tools.system_resources import SAFE_WORKERS
 from _tools.vps_config import SAFETRADE_PROXY
 
 
@@ -265,15 +267,16 @@ class LiveTriadRLTrader:
         from _tools.swarm_router import SwarmRegimeRouter
         from _tools.train_rl_execution import MaskableActorCritic
         print(f"🧠 Инициализация боевого ядра LiveTriadRLTrader ({self.coin.upper()}, режим={self.mode.upper()}, бюджет=${self.initial_budget_usd:.2f})...")
+        self._triad_pool = ThreadPoolExecutor(max_workers=3)
         self.routers = [
             (5, 3.0, SwarmRegimeRouter(self.coin, 5, 3.0, temperature=0.5, use_neural=use_neural, neural_weight=0.15)),
             (12, 3.5, SwarmRegimeRouter(self.coin, 12, 3.5, temperature=0.5, use_neural=use_neural, neural_weight=0.15)),
             (25, 3.0, SwarmRegimeRouter(self.coin, 25, 3.0, temperature=0.5, use_neural=use_neural, neural_weight=0.15)),
         ]
         if use_neural:
-            for _, _, rtr in self.routers:
-                rtr.preload_neural_models()
-            print("⚡ Все 84 нейросетевые модели (FastKerasModel) предзагружены в RAM (0 обращений к диску на тиках).")
+            list(self._triad_pool.map(lambda r_item: r_item[2].preload_neural_models(), self.routers))
+            torch.set_num_threads(2)
+            print(f"⚡ Все активные нейросетевые модели (FastKerasModel, пул={SAFE_WORKERS} потоков) предзагружены в RAM (0 обращений к диску на тиках).")
         self.feature_names = self.routers[0][2].feature_names
 
         ckpt_path = BASE_DIR / "models" / self.coin / "rl_execution" / "best_maskable_ppo.pt"
@@ -696,6 +699,14 @@ class LiveTriadRLTrader:
         imb_l10 = (b10_q - a10_q) / (b10_q + a10_q + 1e-6)
         vol_300 = float(r.get("ST_vol_300s_ticks", 1.0))
         ofi_300 = float(r.get("ST_ofi_norm_300s", 0.0))
+        if not hasattr(self, "flow_hist_10s"):
+            self.flow_hist_10s = deque(maxlen=11)
+        buy_v1 = float(r.get("ST_buy_vol", r.get("ST_buy_vol_1s", 0.0)))
+        sell_v1 = float(r.get("ST_sell_vol", r.get("ST_sell_vol_1s", 0.0)))
+        self.flow_hist_10s.append((b1_q, a1_q, buy_v1, sell_v1))
+        net_tr_10 = sum(x[2] - x[3] for x in list(self.flow_hist_10s)[-10:])
+        dq_10 = (b1_q - self.flow_hist_10s[0][0]) - (a1_q - self.flow_hist_10s[0][1])
+        fast_flow_10s = float(np.clip((net_tr_10 + 0.5 * dq_10) / (b1_q + a1_q + 500.0) * 3.0, -3.0, 3.0))
 
         lob_vec = [
             spread_ticks / 10.0, imb_l1, imb_l5, imb_l10,
@@ -729,7 +740,7 @@ class LiveTriadRLTrader:
         inertia = float(
             0.45 * ez_25 + 0.35 * ez_12 + 0.20 * ez_5
             + 0.25 * d_ez12 + 0.35 * imb_l5 + 0.15 * imb_l1
-            + 0.10 * np.clip(vel_15, -3.0, 3.0)
+            + 0.10 * np.clip(vel_15, -3.0, 3.0) + 0.08 * max(0.0, fast_flow_10s)
         )
         self.last_ez25 = ez_25
         self.last_ez12 = ez_12

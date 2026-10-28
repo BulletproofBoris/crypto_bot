@@ -15,6 +15,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from _tools.system_resources import SAFE_WORKERS
+
+# При параллельном запуске горизонтов/экспертов через ThreadPoolExecutor (SAFE_WORKERS потоков)
+# отключаем вложенный OpenMP-пул внутри одного batch=1 графа, чтобы избежать борьбы потоков за локи
+torch.set_num_threads(1)
+
 
 def _gelu(x: torch.Tensor) -> torch.Tensor:
     return F.gelu(x, approximate="none")

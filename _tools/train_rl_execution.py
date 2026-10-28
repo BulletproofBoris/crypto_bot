@@ -22,6 +22,7 @@ from torch.distributions import Categorical
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
+from _tools.system_resources import SAFE_WORKERS
 from _tools.swarm_router import SwarmRegimeRouter
 from _tools.data_labeler import COIN_CONFIG
 
@@ -94,7 +95,7 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
     cached_X = None
     ts_str_all = df["timestamp"].astype(str).values
     cand_caches = [p for p in cache_dir.glob(f"rl_triad_lob_cache_{coin}_*h.npz") if p != rl_cache_path]
-    prev_cache_path = max(cand_caches, key=lambda p: p.stat().st_mtime) if cand_caches else (cache_dir / f"rl_triad_lob_cache_{coin}_413h.npz")
+    prev_cache_path = max(cand_caches, key=lambda p: p.stat().st_mtime) if cand_caches else (cache_dir / f"rl_triad_lob_cache_{coin}_438h.npz")
     X_triad_Incremental = None
 
     if prev_cache_path.exists() and not force_rebuild:
@@ -323,10 +324,15 @@ class SafeTradeL2ExecutionEnv:
         spread_ticks = self.X_market[:, 18] * 10.0
         d_ez12 = ez12 - pd.Series(ez12).shift(5).bfill().values
         imb1, imb5 = self.X_market[:, 19], self.X_market[:, 20]
+        b1q_s = pd.Series(np.maximum(self.bid_q[:, 0], 0.0))
+        a1q_s = pd.Series(np.maximum(self.ask_q[:, 0], 0.0))
+        net_trade_10s = pd.Series(self.buy_vol - self.sell_vol).rolling(10, min_periods=1).sum().values
+        dq_10s = (b1q_s.diff(10).fillna(0.0).values - a1q_s.diff(10).fillna(0.0).values)
+        fast_flow_10s = np.clip((net_trade_10s + 0.5 * dq_10s) / (b1q_s.values + a1q_s.values + 500.0) * 3.0, -3.0, 3.0).astype(np.float32)
         self.inertia_arr = (
             0.45 * ez25 + 0.35 * ez12 + 0.20 * ez5
             + 0.25 * d_ez12 + 0.35 * imb5 + 0.15 * imb1
-            + 0.10 * np.clip(vel_b1_15, -3.0, 3.0)
+            + 0.10 * np.clip(vel_b1_15, -3.0, 3.0) + 0.08 * np.maximum(0.0, fast_flow_10s)
         ).astype(np.float32)
 
         # Векторный предрасчет не зависящих от позиции компонент наблюдения и масок входа (Zero-Allocation Step Loop)
@@ -1217,7 +1223,7 @@ def train_rl_agent(
     seed: int = 3,
     split_ts_msk: str = None,
 ):
-    torch.set_num_threads(1)
+    torch.set_num_threads(SAFE_WORKERS)
     np.random.seed(seed)
     torch.manual_seed(seed)
     data = build_or_load_rl_cache(coin=coin, tail_hours=tail_hours)
