@@ -343,10 +343,14 @@ class SafeTradeL2ExecutionEnv:
         model_err_12 = np.clip(actual_dt_12 - pred_dt_12, -10.0, 10.0).astype(np.float32)
         surprise_pen = np.maximum(0.0, -model_err_12) * 0.6
 
+        self.vel_10 = self.vel_b1_10
+        self.imb_l5 = imb5.astype(np.float32)
         if self.legacy_v2:
             exp_entry_edge = (0.5 * ez25 + 0.35 * ez12 + 0.15 * ez5) * 4.0 + 0.5 * spread_ticks - p_tn_5 * 3.0 - surprise_pen
             exp_hold_edge = (0.6 * ez12 + 0.4 * ez5) * 4.0 - p_dn_12 * spread_ticks - surprise_pen * 0.8
             in_dip_zone_vec = np.ones(len(b1_vec), dtype=bool)
+            self.in_breakout_arr = np.zeros(len(b1_vec), dtype=bool)
+            self.in_breakout_zone = self.in_breakout_arr
         else:
             ext_pos = 0.35 * np.minimum(self.dd_900, 10.0) * np.maximum(0.0, 1.0 - 1.5 * self.pos_900)
             ext_neg = -1.5 * np.maximum(0.0, self.pos_900 - 0.65)
@@ -376,6 +380,7 @@ class SafeTradeL2ExecutionEnv:
                 & (self.rng_14400 <= 11.0)
             )
             self.in_breakout_arr = in_breakout_vec
+            self.in_breakout_zone = in_breakout_vec
             in_dip_zone_vec = in_dip_zone_vec | in_breakout_vec
 
         self.obs_err12_norm = np.clip(model_err_12 / 5.0, -3.0, 3.0).astype(np.float32)
@@ -665,7 +670,7 @@ class SafeTradeL2ExecutionEnv:
         hold_edge = float(self.obs_hold_edge_norm[t] * 5.0)
         brk_now = bool(getattr(self, "in_breakout_arr", np.zeros(len(self.pos_3600), dtype=bool))[t])
         if not self.legacy_v2 and self.pos_qty <= 1e-8 and self.order_side is None and action == 0 and brk_now and t >= self.cooldown_until:
-            action = 1 if sp >= 2.0 else 2
+            action = 1 if self.can_buy_best_arr[t] else 2
         if not self.legacy_v2 and self.pos_qty <= 1e-8 and self.order_side == "BUY":
             at_b1 = abs(self.order_price - b1) <= tol
             compressed_4h_floor = (4.8 <= self.rng_14400[t] <= 5.5 and self.pos_14400[t] <= 0.05 and self.dd_900[t] <= 1.0)

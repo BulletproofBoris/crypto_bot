@@ -1000,10 +1000,10 @@ class LiveTriadRLTrader:
         # 1. Защита от токсичного пролива: если оба варианта дают отрицательное МО при высоком хвосте падения
         if ev_b1 < -0.35 and ev_b2 < -0.35 and tail_crash_prob > 0.36 and mask[0] and self.active_bid_id is None:
             return 0
-        # 2. Если выбран агрессивный шаг +1 тик (act=1), но пассивный b1 дает выше МО (очередь небольшая) -> экономим 1 тик
-        if act == 1 and mask[2] and (ev_b2 > ev_b1 + 0.12 or sp < 1.8):
+        # 2. При спреде >= 2 тика: если пассивный вход дает заметно выше МО, чем шаг +1 тик внутрь спреда -> выбираем act=2
+        if act == 1 and mask[2] and sp >= 2.0 and ev_b2 > ev_b1 + 0.12:
             return 2
-        # 3. Если выбран пассивный b1 (act=2), но перед нами огромная стена b1_q > 3500 и спред >= 2 тика, а шаг +1 тик высокопрофитный
+        # 3. Если выбран пассивный act=2, но перед нами огромная стена b1_q > 3500 и спред >= 2 тика, а шаг +1 тик высокопрофитный
         if act == 2 and mask[1] and sp >= 2.0 and b1_q > 3500.0 and ev_b1 >= 0.45 and ev_b1 > ev_b2:
             return 1
         return act
@@ -1016,7 +1016,7 @@ class LiveTriadRLTrader:
             logits, val = self.agent(obs_t, mask_t)
             act = int(torch.argmax(logits, dim=-1).item())
             if act == 0 and self.pos_qty <= 1e-4 and self.active_bid_id is None and getattr(self, "last_in_breakout", False):
-                if mask[1] and getattr(self, "last_sp_ticks", 1.0) >= 2.0:
+                if mask[1]:
                     act = 1
                 elif mask[2]:
                     act = 2
