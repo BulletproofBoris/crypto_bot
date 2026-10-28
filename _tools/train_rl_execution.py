@@ -1228,7 +1228,7 @@ def train_rl_agent(
     torch.manual_seed(seed)
     data = build_or_load_rl_cache(coin=coin, tail_hours=tail_hours)
     n_total = len(data["X_market"])
-    ts_msk = pd.to_datetime(data["ts"]).tz_convert("Europe/Moscow")
+    ts_msk = pd.to_datetime(data["ts"], utc=True).tz_convert("Europe/Moscow")
     if split_ts_msk is not None:
         split_idx = int(np.argmax(ts_msk > pd.Timestamp(split_ts_msk)))
     else:
@@ -1469,7 +1469,7 @@ def inspect_and_plot_rl_oos(coin: str = "prl", tail_hours: float = 72.0, start_t
     import matplotlib.pyplot as plt
     data = build_or_load_rl_cache(coin=coin, tail_hours=tail_hours)
     n_total = len(data["X_market"])
-    ts_msk = pd.to_datetime(data["ts"]).tz_convert("Europe/Moscow")
+    ts_msk = pd.to_datetime(data["ts"], utc=True).tz_convert("Europe/Moscow")
     if start_ts_msk is not None:
         cutoff = pd.Timestamp(start_ts_msk)
         split_idx = int(np.argmax(ts_msk > cutoff))
@@ -1606,7 +1606,7 @@ def inspect_and_plot_rl_oos(coin: str = "prl", tail_hours: float = 72.0, start_t
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--coin", type=str, default="prl")
-    parser.add_argument("--tail-hours", type=float, default=413.0)
+    parser.add_argument("--tail-hours", type=float, default=438.0)
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--steps", type=int, default=16384)
     parser.add_argument("--split-ts", type=str, default="2026-10-24 21:00:00+03:00")

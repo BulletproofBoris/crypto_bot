@@ -651,15 +651,18 @@ class LiveTriadRLTrader:
 
     def compute_obs_and_mask(self, X_seq_2d: np.ndarray, row_df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
         triad_vec = []
+        triad_probs = []
         for _, _, router in self.routers:
             res = router.predict_live_tick(X_seq_2d, row_df)
             p = res["probs"]
+            triad_probs.append(np.asarray(p, dtype=np.float32))
             ez = float(res["expected_z"])
             p_up = float(p[4] + p[5] + p[6])
             p_down = float(p[0] + p[1] + p[2])
             p_tp = float(p[5] + p[6])
             p_tn = float(p[0] + p[1])
             triad_vec.extend([ez, p_up, p_down, p_tp, p_tn, float(res["entropy"])])
+        self.last_triad_probs = triad_probs
 
         r = row_df.iloc[-1]
         tol = self.tick_size * 0.25
@@ -907,13 +910,60 @@ class LiveTriadRLTrader:
             return float(np.clip(0.35 + 0.12 * max(0.0, hold_edge) + 0.25 * q_adv, 0.30, 0.65))
         return 0.0
 
+    def _mc_lookahead_refine(self, obs: np.ndarray, mask: np.ndarray, act: int) -> int:
+        """
+        15-секундный векторный Lookahead-фильтр стакана по распределениям Триады probs[-3..+3] (H=5, 12, 25с):
+        оценивает математическое ожидание E[PnL] и вероятность исполнения P(fill) для QUOTE_BID_1 vs QUOTE_BID_2
+        перед выставлением ордера в стакан.
+        """
+        if act not in (1, 2) or self.pos_qty > 1e-4:
+            return act
+        probs_list = getattr(self, "last_triad_probs", None)
+        if not probs_list or len(probs_list) < 3:
+            return act
+        p5, p12, p25 = probs_list[0], probs_list[1], probs_list[2]
+        k_vals = np.array([-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0], dtype=np.float32)
+
+        b1_q = float(getattr(self, "last_b1_q", 500.0))
+        a1_q = float(getattr(self, "last_a1_q", 500.0))
+        sp = float(getattr(self, "last_sp_ticks", 1.0))
+        fee_ticks = 0.32
+
+        # Вероятность проторговки очереди на пассивном биде b1 (QUOTE_BID_2) за 12 секунд
+        q_pass_factor = float(np.clip(350.0 / (b1_q + 350.0), 0.08, 0.90))
+        p_fill_b2 = float(np.clip(p5[0] + p5[1] + p5[2] + p5[3] * q_pass_factor, 0.05, 0.95))
+        # Вероятность исполнения при перешагивании в спред (QUOTE_BID_1, впереди очереди q_ahead=0)
+        p_fill_b1 = float(np.clip(p5[0] + p5[1] + p5[2] + p5[3] * 0.82, 0.15, 0.98)) if sp >= 2.0 else p_fill_b2
+
+        # Ожидаемый профит после входа (на горизонте 12-25с) за вычетом риска токсичного пробоя (-2..-3 тика)
+        ez_post = 0.45 * float(np.dot(p12, k_vals)) + 0.55 * float(np.dot(p25, k_vals))
+        tail_crash_prob = 0.5 * float(p5[0] + p5[1]) + 0.5 * float(p12[0] + p12[1])
+        adverse_pen = tail_crash_prob * 2.4
+
+        # E[PnL] в тиках для пассивного бида b1 (захват полного спреда) и агрессивного b1+1 (минус 1 тик спреда)
+        ev_b2 = p_fill_b2 * (max(1.0, sp * 0.75) + ez_post - fee_ticks) - adverse_pen
+        ev_b1 = p_fill_b1 * (max(1.0, (sp - 1.0) * 0.85) + ez_post - fee_ticks) - adverse_pen * 1.15
+
+        # 1. Защита от токсичного пролива: если оба варианта дают отрицательное МО при высоком хвосте падения
+        if ev_b1 < -0.35 and ev_b2 < -0.35 and tail_crash_prob > 0.36 and mask[0] and self.active_bid_id is None:
+            return 0
+        # 2. Если выбран агрессивный шаг +1 тик (act=1), но пассивный b1 дает выше МО (очередь небольшая) -> экономим 1 тик
+        if act == 1 and mask[2] and (ev_b2 > ev_b1 + 0.12 or sp < 1.8):
+            return 2
+        # 3. Если выбран пассивный b1 (act=2), но перед нами огромная стена b1_q > 3500 и спред >= 2 тика, а шаг +1 тик высокопрофитный
+        if act == 2 and mask[1] and sp >= 2.0 and b1_q > 3500.0 and ev_b1 >= 0.45 and ev_b1 > ev_b2:
+            return 1
+        return act
+
     def decide_action(self, obs: np.ndarray, mask: np.ndarray) -> tuple[int, float]:
         import torch
         with torch.no_grad():
             obs_t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
             mask_t = torch.as_tensor(mask, dtype=torch.bool).unsqueeze(0)
             logits, val = self.agent(obs_t, mask_t)
-            return int(torch.argmax(logits, dim=-1).item()), float(val.item())
+            act = int(torch.argmax(logits, dim=-1).item())
+            act = self._mc_lookahead_refine(obs, mask, act)
+            return act, float(val.item())
 
     def execute_live_action(self, act: int, b1: float, a1: float):
         if self.mode != "live":
