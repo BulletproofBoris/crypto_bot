@@ -546,11 +546,21 @@ class SafeTradeL2ExecutionEnv:
         b1 = max(self.bid_p[t, 0], self.tick_size)
         if b1 < self.avg_entry - self.tick_size * 0.25:
             return 0.0
+        vel10 = float(self.vel_10[t])
+        imb5 = float(self.imb_l5[t])
+        inertia = float(self.inertia_arr[t])
+        if (
+            vel10 >= 1.0
+            or bool(self.in_breakout_zone[t])
+            or (self.avg_entry > 0 and b1 >= self.avg_entry + self.tick_size * 0.75 and inertia >= 0.0)
+            or (imb5 >= 0.22 and inertia >= 0.25 and ez12 >= 0.15)
+        ):
+            return 1.0
         q_a1, _ = self._get_lob_queue(t, "SELL", floor_p)
         q_a2, _ = self._get_lob_queue(t, "SELL", wave_p)
         own_ask_share = self.pos_qty / (q_a1 + self.pos_qty + 1e-6)
 
-        if max(float(self.pos_3600[t]), float(self.pos_3600[self.entry_t])) >= 0.65 and q_a2 > 3000.0:
+        if max(float(self.pos_3600[t]), float(self.pos_3600[self.entry_t])) >= 0.65 and q_a2 > 3000.0 and vel10 <= 0.0 and inertia < 0.25:
             return 0.0
         if q_a2 > 15000.0 and q_a1 < 500.0:
             return 0.50
@@ -746,9 +756,12 @@ class SafeTradeL2ExecutionEnv:
                     self.slot2_qty = 0.0
                 action = 0
             elif self.order_side == "SELL" and self.slot2_side is None:
-                if abs(self.order_price - floor_p) <= tol:
+                pump_up = bool(self.vel_10[t] >= 1.0 or self.in_breakout_zone[t] or (self.imb_l5[t] >= 0.22 and inertia >= 0.25))
+                if pump_up and a1 >= self.order_price - tol and self.imb_l5[t] >= 0.20 and b1 >= self.avg_entry:
+                    action = 3
+                elif self.order_price >= wave_p - tol and b1 >= self.avg_entry - tol:
                     action = 0
-                elif (w2 >= 0.30 or q_a2 > 15000.0) and self.order_price >= wave_p - tol:
+                elif abs(self.order_price - floor_p) <= tol:
                     action = 0
                 else:
                     action = 4
@@ -769,7 +782,7 @@ class SafeTradeL2ExecutionEnv:
                 self.split_done_for_pos = True
                 requote_penalty = 0.005
                 action = 0
-            elif self.order_side != "SELL" and w2 < 0.15:
+            elif self.order_side != "SELL" and w2 < 0.15 and not bool(self.vel_10[t] >= 1.0 or self.in_breakout_zone[t]):
                 action = 4
 
         if action in (1, 2) and self.pos_qty <= 1e-8:
