@@ -862,13 +862,26 @@ class LiveTriadRLTrader:
             and (exp_entry_edge >= 0.60)
             and ((dd_300 >= 1.0) or (spread_ticks >= 2.0))
         )
+        in_breakout_zone = (
+            (ez_5 >= 0.40)
+            and (ez_12 >= 0.80)
+            and (ez_25 >= 0.85)
+            and (inertia >= 0.70)
+            and (exp_entry_edge >= 3.20)
+            and (imb_l5 >= 0.25)
+            and (vel_10 >= 1.0)
+            and (rng_14400 <= 11.0)
+        )
+        self.last_in_breakout = in_breakout_zone
+        in_dip_zone = in_dip_zone or in_breakout_zone
 
         mask = np.zeros(7, dtype=bool)
         if not has_pos:
             mask[0] = True
             if has_bid:
                 drift_limit = self.tick_size * 1.25 if getattr(self, "active_bid_act", 1) == 2 else tol
-                need_cancel = (inertia < -0.10) or (pos_3600 > 0.82) or (imb_l5 < -0.55) or (b1 > self.active_bid_p + drift_limit)
+                brk_hold = in_breakout_zone
+                need_cancel = (inertia < -0.10) or (pos_3600 > 0.82 and not brk_hold) or (imb_l5 < -0.55) or (b1 > self.active_bid_p + drift_limit)
                 if need_cancel:
                     mask[5] = True
                     if in_dip_zone:
@@ -962,6 +975,11 @@ class LiveTriadRLTrader:
             mask_t = torch.as_tensor(mask, dtype=torch.bool).unsqueeze(0)
             logits, val = self.agent(obs_t, mask_t)
             act = int(torch.argmax(logits, dim=-1).item())
+            if act == 0 and self.pos_qty <= 1e-4 and self.active_bid_id is None and getattr(self, "last_in_breakout", False):
+                if mask[1] and getattr(self, "last_sp_ticks", 1.0) >= 2.0:
+                    act = 1
+                elif mask[2]:
+                    act = 2
             act = self._mc_lookahead_refine(obs, mask, act)
             return act, float(val.item())
 
@@ -974,14 +992,15 @@ class LiveTriadRLTrader:
             compressed_4h_floor = (4.8 <= getattr(self, "last_rng14400", 10.0) <= 5.5 and getattr(self, "last_pos14400", 0.5) <= 0.05 and self.last_dd900 <= 1.0)
             pre_dump = (self.last_sp_ticks < 1.5 and self.last_ez25 < -0.15 and self.last_inertia < 0.08 and getattr(self, "last_a1_q", self.last_q_a1) > 4000.0) and not compressed_4h_floor
             front_q_hold = at_b1 and ((0.0 <= self.q_ahead < 600.0) or getattr(self, "bid_partial_filled", 0.0) > 0.0) and not pre_dump and self.last_pos3600 <= 0.65 and self.last_inertia >= -0.10
-            v14_hold_q = at_b1 and ((self.last_pos3600 <= 0.25 and not pre_dump and getattr(self, "last_b1_q", 0.0) >= 5000.0) or compressed_4h_floor or front_q_hold)
+            brk_hold = getattr(self, "last_in_breakout", False)
+            v14_hold_q = at_b1 and ((self.last_pos3600 <= 0.25 and not pre_dump and getattr(self, "last_b1_q", 0.0) >= 5000.0) or compressed_4h_floor or front_q_hold or brk_hold)
             bid_age = getattr(self, "bid_age_sec", 0)
             if self.active_bid_p > b1 + tol and self.last_vel10 <= -1.0 and self.last_hold_edge < 0.0 and getattr(self, "last_a1_q", self.last_q_a1) > 500.0:
                 act = 5
             elif v14_hold_q:
                 if act == 5:
                     act = 0
-            elif self.last_pos3600 > 0.85 or self.last_inertia < -0.20:
+            elif (self.last_pos3600 > 0.85 and not brk_hold) or self.last_inertia < -0.20:
                 act = 5
             elif self.last_dd300 < 0.5 and self.last_dd900 <= 1.0 and self.last_sp_ticks < 1.5 and self.last_ez12 < 0.30:
                 if bid_age >= 15 and self.last_ez12 < 0.12 and self.last_inertia < 0.08 and getattr(self, "bid_partial_filled", 0.0) <= 0.0:

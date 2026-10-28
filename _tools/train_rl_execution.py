@@ -365,6 +365,18 @@ class SafeTradeL2ExecutionEnv:
                 & (exp_entry_edge >= 0.60)
                 & ((self.dd_300 >= 1.0) | (spread_ticks >= 2.0))
             )
+            in_breakout_vec = (
+                (ez5 >= 0.40)
+                & (ez12 >= 0.80)
+                & (ez25 >= 0.85)
+                & (self.inertia_arr >= 0.70)
+                & (exp_entry_edge >= 3.20)
+                & (imb5 >= 0.25)
+                & (self.vel_b1_10 >= 1.0)
+                & (self.rng_14400 <= 11.0)
+            )
+            self.in_breakout_arr = in_breakout_vec
+            in_dip_zone_vec = in_dip_zone_vec | in_breakout_vec
 
         self.obs_err12_norm = np.clip(model_err_12 / 5.0, -3.0, 3.0).astype(np.float32)
         self.obs_entry_edge_norm = np.clip(exp_entry_edge / 5.0, -3.0, 3.0).astype(np.float32)
@@ -558,9 +570,10 @@ class SafeTradeL2ExecutionEnv:
             if self.order_side == "BUY" and not self.legacy_v2:
                 b1 = max(self.bid_p[t, 0], self.tick_size)
                 drift_limit = self.tick_size * 1.25 if self.order_act == 2 else self.tick_size * 0.25
+                brk_hold = bool(getattr(self, "in_breakout_arr", np.zeros(len(self.pos_3600), dtype=bool))[t])
                 need_cancel = (
                     (float(self.inertia_arr[t]) < -0.10)
-                    or (float(self.pos_3600[t]) > 0.82)
+                    or (float(self.pos_3600[t]) > 0.82 and not brk_hold)
                     or (float(self.X_market[t, 20]) < -0.55)
                     or (b1 > self.order_price + drift_limit)
                 )
@@ -640,19 +653,23 @@ class SafeTradeL2ExecutionEnv:
         sp = float(self.X_market[t, 18] * 10.0)
         ez25 = float(self.X_market[t, 12])
         hold_edge = float(self.obs_hold_edge_norm[t] * 5.0)
+        brk_now = bool(getattr(self, "in_breakout_arr", np.zeros(len(self.pos_3600), dtype=bool))[t])
+        if not self.legacy_v2 and self.pos_qty <= 1e-8 and self.order_side is None and action == 0 and brk_now and t >= self.cooldown_until:
+            action = 1 if sp >= 2.0 else 2
         if not self.legacy_v2 and self.pos_qty <= 1e-8 and self.order_side == "BUY":
             at_b1 = abs(self.order_price - b1) <= tol
             compressed_4h_floor = (4.8 <= self.rng_14400[t] <= 5.5 and self.pos_14400[t] <= 0.05 and self.dd_900[t] <= 1.0)
             pre_dump = (sp < 1.5 and ez25 < -0.15 and inertia < 0.08 and self.ask_q[t, 0] > 4000.0) and not compressed_4h_floor
             front_q_hold = at_b1 and (self.q_ahead < 600.0) and not pre_dump and pos3600 <= 0.65 and inertia >= -0.10
-            v14_hold_q = at_b1 and ((pos3600 <= 0.25 and not pre_dump and self.bid_q[t, 0] >= 5000.0) or compressed_4h_floor or front_q_hold)
+            brk_hold = brk_now
+            v14_hold_q = at_b1 and ((pos3600 <= 0.25 and not pre_dump and self.bid_q[t, 0] >= 5000.0) or compressed_4h_floor or front_q_hold or brk_hold)
             bid_age = t - self.bid_placed_t
             if self.order_price > b1 + tol and self.vel_b1_10[t] <= -1.0 and hold_edge < 0.0 and self.ask_q[t, 0] > 500.0:
                 action = 5
             elif v14_hold_q:
                 if action == 5:
                     action = 0
-            elif pos3600 > 0.85 or inertia < -0.20:
+            elif (pos3600 > 0.85 and not brk_hold) or inertia < -0.20:
                 action = 5
             elif self.dd_300[t] < 0.5 and self.dd_900[t] <= 1.0 and sp < 1.5 and self.X_market[t, 6] < 0.30:
                 if bid_age >= 15 and float(self.X_market[t, 6]) < 0.12 and inertia < 0.08:
