@@ -504,6 +504,13 @@ class SafeTradeL2ExecutionEnv:
         self.total_pnl_usd = 0.0
         self.n_trades = 0
         self.cooldown_until = 0
+        self.bid_placed_t = 0
+        self.car_state = 0  # 0: idle, 1: quoting sell @ local ask, 2: quoting buyback @ local bid
+        self.car_qty = 0.0
+        self.car_px = 0.0
+        self.car_q_ahead = 0.0
+        self.car_sell_px = 0.0
+        self.car_cycles = 0
         return self._get_obs()
 
     def _compute_adaptive_wave_weight(self, t: int, floor_p: float, wave_p: float) -> float:
@@ -518,6 +525,9 @@ class SafeTradeL2ExecutionEnv:
         ez25 = float(self.X_market[t, 12])
         ez12 = float(self.X_market[t, 6])
         hold_edge = float(self.obs_hold_edge_norm[t] * 5.0)
+        b1 = max(self.bid_p[t, 0], self.tick_size)
+        if b1 < self.avg_entry - self.tick_size * 0.25:
+            return 0.0
         q_a1, _ = self._get_lob_queue(t, "SELL", floor_p)
         q_a2, _ = self._get_lob_queue(t, "SELL", wave_p)
         own_ask_share = self.pos_qty / (q_a1 + self.pos_qty + 1e-6)
@@ -628,7 +638,9 @@ class SafeTradeL2ExecutionEnv:
             at_b1 = abs(self.order_price - b1) <= tol
             compressed_4h_floor = (4.8 <= self.rng_14400[t] <= 5.5 and self.pos_14400[t] <= 0.05 and self.dd_900[t] <= 1.0)
             pre_dump = (sp < 1.5 and ez25 < -0.15 and inertia < 0.08 and self.ask_q[t, 0] > 4000.0) and not compressed_4h_floor
-            v14_hold_q = at_b1 and ((pos3600 <= 0.25 and not pre_dump and self.bid_q[t, 0] >= 5000.0) or compressed_4h_floor)
+            front_q_hold = at_b1 and (self.q_ahead < 600.0) and not pre_dump and pos3600 <= 0.65 and inertia >= -0.10
+            v14_hold_q = at_b1 and ((pos3600 <= 0.25 and not pre_dump and self.bid_q[t, 0] >= 5000.0) or compressed_4h_floor or front_q_hold)
+            bid_age = t - self.bid_placed_t
             if self.order_price > b1 + tol and self.vel_b1_10[t] <= -1.0 and hold_edge < 0.0 and self.ask_q[t, 0] > 500.0:
                 action = 5
             elif v14_hold_q:
@@ -637,9 +649,22 @@ class SafeTradeL2ExecutionEnv:
             elif pos3600 > 0.85 or inertia < -0.20:
                 action = 5
             elif self.dd_300[t] < 0.5 and self.dd_900[t] <= 1.0 and sp < 1.5 and self.X_market[t, 6] < 0.30:
-                action = 5
+                if bid_age >= 15 and float(self.X_market[t, 6]) < 0.12 and inertia < 0.08:
+                    action = 5
+                elif action == 5:
+                    action = 0
             elif pre_dump:
                 action = 5
+
+        if not self.legacy_v2 and self.pos_qty > 1e-8 and self.order_side == "SELL":
+            floor_p = round((self.avg_entry + self.tick_size) / self.tick_size) * self.tick_size
+            wave_p = round((self.avg_entry + 2.0 * self.tick_size) / self.tick_size) * self.tick_size
+            if self.order_price >= wave_p - tol and b1 < self.avg_entry - tol and hold_edge < -0.20 and a1 <= floor_p + tol:
+                self.order_price = max(a1, floor_p)
+                self.order_qty = self.pos_qty
+                self.q_ahead, _ = self._get_lob_queue(t, "SELL", self.order_price)
+                self.slot2_side = None
+                self.slot2_qty = 0.0
 
         if not self.legacy_v2 and self.pos_qty > 1e-8 and action in (3, 4):
             floor_p = round((self.avg_entry + self.tick_size) / self.tick_size) * self.tick_size
@@ -679,6 +704,17 @@ class SafeTradeL2ExecutionEnv:
                 requote_penalty = 0.005
                 action = 0
             elif self.order_side == "SELL" and self.order_price >= wave_p - tol and self.split_done_for_pos:
+                if self.slot2_side is None and (t - self.entry_t) >= 600 and b1 <= self.avg_entry - 2.0 * self.tick_size and hold_edge < 0.25:
+                    q2 = round(self.pos_qty * 0.50, 4)
+                    q1 = round(self.pos_qty - q2, 4)
+                    self.order_price = max(a1, floor_p)
+                    self.order_qty = q1
+                    self.q_ahead, _ = self._get_lob_queue(t, "SELL", self.order_price)
+                    self.slot2_side = "SELL"
+                    self.slot2_price = max(a1 + self.tick_size, wave_p)
+                    self.slot2_qty = q2
+                    self.slot2_q_ahead, _ = self._get_lob_queue(t, "SELL", self.slot2_price)
+                    self.slot2_active_after = t + 1
                 action = 0
             elif self.order_side == "SELL" and self.slot2_side == "SELL":
                 if w2 <= 0.05 and a1 <= floor_p + tol and q_a2 <= 15000.0:
@@ -725,6 +761,7 @@ class SafeTradeL2ExecutionEnv:
                 q_at_t, _ = self._get_lob_queue(t, "BUY", self.order_price)
                 self.q_ahead = q_at_t
                 self.active_after = t + 1
+                self.bid_placed_t = t
         elif action in (3, 4) and self.pos_qty > 1e-8:
             hold_s = t - self.entry_t
             if self.legacy_v2:
@@ -881,6 +918,49 @@ class SafeTradeL2ExecutionEnv:
                     net_cancel2 = (q2_at_prev - vol_at_px2) - q2_at
                     self.slot2_q_ahead = max(0.0, self.slot2_q_ahead - net_cancel2 * min(1.0, 0.35 * self.slot2_q_ahead / q2_at_prev))
                 self.slot2_q_ahead = min(self.slot2_q_ahead, q2_at)
+
+        # Карусель микро-транша (M4: PRL -> USDT -> PRL) при просадке основной позиции (b1 <= avg_entry - 3 тика)
+        if not self.legacy_v2:
+            if self.pos_qty <= 1e-8:
+                self.car_state = 0
+            else:
+                underwater_ticks = (self.avg_entry - nb1) / self.tick_size
+                if self.car_state == 0 and underwater_ticks >= 3.0 and (nt - self.entry_t) >= 120:
+                    if (na1 - nb1) >= 1.5 * self.tick_size or (float(self.pos_3600[nt]) >= 0.30 and float(self.inertia_arr[nt]) > -0.10):
+                        self.car_qty = round(self.pos_qty * 0.25, 4)
+                        self.car_px = na1
+                        self.car_q_ahead, _ = self._get_lob_queue(nt, "SELL", self.car_px)
+                        self.car_state = 1
+                elif self.car_state == 1:
+                    if nb1 >= self.avg_entry - self.tick_size:
+                        self.car_state = 0
+                    else:
+                        if abs(self.car_px - na1) > tol and na1 < self.avg_entry:
+                            self.car_px = na1
+                            self.car_q_ahead, _ = self._get_lob_queue(nt, "SELL", self.car_px)
+                        vol_hit_c = self.buy_vol[nt] if abs(na1 - self.car_px) <= tol else 0.0
+                        if nb1 >= self.car_px - tol or vol_hit_c > self.car_q_ahead:
+                            self.car_sell_px = self.car_px
+                            self.car_px = round((self.car_sell_px - 2.0 * self.tick_size) / self.tick_size) * self.tick_size
+                            self.car_q_ahead, _ = self._get_lob_queue(nt, "BUY", self.car_px)
+                            self.car_state = 2
+                        else:
+                            self.car_q_ahead = max(0.0, self.car_q_ahead - vol_hit_c)
+                elif self.car_state == 2:
+                    vol_hit_c = self.sell_vol[nt] if abs(nb1 - self.car_px) <= tol else 0.0
+                    if na1 <= self.car_px + tol or vol_hit_c > self.car_q_ahead:
+                        net_car_pnl = self.car_qty * (self.car_sell_px * 0.999 - self.car_px * 1.001)
+                        self.total_pnl_usd += net_car_pnl
+                        self.avg_entry = round(max(self.tick_size, self.avg_entry - net_car_pnl / max(self.pos_qty, 1e-6)), 4)
+                        self.car_cycles += 1
+                        self.car_state = 0
+                    elif nb1 >= self.avg_entry:
+                        net_leg1 = self.car_qty * (self.car_sell_px * 0.999 - self.avg_entry)
+                        self.total_pnl_usd += net_leg1
+                        self.pos_qty = max(0.0, self.pos_qty - self.car_qty)
+                        self.car_state = 0
+                    else:
+                        self.car_q_ahead = max(0.0, self.car_q_ahead - vol_hit_c)
 
         cur_mtm = self.total_pnl_usd + (self.pos_qty * (nb1 - self.avg_entry) if self.pos_qty > 1e-8 else 0.0)
         delta_pnl_ticks = (cur_mtm - self.prev_mtm) / (self.order_usd * (self.tick_size / nb1))

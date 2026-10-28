@@ -65,6 +65,9 @@ def _sync_pack_after_run(
 ):
     """Упаковывает текущие модели, метаданные, прогресс и лог после каждого рана и выгружает в облако / Google Drive."""
     try:
+        is_colab = os.path.exists("/content")
+        if not is_colab and run_idx < runs_per_arch and int(horizon) < 60:
+            return
         zip_path = shutil.make_archive(pack_dir, "zip", root_dir=".", base_dir=pack_dir)
         zip_name = os.path.basename(zip_path)
         size_mb = os.path.getsize(zip_path) / (1024 * 1024)
@@ -76,7 +79,7 @@ def _sync_pack_after_run(
             shutil.copy2(zip_path, dst_gd)
             urls.append(f"GDrive:{dst_gd}")
 
-        do_cloud = sync_cloud if sync_cloud is not None else os.path.exists("/content")
+        do_cloud = sync_cloud if sync_cloud is not None else (is_colab or size_mb < 15.0)
         if do_cloud:
             bucket = sync_bucket or f"prl_h{int(horizon)}s_k3_ckpt"
             fb_url = f"https://filebin.net/{bucket}/{zip_name}"
@@ -102,17 +105,13 @@ def _sync_pack_after_run(
 
 def _auto_restore_pack(pack_dir: str, horizon: int, sync_bucket: str = None, resume_url: str = None):
     """Автоматически подтягивает ранее сохраненный прогресс с Google Drive или облачного бакета при старте на новом сервере."""
-    if os.path.isdir(pack_dir) and any(Path(pack_dir).rglob("*.keras")):
+    is_colab = os.path.exists("/content")
+    if not is_colab and not resume_url and os.path.isdir(pack_dir) and any(Path(pack_dir).rglob("*.keras")):
         return
     zip_name = f"{pack_dir}.zip"
-    gdrive_zip = f"/content/drive/MyDrive/{zip_name}"
-    if not os.path.exists(zip_name) and os.path.exists(gdrive_zip):
-        shutil.copy2(gdrive_zip, zip_name)
-        print(f"🔄 Восстановлен архив чекпоинтов с Google Drive: {gdrive_zip}", flush=True)
-
     bucket = sync_bucket or f"prl_h{int(horizon)}s_k3_ckpt"
     candidates = [u for u in [resume_url, f"https://filebin.net/{bucket}/{zip_name}"] if u]
-    if not os.path.exists(zip_name):
+    if is_colab or resume_url or not os.path.exists(zip_name):
         for url in candidates:
             r = subprocess.run(["curl", "-sL", "--max-time", "30", "-o", zip_name, url], check=False)
             if r.returncode == 0 and os.path.exists(zip_name) and os.path.getsize(zip_name) > 5000:
@@ -123,7 +122,11 @@ def _auto_restore_pack(pack_dir: str, horizon: int, sync_bucket: str = None, res
                 except Exception:
                     if os.path.exists(zip_name):
                         os.remove(zip_name)
-    elif os.path.exists(zip_name) and os.path.getsize(zip_name) > 5000:
+    gdrive_zip = f"/content/drive/MyDrive/{zip_name}"
+    if not os.path.exists(zip_name) and os.path.exists(gdrive_zip):
+        shutil.copy2(gdrive_zip, zip_name)
+        print(f"🔄 Восстановлен архив чекпоинтов с Google Drive: {gdrive_zip}", flush=True)
+    if os.path.exists(zip_name) and os.path.getsize(zip_name) > 5000:
         try:
             shutil.unpack_archive(zip_name, ".")
             print(f"📦 Распакован локальный архив прогресса: {zip_name}", flush=True)

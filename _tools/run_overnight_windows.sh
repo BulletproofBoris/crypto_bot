@@ -46,8 +46,7 @@ archs = ["conv1d_gru", "causal_cnn", "attention", "mlp_bottleneck"]
 
 # (horizon, shift_by, old_count, expected_win00_train_end_prefix)
 shift_plan = [
-    (5,  2, 32, "2026-10-25 23:52"),
-    (12, 1, 10, "2026-10-24 20:51"),
+    (5,  1, 34, "2026-10-26 23:4"),
 ]
 
 for H, shift, old_cnt, ts_prefix in shift_plan:
@@ -89,67 +88,26 @@ for H, shift, old_cnt, ts_prefix in shift_plan:
 '
 
 echo ""
-echo "📦 [Этап 2/5] Проверка сжатого архива признаков data/prl_neural_colab_data.npz ($(date '+%H:%M:%S'))..."
-if [ -f "data/prl_neural_colab_data.npz" ]; then
-    echo "  ⏩ Архив data/prl_neural_colab_data.npz уже существует (пропуск повторной упаковки)."
-else
-    "$PYTHON_BIN" -u _tools/export_colab_dataset.py
-fi
+echo "📦 [Этап 2/4] Пересборка сжатого архива признаков data/prl_neural_colab_data.npz ($(date '+%H:%M:%S'))..."
+"$PYTHON_BIN" -u _tools/export_colab_dataset.py --no-upload
 
 echo ""
-echo "🌲 [Этап 3/5] Проверка роя LightGBM по всем окнам H=5 (34), H=12 (11), H=25 (5), H=60 (1) ($(date '+%H:%M:%S'))..."
-if [ -d "models/prl/h60s_k3" ] && [ -d "models/prl/h12s_k3.5" ]; then
-    echo "  ⏩ Все ансамбли LightGBM (H=5, 12, 25, 60) уже обучены (пропуск)."
-else
-    "$PYTHON_BIN" -u _tools/train_rolling_swarm.py --coins prl --horizons 5,12,25,60
-fi
+echo "🌲 [Этап 3/4] Дообучение роя LightGBM H=5s (35 окон: win_00..win_34) ($(date '+%H:%M:%S'))..."
+"$PYTHON_BIN" -u _tools/train_rolling_swarm.py --coins prl --horizons 5
 
 echo ""
-echo "🧬 [Этап 4.1/5] Проверка нейросетей H=5s: 2 новых окна win_00, win_01 ($(date '+%H:%M:%S'))..."
-if [ -f "models/prl/mlp_bottleneck_h5s/model_win_01.keras" ]; then
-    echo "  ⏩ Все 8 нейросетей H=5s (win_00, win_01) уже обучены (пропуск)."
-else
-    "$PYTHON_BIN" -u -m _tools.colab_neural_trainer \
-        --data-file data/prl_neural_colab_data.npz \
-        --horizon 5 \
-        --windows 0,1 \
-        --runs 10 \
-        --epochs 10 \
-        --prune-epoch 5
-fi
-
-echo ""
-echo "🧬 [Этап 4.2/5] Дообучение прерванного строгого окна H=12s (win_00: attention r02..10, mlp_bottleneck r01..10) ($(date '+%H:%M:%S'))..."
+echo "🧬 [Этап 4/4] Обучение нейросетей H=5s на новом строгом 100%-OOS окне win_00 ($(date '+%H:%M:%S'))..."
 "$PYTHON_BIN" -u -m _tools.colab_neural_trainer \
     --data-file data/prl_neural_colab_data.npz \
-    --horizon 12 \
+    --horizon 5 \
     --windows 0 \
     --runs 10 \
     --epochs 10 \
     --prune-epoch 5
-
-echo ""
-echo "🧬 [Этап 4.3/5] Обучение нового строгого окна H=60s (K=3.0, win_00, с авто-подхватом r08 из бэкапа) ($(date '+%H:%M:%S'))..."
-"$PYTHON_BIN" -u -m _tools.colab_neural_trainer \
-    --data-file data/prl_neural_colab_data.npz \
-    --horizon 60 \
-    --windows 0 \
-    --runs 10 \
-    --epochs 10 \
-    --prune-epoch 5
-
-echo ""
-echo "🤖 [Этап 5/5] Пересборка каузального кэша Триады (421ч) и обучение Maskable PPO v4 ($(date '+%H:%M:%S'))..."
-"$PYTHON_BIN" -u _tools/train_rl_execution.py \
-    --coin prl \
-    --tail-hours 421.0 \
-    --epochs 25 \
-    --steps 16384 \
-    --split-ts "2026-10-25 00:00:00+03:00"
 
 echo ""
 echo "========================================================================================"
-echo "✅ КОНВЕЙЕР НОЧНОГО ОБУЧЕНИЯ СТРОГИХ ОКОН УСПЕШНО ЗАВЕРШЕН: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "✅ ОБУЧЕНИЕ НОВОГО СТРОГОГО ОКНА H=5s (win_00) УСПЕШНО ЗАВЕРШЕНО: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "========================================================================================"
 exit 0
 }
