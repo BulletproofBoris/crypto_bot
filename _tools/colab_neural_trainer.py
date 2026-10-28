@@ -20,7 +20,13 @@ import subprocess
 from pathlib import Path
 import numpy as np
 import pandas as pd
+os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
 import tensorflow as tf
+for _gpu in tf.config.list_physical_devices("GPU"):
+    try:
+        tf.config.experimental.set_memory_growth(_gpu, True)
+    except Exception:
+        pass
 from sklearn.metrics import roc_auc_score
 from sklearn.utils.class_weight import compute_class_weight
 

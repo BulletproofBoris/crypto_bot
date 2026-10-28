@@ -46,9 +46,10 @@ def configure_thread_limits():
     # Polars
     os.environ["POLARS_MAX_THREADS"] = s
     
-    # TensorFlow intra/inter (если используется)
+    # TensorFlow intra/inter и динамическое выделение VRAM GPU (RTX 3080 / WSL2)
     os.environ["TF_NUM_INTRAOP_THREADS"] = s
     os.environ["TF_NUM_INTEROP_THREADS"] = str(max(1, safe_cores // 2))
+    os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
     
     return safe_cores
 
