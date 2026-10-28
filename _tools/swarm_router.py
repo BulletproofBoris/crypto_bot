@@ -475,11 +475,11 @@ class SwarmRegimeRouter:
         }
 
     def preload_neural_models(self):
-        """Предзагружает активные графы FastKerasModel (win_00..win_14) в RAM в многопоточном режиме (_SWARM_POOL)."""
+        """Предзагружает все 100% графов FastKerasModel (win_00..win_34, 204 модели) в RAM в многопоточном режиме (_SWARM_POOL)."""
         from _tools.fast_neural_engine import FastKerasModel
 
         def _load_one(exp):
-            if exp.get("win_idx", 0) <= 14 and exp.get("fast_model") is None:
+            if exp.get("fast_model") is None:
                 exp["fast_model"] = FastKerasModel(exp["k_file"], exp["base_arch"])
 
         list(_SWARM_POOL.map(_load_one, self.neural_experts))
@@ -540,8 +540,11 @@ class SwarmRegimeRouter:
             nn_probs_num = np.zeros(7, dtype=np.float32)
             nn_w_sum = 0.0
             norm_cache = {}
+            active_win_set = set(int(x) for x in np.argsort(weights)[-12:]) | {0}
             for idx_e, exp in enumerate(self.neural_experts):
                 w_idx = min(exp.get("win_idx", 0), len(weights) - 1)
+                if w_idx not in active_win_set:
+                    continue
                 reg_w = float(weights[w_idx])
                 if reg_w < 0.004:
                     continue

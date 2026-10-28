@@ -1165,6 +1165,52 @@ class LiveTriadRLTrader:
                 print(f"  ⚠️ [ORDER SELL ERROR] qty={sell_qty:.4f} @ ${target_p:.2f}: {e}")
                 self.sync_account_balances(b1)
 
+    def subsecond_guardian_step(self, streamer, rest_depth: dict = None):
+        """
+        Внутрисекундный Сторож Очереди (~320 мс / ~640 мс между тиками):
+        1) Экстренно снимает лимитный бид при внезапном обвале подпорки b1_q или пробое на BigONE.
+        2) Мгновенно выставляет тейк-профит (Ask) в течение 320 мс после налива нашего бида.
+        """
+        if self.mode != "live" or self.client is None:
+            return
+        if self.active_bid_id is None and self.pos_qty < 2.0:
+            return
+        snap = streamer.peek_fast_bbo(rest_depth)
+        b1, a1 = snap["b1"], snap["a1"]
+        b1_q, a1_q, bo_b1 = snap["b1_q"], snap["a1_q"], snap["bo_b1"]
+        if b1 <= 0 or a1 <= 0:
+            return
+        tol = self.tick_size * 0.25
+
+        if self.active_bid_id is not None:
+            # Случай А: Цена пробила наш бид вниз внутри секунды -> проверяем налив и мгновенно ставим Ask
+            if b1 < self.active_bid_p - tol:
+                self.sync_live_orders(b1, count_hold=False)
+                if self.pos_qty >= 2.0 and self.active_ask_id is None:
+                    print(f"  ⚡ [SUB-SEC GUARDIAN] Мгновенный выход на продажу после налива бида @ ${self.avg_entry:.2f} (<320 мс)")
+                    self.execute_live_action(4, b1, a1)
+                return
+
+            # Случай Б: Мы стоим на лучшем биде b1, но внешняя защита очереди рухнула под лавиной аска или пробоем BigONE
+            if abs(self.active_bid_p - b1) <= tol:
+                ext_b1_q = max(0.0, b1_q - self.active_bid_q)
+                bo_crash = (bo_b1 > 0.0) and (bo_b1 < self.active_bid_p - 2.5 * self.tick_size)
+                book_collapse = (ext_b1_q < 35.0) and (a1_q > 5.0 * max(10.0, ext_b1_q))
+                if bo_crash or book_collapse:
+                    oid = self.active_bid_id
+                    try:
+                        self.client.cancel_order(oid)
+                        print(
+                            f"  🛡️ [SUB-SEC GUARDIAN] Экстренное снятие бида id={oid} @ ${self.active_bid_p:.2f} за <320 мс "
+                            f"(ext_b1_q={ext_b1_q:.1f}, a1_q={a1_q:.1f}, BO_bid=${bo_b1:.3f})"
+                        )
+                    except Exception:
+                        pass
+                    self.sync_live_orders(b1, count_hold=False)
+                    self.active_bid_id, self.active_bid_p, self.active_bid_q = None, 0.0, 0.0
+                    self.q_ahead = -1.0
+                    self._save_wallet()
+
 
 def run_replay_test(coin: str = "prl", steps: int = 30, use_neural: bool = True):
     import pyarrow.parquet as pq
@@ -1247,16 +1293,32 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
 
     now_str = datetime.now(msk_tz).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     print(f"🚀 [{now_str} MSK] Старт боевого цикла {mode.upper()} на {steps} сек (лимит капитала=${budget_usd:.2f}, ордер=${order_usd:.2f}, тик=${trader.tick_size})...")
+
+    import threading
+    shared_depth = {"data": None, "ts": 0.0, "stop": False}
+
+    def _async_depth_poller():
+        while not shared_depth["stop"]:
+            try:
+                if not (local_depth.exists() and (time.time() - local_depth.stat().st_mtime) < 1.2):
+                    d_res = trader.client.get_depth(trader.market, limit=50)
+                    if d_res and d_res.get("bids"):
+                        shared_depth["data"] = d_res
+                        shared_depth["ts"] = time.time()
+            except Exception:
+                pass
+            time.sleep(0.35)
+
+    poller_th = threading.Thread(target=_async_depth_poller, daemon=True)
+    poller_th.start()
+
     for step_idx in range(1, steps + 1):
         t0 = time.perf_counter()
         now_utc = datetime.now(timezone.utc)
         now_msk = now_utc.astimezone(msk_tz)
         ts_msk_str = now_msk.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
-        if local_depth.exists() and (time.time() - local_depth.stat().st_mtime) < 2.5:
-            depth = None
-        else:
-            depth = trader.client.get_depth(trader.market, limit=50)
+        depth = shared_depth["data"] if (time.time() - shared_depth["ts"]) < 3.0 else None
         last_row = streamer.step(depth, now_utc)
 
         b1 = float(last_row["ST_best_bid"].iloc[0])
@@ -1265,10 +1327,6 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
             trader.hold_sec += 1
             if b1 > 0:
                 trader.peak_bid = max(trader.peak_bid, trader.avg_entry, b1)
-        if step_idx % 3 == 1:
-            trader.sync_live_orders(b1, count_hold=False)
-        if step_idx % 15 == 1:
-            trader.sync_account_balances(b1)
 
         x_new = last_row.reindex(columns=trader.feature_names, fill_value=0.0).to_numpy(dtype=np.float32)[0]
         X_buf.append(x_new)
@@ -1313,7 +1371,22 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
                 f"V={v_pred:+.2f}t | Equity=${eq_usd:.2f} ({pnl_tot:+.2f}$) | {dt_ms:.1f} ms",
                 flush=True,
             )
-        time.sleep(max(0.05, 1.0 - (time.perf_counter() - t0)))
+
+        # Используем свободные ~750 мс между 1-секундными тиками для фоновой сверки ордеров/кошелька
+        # и 2 внутрисекундных проверок Сторожа Очереди (на +320 мс и +640 мс)
+        if step_idx % 2 == 0:
+            trader.sync_live_orders(b1, count_hold=False)
+        if step_idx % 15 == 0:
+            trader.sync_account_balances(b1)
+
+        for sub_target in (0.38, 0.70):
+            rem_sub = sub_target - (time.perf_counter() - t0)
+            if rem_sub > 0.02:
+                time.sleep(rem_sub)
+                trader.subsecond_guardian_step(streamer, shared_depth["data"])
+
+        time.sleep(max(0.02, 1.0 - (time.perf_counter() - t0)))
+    shared_depth["stop"] = True
 
 
 def show_live_status(tail_lines: int = 25):
@@ -1468,7 +1541,7 @@ def start_live_daemon(budget_usd: float = 54.0, order_usd: float = 54.0, steps: 
         env_local = BASE_DIR / ".env"
         if env_local.exists():
             sftp.put(str(env_local), "/opt/crypto_bot/.env")
-        for mod_name in ("live_rl_trader.py", "live_feature_updater.py", "microstructure_features.py", "swarm_router.py", "fast_neural_engine.py", "train_rl_execution.py"):
+        for mod_name in ("system_resources.py", "live_rl_trader.py", "live_feature_updater.py", "microstructure_features.py", "swarm_router.py", "fast_neural_engine.py", "train_rl_execution.py"):
             loc_mod = BASE_DIR / "_tools" / mod_name
             if loc_mod.exists():
                 sftp.put(str(loc_mod), f"/opt/crypto_bot/_tools/{mod_name}")
@@ -1531,7 +1604,7 @@ if __name__ == "__main__":
             "--steps", str(args.steps), "--order-usd", str(args.order_usd), "--budget-usd", str(args.budget_usd),
         ]
         with open(log_file, "a", encoding="utf-8") as lf:
-            proc = subprocess.Popen(cmd, cwd=str(BASE_DIR), stdout=lf, stderr=lf, start_new_session=True)
+            proc = subprocess.Popen(cmd, cwd=str(BASE_DIR), stdin=subprocess.DEVNULL, stdout=lf, stderr=lf, start_new_session=True, close_fds=True)
         pid_file.write_text(str(proc.pid), encoding="utf-8")
         print(f"🚀 Фоновый демон запущен (PID={proc.pid}). Лог: {log_file}")
     elif args.mode == "replay":

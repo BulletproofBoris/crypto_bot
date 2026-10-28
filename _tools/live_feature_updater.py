@@ -566,3 +566,43 @@ class LiveFeatureStreamer:
         df_win = self._compute_window_features()
         return df_win.iloc[-n:].fillna(0.0).reset_index(drop=True)
 
+    def peek_fast_bbo(self, rest_depth: dict = None) -> dict:
+        """Субсекундное чтение (<0.3 мс) лучших цен/объемов ST и BO для внутрисекундного сторожа очереди."""
+        last_d = self.raw_rows[-1] if self.raw_rows else {}
+        b1 = float(last_d.get("ST_bid_1_price", last_d.get("ST_best_bid", 0.0)))
+        a1 = float(last_d.get("ST_ask_1_price", last_d.get("ST_best_ask", 0.0)))
+        b1_q = float(last_d.get("ST_bid_1_qty", 0.0))
+        a1_q = float(last_d.get("ST_ask_1_qty", 0.0))
+        bo_b1 = float(last_d.get("BO_bid_1_price", 0.0))
+
+        st_tail = self._tail_lines(self.st_depth_path, n=1)
+        if st_tail:
+            parts = st_tail[-1].split(",")
+            if len(parts) > 103:
+                try:
+                    b1 = float(parts[1] or b1)
+                    b1_q = float(parts[2] or b1_q)
+                    a1 = float(parts[101] or a1)
+                    a1_q = float(parts[102] or a1_q)
+                except ValueError:
+                    pass
+        if rest_depth:
+            bids = rest_depth.get("bids", [])
+            asks = rest_depth.get("asks", [])
+            if bids and asks:
+                try:
+                    b1, b1_q = float(bids[0][0]), float(bids[0][1])
+                    a1, a1_q = float(asks[0][0]), float(asks[0][1])
+                except (ValueError, IndexError):
+                    pass
+        bo_tail = self._tail_lines(self.bo_depth_path, n=1)
+        if bo_tail:
+            b_parts = bo_tail[-1].split(",")
+            if len(b_parts) > 3:
+                try:
+                    bo_b1 = float(b_parts[1] or bo_b1)
+                except ValueError:
+                    pass
+        return {"b1": b1, "a1": a1, "b1_q": b1_q, "a1_q": a1_q, "bo_b1": bo_b1}
+
+

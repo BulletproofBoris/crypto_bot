@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 from _tools.system_resources import SAFE_WORKERS
 
+_FILTER_POOL = ThreadPoolExecutor(max_workers=min(4, max(1, SAFE_WORKERS)))
+
 # Геометрическая сетка частотных полос (в секундах):
 # 5s  = Горизонт исполнения H (Impulse band)
 # 20s = Окно микроструктурной волны L = 4*H и время блока (Wave band)
@@ -206,9 +208,8 @@ def add_exchange_filter_bank(df_1s, prefix, coin="prl"):
             f"{prefix}_imbalance_ema_{w}s": df_1s[f"{prefix}_imbalance_top5"].ewm(span=w, adjust=False).mean(),
         }
 
-    with ThreadPoolExecutor(max_workers=min(len(FILTER_WINDOWS), SAFE_WORKERS)) as pool:
-        for w_dict in pool.map(_calc_window_bank, FILTER_WINDOWS):
-            new_cols.update(w_dict)
+    for w_dict in _FILTER_POOL.map(_calc_window_bank, FILTER_WINDOWS):
+        new_cols.update(w_dict)
 
     # 3. Ортогональные полосовые фильтры (Band-Pass разности между соседними частотами)
     new_cols[f"{prefix}_ofi_band_5_20"] = new_cols[f"{prefix}_ofi_norm_5s"] - new_cols[f"{prefix}_ofi_norm_20s"]
