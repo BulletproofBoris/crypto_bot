@@ -327,6 +327,14 @@ class SafeTradeL2ExecutionEnv:
         imb1, imb5 = self.X_market[:, 19], self.X_market[:, 20]
         b1q_s = pd.Series(np.maximum(self.bid_q[:, 0], 0.0))
         a1q_s = pd.Series(np.maximum(self.ask_q[:, 0], 0.0))
+        same_b1_5s = np.abs(self.bid_p[:, 0] - s_bid.shift(5).bfill().values) < (self.tick_size * 0.25)
+        s_ask = pd.Series(self.ask_p[:, 0])
+        same_a1_5s = np.abs(self.ask_p[:, 0] - s_ask.shift(5).bfill().values) < (self.tick_size * 0.25)
+        self.dq_bid_5s = np.where(same_b1_5s, b1q_s.diff(5).fillna(0.0).values, 0.0).astype(np.float32)
+        self.dq_ask_5s = np.where(same_a1_5s, a1q_s.diff(5).fillna(0.0).values, 0.0).astype(np.float32)
+        self.buy_vol_10s = pd.Series(self.buy_vol).rolling(10, min_periods=1).sum().values.astype(np.float32)
+        net_trade_5s = pd.Series(self.buy_vol - self.sell_vol).rolling(5, min_periods=1).sum().values
+        self.ofi_5s = (self.dq_bid_5s - self.dq_ask_5s + net_trade_5s).astype(np.float32)
         net_trade_10s = pd.Series(self.buy_vol - self.sell_vol).rolling(10, min_periods=1).sum().values
         dq_10s = (b1q_s.diff(10).fillna(0.0).values - a1q_s.diff(10).fillna(0.0).values)
         fast_flow_10s = np.clip((net_trade_10s + 0.5 * dq_10s) / (b1q_s.values + a1q_s.values + 500.0) * 3.0, -3.0, 3.0).astype(np.float32)
@@ -362,9 +370,17 @@ class SafeTradeL2ExecutionEnv:
             # Освобождаем PPO от жестких эвристик: разрешаем входы по сигналам нейросетевого роя,
             # отсекая только физически опасные зоны (покупка на хаях часа pos_3600 > 0.80, вершине 4ч пампа pos_14400 > 0.72 или в отвесном обвале)
             safe_macro_4h = (self.rng_14400 < 6.0) | (self.pos_14400 <= 0.72)
+            waterfall_trap_vec = getattr(self, "enable_unfreeze", True) & (self.dd_900 >= 8.0) & (self.pos_14400 >= 0.45) & (ez25 < 0.0)
+            staircase_bleed_vec = getattr(self, "enable_unfreeze", True) & (
+                ((self.pos_3600 <= 0.05) & (self.pos_14400 <= 0.05) & (self.vel_b1_180 <= -2.0) & (ez25 < 0.0))
+                | ((ez5 < 0.15) & (ez12 <= 0.0) & (ez25 <= 0.0))
+                | ((self.pos_3600 <= 0.05) & (ez12 <= 0.0) & (ez25 <= 0.0) & ~((self.bid_q[:, 0] >= 9000.0) & (imb5 >= 0.60) & (ez5 >= 0.15)))
+            )
             in_dip_zone_vec = (
                 (self.pos_3600 <= 0.80)
                 & safe_macro_4h
+                & ~waterfall_trap_vec
+                & ~staircase_bleed_vec
                 & (self.vel_b1_10 >= -0.5)
                 & (self.inertia_arr >= 0.15)
                 & (exp_entry_edge >= 0.60)
@@ -575,7 +591,11 @@ class SafeTradeL2ExecutionEnv:
             and b1 >= self.avg_entry - self.tick_size * 1.25
             and (
                 a1 >= self.avg_entry + 1.8 * self.tick_size
-                or ((float(self.pos_3600[t]) >= 0.30 or float(self.dd_300[t]) >= 3.0) and float(self.bid_q[t, 0]) >= 4000.0 and imb5 >= 0.20)
+                or (
+                    (float(self.pos_3600[t]) >= 0.30 or float(self.dd_300[t]) >= 3.0)
+                    and float(self.bid_q[t, 0]) >= 4000.0
+                    and (imb5 >= 0.20 or (ez12 >= 0.55 and ez25 >= 0.35 and float(self.ask_q[t, 0]) <= 2500.0))
+                )
             )
         )
         if b1 < self.avg_entry - self.tick_size * 0.25 and not step_in_supported:
@@ -709,6 +729,12 @@ class SafeTradeL2ExecutionEnv:
             and float(self.ask_q[t, 0]) <= 2500.0
             and pos3600 <= 0.75
             and inertia >= 0.05
+            and (inertia >= 0.20 or float(self.imb_l5[t]) >= 0.50 or ez25 > -0.25)
+            and not (float(self.X_market[t, 0]) < 0.15 and float(self.X_market[t, 6]) <= 0.0 and ez25 <= 0.0)
+            and not (pos3600 <= 0.05 and float(self.X_market[t, 6]) <= 0.0 and ez25 <= 0.0 and not (float(self.bid_q[t, 0]) >= 9000.0 and float(self.imb_l5[t]) >= 0.60 and float(self.X_market[t, 0]) >= 0.15))
+            and not (pos3600 <= 0.05 and float(self.pos_14400[t]) <= 0.05 and float(self.X_market[t, 0]) < 0.0 and ez25 < 0.0 and float(self.ask_q[t, 0]) > 1000.0)
+            and not (pos3600 <= 0.05 and float(self.pos_14400[t]) <= 0.05 and float(self.vel_b1_180[t]) <= -2.0 and ez25 < 0.0)
+            and not (float(self.dd_900[t]) >= 8.0 and float(self.pos_14400[t]) >= 0.45 and ez25 < 0.0)
             and float(self.vel_b1_10[t]) >= -0.5
         )
         if not self.legacy_v2 and self.pos_qty <= 1e-8 and self.order_side is None and action == 0 and (brk_now or wide_scalp_ok) and t >= self.cooldown_until:
@@ -716,10 +742,17 @@ class SafeTradeL2ExecutionEnv:
         if not self.legacy_v2 and self.pos_qty <= 1e-8 and self.order_side == "BUY":
             at_b1 = (self.order_price >= b1 - tol) and (self.order_price <= b1 + self.tick_size + tol)
             compressed_4h_floor = (4.8 <= self.rng_14400[t] <= 5.5 and self.pos_14400[t] <= 0.05 and self.dd_900[t] <= 1.0)
-            l1_crush = (sp < 1.5 and float(self.ask_q[t, 0]) > 5000.0 and float(self.bid_q[t, 0]) < 800.0 and inertia < 0.0)
+            l1_bid_erosion = (
+                getattr(self, "enable_unfreeze", True)
+                and sp < 1.5
+                and float(self.dq_bid_5s[t]) <= -1000.0
+                and float(self.bid_q[t, 0]) < 1800.0
+                and float(self.buy_vol_10s[t]) < 100.0
+            )
+            l1_crush = (sp < 1.5 and float(self.ask_q[t, 0]) > 5000.0 and float(self.bid_q[t, 0]) < 800.0 and inertia < 0.0) or l1_bid_erosion
             pre_dump = ((sp < 1.5 and ez25 < -0.15 and inertia < 0.08 and self.ask_q[t, 0] > 4000.0) or l1_crush) and not compressed_4h_floor
             front_q_hold = at_b1 and (self.q_ahead < 600.0) and not pre_dump and pos3600 <= 0.65 and inertia >= -0.10
-            brk_hold = brk_now or (at_b1 and (a1 - b1) >= 1.8 * self.tick_size and float(self.bid_q[t, 0]) >= 1500.0 and inertia >= -0.05)
+            brk_hold = (brk_now or (at_b1 and (a1 - b1) >= 1.8 * self.tick_size and float(self.bid_q[t, 0]) >= 1500.0 and inertia >= -0.05)) and not pre_dump
             v14_hold_q = at_b1 and ((pos3600 <= 0.25 and not pre_dump and self.bid_q[t, 0] >= 5000.0) or compressed_4h_floor or front_q_hold or brk_hold)
             bid_age = t - self.bid_placed_t
             if self.order_price > b1 + tol and self.vel_b1_10[t] <= -1.0 and hold_edge < 0.0 and self.ask_q[t, 0] > 500.0:
@@ -751,7 +784,11 @@ class SafeTradeL2ExecutionEnv:
                 and b1 >= self.avg_entry - 1.25 * self.tick_size
                 and (
                     a1 >= self.avg_entry + 1.8 * self.tick_size
-                    or ((pos3600 >= 0.30 or float(self.dd_300[t]) >= 3.0) and float(self.bid_q[t, 0]) >= 4000.0 and float(self.imb_l5[t]) >= 0.20)
+                    or (
+                        (pos3600 >= 0.30 or float(self.dd_300[t]) >= 3.0)
+                        and float(self.bid_q[t, 0]) >= 4000.0
+                        and (float(self.imb_l5[t]) >= 0.20 or (ez12_now >= 0.55 and ez25 >= 0.35 and float(self.ask_q[t, 0]) <= 2500.0))
+                    )
                 )
             )
             if unfreeze_mode:
@@ -832,14 +869,6 @@ class SafeTradeL2ExecutionEnv:
                 action = 0
             elif self.order_side == "SELL" and self.slot2_side is None:
                 pump_up = bool(self.vel_10[t] >= 1.0 or self.in_breakout_zone[t] or (self.imb_l5[t] >= 0.22 and inertia >= 0.25))
-                wave_hold_ok = b1 >= self.avg_entry - tol or (
-                    getattr(self, "enable_unfreeze", True)
-                    and b1 >= self.avg_entry - 1.25 * self.tick_size
-                    and (
-                        a1 >= self.avg_entry + 1.8 * self.tick_size
-                        or ((pos3600 >= 0.30 or float(self.dd_300[t]) >= 3.0) and float(self.bid_q[t, 0]) >= 4000.0 and float(self.imb_l5[t]) >= 0.20)
-                    )
-                )
                 if pump_up and a1 >= self.order_price - tol and self.imb_l5[t] >= 0.20 and b1 >= self.avg_entry:
                     action = 3
                 elif self.order_price >= wave_p - tol and wave_hold_ok:

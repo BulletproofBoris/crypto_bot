@@ -66,12 +66,34 @@ def select_golden_regimes(data: dict, win_sec: int = 14400) -> list[dict]:
     recov_cands = [s for s in starts if s >= n // 2 and np.sum(b_vol[s:s + 1800] > 0) >= 15]
     best_recov = recov_cands[-1] if recov_cands else starts[-1]
 
+    base_5 = {best_pump, best_dump, best_wide, best_tight, best_recov}
+    rem_starts = [s for s in starts if all(abs(s - ex) >= win_sec for ex in base_5)]
+    if not rem_starts:
+        rem_starts = starts
+
+    def _v_shape_score(s: int) -> float:
+        w = b1[s:s + win_sec]
+        min_idx = int(np.argmin(w))
+        drop_t = (w[0] - w[min_idx]) / tick
+        rec_t = (np.max(w[min_idx:]) - w[min_idx]) / tick
+        return float(min(drop_t, rec_t) * 2.0 + 0.2 * (drop_t + rec_t))
+
+    best_vshape = max(rem_starts, key=_v_shape_score)
+    rem_starts_2 = [s for s in rem_starts if abs(s - best_vshape) >= win_sec] or rem_starts
+    best_swing = max(rem_starts_2, key=lambda s: float(np.sum(np.abs(np.diff(b1[s:s + win_sec])) / tick)))
+    rem_starts_3 = [s for s in rem_starts_2 if abs(s - best_swing) >= win_sec] or rem_starts_2
+    grind_cands = [s for s in range(14400, n - win_sec - 600, step) if all(abs(s - ex) >= win_sec for ex in (base_5 | {best_vshape, best_swing})) and (b1[s + win_sec] - b1[s]) / tick <= -6.0 and np.max(b1[s:s + win_sec]) <= b1[s] + tick]
+    best_grind = min(grind_cands or rem_starts_3, key=lambda s: float((b1[s + win_sec] - b1[s]) / tick))
+
     return [
         {"id": "R1_PUMP_BREAKOUT", "title": "🚀 Памп и пробой вверх", "start": int(best_pump), "end": int(best_pump + win_sec), "force_underwater": False},
         {"id": "R2_TOXIC_DUMP", "title": "🩸 Токсичный пролив вниз", "start": int(best_dump), "end": int(best_dump + win_sec), "force_underwater": False},
         {"id": "R3_WIDE_SPREAD_SCALP", "title": "🦀 Живой коридор (спред >= 2т)", "start": int(best_wide), "end": int(best_wide + win_sec), "force_underwater": False},
         {"id": "R4_TIGHT_1TICK_CHOP", "title": "🧱 Вязкий флэт (спред 1т)", "start": int(best_tight), "end": int(best_tight + win_sec), "force_underwater": False},
         {"id": "R5_UNDERWATER_RECOVERY", "title": "🔄 Свежий рынок + выход из -6т", "start": int(best_recov), "end": int(best_recov + win_sec), "force_underwater": True},
+        {"id": "R6_V_SHAPE_REVERSAL", "title": "🎢 V-образный пролив и выкуп", "start": int(best_vshape), "end": int(best_vshape + win_sec), "force_underwater": False},
+        {"id": "R7_WHIPSAW_SWING", "title": "⚡ Высоковолатильные качели", "start": int(best_swing), "end": int(best_swing + win_sec), "force_underwater": False},
+        {"id": "R8_STAIRCASE_GRIND_DOWN", "title": "📉 Ступенчатый спуск (-9т)", "start": int(best_grind), "end": int(best_grind + win_sec), "force_underwater": False},
     ]
 
 
@@ -192,11 +214,12 @@ def run_regression_gate(save_as_baseline: bool = False, order_usd: float = 50.0)
         })
 
     df_res = pd.DataFrame(rows)
-    tot_base = sum(base_map[c["id"]]["net_pnl_pct"] for c in cand_results)
+    tot_base = sum(base_map.get(c["id"], c)["net_pnl_pct"] for c in cand_results)
     tot_cand = sum(c["net_pnl_pct"] for c in cand_results)
+    n_reg = len(cand_results)
     verdict = "✅ ДОПУЩЕНО К ДЕПЛОЮ (Non-Regression Gate PASSED)" if all_passed and tot_cand >= tot_base - 0.10 else "❌ ОТКЛОНЕНО: ОБНАРУЖЕНА РЕГРЕССИЯ"
-    print(f"🛡️ Проверка Безоткатной Эволюции (5 эталонных режимов x 4ч = 20ч L2 стакана) за {time.perf_counter() - t0:.1f} сек:")
-    print(f"📊 Суммарный PnL по 5 режимам: {tot_base:+.2f}% ➔ {tot_cand:+.2f}% (Δ={tot_cand - tot_base:+.2f}%) | Вердикт: {verdict}\n")
+    print(f"🛡️ Проверка Безоткатной Эволюции ({n_reg} эталонных режимов x 4ч = {n_reg * 4}ч L2 стакана) за {time.perf_counter() - t0:.1f} сек:")
+    print(f"📊 Суммарный PnL по {n_reg} режимам: {tot_base:+.2f}% ➔ {tot_cand:+.2f}% (Δ={tot_cand - tot_base:+.2f}%) | Вердикт: {verdict}\n")
     print(df_res.to_string(index=False))
     return df_res
 

@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-10-29 14:16:36",
+  "updated_at": "2026-10-29 15:00:25",
   "regimes": [
     {
       "id": "R1_PUMP_BREAKOUT",
@@ -9,7 +9,7 @@
       "n_trades": 6,
       "max_freeze_min": 11.3,
       "max_dd_usd": 1.2405,
-      "requotes": 51
+      "requotes": 50
     },
     {
       "id": "R2_TOXIC_DUMP",
@@ -19,7 +19,7 @@
       "n_trades": 13,
       "max_freeze_min": 7.8,
       "max_dd_usd": 1.0197,
-      "requotes": 110
+      "requotes": 107
     },
     {
       "id": "R3_WIDE_SPREAD_SCALP",
@@ -34,12 +34,12 @@
     {
       "id": "R4_TIGHT_1TICK_CHOP",
       "title": "🧱 Вязкий флэт (спред 1т)",
-      "net_pnl_usd": 0.9949,
-      "net_pnl_pct": 1.99,
+      "net_pnl_usd": 1.502,
+      "net_pnl_pct": 3.0,
       "n_trades": 9,
       "max_freeze_min": 44.3,
       "max_dd_usd": 1.4462,
-      "requotes": 29
+      "requotes": 30
     },
     {
       "id": "R5_UNDERWATER_RECOVERY",
@@ -50,6 +50,36 @@
       "max_freeze_min": 34.1,
       "max_dd_usd": 0.6524,
       "requotes": 16
+    },
+    {
+      "id": "R6_V_SHAPE_REVERSAL",
+      "title": "🎢 V-образный пролив и выкуп",
+      "net_pnl_usd": 2.9905,
+      "net_pnl_pct": 5.98,
+      "n_trades": 12,
+      "max_freeze_min": 9.4,
+      "max_dd_usd": 1.3589,
+      "requotes": 87
+    },
+    {
+      "id": "R7_WHIPSAW_SWING",
+      "title": "⚡ Высоковолатильные качели",
+      "net_pnl_usd": 2.8856,
+      "net_pnl_pct": 5.77,
+      "n_trades": 15,
+      "max_freeze_min": 9.6,
+      "max_dd_usd": 1.0971,
+      "requotes": 73
+    },
+    {
+      "id": "R8_STAIRCASE_GRIND_DOWN",
+      "title": "📉 Ступенчатый спуск (-9т)",
+      "net_pnl_usd": -0.0729,
+      "net_pnl_pct": -0.15,
+      "n_trades": 5,
+      "max_freeze_min": 21.3,
+      "max_dd_usd": 0.8973,
+      "requotes": 65
     }
   ],
   "prev_frozen": [
@@ -91,7 +121,7 @@
       "n_trades": 3,
       "max_freeze_min": 118.3,
       "max_dd_usd": 1.3863,
-      "requotes": 8
+      "requotes": 9
     },
     {
       "id": "R5_UNDERWATER_RECOVERY",
@@ -102,6 +132,36 @@
       "max_freeze_min": 245.1,
       "max_dd_usd": 0.9506,
       "requotes": 1
+    },
+    {
+      "id": "R6_V_SHAPE_REVERSAL",
+      "title": "🎢 V-образный пролив и выкуп",
+      "net_pnl_usd": 0.9506,
+      "net_pnl_pct": 1.9,
+      "n_trades": 2,
+      "max_freeze_min": 196.3,
+      "max_dd_usd": 5.0377,
+      "requotes": 11
+    },
+    {
+      "id": "R7_WHIPSAW_SWING",
+      "title": "⚡ Высоковолатильные качели",
+      "net_pnl_usd": 0.9138,
+      "net_pnl_pct": 1.83,
+      "n_trades": 7,
+      "max_freeze_min": 24.4,
+      "max_dd_usd": 1.0971,
+      "requotes": 52
+    },
+    {
+      "id": "R8_STAIRCASE_GRIND_DOWN",
+      "title": "📉 Ступенчатый спуск (-9т)",
+      "net_pnl_usd": -0.9424,
+      "net_pnl_pct": -1.88,
+      "n_trades": 2,
+      "max_freeze_min": 121.7,
+      "max_dd_usd": 1.9133,
+      "requotes": 29
     }
   ]
 }
