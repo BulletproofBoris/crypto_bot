@@ -1,0 +1,107 @@
+{
+  "updated_at": "2026-10-29 12:11:20",
+  "regimes": [
+    {
+      "id": "R1_PUMP_BREAKOUT",
+      "title": "🚀 Памп и пробой вверх",
+      "net_pnl_usd": 0.1548,
+      "net_pnl_pct": 0.31,
+      "n_trades": 1,
+      "max_freeze_min": 0.3,
+      "max_dd_usd": 0.3051,
+      "requotes": 48
+    },
+    {
+      "id": "R2_TOXIC_DUMP",
+      "title": "🩸 Токсичный пролив вниз",
+      "net_pnl_usd": -0.9149,
+      "net_pnl_pct": -1.83,
+      "n_trades": 15,
+      "max_freeze_min": 13.2,
+      "max_dd_usd": 2.5819,
+      "requotes": 109
+    },
+    {
+      "id": "R3_WIDE_SPREAD_SCALP",
+      "title": "🦀 Живой коридор (спред >= 2т)",
+      "net_pnl_usd": 0.0,
+      "net_pnl_pct": 0.0,
+      "n_trades": 0,
+      "max_freeze_min": 0.0,
+      "max_dd_usd": 0.0,
+      "requotes": 20
+    },
+    {
+      "id": "R4_TIGHT_1TICK_CHOP",
+      "title": "🧱 Вязкий флэт (спред 1т)",
+      "net_pnl_usd": 0.4064,
+      "net_pnl_pct": 0.81,
+      "n_trades": 4,
+      "max_freeze_min": 44.3,
+      "max_dd_usd": 1.4462,
+      "requotes": 17
+    },
+    {
+      "id": "R5_UNDERWATER_RECOVERY",
+      "title": "🔄 Свежий рынок + выход из -6т",
+      "net_pnl_usd": -0.0557,
+      "net_pnl_pct": -0.11,
+      "n_trades": 3,
+      "max_freeze_min": 110.2,
+      "max_dd_usd": 1.1461,
+      "requotes": 10
+    }
+  ],
+  "prev_frozen": [
+    {
+      "id": "R1_PUMP_BREAKOUT",
+      "title": "🚀 Памп и пробой вверх",
+      "net_pnl_usd": 0.1548,
+      "net_pnl_pct": 0.31,
+      "n_trades": 1,
+      "max_freeze_min": 0.3,
+      "max_dd_usd": 0.3051,
+      "requotes": 48
+    },
+    {
+      "id": "R2_TOXIC_DUMP",
+      "title": "🩸 Токсичный пролив вниз",
+      "net_pnl_usd": -2.8358,
+      "net_pnl_pct": -5.67,
+      "n_trades": 3,
+      "max_freeze_min": 135.8,
+      "max_dd_usd": 4.04,
+      "requotes": 26
+    },
+    {
+      "id": "R3_WIDE_SPREAD_SCALP",
+      "title": "🦀 Живой коридор (спред >= 2т)",
+      "net_pnl_usd": 0.0,
+      "net_pnl_pct": 0.0,
+      "n_trades": 0,
+      "max_freeze_min": 0.0,
+      "max_dd_usd": 0.0,
+      "requotes": 20
+    },
+    {
+      "id": "R4_TIGHT_1TICK_CHOP",
+      "title": "🧱 Вязкий флэт (спред 1т)",
+      "net_pnl_usd": 0.2553,
+      "net_pnl_pct": 0.51,
+      "n_trades": 3,
+      "max_freeze_min": 118.3,
+      "max_dd_usd": 1.3863,
+      "requotes": 8
+    },
+    {
+      "id": "R5_UNDERWATER_RECOVERY",
+      "title": "🔄 Свежий рынок + выход из -6т",
+      "net_pnl_usd": -0.6649,
+      "net_pnl_pct": -1.33,
+      "n_trades": 0,
+      "max_freeze_min": 245.1,
+      "max_dd_usd": 0.9506,
+      "requotes": 1
+    }
+  ]
+}

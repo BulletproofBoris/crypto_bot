@@ -694,10 +694,28 @@ class SafeTradeL2ExecutionEnv:
             elif pre_dump:
                 action = 5
 
-        if not self.legacy_v2 and self.pos_qty > 1e-8 and self.order_side == "SELL":
+        if not self.legacy_v2 and self.pos_qty > 1e-8:
             floor_p = round((self.avg_entry + self.tick_size) / self.tick_size) * self.tick_size
             wave_p = round((self.avg_entry + 2.0 * self.tick_size) / self.tick_size) * self.tick_size
-            if self.order_price >= wave_p - tol and b1 < self.avg_entry - tol and hold_edge < -0.20 and a1 <= floor_p + tol:
+            ez12_now = float(self.X_market[t, 6])
+            car_step_up_ask = (sp < 1.5) and (
+                float(self.imb_l5[t]) > 0.25 and float(self.vel_10[t]) >= 1.0
+            )
+            opt_car_sell_p = round(min(floor_p, (a1 + self.tick_size) if car_step_up_ask else max(a1, b1 + self.tick_size)) / self.tick_size) * self.tick_size
+            unfreeze_mode = getattr(self, "enable_unfreeze", True) and ((self.avg_entry - b1) / self.tick_size >= 3.0 and (t - self.entry_t) >= 300)
+            if unfreeze_mode:
+                if self.order_side != "SELL" or self.slot2_side is not None or self.order_price > opt_car_sell_p + tol or (self.order_price < opt_car_sell_p - tol and car_step_up_ask):
+                    self.order_side = "SELL"
+                    self.order_act = 4
+                    self.order_price = opt_car_sell_p
+                    self.order_qty = self.pos_qty
+                    self.q_ahead, _ = self._get_lob_queue(t, "SELL", self.order_price)
+                    self.active_after = t + 1
+                    self.slot2_side = None
+                    self.slot2_qty = 0.0
+                    self.car_state = 0
+                action = 0
+            elif self.order_side == "SELL" and self.order_price >= wave_p - tol and b1 < self.avg_entry - tol and hold_edge < -0.20 and a1 <= floor_p + tol:
                 self.order_price = max(a1, floor_p)
                 self.order_qty = self.pos_qty
                 self.q_ahead, _ = self._get_lob_queue(t, "SELL", self.order_price)
