@@ -275,7 +275,8 @@ class SafeTradeL2ExecutionEnv:
       6: PANIC_TAKER_EXIT (мгновенный выход по рынку через 10 уровней стакана)
     """
 
-    def __init__(self, data: dict, start_idx: int, end_idx: int, episode_len: int = 3600, order_usd: float = 95.5, legacy_v2: bool = False):
+    def __init__(self, data: dict, start_idx: int, end_idx: int, episode_len: int = 3600, order_usd: float = 95.5, legacy_v2: bool = False, enable_unfreeze: bool = True):
+        self.enable_unfreeze = bool(enable_unfreeze)
         self.X_market = data["X_market"]
         self.bid_p = data["bid_p"]
         self.bid_q = data["bid_q"]
@@ -369,15 +370,28 @@ class SafeTradeL2ExecutionEnv:
                 & (exp_entry_edge >= 0.60)
                 & ((self.dd_300 >= 1.0) | (spread_ticks >= 2.0))
             )
+            brk_wide_vec = (
+                getattr(self, "enable_unfreeze", True)
+                & (spread_ticks >= 1.8)
+                & (self.bid_q[:, 0] >= 5500.0)
+                & (self.ask_q[:, 0] <= 2500.0)
+                & ((self.ask_q[:, 0] <= 1000.0) | (self.pos_3600 >= 0.35))
+                & (self.inertia_arr >= 0.60)
+                & (ez25 >= 0.35)
+                & (self.dd_300 >= 1.0)
+            )
             in_breakout_vec = (
-                (ez5 >= 0.40)
-                & (ez12 >= 0.80)
-                & (ez25 >= 0.85)
-                & (self.inertia_arr >= 0.70)
-                & (exp_entry_edge >= 3.20)
-                & (imb5 >= 0.25)
-                & (self.vel_b1_10 >= 1.0)
-                & (self.rng_14400 <= 11.0)
+                (
+                    (ez5 >= 0.40)
+                    & (ez12 >= 0.80)
+                    & (ez25 >= 0.85)
+                    & (self.inertia_arr >= 0.70)
+                    & (exp_entry_edge >= 3.20)
+                    & (imb5 >= 0.25)
+                    & (self.vel_b1_10 >= 1.0)
+                    & (self.rng_14400 <= 11.0)
+                )
+                | brk_wide_vec
             )
             self.in_breakout_arr = in_breakout_vec
             self.in_breakout_zone = in_breakout_vec
@@ -561,7 +575,7 @@ class SafeTradeL2ExecutionEnv:
             and b1 >= self.avg_entry - self.tick_size * 1.25
             and (
                 a1 >= self.avg_entry + 1.8 * self.tick_size
-                or (float(self.pos_3600[t]) >= 0.70 and float(self.bid_q[t, 0]) >= 5000.0 and imb5 >= 0.20 and inertia >= 0.20)
+                or ((float(self.pos_3600[t]) >= 0.30 or float(self.dd_300[t]) >= 3.0) and float(self.bid_q[t, 0]) >= 4000.0 and imb5 >= 0.20)
             )
         )
         if b1 < self.avg_entry - self.tick_size * 0.25 and not step_in_supported:
@@ -571,7 +585,13 @@ class SafeTradeL2ExecutionEnv:
             or bool(self.in_breakout_zone[t])
             or (self.avg_entry > 0 and b1 >= self.avg_entry + self.tick_size * 0.75 and inertia >= 0.0)
             or (imb5 >= 0.22 and inertia >= 0.25 and ez12 >= 0.15)
-            or (getattr(self, "enable_unfreeze", True) and imb5 >= 0.35 and float(self.bid_q[t, 0]) >= 5000.0 and float(self.ask_q[t, 0]) <= 1500.0 and inertia >= 0.05)
+            or (
+                getattr(self, "enable_unfreeze", True)
+                and imb5 >= 0.35
+                and float(self.bid_q[t, 0]) >= 5000.0
+                and float(self.ask_q[t, 0]) <= 1500.0
+                and (inertia >= 0.05 or (a1 >= self.avg_entry + 1.8 * self.tick_size and imb5 >= 0.50))
+            )
         ):
             return 1.0
         q_a1, _ = self._get_lob_queue(t, "SELL", floor_p)
@@ -726,6 +746,14 @@ class SafeTradeL2ExecutionEnv:
             )
             opt_car_sell_p = round(min(floor_p, (a1 + self.tick_size) if car_step_up_ask else max(a1, b1 + self.tick_size)) / self.tick_size) * self.tick_size
             unfreeze_mode = getattr(self, "enable_unfreeze", True) and ((self.avg_entry - b1) / self.tick_size >= 3.0 and (t - self.entry_t) >= 300)
+            wave_hold_ok = b1 >= self.avg_entry - tol or (
+                getattr(self, "enable_unfreeze", True)
+                and b1 >= self.avg_entry - 1.25 * self.tick_size
+                and (
+                    a1 >= self.avg_entry + 1.8 * self.tick_size
+                    or ((pos3600 >= 0.30 or float(self.dd_300[t]) >= 3.0) and float(self.bid_q[t, 0]) >= 4000.0 and float(self.imb_l5[t]) >= 0.20)
+                )
+            )
             if unfreeze_mode:
                 if self.order_side != "SELL" or self.slot2_side is not None or self.order_price > opt_car_sell_p + tol or (self.order_price < opt_car_sell_p - tol and car_step_up_ask):
                     self.order_side = "SELL"
@@ -738,7 +766,7 @@ class SafeTradeL2ExecutionEnv:
                     self.slot2_qty = 0.0
                     self.car_state = 0
                 action = 0
-            elif self.order_side == "SELL" and self.order_price >= wave_p - tol and b1 < self.avg_entry - tol and hold_edge < -0.20 and a1 <= floor_p + tol:
+            elif self.order_side == "SELL" and self.order_price >= wave_p - tol and not wave_hold_ok and hold_edge < -0.20 and a1 <= floor_p + tol:
                 self.order_price = max(a1, floor_p)
                 self.order_qty = self.pos_qty
                 self.q_ahead, _ = self._get_lob_queue(t, "SELL", self.order_price)
@@ -809,7 +837,7 @@ class SafeTradeL2ExecutionEnv:
                     and b1 >= self.avg_entry - 1.25 * self.tick_size
                     and (
                         a1 >= self.avg_entry + 1.8 * self.tick_size
-                        or (pos3600 >= 0.70 and float(self.bid_q[t, 0]) >= 5000.0 and float(self.imb_l5[t]) >= 0.20)
+                        or ((pos3600 >= 0.30 or float(self.dd_300[t]) >= 3.0) and float(self.bid_q[t, 0]) >= 4000.0 and float(self.imb_l5[t]) >= 0.20)
                     )
                 )
                 if pump_up and a1 >= self.order_price - tol and self.imb_l5[t] >= 0.20 and b1 >= self.avg_entry:

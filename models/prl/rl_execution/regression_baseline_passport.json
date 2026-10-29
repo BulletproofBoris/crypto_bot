@@ -1,25 +1,25 @@
 {
-  "updated_at": "2026-10-29 13:42:02",
+  "updated_at": "2026-10-29 14:16:36",
   "regimes": [
     {
       "id": "R1_PUMP_BREAKOUT",
       "title": "🚀 Памп и пробой вверх",
-      "net_pnl_usd": 1.1769,
-      "net_pnl_pct": 2.35,
-      "n_trades": 5,
-      "max_freeze_min": 8.5,
-      "max_dd_usd": 0.7477,
-      "requotes": 60
+      "net_pnl_usd": 1.5696,
+      "net_pnl_pct": 3.14,
+      "n_trades": 6,
+      "max_freeze_min": 11.3,
+      "max_dd_usd": 1.2405,
+      "requotes": 51
     },
     {
       "id": "R2_TOXIC_DUMP",
       "title": "🩸 Токсичный пролив вниз",
-      "net_pnl_usd": 1.7737,
-      "net_pnl_pct": 3.55,
-      "n_trades": 12,
+      "net_pnl_usd": 2.0944,
+      "net_pnl_pct": 4.19,
+      "n_trades": 13,
       "max_freeze_min": 7.8,
       "max_dd_usd": 1.0197,
-      "requotes": 111
+      "requotes": 110
     },
     {
       "id": "R3_WIDE_SPREAD_SCALP",
@@ -34,12 +34,12 @@
     {
       "id": "R4_TIGHT_1TICK_CHOP",
       "title": "🧱 Вязкий флэт (спред 1т)",
-      "net_pnl_usd": 0.6839,
-      "net_pnl_pct": 1.37,
-      "n_trades": 7,
+      "net_pnl_usd": 0.9949,
+      "net_pnl_pct": 1.99,
+      "n_trades": 9,
       "max_freeze_min": 44.3,
       "max_dd_usd": 1.4462,
-      "requotes": 25
+      "requotes": 29
     },
     {
       "id": "R5_UNDERWATER_RECOVERY",

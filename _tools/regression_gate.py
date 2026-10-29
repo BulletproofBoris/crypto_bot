@@ -89,7 +89,7 @@ def _slice_data(data: dict, start: int, end: int, pad: int = 14400) -> tuple[dic
 
 def evaluate_regime(data: dict, agent: MaskableActorCritic, reg: dict, order_usd: float = 50.0, enable_unfreeze: bool = True) -> dict:
     sub_data, rel_s, rel_e = _slice_data(data, reg["start"], reg["end"])
-    env = SafeTradeL2ExecutionEnv(sub_data, rel_s, rel_e, episode_len=rel_e - rel_s - 2, order_usd=order_usd)
+    env = SafeTradeL2ExecutionEnv(sub_data, rel_s, rel_e, episode_len=rel_e - rel_s - 2, order_usd=order_usd, enable_unfreeze=enable_unfreeze)
     env.enable_unfreeze = bool(enable_unfreeze)
     obs = env.reset(eval_mode=True)
 
