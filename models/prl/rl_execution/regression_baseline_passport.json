@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-10-29 12:56:26",
+  "updated_at": "2026-10-29 13:05:56",
   "regimes": [
     {
       "id": "R1_PUMP_BREAKOUT",
@@ -14,9 +14,9 @@
     {
       "id": "R2_TOXIC_DUMP",
       "title": "🩸 Токсичный пролив вниз",
-      "net_pnl_usd": 0.8766,
-      "net_pnl_pct": 1.75,
-      "n_trades": 15,
+      "net_pnl_usd": 0.9874,
+      "net_pnl_pct": 1.97,
+      "n_trades": 16,
       "max_freeze_min": 10.6,
       "max_dd_usd": 1.0197,
       "requotes": 107
@@ -61,7 +61,7 @@
       "n_trades": 1,
       "max_freeze_min": 0.3,
       "max_dd_usd": 0.3051,
-      "requotes": 48
+      "requotes": 49
     },
     {
       "id": "R2_TOXIC_DUMP",

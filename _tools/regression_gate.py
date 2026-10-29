@@ -201,6 +201,114 @@ def run_regression_gate(save_as_baseline: bool = False, order_usd: float = 50.0)
     return df_res
 
 
+def finetune_ppo_with_gate(epochs: int = 8, steps_per_epoch: int = 16384, order_usd: float = 50.0):
+    """H4: Дообучение Maskable PPO внутри обновлённой среды (H1+H2+H3) под строгим контролем шлюза 5 режимов."""
+    import shutil
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from torch.distributions import Categorical
+
+    data = _load_best_cache("prl")
+    regimes = select_golden_regimes(data)
+    obs_dim = data["X_market"].shape[1] + 10
+    ckpt_path = BASE_DIR / "models" / "prl" / "rl_execution" / "best_maskable_ppo.pt"
+    backup_path = BASE_DIR / "models" / "prl" / "rl_execution" / "best_maskable_ppo_pre_h4.pt"
+    shutil.copy2(ckpt_path, backup_path)
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state_dict = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
+    hidden_dim = state_dict["backbone.0.weight"].shape[0]
+
+    model = MaskableActorCritic(obs_dim=obs_dim, n_actions=7, hidden_dim=hidden_dim)
+    model.load_state_dict(state_dict)
+    best_ref = MaskableActorCritic(obs_dim=obs_dim, n_actions=7, hidden_dim=hidden_dim)
+    best_ref.load_state_dict(state_dict)
+    best_ref.eval()
+
+    base_eval = [evaluate_regime(data, best_ref, r, order_usd=order_usd, enable_unfreeze=True) for r in regimes]
+    best_map = {r["id"]: r for r in base_eval}
+    best_tot_pnl = sum(r["net_pnl_pct"] for r in base_eval)
+    print(f"🎯 H4 Старт дообучения PPO: текущий эталон по 5 режимам = {best_tot_pnl:+.2f}%", flush=True)
+
+    n_total = len(data["X_market"])
+    train_env = SafeTradeL2ExecutionEnv(data, start_idx=max(14400, n_total - 260 * 3600), end_idx=n_total - 20 * 3600, episode_len=7200, order_usd=order_usd)
+    opt = torch.optim.AdamW(model.parameters(), lr=4e-5, weight_decay=1e-4)
+    ce_w = torch.tensor([1.0, 15.0, 15.0, 4.0, 4.0, 6.0, 8.0], dtype=torch.float32)
+
+    for ep in range(1, epochs + 1):
+        model.train()
+        b_obs, b_masks, b_acts, b_tacts, b_logp, b_rews, b_vals, b_dones = [], [], [], [], [], [], [], []
+        obs = train_env.reset()
+        for _ in range(steps_per_epoch):
+            mask = train_env.get_action_mask()
+            with torch.no_grad():
+                o_t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
+                m_t = torch.as_tensor(mask, dtype=torch.bool).unsqueeze(0)
+                logits, val = model(o_t, m_t)
+                ref_logits, _ = best_ref(o_t, m_t)
+                t_act = int(torch.argmax(ref_logits, dim=-1).item())
+                dist = Categorical(logits=logits)
+                act_t = dist.sample()
+                logp_t = dist.log_prob(act_t)
+            act = int(act_t.item())
+            next_obs, rew, done = train_env.step(act)
+            b_obs.append(obs); b_masks.append(mask); b_acts.append(act); b_tacts.append(t_act)
+            b_logp.append(float(logp_t.item())); b_rews.append(rew); b_vals.append(float(val.item())); b_dones.append(done)
+            obs = train_env.reset() if done else next_obs
+
+        advs = np.zeros(steps_per_epoch, dtype=np.float32)
+        last_gae = 0.0
+        for t_i in reversed(range(steps_per_epoch)):
+            next_val = 0.0 if (t_i == steps_per_epoch - 1 or b_dones[t_i]) else b_vals[t_i + 1]
+            delta = b_rews[t_i] + 0.995 * next_val - b_vals[t_i]
+            last_gae = delta + 0.995 * 0.95 * (0.0 if b_dones[t_i] else last_gae)
+            advs[t_i] = last_gae
+        rets = advs + np.array(b_vals, dtype=np.float32)
+        advs = (advs - advs.mean()) / (advs.std() + 1e-8)
+
+        T_obs = torch.as_tensor(np.array(b_obs), dtype=torch.float32)
+        T_masks = torch.as_tensor(np.array(b_masks), dtype=torch.bool)
+        T_acts = torch.as_tensor(np.array(b_acts), dtype=torch.long)
+        T_tacts = torch.as_tensor(np.array(b_tacts), dtype=torch.long)
+        T_old_logp = torch.as_tensor(np.array(b_logp), dtype=torch.float32)
+        T_advs = torch.as_tensor(advs, dtype=torch.float32)
+        T_rets = torch.as_tensor(rets, dtype=torch.float32)
+
+        for _ in range(2):
+            perm = torch.randperm(steps_per_epoch)
+            for i in range(0, steps_per_epoch, 1024):
+                idx = perm[i:i + 1024]
+                logits, vals = model(T_obs[idx], T_masks[idx])
+                dist = Categorical(logits=logits)
+                ratio = torch.exp(dist.log_prob(T_acts[idx]) - T_old_logp[idx])
+                surr = torch.min(ratio * T_advs[idx], torch.clamp(ratio, 0.88, 1.12) * T_advs[idx])
+                bc_loss = F.cross_entropy(logits, T_tacts[idx], weight=ce_w)
+                loss = -surr.mean() + 0.25 * F.mse_loss(vals, T_rets[idx]) + 0.25 * bc_loss - 0.003 * dist.entropy().mean()
+                opt.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(model.parameters(), 0.5); opt.step()
+
+        model.eval()
+        cand_eval = [evaluate_regime(data, model, r, order_usd=order_usd, enable_unfreeze=True) for r in regimes]
+        cand_tot = sum(r["net_pnl_pct"] for r in cand_eval)
+        gate_ok = all(
+            (c["net_pnl_pct"] >= best_map[c["id"]]["net_pnl_pct"] - 0.15)
+            and (c["max_freeze_min"] <= max(45.0, best_map[c["id"]]["max_freeze_min"] + 1.0))
+            for c in cand_eval
+        )
+        if gate_ok and cand_tot > best_tot_pnl + 0.01:
+            best_tot_pnl = cand_tot
+            best_map = {c["id"]: c for c in cand_eval}
+            best_ref.load_state_dict(model.state_dict())
+            torch.save(model.state_dict(), ckpt_path)
+            print(f"  [H4 Ep {ep}/{epochs}] 🏆 НОВЫЙ РЕКОРД ШЛЮЗА: {cand_tot:+.2f}% -> чекпоинт сохранён!", flush=True)
+        else:
+            print(f"  [H4 Ep {ep}/{epochs}] ↩️ Кандидат {cand_tot:+.2f}% (gate_ok={gate_ok}) не превзошёл {best_tot_pnl:+.2f}% -> откат к эталону", flush=True)
+            with torch.no_grad():
+                for p_c, p_b in zip(model.parameters(), best_ref.parameters()):
+                    p_c.data.mul_(0.25).add_(p_b.data, alpha=0.75)
+
+
 if __name__ == "__main__":
+    if "--finetune-ppo" in sys.argv:
+        finetune_ppo_with_gate()
     save_flag = "--save-baseline" in sys.argv
     run_regression_gate(save_as_baseline=save_flag)
