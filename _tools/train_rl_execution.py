@@ -528,6 +528,8 @@ class SafeTradeL2ExecutionEnv:
         self.n_trades = 0
         self.cooldown_until = 0
         self.bid_placed_t = 0
+        self.last_exit_t = 0
+        self.last_exit_price = 0.0
         self.car_state = 0  # 0: idle, 1: quoting sell @ local ask, 2: quoting buyback @ local bid
         self.car_qty = 0.0
         self.car_px = 0.0
@@ -557,7 +559,10 @@ class SafeTradeL2ExecutionEnv:
         step_in_supported = (
             getattr(self, "enable_unfreeze", True)
             and b1 >= self.avg_entry - self.tick_size * 1.25
-            and a1 >= self.avg_entry + 1.8 * self.tick_size
+            and (
+                a1 >= self.avg_entry + 1.8 * self.tick_size
+                or (float(self.pos_3600[t]) >= 0.70 and float(self.bid_q[t, 0]) >= 5000.0 and imb5 >= 0.20 and inertia >= 0.20)
+            )
         )
         if b1 < self.avg_entry - self.tick_size * 0.25 and not step_in_supported:
             return 0.0
@@ -799,9 +804,17 @@ class SafeTradeL2ExecutionEnv:
                 action = 0
             elif self.order_side == "SELL" and self.slot2_side is None:
                 pump_up = bool(self.vel_10[t] >= 1.0 or self.in_breakout_zone[t] or (self.imb_l5[t] >= 0.22 and inertia >= 0.25))
+                wave_hold_ok = b1 >= self.avg_entry - tol or (
+                    getattr(self, "enable_unfreeze", True)
+                    and b1 >= self.avg_entry - 1.25 * self.tick_size
+                    and (
+                        a1 >= self.avg_entry + 1.8 * self.tick_size
+                        or (pos3600 >= 0.70 and float(self.bid_q[t, 0]) >= 5000.0 and float(self.imb_l5[t]) >= 0.20)
+                    )
+                )
                 if pump_up and a1 >= self.order_price - tol and self.imb_l5[t] >= 0.20 and b1 >= self.avg_entry:
                     action = 3
-                elif self.order_price >= wave_p - tol and b1 >= self.avg_entry - tol:
+                elif self.order_price >= wave_p - tol and wave_hold_ok:
                     action = 0
                 elif abs(self.order_price - floor_p) <= tol:
                     action = 0
@@ -831,7 +844,18 @@ class SafeTradeL2ExecutionEnv:
                 action = 4
 
         if action in (1, 2) and self.pos_qty <= 1e-8:
-            step_in = (a1 - b1) >= 1.8 * self.tick_size and (self.legacy_v2 or inertia >= 0.35 or wide_scalp_ok)
+            step_in_l5_ok = (
+                float(self.imb_l5[t]) >= 0.0
+                or float(self.bid_q[t, 0]) >= 8500.0
+                or float(self.X_market[t, 6]) >= 0.90
+            )
+            step_in = (
+                (a1 - b1) >= 1.8 * self.tick_size
+                and (
+                    self.legacy_v2
+                    or (float(self.ask_q[t, 0]) <= 5000.0 and step_in_l5_ok and (inertia >= 0.35 or wide_scalp_ok))
+                )
+            )
             target_p = (b1 + self.tick_size if step_in else b1) if action == 1 else max(self.tick_size, b1 - self.tick_size)
             if self.order_side != "BUY" or abs(self.order_price - target_p) > tol:
                 requote_penalty = 0.025 if self.order_side is not None else 0.005
@@ -959,6 +983,8 @@ class SafeTradeL2ExecutionEnv:
                     else:
                         if getattr(self, "enable_unfreeze", True) and realized_ticks <= -2.0 and float(self.dd_900[nt]) >= 4.0:
                             self.cooldown_until = nt + 600
+                        self.last_exit_t = nt
+                        self.last_exit_price = self.order_price
                         self.pos_qty = 0.0
                         self.avg_entry = 0.0
                         self.peak_bid = 0.0
@@ -989,9 +1015,12 @@ class SafeTradeL2ExecutionEnv:
                 net_pnl2 = self.slot2_qty * (self.slot2_price - self.avg_entry) - sell_fee2
                 self.total_pnl_usd += net_pnl2
                 self.pos_qty = max(0.0, self.pos_qty - self.slot2_qty)
+                slot2_px = self.slot2_price
                 self.slot2_side = None
                 self.slot2_qty = 0.0
                 if self.pos_qty <= 1e-4:
+                    self.last_exit_t = nt
+                    self.last_exit_price = slot2_px
                     self.pos_qty = 0.0
                     self.avg_entry = 0.0
                     self.peak_bid = 0.0

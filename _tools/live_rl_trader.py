@@ -994,7 +994,10 @@ class LiveTriadRLTrader:
         step_in_supported = (
             self.avg_entry > 0
             and b1_cur >= self.avg_entry - self.tick_size * 1.25
-            and a1_cur >= self.avg_entry + 1.8 * self.tick_size
+            and (
+                a1_cur >= self.avg_entry + 1.8 * self.tick_size
+                or (self.last_pos3600 >= 0.70 and float(getattr(self, "last_b1_q", 0.0)) >= 5000.0 and imb5 >= 0.20 and inertia >= 0.20)
+            )
         )
         if self.avg_entry > 0 and b1_cur < self.avg_entry - self.tick_size * 0.25 and not step_in_supported:
             return 0.0
@@ -1123,7 +1126,15 @@ class LiveTriadRLTrader:
                 act = 5
 
         if act in (1, 2) and self.pos_qty <= 1e-4:
-            step_in = (a1 - b1) >= 1.8 * self.tick_size and (self.last_inertia >= 0.35 or wide_scalp_ok)
+            a1_q_cur = float(getattr(self, "last_a1_q", self.last_q_a1))
+            b1_q_cur = float(getattr(self, "last_b1_q", 0.0))
+            step_in_l5_ok = (self.last_imb5 >= 0.0 or b1_q_cur >= 8500.0 or self.last_ez12 >= 0.90)
+            step_in = (
+                (a1 - b1) >= 1.8 * self.tick_size
+                and a1_q_cur <= 5000.0
+                and step_in_l5_ok
+                and (self.last_inertia >= 0.35 or wide_scalp_ok)
+            )
             target_p = round(((b1 + self.tick_size if step_in else b1) if act == 1 else max(self.tick_size, b1 - self.tick_size)) / self.tick_size) * self.tick_size
             if self.active_bid_id is not None and abs(self.active_bid_p - target_p) <= tol:
                 return
@@ -1265,10 +1276,17 @@ class LiveTriadRLTrader:
                             print(f"  ⚠️ [CAROUSEL TRAIL BUY ERROR]: {eb}")
             can_step_up_car = (getattr(self, "car_state", 0) == 2 and self.slot2_ask_id is None and a1 >= self.car_sell_px + 2.0 * self.tick_size - tol and self.pos_qty >= 20.0)
             if act == 0:
+                wave_hold_ok = b1 >= self.avg_entry - tol or (
+                    b1 >= self.avg_entry - 1.25 * self.tick_size
+                    and (
+                        a1 >= self.avg_entry + 1.8 * self.tick_size
+                        or (self.last_pos3600 >= 0.70 and float(getattr(self, "last_b1_q", 0.0)) >= 5000.0 and self.last_imb5 >= 0.20)
+                    )
+                )
                 if pump_up and self.active_ask_id is not None and a1 >= self.active_ask_p - tol and self.last_imb5 >= 0.20 and b1 >= self.avg_entry:
                     self.split_done_for_pos = False
                     act = 3
-                elif self.active_ask_p >= wave_p - tol and b1 < self.avg_entry - tol and self.last_hold_edge < -0.20 and a1 <= floor_p + tol:
+                elif self.active_ask_p >= wave_p - tol and not wave_hold_ok and self.last_hold_edge < -0.20 and a1 <= floor_p + tol:
                     act = 4
                 elif (getattr(self, "car_state", 0) == 0 or can_step_up_car) and (self.avg_entry - b1) / self.tick_size >= 3.0 and self.hold_sec >= 60 and self.slot2_ask_id is None:
                     self.split_done_for_pos = False

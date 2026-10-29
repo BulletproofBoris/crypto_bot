@@ -1,25 +1,25 @@
 {
-  "updated_at": "2026-10-29 13:05:56",
+  "updated_at": "2026-10-29 13:42:02",
   "regimes": [
     {
       "id": "R1_PUMP_BREAKOUT",
       "title": "🚀 Памп и пробой вверх",
-      "net_pnl_usd": 0.9467,
-      "net_pnl_pct": 1.89,
+      "net_pnl_usd": 1.1769,
+      "net_pnl_pct": 2.35,
       "n_trades": 5,
-      "max_freeze_min": 4.8,
+      "max_freeze_min": 8.5,
       "max_dd_usd": 0.7477,
       "requotes": 60
     },
     {
       "id": "R2_TOXIC_DUMP",
       "title": "🩸 Токсичный пролив вниз",
-      "net_pnl_usd": 0.9874,
-      "net_pnl_pct": 1.97,
-      "n_trades": 16,
-      "max_freeze_min": 10.6,
+      "net_pnl_usd": 1.7737,
+      "net_pnl_pct": 3.55,
+      "n_trades": 12,
+      "max_freeze_min": 7.8,
       "max_dd_usd": 1.0197,
-      "requotes": 107
+      "requotes": 111
     },
     {
       "id": "R3_WIDE_SPREAD_SCALP",
@@ -34,22 +34,22 @@
     {
       "id": "R4_TIGHT_1TICK_CHOP",
       "title": "🧱 Вязкий флэт (спред 1т)",
-      "net_pnl_usd": 0.5732,
-      "net_pnl_pct": 1.15,
+      "net_pnl_usd": 0.6839,
+      "net_pnl_pct": 1.37,
       "n_trades": 7,
       "max_freeze_min": 44.3,
       "max_dd_usd": 1.4462,
-      "requotes": 24
+      "requotes": 25
     },
     {
       "id": "R5_UNDERWATER_RECOVERY",
       "title": "🔄 Свежий рынок + выход из -6т",
-      "net_pnl_usd": -0.0557,
-      "net_pnl_pct": -0.11,
+      "net_pnl_usd": 0.8381,
+      "net_pnl_pct": 1.68,
       "n_trades": 3,
-      "max_freeze_min": 110.2,
-      "max_dd_usd": 1.1461,
-      "requotes": 10
+      "max_freeze_min": 34.1,
+      "max_dd_usd": 0.6524,
+      "requotes": 16
     }
   ],
   "prev_frozen": [
@@ -66,12 +66,12 @@
     {
       "id": "R2_TOXIC_DUMP",
       "title": "🩸 Токсичный пролив вниз",
-      "net_pnl_usd": -2.8358,
-      "net_pnl_pct": -5.67,
-      "n_trades": 3,
-      "max_freeze_min": 135.8,
-      "max_dd_usd": 4.04,
-      "requotes": 26
+      "net_pnl_usd": -1.6549,
+      "net_pnl_pct": -3.31,
+      "n_trades": 6,
+      "max_freeze_min": 70.7,
+      "max_dd_usd": 3.444,
+      "requotes": 66
     },
     {
       "id": "R3_WIDE_SPREAD_SCALP",
