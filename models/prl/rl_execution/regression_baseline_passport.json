@@ -1,11 +1,11 @@
 {
-  "updated_at": "2026-10-29 12:44:10",
+  "updated_at": "2026-10-29 12:56:26",
   "regimes": [
     {
       "id": "R1_PUMP_BREAKOUT",
       "title": "🚀 Памп и пробой вверх",
-      "net_pnl_usd": 0.6982,
-      "net_pnl_pct": 1.4,
+      "net_pnl_usd": 0.9467,
+      "net_pnl_pct": 1.89,
       "n_trades": 5,
       "max_freeze_min": 4.8,
       "max_dd_usd": 0.7477,
@@ -14,12 +14,12 @@
     {
       "id": "R2_TOXIC_DUMP",
       "title": "🩸 Токсичный пролив вниз",
-      "net_pnl_usd": 0.5688,
-      "net_pnl_pct": 1.14,
+      "net_pnl_usd": 0.8766,
+      "net_pnl_pct": 1.75,
       "n_trades": 15,
       "max_freeze_min": 10.6,
-      "max_dd_usd": 1.1931,
-      "requotes": 105
+      "max_dd_usd": 1.0197,
+      "requotes": 107
     },
     {
       "id": "R3_WIDE_SPREAD_SCALP",
@@ -39,7 +39,7 @@
       "n_trades": 7,
       "max_freeze_min": 44.3,
       "max_dd_usd": 1.4462,
-      "requotes": 23
+      "requotes": 24
     },
     {
       "id": "R5_UNDERWATER_RECOVERY",

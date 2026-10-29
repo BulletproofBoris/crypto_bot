@@ -549,16 +549,23 @@ class SafeTradeL2ExecutionEnv:
         ez12 = float(self.X_market[t, 6])
         hold_edge = float(self.obs_hold_edge_norm[t] * 5.0)
         b1 = max(self.bid_p[t, 0], self.tick_size)
-        if b1 < self.avg_entry - self.tick_size * 0.25:
-            return 0.0
+        a1 = max(self.ask_p[t, 0], b1 + self.tick_size)
         vel10 = float(self.vel_10[t])
         imb5 = float(self.imb_l5[t])
         inertia = float(self.inertia_arr[t])
+        step_in_supported = (
+            getattr(self, "enable_unfreeze", True)
+            and b1 >= self.avg_entry - self.tick_size * 1.25
+            and a1 >= self.avg_entry + 1.8 * self.tick_size
+        )
+        if b1 < self.avg_entry - self.tick_size * 0.25 and not step_in_supported:
+            return 0.0
         if (
             vel10 >= 1.0
             or bool(self.in_breakout_zone[t])
             or (self.avg_entry > 0 and b1 >= self.avg_entry + self.tick_size * 0.75 and inertia >= 0.0)
             or (imb5 >= 0.22 and inertia >= 0.25 and ez12 >= 0.15)
+            or (getattr(self, "enable_unfreeze", True) and imb5 >= 0.35 and float(self.bid_q[t, 0]) >= 5000.0 and float(self.ask_q[t, 0]) <= 1500.0 and inertia >= 0.05)
         ):
             return 1.0
         q_a1, _ = self._get_lob_queue(t, "SELL", floor_p)
@@ -724,7 +731,7 @@ class SafeTradeL2ExecutionEnv:
                     self.slot2_qty = 0.0
                     self.car_state = 0
                 action = 0
-            elif self.order_side == "SELL" and self.order_price >= wave_p - tol and b1 < self.avg_entry - tol and hold_edge < -0.20 and a1 <= floor_p + tol:
+            elif self.order_side == "SELL" and self.order_price >= wave_p - tol and b1 < self.avg_entry - tol and (hold_edge < -0.20 or (getattr(self, "enable_unfreeze", True) and (t - self.entry_t) >= 180)) and a1 <= floor_p + tol:
                 self.order_price = max(a1, floor_p)
                 self.order_qty = self.pos_qty
                 self.q_ahead, _ = self._get_lob_queue(t, "SELL", self.order_price)
@@ -814,6 +821,9 @@ class SafeTradeL2ExecutionEnv:
                 self.split_done_for_pos = True
                 requote_penalty = 0.005
                 action = 0
+            elif self.order_side != "SELL" and w2 > 0.85 and getattr(self, "enable_unfreeze", True):
+                self.split_done_for_pos = True
+                action = 3
             elif self.order_side != "SELL" and w2 < 0.15 and not bool(self.vel_10[t] >= 1.0 or self.in_breakout_zone[t]):
                 action = 4
 
@@ -843,7 +853,7 @@ class SafeTradeL2ExecutionEnv:
             else:
                 floor_p = round((self.avg_entry + self.tick_size) / self.tick_size) * self.tick_size
                 if action == 3:
-                    target_p = max(a1 + self.tick_size, self.avg_entry + 2.0 * self.tick_size)
+                    target_p = max(a1, self.avg_entry + 2.0 * self.tick_size)
                 else:
                     if self.order_side == "SELL" and abs(self.order_price - floor_p) <= tol and b1 < floor_p - tol:
                         target_p = floor_p

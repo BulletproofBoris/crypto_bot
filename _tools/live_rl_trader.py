@@ -986,12 +986,18 @@ class LiveTriadRLTrader:
         ez12 = float(self.last_ez12)
         hold_edge = float(self.last_hold_edge)
         b1_cur = float(self.bid_hist_1h[-1]) if len(self.bid_hist_1h) > 0 else self.avg_entry
-        if self.avg_entry > 0 and b1_cur < self.avg_entry - self.tick_size * 0.25:
-            return 0.0
+        a1_cur = b1_cur + float(getattr(self, "last_sp_ticks", 1.0)) * self.tick_size
         vel10 = float(getattr(self, "last_vel10", 0.0))
         vel3 = float(getattr(self, "last_vel3", 0.0))
         imb5 = float(getattr(self, "last_imb5", 0.0))
         inertia = float(getattr(self, "last_inertia", 0.0))
+        step_in_supported = (
+            self.avg_entry > 0
+            and b1_cur >= self.avg_entry - self.tick_size * 1.25
+            and a1_cur >= self.avg_entry + 1.8 * self.tick_size
+        )
+        if self.avg_entry > 0 and b1_cur < self.avg_entry - self.tick_size * 0.25 and not step_in_supported:
+            return 0.0
         if (
             vel10 >= 1.0
             or vel3 >= 1.0
@@ -999,6 +1005,7 @@ class LiveTriadRLTrader:
             or (self.avg_entry > 0 and b1_cur >= self.avg_entry + self.tick_size * 0.75 and inertia >= 0.0)
             or (imb5 >= 0.22 and inertia >= 0.25 and ez12 >= 0.15)
             or (ez60 >= 0.28 and ez25 >= 0.15 and inertia >= 0.20)
+            or (imb5 >= 0.35 and float(getattr(self, "last_b1_q", 0.0)) >= 5000.0 and float(getattr(self, "last_a1_q", self.last_q_a1)) <= 1500.0 and inertia >= 0.05)
         ):
             return 1.0
         q_a1 = float(self.last_q_a1)
@@ -1431,14 +1438,17 @@ class LiveTriadRLTrader:
                         except Exception as e:
                             print(f"  ⚠️ [2-SLOT SELL ERROR]: {e}")
                             self.sync_account_balances(b1)
+                elif self.active_ask_id is None and w2 > 0.85:
+                    self.split_done_for_pos = True
+                    act = 3
                 elif self.active_ask_id is None and w2 < 0.15 and not pump_up:
                     act = 4
 
             if act == 6:
                 target_p = max(self.tick_size, b1 - self.tick_size)
             elif act == 3:
-                step_up = 2.0 * self.tick_size if (self.last_vel10 >= 2.0 or getattr(self, "last_vel3", 0.0) >= 2.0 or getattr(self, "last_in_breakout", False)) else self.tick_size
-                target_p = max(a1 + step_up, b1 + 2.0 * self.tick_size, super_p if step_up > 1.5 * self.tick_size else wave_p)
+                is_sup_step = (self.last_vel10 >= 2.0 or getattr(self, "last_vel3", 0.0) >= 2.0 or getattr(self, "last_in_breakout", False))
+                target_p = max(a1 + (2.0 * self.tick_size if is_sup_step else 0.0), b1 + 2.0 * self.tick_size, super_p if is_sup_step else wave_p)
             else:
                 if self.active_ask_id is not None and abs(self.active_ask_p - floor_p) <= tol and b1 < floor_p - tol:
                     return
