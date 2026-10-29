@@ -362,9 +362,16 @@ class LiveTriadRLTrader:
             self.slot2_ask_p = float(st.get("slot2_ask_p", 0.0))
             self.slot2_ask_q = float(st.get("slot2_ask_q", 0.0))
             self.split_done_for_pos = bool(st.get("split_done_for_pos", False))
+            self.hold_sec = int(st.get("hold_sec", 120 if self.pos_qty >= 2.0 else 0))
             self.car_state = int(st.get("car_state", 0))
             self.car_sell_px = float(st.get("car_sell_px", 0.0))
             self.car_cycles = int(st.get("car_cycles", 0))
+            if self.pos_qty < 2.0:
+                self.car_state = 0
+            elif self.car_state == 1 and self.slot2_ask_id is None:
+                self.car_state = 0
+            elif self.car_state == 2 and self.active_bid_id is None and self.bot_cash_usd < 3.5:
+                self.car_state = 0
         self.bid_age_sec = 0
         self.bid_partial_filled = 0.0
         b1_init = 0.0
@@ -390,6 +397,7 @@ class LiveTriadRLTrader:
             "bot_cash_usd": round(self.bot_cash_usd, 6),
             "pos_qty": round(self.pos_qty, 6),
             "avg_entry": round(self.avg_entry, 6),
+            "hold_sec": int(self.hold_sec),
             "realized_pnl_usd": round(self.realized_pnl_usd, 6),
             "net_deposits_usd": round(self.net_deposits_usd, 6),
             "deposits_log": self.deposits_log[-50:],
@@ -422,6 +430,10 @@ class LiveTriadRLTrader:
             self.hold_sec += 1
             if b1 > 0:
                 self.peak_bid = max(self.peak_bid, self.avg_entry, b1)
+        if getattr(self, "car_state", 0) == 1 and self.slot2_ask_id is None:
+            self.car_state = 2 if (self.active_bid_id is not None or self.bot_cash_usd >= 3.5) else 0
+        elif getattr(self, "car_state", 0) == 2 and self.active_bid_id is None and self.bot_cash_usd < 3.5:
+            self.car_state = 0
         if self.active_bid_id is not None:
             if count_hold:
                 self.bid_age_sec = getattr(self, "bid_age_sec", 0) + 1
@@ -436,13 +448,33 @@ class LiveTriadRLTrader:
                     cost = filled * px
                     net_filled = math.floor(filled * (1.0 - fee_rate) * 10000.0) / 10000.0
                     self.bot_cash_usd = max(0.0, self.bot_cash_usd - cost)
-                    if getattr(self, "car_state", 0) == 2 and self.pos_qty >= 2.0:
-                        net_car_pnl = filled * (self.car_sell_px * (1.0 - fee_rate) - px / max(1e-6, 1.0 - fee_rate))
+                    if getattr(self, "car_state", 0) in (1, 2) and self.pos_qty >= 2.0:
+                        self.avg_entry = round((self.pos_qty * self.avg_entry + net_filled * px) / max(1e-6, self.pos_qty + net_filled), 4)
                         self.pos_qty = math.floor((self.pos_qty + net_filled) * 10000.0) / 10000.0
-                        self.avg_entry = round(max(self.tick_size, self.avg_entry - max(0.0, net_car_pnl) / max(1e-6, self.pos_qty)), 4)
                         self.car_cycles = getattr(self, "car_cycles", 0) + 1
                         self.car_state = 0
-                        print(f"  🎠 [CAROUSEL BUYBACK #{self.car_cycles}] +{net_filled:.4f} PRL @ ${px:.2f} (после продажи @ ${self.car_sell_px:.2f}) | Новый avg_entry=${self.avg_entry:.4f}")
+                        self.split_done_for_pos = False
+                        print(f"  🎠 [CAROUSEL BUYBACK #{self.car_cycles}] +{net_filled:.4f} PRL @ ${px:.2f} (после продажи @ ${self.car_sell_px:.2f}) | Поз={self.pos_qty:.4f} PRL | Новый avg_entry=${self.avg_entry:.4f}")
+                        for oid_attr in ("active_ask_id", "slot2_ask_id"):
+                            oid = getattr(self, oid_attr)
+                            if oid is not None:
+                                try:
+                                    self.client.cancel_order(oid)
+                                except Exception:
+                                    pass
+                        self.active_ask_id, self.active_ask_p, self.active_ask_q = None, 0.0, 0.0
+                        self.slot2_ask_id, self.slot2_ask_p, self.slot2_ask_q = None, 0.0, 0.0
+                        self.sync_account_balances(b1, from_trade_fill=True)
+                        new_floor_p = round((math.floor(self.avg_entry / self.tick_size + 1e-9) + 1) * self.tick_size, 2)
+                        tot_q = math.floor(min(self.pos_qty, self.ex_coin_free) * 10000.0) / 10000.0
+                        if tot_q >= 2.0:
+                            try:
+                                ra = self.client.place_limit_order(self.market, "sell", tot_q, max(b1 + self.tick_size, new_floor_p))
+                                self.active_ask_id = ra.get("id")
+                                self.active_ask_p = float(ra.get("price", new_floor_p))
+                                self.active_ask_q = float(ra.get("origin_amount", tot_q))
+                            except Exception:
+                                pass
                     else:
                         self.avg_entry = (self.pos_qty * self.avg_entry + net_filled * px) / max(1e-6, self.pos_qty + net_filled)
                         self.pos_qty = math.floor((self.pos_qty + net_filled) * 10000.0) / 10000.0
@@ -450,6 +482,7 @@ class LiveTriadRLTrader:
                         self.peak_bid = max(px, b1 if b1 > 0 else px)
                         self.ez25_entry = self.last_ez25
                         self.split_done_for_pos = False
+                        self.car_state = 0
                     self.q_ahead = 0.0
                     self.bid_age_sec = 0
                     self.bid_partial_filled = 0.0
@@ -481,9 +514,18 @@ class LiveTriadRLTrader:
                     self.realized_pnl_usd += pnl
                     self.pos_qty = max(0.0, math.floor((self.pos_qty - filled) * 10000.0) / 10000.0)
                     if self.pos_qty < 2.0:
+                        if eff_entry > 0.0 and getattr(self, "last_dd900", 0.0) >= 4.0:
+                            real_t = (px - eff_entry) / self.tick_size
+                            if real_t <= -2.0:
+                                self.cooldown_until_ts = time.time() + 600.0
+                                print(f"  🛡️ [DUMP COOLDOWN] 10-мин пауза на вход после разморозки на проливе (realized={real_t:.1f}t, dd900={self.last_dd900:.1f}t)")
+                            elif real_t <= -0.8 and b1 > 0.0 and (eff_entry - b1) / self.tick_size >= 2.8:
+                                self.cooldown_until_ts = time.time() + 900.0
+                                print(f"  🛡️ [DUMP COOLDOWN] 15-мин пауза на вход после ранней разморозки (realized={real_t:.1f}t, dd900={self.last_dd900:.1f}t)")
                         self.pos_qty, self.avg_entry, self.hold_sec, self.peak_bid = 0.0, 0.0, 0, 0.0
                         self.split_done_for_pos = False
                         self.user_manual_ask = False
+                        self.car_state = 0
                     self.n_trades += 1
                     self.q_ahead = 0.0
                     if self.slot2_ask_id is not None and self.pos_qty >= 2.0:
@@ -524,11 +566,19 @@ class LiveTriadRLTrader:
                         self.pos_qty, self.avg_entry, self.hold_sec, self.peak_bid = 0.0, 0.0, 0, 0.0
                         self.split_done_for_pos = False
                         self.car_state = 0
-                    elif getattr(self, "car_state", 0) == 1:
+                    elif getattr(self, "car_state", 0) in (1, 2):
+                        if self.active_bid_id is not None:
+                            try:
+                                self.client.cancel_order(self.active_bid_id)
+                            except Exception:
+                                pass
+                            self.active_bid_id, self.active_bid_p, self.active_bid_q = None, 0.0, 0.0
                         self.car_sell_px = px2
                         self.car_state = 2
-                        buy_p = round((px2 - 2.0 * self.tick_size) / self.tick_size) * self.tick_size
-                        buy_q = math.floor((proceeds2 * 0.998 / max(buy_p, self.tick_size)) * 10000.0) / 10000.0
+                        self.sync_account_balances(b1, from_trade_fill=True)
+                        buy_p = round(min(b1, px2 - 2.0 * self.tick_size) / self.tick_size) * self.tick_size
+                        usable_u = min(self.bot_cash_usd * 0.998, self.ex_usdt_free * 0.998)
+                        buy_q = math.floor((usable_u / max(buy_p, self.tick_size)) * 10000.0) / 10000.0
                         if buy_q >= 2.0 and self.active_bid_id is None:
                             try:
                                 rb = self.client.place_limit_order(self.market, "buy", buy_q, buy_p)
@@ -781,6 +831,14 @@ class LiveTriadRLTrader:
             + 0.25 * d_ez12 + 0.35 * imb_l5 + 0.15 * imb_l1
             + 0.10 * np.clip(vel_15, -3.0, 3.0) + 0.08 * max(0.0, fast_flow_10s)
         )
+        fh = list(self.flow_hist_10s)
+        b1_5s_ago = b_arr[-6] if len(b_arr) >= 6 else b_arr[0]
+        same_b1_5s = abs(b1 - b1_5s_ago) < (self.tick_size * 0.25)
+        b1q_5s_ago = fh[-6][0] if len(fh) >= 6 else fh[0][0]
+        a1q_5s_ago = fh[-6][1] if len(fh) >= 6 else fh[0][1]
+        self.last_dq_bid_5s = float(b1_q - b1q_5s_ago) if same_b1_5s else 0.0
+        self.last_buy_vol_10s = float(sum(x[2] for x in fh[-10:]))
+        self.last_ofi_5s = float(self.last_dq_bid_5s - (a1_q - a1q_5s_ago) + sum(x[2] - x[3] for x in fh[-5:]))
         self.last_ez25 = ez_25
         self.last_ez12 = ez_12
         self.last_inertia = inertia
@@ -885,29 +943,58 @@ class LiveTriadRLTrader:
 
         vel_3 = (b1 - (b_arr[-4] if len(b_arr) >= 4 else b_arr[0])) / self.tick_size
         self.last_vel3 = vel_3
+        self.last_ez5 = ez_5
+        self.last_vel180 = vel_180
         safe_macro_4h = (rng_14400 < 6.0) or (pos_14400 <= 0.72)
+        waterfall_trap = (dd_900 >= 8.0) and (pos_14400 >= 0.45) and (ez_25 < 0.0)
+        staircase_bleed = (
+            ((pos_3600 <= 0.05) and (pos_14400 <= 0.05) and (vel_180 <= -2.0) and (ez_25 < 0.0))
+            or ((pos_3600 <= 0.05) and (pos_14400 <= 0.05) and (rng_14400 >= 10.0) and (dd_900 <= 3.5) and (a1_q > 1000.0) and (b1_q < 20000.0))
+            or ((ez_5 < 0.15) and (ez_12 <= 0.0) and (ez_25 <= 0.0))
+            or ((pos_3600 <= 0.05) and (ez_12 <= 0.0) and (ez_25 <= 0.0) and not ((b1_q >= 9000.0) and (imb_l5 >= 0.60) and (ez_5 >= 0.15)))
+        )
+        top_rollover = (spread_ticks < 1.5) and (rng_14400 >= 16.0) and (pos_14400 >= 0.50) and (pos_3600 <= 0.15) and (dd_300 <= 1.0)
+        self.last_waterfall_trap = waterfall_trap
         in_dip_zone = (
             (pos_3600 <= 0.80)
             and safe_macro_4h
+            and not waterfall_trap
+            and not staircase_bleed
+            and not top_rollover
             and (vel_10 >= -0.5)
             and (inertia >= 0.15)
             and (exp_entry_edge >= 0.60)
             and ((dd_300 >= 1.0) or (spread_ticks >= 2.0))
         )
+        a1_q_brk = float(getattr(self, "last_a1_q", self.last_q_a1))
+        brk_wide = (
+            (spread_ticks >= 1.8)
+            and (float(getattr(self, "last_b1_q", 0.0)) >= 5500.0)
+            and (a1_q_brk <= 2500.0)
+            and (a1_q_brk <= 1000.0 or pos_3600 >= 0.35)
+            and (inertia >= 0.60)
+            and (ez_25 >= 0.35)
+            and (dd_300 >= 1.0)
+        )
         in_breakout_zone = (
-            (ez_5 >= 0.40)
-            and (ez_12 >= 0.80)
-            and (ez_25 >= 0.85)
-            and (inertia >= 0.70)
-            and (exp_entry_edge >= 3.20)
-            and (imb_l5 >= 0.25)
-            and (vel_10 >= 1.0)
-            and (rng_14400 <= 11.0)
+            (
+                (ez_5 >= 0.40)
+                and (ez_12 >= 0.80)
+                and (ez_25 >= 0.85)
+                and (inertia >= 0.70)
+                and (exp_entry_edge >= 3.20)
+                and (imb_l5 >= 0.25)
+                and (vel_10 >= 1.0)
+                and (rng_14400 <= 11.0)
+            )
+            or brk_wide
         )
         self.last_in_breakout = in_breakout_zone
         in_dip_zone = in_dip_zone or in_breakout_zone
+        self.last_can_buy_best = bool(in_dip_zone and imb_l5 > -0.65)
 
         mask = np.zeros(7, dtype=bool)
+        in_cooldown = time.time() < getattr(self, "cooldown_until_ts", 0.0)
         if not has_pos:
             mask[0] = True
             if has_bid:
@@ -916,13 +1003,13 @@ class LiveTriadRLTrader:
                 need_cancel = (inertia < -0.10) or (pos_3600 > 0.82 and not brk_hold) or (imb_l5 < -0.55) or (b1 > self.active_bid_p + drift_limit)
                 if need_cancel:
                     mask[5] = True
-                    if in_dip_zone:
+                    if in_dip_zone and not in_cooldown:
                         mask[2] = True
                         if imb_l5 > -0.65:
                             mask[1] = True
-                elif getattr(self, "active_bid_act", 1) == 2 and in_dip_zone and imb_l5 > -0.65:
+                elif getattr(self, "active_bid_act", 1) == 2 and in_dip_zone and imb_l5 > -0.65 and not in_cooldown:
                     mask[1] = True
-            elif in_dip_zone:
+            elif in_dip_zone and not in_cooldown:
                 mask[2] = True
                 if imb_l5 > -0.65:
                     mask[1] = True
@@ -940,12 +1027,25 @@ class LiveTriadRLTrader:
         ez12 = float(self.last_ez12)
         hold_edge = float(self.last_hold_edge)
         b1_cur = float(self.bid_hist_1h[-1]) if len(self.bid_hist_1h) > 0 else self.avg_entry
-        if self.avg_entry > 0 and b1_cur < self.avg_entry - self.tick_size * 0.25:
-            return 0.0
+        a1_cur = b1_cur + float(getattr(self, "last_sp_ticks", 1.0)) * self.tick_size
         vel10 = float(getattr(self, "last_vel10", 0.0))
         vel3 = float(getattr(self, "last_vel3", 0.0))
         imb5 = float(getattr(self, "last_imb5", 0.0))
         inertia = float(getattr(self, "last_inertia", 0.0))
+        step_in_supported = (
+            self.avg_entry > 0
+            and b1_cur >= self.avg_entry - self.tick_size * 1.25
+            and (
+                a1_cur >= self.avg_entry + 1.8 * self.tick_size
+                or (
+                    (self.last_pos3600 >= 0.30 or self.last_dd300 >= 3.0)
+                    and float(getattr(self, "last_b1_q", 0.0)) >= 4000.0
+                    and (imb5 >= 0.20 or (ez12 >= 0.55 and ez25 >= 0.35 and float(getattr(self, "last_a1_q", self.last_q_a1)) <= 2500.0))
+                )
+            )
+        )
+        if self.avg_entry > 0 and b1_cur < self.avg_entry - self.tick_size * 0.25 and not step_in_supported:
+            return 0.0
         if (
             vel10 >= 1.0
             or vel3 >= 1.0
@@ -953,6 +1053,12 @@ class LiveTriadRLTrader:
             or (self.avg_entry > 0 and b1_cur >= self.avg_entry + self.tick_size * 0.75 and inertia >= 0.0)
             or (imb5 >= 0.22 and inertia >= 0.25 and ez12 >= 0.15)
             or (ez60 >= 0.28 and ez25 >= 0.15 and inertia >= 0.20)
+            or (
+                imb5 >= 0.35
+                and float(getattr(self, "last_b1_q", 0.0)) >= 5000.0
+                and float(getattr(self, "last_a1_q", self.last_q_a1)) <= 1500.0
+                and (inertia >= 0.05 or (a1_cur >= self.avg_entry + 1.8 * self.tick_size and imb5 >= 0.50))
+            )
         ):
             return 1.0
         q_a1 = float(self.last_q_a1)
@@ -1034,14 +1140,54 @@ class LiveTriadRLTrader:
         if self.mode != "live":
             return
         tol = self.tick_size * 0.25
+        in_cooldown = time.time() < getattr(self, "cooldown_until_ts", 0.0)
+        wide_scalp_ok = bool(
+            (a1 - b1) >= 1.8 * self.tick_size
+            and float(getattr(self, "last_b1_q", 0.0)) >= 2500.0
+            and float(getattr(self, "last_a1_q", self.last_q_a1)) <= 2500.0
+            and self.last_pos3600 <= 0.75
+            and self.last_inertia >= 0.05
+            and (self.last_inertia >= 0.20 or self.last_imb5 >= 0.50 or self.last_ez25 > -0.25)
+            and not (float(getattr(self, "last_ez5", 0.0)) < 0.15 and self.last_ez12 <= 0.0 and self.last_ez25 <= 0.0)
+            and not (self.last_pos3600 <= 0.05 and self.last_ez12 <= 0.0 and self.last_ez25 <= 0.0 and not (float(getattr(self, "last_b1_q", 0.0)) >= 9000.0 and self.last_imb5 >= 0.60 and float(getattr(self, "last_ez5", 0.0)) >= 0.15))
+            and not (self.last_pos3600 <= 0.05 and float(getattr(self, "last_pos14400", 0.5)) <= 0.05 and float(getattr(self, "last_rng14400", 10.0)) >= 10.0 and self.last_dd900 <= 3.5 and float(getattr(self, "last_a1_q", self.last_q_a1)) > 1000.0 and float(getattr(self, "last_b1_q", 0.0)) < 20000.0)
+            and not (self.last_pos3600 <= 0.05 and float(getattr(self, "last_pos14400", 0.5)) <= 0.05 and float(getattr(self, "last_vel180", 0.0)) <= -2.0 and self.last_ez25 < 0.0)
+            and not (self.last_dd900 >= 8.0 and float(getattr(self, "last_pos14400", 0.5)) >= 0.45 and self.last_ez25 < 0.0)
+            and self.last_vel10 >= -0.5
+        )
+        if self.pos_qty <= 1e-4 and self.active_bid_id is None and act == 0 and wide_scalp_ok and not in_cooldown:
+            act = 1
         if self.pos_qty <= 1e-4 and self.active_bid_id is not None:
             at_b1 = (self.active_bid_p >= b1 - tol) and (self.active_bid_p <= b1 + self.tick_size + tol)
             compressed_4h_floor = (4.8 <= getattr(self, "last_rng14400", 10.0) <= 5.5 and getattr(self, "last_pos14400", 0.5) <= 0.05 and self.last_dd900 <= 1.0)
-            pre_dump = (self.last_sp_ticks < 1.5 and self.last_ez25 < -0.15 and self.last_inertia < 0.08 and getattr(self, "last_a1_q", self.last_q_a1) > 4000.0) and not compressed_4h_floor
-            front_q_hold = at_b1 and ((0.0 <= self.q_ahead < 600.0) or getattr(self, "bid_partial_filled", 0.0) > 0.0) and not pre_dump and self.last_pos3600 <= 0.65 and self.last_inertia >= -0.10
-            brk_hold = getattr(self, "last_in_breakout", False)
-            v14_hold_q = at_b1 and ((self.last_pos3600 <= 0.25 and not pre_dump and getattr(self, "last_b1_q", 0.0) >= 5000.0) or compressed_4h_floor or front_q_hold or brk_hold)
+            l1_bid_erosion = (
+                self.last_sp_ticks < 1.5
+                and float(getattr(self, "last_dq_bid_5s", 0.0)) <= -1000.0
+                and float(getattr(self, "last_b1_q", 0.0)) < 1800.0
+                and float(getattr(self, "last_buy_vol_10s", 100.0)) < 100.0
+            )
             bid_age = getattr(self, "bid_age_sec", 0)
+            stale_top_rollover = (
+                bid_age >= 180
+                and self.last_sp_ticks < 1.5
+                and self.last_pos3600 <= 0.15
+                and float(getattr(self, "last_pos14400", 0.5)) >= 0.50
+                and getattr(self, "bid_partial_filled", 0.0) <= 0.0
+            )
+            staircase_ask_wall = (
+                self.last_pos3600 <= 0.05
+                and float(getattr(self, "last_pos14400", 0.5)) <= 0.05
+                and float(getattr(self, "last_rng14400", 10.0)) >= 10.0
+                and self.last_dd900 <= 3.5
+                and float(getattr(self, "last_a1_q", self.last_q_a1)) > 1000.0
+                and float(getattr(self, "last_b1_q", 0.0)) < 20000.0
+                and getattr(self, "bid_partial_filled", 0.0) <= 0.0
+            )
+            l1_crush = (self.last_sp_ticks < 1.5 and float(getattr(self, "last_a1_q", self.last_q_a1)) > 5000.0 and float(getattr(self, "last_b1_q", 0.0)) < 800.0 and self.last_inertia < 0.0) or l1_bid_erosion or stale_top_rollover or staircase_ask_wall
+            pre_dump = ((self.last_sp_ticks < 1.5 and self.last_ez25 < -0.15 and self.last_inertia < 0.08 and getattr(self, "last_a1_q", self.last_q_a1) > 4000.0) or l1_crush) and not compressed_4h_floor
+            front_q_hold = at_b1 and ((0.0 <= self.q_ahead < 600.0) or getattr(self, "bid_partial_filled", 0.0) > 0.0) and not pre_dump and self.last_pos3600 <= 0.65 and self.last_inertia >= -0.10
+            brk_hold = (getattr(self, "last_in_breakout", False) or (at_b1 and (a1 - b1) >= 1.8 * self.tick_size and float(getattr(self, "last_b1_q", 0.0)) >= 1500.0 and self.last_inertia >= -0.05)) and not pre_dump
+            v14_hold_q = at_b1 and ((self.last_pos3600 <= 0.25 and not pre_dump and getattr(self, "last_b1_q", 0.0) >= 5000.0) or compressed_4h_floor or front_q_hold or brk_hold)
             if self.active_bid_p > b1 + tol and self.last_vel10 <= -1.0 and self.last_hold_edge < 0.0 and getattr(self, "last_a1_q", self.last_q_a1) > 500.0:
                 act = 5
             elif v14_hold_q:
@@ -1058,7 +1204,15 @@ class LiveTriadRLTrader:
                 act = 5
 
         if act in (1, 2) and self.pos_qty <= 1e-4:
-            step_in = (a1 - b1) >= 2.0 * self.tick_size and self.last_inertia >= 0.35
+            a1_q_cur = float(getattr(self, "last_a1_q", self.last_q_a1))
+            b1_q_cur = float(getattr(self, "last_b1_q", 0.0))
+            step_in_l5_ok = (self.last_imb5 >= 0.0 or b1_q_cur >= 8500.0 or self.last_ez12 >= 0.90)
+            step_in = (
+                (a1 - b1) >= 1.8 * self.tick_size
+                and a1_q_cur <= 5000.0
+                and step_in_l5_ok
+                and (self.last_inertia >= 0.35 or wide_scalp_ok)
+            )
             target_p = round(((b1 + self.tick_size if step_in else b1) if act == 1 else max(self.tick_size, b1 - self.tick_size)) / self.tick_size) * self.tick_size
             if self.active_bid_id is not None and abs(self.active_bid_p - target_p) <= tol:
                 return
@@ -1104,7 +1258,14 @@ class LiveTriadRLTrader:
             self.sync_account_balances(b1)
             self._save_wallet()
         elif (act in (3, 4, 6) or (act == 0 and self.active_ask_id is not None)) and self.pos_qty >= 2.0:
-            if getattr(self, "user_manual_ask", False) and self.active_ask_id is not None and act != 6:
+            early_wide_unfreeze = (
+                (self.avg_entry - b1) / self.tick_size >= 3.0
+                and a1 >= self.avg_entry - tol
+                and float(getattr(self, "last_a1_q", self.last_q_a1)) <= 250.0
+                and self.last_dd900 >= 4.0
+            )
+            unfreeze_mode = ((self.avg_entry - b1) / self.tick_size >= 3.0 and self.hold_sec >= 300) or early_wide_unfreeze
+            if getattr(self, "user_manual_ask", False) and self.active_ask_id is not None and act != 6 and not unfreeze_mode:
                 return
             floor_p = round((self.avg_entry + self.tick_size) / self.tick_size) * self.tick_size
             wave_p = round((self.avg_entry + 2.0 * self.tick_size) / self.tick_size) * self.tick_size
@@ -1115,14 +1276,113 @@ class LiveTriadRLTrader:
                 or getattr(self, "last_in_breakout", False)
                 or (self.last_imb5 >= 0.22 and self.last_inertia >= 0.25)
             )
+            car_step_up_ask = (self.last_sp_ticks < 1.5) and (
+                self.last_imb5 > 0.25 and self.last_vel10 >= 1.0
+            )
+            opt_car_sell_p = round(min(floor_p, (a1 + self.tick_size) if car_step_up_ask else max(a1, b1 + self.tick_size)) / self.tick_size) * self.tick_size
+            if unfreeze_mode and (self.active_ask_id is None or self.slot2_ask_id is not None or self.active_ask_p > opt_car_sell_p + tol or (self.active_ask_p < opt_car_sell_p - tol and car_step_up_ask)):
+                for oid_attr in ("active_ask_id", "slot2_ask_id"):
+                    oid = getattr(self, oid_attr)
+                    if oid is not None:
+                        try:
+                            self.client.cancel_order(oid)
+                        except Exception:
+                            pass
+                self.sync_live_orders(b1)
+                self.active_ask_id, self.active_ask_p, self.active_ask_q = None, 0.0, 0.0
+                self.slot2_ask_id, self.slot2_ask_p, self.slot2_ask_q = None, 0.0, 0.0
+                if getattr(self, "car_state", 0) != 2:
+                    self.car_state = 0
+                self.split_done_for_pos = False
+                self.user_manual_ask = False
+                self.sync_account_balances(b1)
+                sell_q = math.floor(min(self.pos_qty, self.ex_coin_free) * 10000.0) / 10000.0
+                if sell_q >= 2.0:
+                    try:
+                        ru = self.client.place_limit_order(self.market, "sell", sell_q, opt_car_sell_p)
+                        self.active_ask_id = ru.get("id")
+                        self.active_ask_p = float(ru.get("price", opt_car_sell_p))
+                        self.active_ask_q = float(ru.get("origin_amount", sell_q))
+                        self.q_ahead = -1.0
+                        self._save_wallet()
+                        print(f"  🔄 [UNFREEZE TO TURNOVER] id={self.active_ask_id} | Разморозка 100% поз ({self.active_ask_q:.4f} PRL) в оборот @ ${self.active_ask_p:.2f}")
+                    except Exception as eu:
+                        print(f"  ⚠️ [UNFREEZE SELL ERROR]: {eu}")
+                return
+            if unfreeze_mode and self.active_ask_id is not None:
+                return
+            if getattr(self, "car_state", 0) in (1, 2) and (self.active_bid_id is not None or self.bot_cash_usd >= 3.5) and self.car_sell_px > 0:
+                step_back = self.tick_size if b1 >= self.car_sell_px + tol else 2.0 * self.tick_size
+                max_buy_p = round((self.car_sell_px - step_back) / self.tick_size) * self.tick_size
+                target_buy_p = round(min(b1, max_buy_p) / self.tick_size) * self.tick_size
+                dump_danger = (self.last_inertia < -0.25 or self.last_imb5 < -0.45)
+                if dump_danger and b1 <= target_buy_p + tol:
+                    target_buy_p = round(max(self.tick_size, b1 - self.tick_size) / self.tick_size) * self.tick_size
+                if self.active_bid_id is None and self.bot_cash_usd >= 3.5 and not dump_danger:
+                    self.sync_account_balances(b1)
+                    usable_u = min(self.bot_cash_usd * 0.998, self.ex_usdt_free * 0.998)
+                    buy_q = math.floor((usable_u / max(target_buy_p, self.tick_size)) * 10000.0) / 10000.0
+                    if buy_q >= 2.0:
+                        try:
+                            rb = self.client.place_limit_order(self.market, "buy", buy_q, target_buy_p)
+                            self.active_bid_id = rb.get("id")
+                            self.active_bid_p = float(rb.get("price", target_buy_p))
+                            self.active_bid_q = float(rb.get("origin_amount", buy_q))
+                            self._save_wallet()
+                            print(f"  🎠 [CAROUSEL LEG-2 BUY] id={self.active_bid_id} | Откуп {self.active_bid_q:.4f} PRL @ ${self.active_bid_p:.2f} (после продажи @ ${self.car_sell_px:.2f})")
+                        except Exception as eb:
+                            print(f"  ⚠️ [CAROUSEL BUY ERROR]: {eb}")
+                    elif self.slot2_ask_id is None:
+                        self.car_state = 0
+                elif self.active_bid_id is not None and (
+                    (dump_danger and self.active_bid_p >= b1 - tol and target_buy_p < self.active_bid_p - tol)
+                    or (not dump_danger and target_buy_p > self.active_bid_p + tol and self.last_inertia >= -0.15)
+                ):
+                    try:
+                        self.client.cancel_order(self.active_bid_id)
+                    except Exception:
+                        pass
+                    self.sync_live_orders(b1)
+                    self.active_bid_id, self.active_bid_p, self.active_bid_q = None, 0.0, 0.0
+                    self.sync_account_balances(b1)
+                    usable_u = min(self.bot_cash_usd * 0.998, self.ex_usdt_free * 0.998)
+                    buy_q = math.floor((usable_u / max(target_buy_p, self.tick_size)) * 10000.0) / 10000.0
+                    if buy_q >= 2.0:
+                        try:
+                            rb = self.client.place_limit_order(self.market, "buy", buy_q, target_buy_p)
+                            self.active_bid_id = rb.get("id")
+                            self.active_bid_p = float(rb.get("price", target_buy_p))
+                            self.active_bid_q = float(rb.get("origin_amount", buy_q))
+                            self._save_wallet()
+                            tag = "CAROUSEL DODGE DUMP" if dump_danger else "CAROUSEL TRAIL BUY"
+                            print(f"  🎠 [{tag}] id={self.active_bid_id} | Переставлен откуп {self.active_bid_q:.4f} PRL @ ${self.active_bid_p:.2f}")
+                        except Exception as eb:
+                            print(f"  ⚠️ [CAROUSEL TRAIL BUY ERROR]: {eb}")
+            can_step_up_car = (getattr(self, "car_state", 0) == 2 and self.slot2_ask_id is None and a1 >= self.car_sell_px + 2.0 * self.tick_size - tol and self.pos_qty >= 20.0)
             if act == 0:
+                wave_hold_ok = b1 >= self.avg_entry - tol or (
+                    b1 >= self.avg_entry - 1.25 * self.tick_size
+                    and (
+                        a1 >= self.avg_entry + 1.8 * self.tick_size
+                        or (
+                            (self.last_pos3600 >= 0.30 or self.last_dd300 >= 3.0)
+                            and float(getattr(self, "last_b1_q", 0.0)) >= 4000.0
+                            and (self.last_imb5 >= 0.20 or (self.last_ez12 >= 0.55 and self.last_ez25 >= 0.35 and float(getattr(self, "last_a1_q", self.last_q_a1)) <= 2500.0))
+                        )
+                    )
+                )
                 if pump_up and self.active_ask_id is not None and a1 >= self.active_ask_p - tol and self.last_imb5 >= 0.20 and b1 >= self.avg_entry:
                     self.split_done_for_pos = False
                     act = 3
-                elif self.active_ask_p >= wave_p - tol and b1 < self.avg_entry - tol and self.last_hold_edge < -0.20 and a1 <= floor_p + tol:
+                elif self.active_ask_p >= wave_p - tol and not wave_hold_ok and self.last_hold_edge < -0.20 and a1 <= floor_p + tol:
+                    act = 4
+                elif (getattr(self, "car_state", 0) == 0 or can_step_up_car) and (self.avg_entry - b1) / self.tick_size >= 3.0 and self.hold_sec >= 60 and self.slot2_ask_id is None:
                     self.split_done_for_pos = False
                     act = 4
-                elif getattr(self, "car_state", 0) == 0 and (self.avg_entry - b1) / self.tick_size >= 3.0 and self.hold_sec >= 120 and self.slot2_ask_id is None:
+                elif getattr(self, "car_state", 0) == 1 and self.slot2_ask_id is not None and (
+                    self.slot2_ask_p > opt_car_sell_p + 1.5 * self.tick_size
+                    or (self.slot2_ask_p < opt_car_sell_p - tol and car_step_up_ask)
+                ):
                     act = 4
                 else:
                     return
@@ -1140,8 +1400,10 @@ class LiveTriadRLTrader:
                     and (self.last_ez25 >= 0.85 or self.last_hold_edge >= 3.80)
                     and self.last_inertia >= 1.25
                     and q_a1 < 1000.0
-                    and q_a2 < 4500.0
-                    and self.last_dd900 >= 2.0
+                    and (
+                        (q_a2 < 4500.0 and self.last_dd900 >= 2.0)
+                        or (float(getattr(self, "last_rng14400", 10.0)) >= 19.0 and self.last_ez12 >= 1.25 and self.last_ez25 >= 0.90 and self.last_hold_edge >= 3.80 and self.last_inertia >= 1.50 and self.last_dd900 >= 1.0)
+                    )
                 )
                 is_super = (
                     (self.last_dd300 >= 4.0 and self.last_sp_ticks < 1.5 and self.last_ez25 >= 0.20 and self.last_hold_edge >= 1.50 and q_a2 < 800.0)
@@ -1153,9 +1415,36 @@ class LiveTriadRLTrader:
                     if pump_up and a1 >= self.active_ask_p - tol and self.last_imb5 >= 0.20 and b1 >= self.avg_entry:
                         self.split_done_for_pos = False
                         act = 3
+                    elif b1 < self.avg_entry - tol and self.last_hold_edge < -0.20 and a1 <= floor_p + tol:
+                        act = 4
                     else:
                         return
                 elif self.active_ask_id is not None and self.slot2_ask_id is not None:
+                    if getattr(self, "car_state", 0) == 1:
+                        need_repeg = (
+                            self.slot2_ask_p > opt_car_sell_p + 1.5 * self.tick_size
+                            or (self.slot2_ask_p < opt_car_sell_p - tol and car_step_up_ask)
+                        )
+                        if need_repeg and b1 <= self.avg_entry - 2.0 * self.tick_size:
+                            try:
+                                self.client.cancel_order(self.slot2_ask_id)
+                            except Exception:
+                                pass
+                            self.sync_live_orders(b1)
+                            self.slot2_ask_id, self.slot2_ask_p, self.slot2_ask_q = None, 0.0, 0.0
+                            self.sync_account_balances(b1)
+                            rem_free = math.floor(self.ex_coin_free * 10000.0) / 10000.0
+                            if rem_free >= 2.0:
+                                try:
+                                    r2 = self.client.place_limit_order(self.market, "sell", rem_free, opt_car_sell_p)
+                                    self.slot2_ask_id = r2.get("id")
+                                    self.slot2_ask_p = float(r2.get("price", opt_car_sell_p))
+                                    self.slot2_ask_q = float(r2.get("origin_amount", rem_free))
+                                    self._save_wallet()
+                                    print(f"  🎠 [CAROUSEL RE-PEG SELL] id={self.slot2_ask_id} | {self.slot2_ask_q:.4f} PRL @ ${self.slot2_ask_p:.2f}")
+                                except Exception as e:
+                                    print(f"  ⚠️ [CAROUSEL RE-PEG ERROR]: {e}")
+                        return
                     if w2 <= 0.05 and a1 <= floor_p + tol and q_a2 <= 15000.0:
                         try:
                             self.client.cancel_order(self.slot2_ask_id)
@@ -1178,34 +1467,34 @@ class LiveTriadRLTrader:
                     return
                 elif self.active_ask_id is not None and self.slot2_ask_id is None:
                     underwater_ticks = (self.avg_entry - b1) / self.tick_size
-                    if getattr(self, "car_state", 0) == 0 and underwater_ticks >= 3.0 and self.hold_sec >= 120 and self.pos_qty >= 8.0:
-                        if (a1 - b1) >= 1.5 * self.tick_size or (self.last_pos3600 >= 0.30 and self.last_inertia > -0.10):
+                    if (getattr(self, "car_state", 0) == 0 or can_step_up_car) and underwater_ticks >= 3.0 and self.hold_sec >= 60 and self.pos_qty >= 8.0:
+                        try:
+                            self.client.cancel_order(self.active_ask_id)
+                        except Exception:
+                            pass
+                        self.sync_live_orders(b1)
+                        self.active_ask_id, self.active_ask_p, self.active_ask_q = None, 0.0, 0.0
+                        self.sync_account_balances(b1)
+                        tot_c = math.floor(min(self.pos_qty, self.ex_coin_free) * 10000.0) / 10000.0
+                        q_car = math.floor((tot_c * 0.25) * 10000.0) / 10000.0
+                        q_core = math.floor((tot_c - q_car) * 10000.0) / 10000.0
+                        if q_core >= 2.0 and q_car >= 2.0:
                             try:
-                                self.client.cancel_order(self.active_ask_id)
-                            except Exception:
-                                pass
-                            self.sync_live_orders(b1)
-                            self.active_ask_id, self.active_ask_p, self.active_ask_q = None, 0.0, 0.0
-                            self.sync_account_balances(b1)
-                            tot_c = math.floor(min(self.pos_qty, self.ex_coin_free) * 10000.0) / 10000.0
-                            q_car = math.floor((tot_c * 0.25) * 10000.0) / 10000.0
-                            q_core = math.floor((tot_c - q_car) * 10000.0) / 10000.0
-                            if q_core >= 2.0 and q_car >= 2.0:
-                                try:
-                                    r1 = self.client.place_limit_order(self.market, "sell", q_core, max(a1, floor_p))
-                                    self.active_ask_id = r1.get("id")
-                                    self.active_ask_p = float(r1.get("price", max(a1, floor_p)))
-                                    self.active_ask_q = float(r1.get("origin_amount", q_core))
-                                    r2 = self.client.place_limit_order(self.market, "sell", q_car, a1)
-                                    self.slot2_ask_id = r2.get("id")
-                                    self.slot2_ask_p = float(r2.get("price", a1))
-                                    self.slot2_ask_q = float(r2.get("origin_amount", q_car))
-                                    self.car_state = 1
-                                    self._save_wallet()
-                                    print(f"  🎠 [CAROUSEL LEG-1 SELL] Core={self.active_ask_q:.4f} PRL @ ${self.active_ask_p:.2f} | Carousel(25%)={self.slot2_ask_q:.4f} PRL @ ${self.slot2_ask_p:.2f}")
-                                    return
-                                except Exception as ec:
-                                    print(f"  ⚠️ [CAROUSEL LEG-1 ERROR]: {ec}")
+                                r1 = self.client.place_limit_order(self.market, "sell", q_core, max(a1, floor_p))
+                                self.active_ask_id = r1.get("id")
+                                self.active_ask_p = float(r1.get("price", max(a1, floor_p)))
+                                self.active_ask_q = float(r1.get("origin_amount", q_core))
+                                r2 = self.client.place_limit_order(self.market, "sell", q_car, opt_car_sell_p)
+                                self.slot2_ask_id = r2.get("id")
+                                self.slot2_ask_p = float(r2.get("price", opt_car_sell_p))
+                                self.slot2_ask_q = float(r2.get("origin_amount", q_car))
+                                self.car_state = 1
+                                self._save_wallet()
+                                leg_tag = "CAROUSEL STEP-UP SELL" if can_step_up_car else "CAROUSEL LEG-1 SELL"
+                                print(f"  🎠 [{leg_tag}] Core={self.active_ask_q:.4f} PRL @ ${self.active_ask_p:.2f} | Carousel(25%)={self.slot2_ask_q:.4f} PRL @ ${self.slot2_ask_p:.2f}")
+                                return
+                            except Exception as ec:
+                                print(f"  ⚠️ [CAROUSEL LEG-1 ERROR]: {ec}")
                     if pump_up and a1 >= self.active_ask_p - tol and self.last_imb5 >= 0.20 and b1 >= self.avg_entry:
                         act = 3
                     elif self.active_ask_p >= wave_p - tol and b1 >= self.avg_entry - tol:
@@ -1259,14 +1548,17 @@ class LiveTriadRLTrader:
                         except Exception as e:
                             print(f"  ⚠️ [2-SLOT SELL ERROR]: {e}")
                             self.sync_account_balances(b1)
+                elif self.active_ask_id is None and w2 > 0.85:
+                    self.split_done_for_pos = True
+                    act = 3
                 elif self.active_ask_id is None and w2 < 0.15 and not pump_up:
                     act = 4
 
             if act == 6:
                 target_p = max(self.tick_size, b1 - self.tick_size)
             elif act == 3:
-                step_up = 2.0 * self.tick_size if (self.last_vel10 >= 2.0 or getattr(self, "last_vel3", 0.0) >= 2.0 or getattr(self, "last_in_breakout", False)) else self.tick_size
-                target_p = max(a1 + step_up, b1 + 2.0 * self.tick_size, super_p if step_up > 1.5 * self.tick_size else wave_p)
+                is_sup_step = (self.last_vel10 >= 2.0 or getattr(self, "last_vel3", 0.0) >= 2.0 or getattr(self, "last_in_breakout", False))
+                target_p = max(a1 + (2.0 * self.tick_size if is_sup_step else 0.0), b1 + 2.0 * self.tick_size, super_p if is_sup_step else wave_p)
             else:
                 if self.active_ask_id is not None and abs(self.active_ask_p - floor_p) <= tol and b1 < floor_p - tol:
                     return
@@ -1678,13 +1970,15 @@ def sync_and_inspect_telemetry(last_n: int = 20) -> pd.DataFrame:
     return df[cols_show].tail(last_n)
 
 
-def start_live_daemon(budget_usd: float = 54.0, order_usd: float = 54.0, steps: int = 86400, push_wallet: bool = False):
+def start_live_daemon(budget_usd: float = 54.0, order_usd: float = 54.0, steps: int = 86400, push_wallet: bool = False, sync_models: bool = False):
     """Запускает / перезапускает автономный фоновый демон бота непосредственно на VPS (81.19.137.18) с авто-синхронизацией кода и .env."""
     stop_live_daemon(cancel_open_orders=False)
     from _tools.vps_config import create_ssh_client
     ssh = create_ssh_client(timeout=12.0)
     try:
         sftp = ssh.open_sftp()
+        if sftp.get_channel() is not None:
+            sftp.get_channel().settimeout(20.0)
         env_local = BASE_DIR / ".env"
         if env_local.exists():
             sftp.put(str(env_local), "/opt/crypto_bot/.env")
@@ -1697,23 +1991,39 @@ def start_live_daemon(budget_usd: float = 54.0, order_usd: float = 54.0, steps: 
             sftp.put(str(ppo_local), "/opt/crypto_bot/models/prl/rl_execution/best_maskable_ppo.pt")
         for af in (BASE_DIR / "models" / "prl").glob("ensemble_alliance_h*.json"):
             sftp.put(str(af), f"/opt/crypto_bot/models/prl/{af.name}")
-        for pat in ("h*s_k*", "*_h*s"):
-            for h_dir in (BASE_DIR / "models" / "prl").glob(pat):
-                if not h_dir.is_dir():
-                    continue
-                for root, _, files in os.walk(h_dir):
-                    rel_r = Path(root).relative_to(BASE_DIR / "models" / "prl")
-                    rem_d = f"/opt/crypto_bot/models/prl/{rel_r}"
-                    try:
-                        rem_attrs = {a.filename: a.st_size for a in sftp.listdir_attr(rem_d)}
-                    except Exception:
-                        ssh.exec_command(f"mkdir -p {rem_d}")[1].read()
-                        rem_attrs = {}
-                    for fn in files:
-                        lf = Path(root) / fn
-                        if rem_attrs.get(fn) == lf.stat().st_size and not fn.endswith(".json"):
-                            continue
-                        sftp.put(str(lf), f"{rem_d}/{fn}")
+        to_sync = []
+        if sync_models:
+            for pat in ("h*s_k*", "*_h*s"):
+                for h_dir in (BASE_DIR / "models" / "prl").glob(pat):
+                    if not h_dir.is_dir():
+                        continue
+                    for root, _, files in os.walk(h_dir):
+                        rel_r = Path(root).relative_to(BASE_DIR / "models" / "prl")
+                        rem_d = f"/opt/crypto_bot/models/prl/{rel_r}"
+                        try:
+                            rem_attrs = {a.filename: a.st_size for a in sftp.listdir_attr(rem_d)}
+                        except Exception:
+                            ssh.exec_command(f"mkdir -p {rem_d}")[1].read()
+                            rem_attrs = {}
+                        for fn in files:
+                            lf = Path(root) / fn
+                            if rem_attrs.get(fn) == lf.stat().st_size and not fn.endswith(".json"):
+                                continue
+                            to_sync.append((lf, f"{rel_r}/{fn}", f"{rem_d}/{fn}"))
+        if len(to_sync) <= 15:
+            for lf, _, rem_f in to_sync:
+                sftp.put(str(lf), rem_f)
+        else:
+            import io
+            import tarfile
+            print(f"📦 Пакетная потоковая синхронизация {len(to_sync)} обновленных файлов моделей через tar.gz...", flush=True)
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=1) as tf:
+                for lf, arc_rel, _ in to_sync:
+                    tf.add(str(lf), arcname=arc_rel)
+            buf.seek(0)
+            sftp.putfo(buf, "/tmp/prl_models_sync.tar.gz")
+            ssh.exec_command("tar -xzf /tmp/prl_models_sync.tar.gz -C /opt/crypto_bot/models/prl && rm -f /tmp/prl_models_sync.tar.gz")[1].read()
         w_local = BASE_DIR / "models" / "prl" / "rl_execution" / "live_wallet_state.json"
         if push_wallet and w_local.exists():
             sftp.put(str(w_local), "/opt/crypto_bot/models/prl/rl_execution/live_wallet_state.json")

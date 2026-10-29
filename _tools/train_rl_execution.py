@@ -275,7 +275,8 @@ class SafeTradeL2ExecutionEnv:
       6: PANIC_TAKER_EXIT (мгновенный выход по рынку через 10 уровней стакана)
     """
 
-    def __init__(self, data: dict, start_idx: int, end_idx: int, episode_len: int = 3600, order_usd: float = 95.5, legacy_v2: bool = False):
+    def __init__(self, data: dict, start_idx: int, end_idx: int, episode_len: int = 3600, order_usd: float = 95.5, legacy_v2: bool = False, enable_unfreeze: bool = True):
+        self.enable_unfreeze = bool(enable_unfreeze)
         self.X_market = data["X_market"]
         self.bid_p = data["bid_p"]
         self.bid_q = data["bid_q"]
@@ -326,6 +327,14 @@ class SafeTradeL2ExecutionEnv:
         imb1, imb5 = self.X_market[:, 19], self.X_market[:, 20]
         b1q_s = pd.Series(np.maximum(self.bid_q[:, 0], 0.0))
         a1q_s = pd.Series(np.maximum(self.ask_q[:, 0], 0.0))
+        same_b1_5s = np.abs(self.bid_p[:, 0] - s_bid.shift(5).bfill().values) < (self.tick_size * 0.25)
+        s_ask = pd.Series(self.ask_p[:, 0])
+        same_a1_5s = np.abs(self.ask_p[:, 0] - s_ask.shift(5).bfill().values) < (self.tick_size * 0.25)
+        self.dq_bid_5s = np.where(same_b1_5s, b1q_s.diff(5).fillna(0.0).values, 0.0).astype(np.float32)
+        self.dq_ask_5s = np.where(same_a1_5s, a1q_s.diff(5).fillna(0.0).values, 0.0).astype(np.float32)
+        self.buy_vol_10s = pd.Series(self.buy_vol).rolling(10, min_periods=1).sum().values.astype(np.float32)
+        net_trade_5s = pd.Series(self.buy_vol - self.sell_vol).rolling(5, min_periods=1).sum().values
+        self.ofi_5s = (self.dq_bid_5s - self.dq_ask_5s + net_trade_5s).astype(np.float32)
         net_trade_10s = pd.Series(self.buy_vol - self.sell_vol).rolling(10, min_periods=1).sum().values
         dq_10s = (b1q_s.diff(10).fillna(0.0).values - a1q_s.diff(10).fillna(0.0).values)
         fast_flow_10s = np.clip((net_trade_10s + 0.5 * dq_10s) / (b1q_s.values + a1q_s.values + 500.0) * 3.0, -3.0, 3.0).astype(np.float32)
@@ -361,23 +370,48 @@ class SafeTradeL2ExecutionEnv:
             # Освобождаем PPO от жестких эвристик: разрешаем входы по сигналам нейросетевого роя,
             # отсекая только физически опасные зоны (покупка на хаях часа pos_3600 > 0.80, вершине 4ч пампа pos_14400 > 0.72 или в отвесном обвале)
             safe_macro_4h = (self.rng_14400 < 6.0) | (self.pos_14400 <= 0.72)
+            waterfall_trap_vec = getattr(self, "enable_unfreeze", True) & (self.dd_900 >= 8.0) & (self.pos_14400 >= 0.45) & (ez25 < 0.0)
+            staircase_bleed_vec = getattr(self, "enable_unfreeze", True) & (
+                ((self.pos_3600 <= 0.05) & (self.pos_14400 <= 0.05) & (self.vel_b1_180 <= -2.0) & (ez25 < 0.0))
+                | ((self.pos_3600 <= 0.05) & (self.pos_14400 <= 0.05) & (self.rng_14400 >= 10.0) & (self.dd_900 <= 3.5) & (self.ask_q[:, 0] > 1000.0) & (self.bid_q[:, 0] < 20000.0))
+                | ((ez5 < 0.15) & (ez12 <= 0.0) & (ez25 <= 0.0))
+                | ((self.pos_3600 <= 0.05) & (ez12 <= 0.0) & (ez25 <= 0.0) & ~((self.bid_q[:, 0] >= 9000.0) & (imb5 >= 0.60) & (ez5 >= 0.15)))
+            )
+            top_rollover_vec = getattr(self, "enable_unfreeze", True) & (spread_ticks < 1.5) & (self.rng_14400 >= 16.0) & (self.pos_14400 >= 0.50) & (self.pos_3600 <= 0.15) & (self.dd_300 <= 1.0)
+            self.waterfall_trap_arr = waterfall_trap_vec
             in_dip_zone_vec = (
                 (self.pos_3600 <= 0.80)
                 & safe_macro_4h
+                & ~waterfall_trap_vec
+                & ~staircase_bleed_vec
+                & ~top_rollover_vec
                 & (self.vel_b1_10 >= -0.5)
                 & (self.inertia_arr >= 0.15)
                 & (exp_entry_edge >= 0.60)
                 & ((self.dd_300 >= 1.0) | (spread_ticks >= 2.0))
             )
+            brk_wide_vec = (
+                getattr(self, "enable_unfreeze", True)
+                & (spread_ticks >= 1.8)
+                & (self.bid_q[:, 0] >= 5500.0)
+                & (self.ask_q[:, 0] <= 2500.0)
+                & ((self.ask_q[:, 0] <= 1000.0) | (self.pos_3600 >= 0.35))
+                & (self.inertia_arr >= 0.60)
+                & (ez25 >= 0.35)
+                & (self.dd_300 >= 1.0)
+            )
             in_breakout_vec = (
-                (ez5 >= 0.40)
-                & (ez12 >= 0.80)
-                & (ez25 >= 0.85)
-                & (self.inertia_arr >= 0.70)
-                & (exp_entry_edge >= 3.20)
-                & (imb5 >= 0.25)
-                & (self.vel_b1_10 >= 1.0)
-                & (self.rng_14400 <= 11.0)
+                (
+                    (ez5 >= 0.40)
+                    & (ez12 >= 0.80)
+                    & (ez25 >= 0.85)
+                    & (self.inertia_arr >= 0.70)
+                    & (exp_entry_edge >= 3.20)
+                    & (imb5 >= 0.25)
+                    & (self.vel_b1_10 >= 1.0)
+                    & (self.rng_14400 <= 11.0)
+                )
+                | brk_wide_vec
             )
             self.in_breakout_arr = in_breakout_vec
             self.in_breakout_zone = in_breakout_vec
@@ -528,12 +562,15 @@ class SafeTradeL2ExecutionEnv:
         self.n_trades = 0
         self.cooldown_until = 0
         self.bid_placed_t = 0
+        self.last_exit_t = 0
+        self.last_exit_price = 0.0
         self.car_state = 0  # 0: idle, 1: quoting sell @ local ask, 2: quoting buyback @ local bid
         self.car_qty = 0.0
         self.car_px = 0.0
         self.car_q_ahead = 0.0
         self.car_sell_px = 0.0
         self.car_cycles = 0
+        self.unfreeze_active = False
         return self._get_obs()
 
     def _compute_adaptive_wave_weight(self, t: int, floor_p: float, wave_p: float) -> float:
@@ -549,16 +586,36 @@ class SafeTradeL2ExecutionEnv:
         ez12 = float(self.X_market[t, 6])
         hold_edge = float(self.obs_hold_edge_norm[t] * 5.0)
         b1 = max(self.bid_p[t, 0], self.tick_size)
-        if b1 < self.avg_entry - self.tick_size * 0.25:
-            return 0.0
+        a1 = max(self.ask_p[t, 0], b1 + self.tick_size)
         vel10 = float(self.vel_10[t])
         imb5 = float(self.imb_l5[t])
         inertia = float(self.inertia_arr[t])
+        step_in_supported = (
+            getattr(self, "enable_unfreeze", True)
+            and b1 >= self.avg_entry - self.tick_size * 1.25
+            and (
+                a1 >= self.avg_entry + 1.8 * self.tick_size
+                or (
+                    (float(self.pos_3600[t]) >= 0.30 or float(self.dd_300[t]) >= 3.0)
+                    and float(self.bid_q[t, 0]) >= 4000.0
+                    and (imb5 >= 0.20 or (ez12 >= 0.55 and ez25 >= 0.35 and float(self.ask_q[t, 0]) <= 2500.0))
+                )
+            )
+        )
+        if b1 < self.avg_entry - self.tick_size * 0.25 and not step_in_supported:
+            return 0.0
         if (
             vel10 >= 1.0
             or bool(self.in_breakout_zone[t])
             or (self.avg_entry > 0 and b1 >= self.avg_entry + self.tick_size * 0.75 and inertia >= 0.0)
             or (imb5 >= 0.22 and inertia >= 0.25 and ez12 >= 0.15)
+            or (
+                getattr(self, "enable_unfreeze", True)
+                and imb5 >= 0.35
+                and float(self.bid_q[t, 0]) >= 5000.0
+                and float(self.ask_q[t, 0]) <= 1500.0
+                and (inertia >= 0.05 or (a1 >= self.avg_entry + 1.8 * self.tick_size and imb5 >= 0.50))
+            )
         ):
             return 1.0
         q_a1, _ = self._get_lob_queue(t, "SELL", floor_p)
@@ -669,14 +726,53 @@ class SafeTradeL2ExecutionEnv:
         ez25 = float(self.X_market[t, 12])
         hold_edge = float(self.obs_hold_edge_norm[t] * 5.0)
         brk_now = bool(getattr(self, "in_breakout_arr", np.zeros(len(self.pos_3600), dtype=bool))[t])
-        if not self.legacy_v2 and self.pos_qty <= 1e-8 and self.order_side is None and action == 0 and brk_now and t >= self.cooldown_until:
-            action = 1 if self.can_buy_best_arr[t] else 2
+        wide_scalp_ok = bool(
+            getattr(self, "enable_unfreeze", True)
+            and (a1 - b1) >= 1.8 * self.tick_size
+            and float(self.bid_q[t, 0]) >= 2500.0
+            and float(self.ask_q[t, 0]) <= 2500.0
+            and pos3600 <= 0.75
+            and inertia >= 0.05
+            and (inertia >= 0.20 or float(self.imb_l5[t]) >= 0.50 or ez25 > -0.25)
+            and not (float(self.X_market[t, 0]) < 0.15 and float(self.X_market[t, 6]) <= 0.0 and ez25 <= 0.0)
+            and not (pos3600 <= 0.05 and float(self.X_market[t, 6]) <= 0.0 and ez25 <= 0.0 and not (float(self.bid_q[t, 0]) >= 9000.0 and float(self.imb_l5[t]) >= 0.60 and float(self.X_market[t, 0]) >= 0.15))
+            and not (pos3600 <= 0.05 and float(self.pos_14400[t]) <= 0.05 and float(self.rng_14400[t]) >= 10.0 and float(self.dd_900[t]) <= 3.5 and float(self.ask_q[t, 0]) > 1000.0 and float(self.bid_q[t, 0]) < 20000.0)
+            and not (pos3600 <= 0.05 and float(self.pos_14400[t]) <= 0.05 and float(self.vel_b1_180[t]) <= -2.0 and ez25 < 0.0)
+            and not (float(self.dd_900[t]) >= 8.0 and float(self.pos_14400[t]) >= 0.45 and ez25 < 0.0)
+            and float(self.vel_b1_10[t]) >= -0.5
+        )
+        if not self.legacy_v2 and self.pos_qty <= 1e-8 and self.order_side is None and action == 0 and (brk_now or wide_scalp_ok) and t >= self.cooldown_until:
+            action = 1 if (self.can_buy_best_arr[t] or wide_scalp_ok) else 2
         if not self.legacy_v2 and self.pos_qty <= 1e-8 and self.order_side == "BUY":
             at_b1 = (self.order_price >= b1 - tol) and (self.order_price <= b1 + self.tick_size + tol)
             compressed_4h_floor = (4.8 <= self.rng_14400[t] <= 5.5 and self.pos_14400[t] <= 0.05 and self.dd_900[t] <= 1.0)
-            pre_dump = (sp < 1.5 and ez25 < -0.15 and inertia < 0.08 and self.ask_q[t, 0] > 4000.0) and not compressed_4h_floor
+            l1_bid_erosion = (
+                getattr(self, "enable_unfreeze", True)
+                and sp < 1.5
+                and float(self.dq_bid_5s[t]) <= -1000.0
+                and float(self.bid_q[t, 0]) < 1800.0
+                and float(self.buy_vol_10s[t]) < 100.0
+            )
+            stale_top_rollover = (
+                getattr(self, "enable_unfreeze", True)
+                and (t - self.bid_placed_t) >= 180
+                and sp < 1.5
+                and pos3600 <= 0.15
+                and float(self.pos_14400[t]) >= 0.50
+            )
+            staircase_ask_wall = (
+                getattr(self, "enable_unfreeze", True)
+                and pos3600 <= 0.05
+                and float(self.pos_14400[t]) <= 0.05
+                and float(self.rng_14400[t]) >= 10.0
+                and float(self.dd_900[t]) <= 3.5
+                and float(self.ask_q[t, 0]) > 1000.0
+                and float(self.bid_q[t, 0]) < 20000.0
+            )
+            l1_crush = (sp < 1.5 and float(self.ask_q[t, 0]) > 5000.0 and float(self.bid_q[t, 0]) < 800.0 and inertia < 0.0) or l1_bid_erosion or stale_top_rollover or staircase_ask_wall
+            pre_dump = ((sp < 1.5 and ez25 < -0.15 and inertia < 0.08 and self.ask_q[t, 0] > 4000.0) or l1_crush) and not compressed_4h_floor
             front_q_hold = at_b1 and (self.q_ahead < 600.0) and not pre_dump and pos3600 <= 0.65 and inertia >= -0.10
-            brk_hold = brk_now
+            brk_hold = (brk_now or (at_b1 and (a1 - b1) >= 1.8 * self.tick_size and float(self.bid_q[t, 0]) >= 1500.0 and inertia >= -0.05)) and not pre_dump
             v14_hold_q = at_b1 and ((pos3600 <= 0.25 and not pre_dump and self.bid_q[t, 0] >= 5000.0) or compressed_4h_floor or front_q_hold or brk_hold)
             bid_age = t - self.bid_placed_t
             if self.order_price > b1 + tol and self.vel_b1_10[t] <= -1.0 and hold_edge < 0.0 and self.ask_q[t, 0] > 500.0:
@@ -694,15 +790,55 @@ class SafeTradeL2ExecutionEnv:
             elif pre_dump:
                 action = 5
 
-        if not self.legacy_v2 and self.pos_qty > 1e-8 and self.order_side == "SELL":
+        if not self.legacy_v2 and self.pos_qty > 1e-8:
             floor_p = round((self.avg_entry + self.tick_size) / self.tick_size) * self.tick_size
             wave_p = round((self.avg_entry + 2.0 * self.tick_size) / self.tick_size) * self.tick_size
-            if self.order_price >= wave_p - tol and b1 < self.avg_entry - tol and hold_edge < -0.20 and a1 <= floor_p + tol:
+            ez12_now = float(self.X_market[t, 6])
+            car_step_up_ask = (sp < 1.5) and (
+                float(self.imb_l5[t]) > 0.25 and float(self.vel_10[t]) >= 1.0
+            )
+            opt_car_sell_p = round(min(floor_p, (a1 + self.tick_size) if car_step_up_ask else max(a1, b1 + self.tick_size)) / self.tick_size) * self.tick_size
+            early_wide_unfreeze = (
+                (self.avg_entry - b1) / self.tick_size >= 3.0
+                and a1 >= self.avg_entry - tol
+                and float(self.ask_q[t, 0]) <= 250.0
+                and float(self.dd_900[t]) >= 4.0
+            )
+            unfreeze_mode = getattr(self, "enable_unfreeze", True) and (
+                ((self.avg_entry - b1) / self.tick_size >= 3.0 and (t - self.entry_t) >= 300)
+                or early_wide_unfreeze
+            )
+            wave_hold_ok = b1 >= self.avg_entry - tol or (
+                getattr(self, "enable_unfreeze", True)
+                and b1 >= self.avg_entry - 1.25 * self.tick_size
+                and (
+                    a1 >= self.avg_entry + 1.8 * self.tick_size
+                    or (
+                        (pos3600 >= 0.30 or float(self.dd_300[t]) >= 3.0)
+                        and float(self.bid_q[t, 0]) >= 4000.0
+                        and (float(self.imb_l5[t]) >= 0.20 or (ez12_now >= 0.55 and ez25 >= 0.35 and float(self.ask_q[t, 0]) <= 2500.0))
+                    )
+                )
+            )
+            if unfreeze_mode:
+                if self.order_side != "SELL" or self.slot2_side is not None or self.order_price > opt_car_sell_p + tol or (self.order_price < opt_car_sell_p - tol and car_step_up_ask):
+                    self.order_side = "SELL"
+                    self.order_act = 4
+                    self.order_price = opt_car_sell_p
+                    self.order_qty = self.pos_qty
+                    self.q_ahead, _ = self._get_lob_queue(t, "SELL", self.order_price)
+                    self.active_after = t + 1
+                    self.slot2_side = None
+                    self.slot2_qty = 0.0
+                    self.car_state = 0
+                action = 0
+            elif self.order_side == "SELL" and self.order_price >= wave_p - tol and not wave_hold_ok and hold_edge < -0.20 and a1 <= floor_p + tol:
                 self.order_price = max(a1, floor_p)
                 self.order_qty = self.pos_qty
                 self.q_ahead, _ = self._get_lob_queue(t, "SELL", self.order_price)
                 self.slot2_side = None
                 self.slot2_qty = 0.0
+                action = 0
 
         if not self.legacy_v2 and self.pos_qty > 1e-8 and action in (3, 4):
             floor_p = round((self.avg_entry + self.tick_size) / self.tick_size) * self.tick_size
@@ -721,8 +857,10 @@ class SafeTradeL2ExecutionEnv:
                 and (ez25 >= 0.85 or hold_edge >= 3.80)
                 and inertia >= 1.25
                 and q_a1 < 1000.0
-                and q_a2 < 4500.0
-                and self.dd_900[t] >= 2.0
+                and (
+                    (q_a2 < 4500.0 and self.dd_900[t] >= 2.0)
+                    or (self.rng_14400[t] >= 19.0 and ez12 >= 1.25 and ez25 >= 0.90 and hold_edge >= 3.80 and inertia >= 1.50 and self.dd_900[t] >= 1.0)
+                )
             )
             is_super = (
                 (self.dd_300[t] >= 4.0 and sp < 1.5 and ez25 >= 0.20 and hold_edge >= 1.50 and q_a2 < 800.0)
@@ -764,7 +902,7 @@ class SafeTradeL2ExecutionEnv:
                 pump_up = bool(self.vel_10[t] >= 1.0 or self.in_breakout_zone[t] or (self.imb_l5[t] >= 0.22 and inertia >= 0.25))
                 if pump_up and a1 >= self.order_price - tol and self.imb_l5[t] >= 0.20 and b1 >= self.avg_entry:
                     action = 3
-                elif self.order_price >= wave_p - tol and b1 >= self.avg_entry - tol:
+                elif self.order_price >= wave_p - tol and wave_hold_ok:
                     action = 0
                 elif abs(self.order_price - floor_p) <= tol:
                     action = 0
@@ -787,11 +925,25 @@ class SafeTradeL2ExecutionEnv:
                 self.split_done_for_pos = True
                 requote_penalty = 0.005
                 action = 0
+            elif self.order_side != "SELL" and w2 > 0.85 and getattr(self, "enable_unfreeze", True):
+                self.split_done_for_pos = True
+                action = 3
             elif self.order_side != "SELL" and w2 < 0.15 and not bool(self.vel_10[t] >= 1.0 or self.in_breakout_zone[t]):
                 action = 4
 
         if action in (1, 2) and self.pos_qty <= 1e-8:
-            step_in = (a1 - b1) >= 2.0 * self.tick_size and (self.legacy_v2 or inertia >= 0.35)
+            step_in_l5_ok = (
+                float(self.imb_l5[t]) >= 0.0
+                or float(self.bid_q[t, 0]) >= 8500.0
+                or float(self.X_market[t, 6]) >= 0.90
+            )
+            step_in = (
+                (a1 - b1) >= 1.8 * self.tick_size
+                and (
+                    self.legacy_v2
+                    or (float(self.ask_q[t, 0]) <= 5000.0 and step_in_l5_ok and (inertia >= 0.35 or wide_scalp_ok))
+                )
+            )
             target_p = (b1 + self.tick_size if step_in else b1) if action == 1 else max(self.tick_size, b1 - self.tick_size)
             if self.order_side != "BUY" or abs(self.order_price - target_p) > tol:
                 requote_penalty = 0.025 if self.order_side is not None else 0.005
@@ -816,7 +968,7 @@ class SafeTradeL2ExecutionEnv:
             else:
                 floor_p = round((self.avg_entry + self.tick_size) / self.tick_size) * self.tick_size
                 if action == 3:
-                    target_p = max(a1 + self.tick_size, self.avg_entry + 2.0 * self.tick_size)
+                    target_p = max(a1, self.avg_entry + 2.0 * self.tick_size)
                 else:
                     if self.order_side == "SELL" and abs(self.order_price - floor_p) <= tol and b1 < floor_p - tol:
                         target_p = floor_p
@@ -882,6 +1034,7 @@ class SafeTradeL2ExecutionEnv:
                         self.slot2_side = None
                         self.slot2_qty = 0.0
                         self.split_done_for_pos = False
+                        self.unfreeze_active = False
                         self.n_trades += 1
                         if not self.legacy_v2:
                             self.total_pnl_usd -= self.pos_qty * self.avg_entry * 0.001  # Реальная комиссия SafeTrade Maker Buy (0.10%)
@@ -916,12 +1069,20 @@ class SafeTradeL2ExecutionEnv:
                         self.slot2_side = None
                         self.slot2_qty = 0.0
                     else:
+                        if getattr(self, "enable_unfreeze", True) and float(self.dd_900[nt]) >= 4.0:
+                            if realized_ticks <= -2.0:
+                                self.cooldown_until = nt + 600
+                            elif realized_ticks <= -0.8 and (self.avg_entry - nb1) / self.tick_size >= 2.8:
+                                self.cooldown_until = nt + 900
+                        self.last_exit_t = nt
+                        self.last_exit_price = self.order_price
                         self.pos_qty = 0.0
                         self.avg_entry = 0.0
                         self.peak_bid = 0.0
                         self.order_side = None
                         self.slot2_side = None
                         self.slot2_qty = 0.0
+                        self.unfreeze_active = False
                 else:
                     if vol_at_px > 0:
                         self.q_ahead = max(0.0, self.q_ahead - vol_at_px)
@@ -945,9 +1106,12 @@ class SafeTradeL2ExecutionEnv:
                 net_pnl2 = self.slot2_qty * (self.slot2_price - self.avg_entry) - sell_fee2
                 self.total_pnl_usd += net_pnl2
                 self.pos_qty = max(0.0, self.pos_qty - self.slot2_qty)
+                slot2_px = self.slot2_price
                 self.slot2_side = None
                 self.slot2_qty = 0.0
                 if self.pos_qty <= 1e-4:
+                    self.last_exit_t = nt
+                    self.last_exit_price = slot2_px
                     self.pos_qty = 0.0
                     self.avg_entry = 0.0
                     self.peak_bid = 0.0
