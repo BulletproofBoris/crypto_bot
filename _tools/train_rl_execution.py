@@ -373,14 +373,18 @@ class SafeTradeL2ExecutionEnv:
             waterfall_trap_vec = getattr(self, "enable_unfreeze", True) & (self.dd_900 >= 8.0) & (self.pos_14400 >= 0.45) & (ez25 < 0.0)
             staircase_bleed_vec = getattr(self, "enable_unfreeze", True) & (
                 ((self.pos_3600 <= 0.05) & (self.pos_14400 <= 0.05) & (self.vel_b1_180 <= -2.0) & (ez25 < 0.0))
+                | ((self.pos_3600 <= 0.05) & (self.pos_14400 <= 0.05) & (self.rng_14400 >= 10.0) & (self.dd_900 <= 3.5) & (self.ask_q[:, 0] > 1000.0) & (self.bid_q[:, 0] < 20000.0))
                 | ((ez5 < 0.15) & (ez12 <= 0.0) & (ez25 <= 0.0))
                 | ((self.pos_3600 <= 0.05) & (ez12 <= 0.0) & (ez25 <= 0.0) & ~((self.bid_q[:, 0] >= 9000.0) & (imb5 >= 0.60) & (ez5 >= 0.15)))
             )
+            top_rollover_vec = getattr(self, "enable_unfreeze", True) & (spread_ticks < 1.5) & (self.rng_14400 >= 16.0) & (self.pos_14400 >= 0.50) & (self.pos_3600 <= 0.15) & (self.dd_300 <= 1.0)
+            self.waterfall_trap_arr = waterfall_trap_vec
             in_dip_zone_vec = (
                 (self.pos_3600 <= 0.80)
                 & safe_macro_4h
                 & ~waterfall_trap_vec
                 & ~staircase_bleed_vec
+                & ~top_rollover_vec
                 & (self.vel_b1_10 >= -0.5)
                 & (self.inertia_arr >= 0.15)
                 & (exp_entry_edge >= 0.60)
@@ -732,7 +736,7 @@ class SafeTradeL2ExecutionEnv:
             and (inertia >= 0.20 or float(self.imb_l5[t]) >= 0.50 or ez25 > -0.25)
             and not (float(self.X_market[t, 0]) < 0.15 and float(self.X_market[t, 6]) <= 0.0 and ez25 <= 0.0)
             and not (pos3600 <= 0.05 and float(self.X_market[t, 6]) <= 0.0 and ez25 <= 0.0 and not (float(self.bid_q[t, 0]) >= 9000.0 and float(self.imb_l5[t]) >= 0.60 and float(self.X_market[t, 0]) >= 0.15))
-            and not (pos3600 <= 0.05 and float(self.pos_14400[t]) <= 0.05 and float(self.X_market[t, 0]) < 0.0 and ez25 < 0.0 and float(self.ask_q[t, 0]) > 1000.0)
+            and not (pos3600 <= 0.05 and float(self.pos_14400[t]) <= 0.05 and float(self.rng_14400[t]) >= 10.0 and float(self.dd_900[t]) <= 3.5 and float(self.ask_q[t, 0]) > 1000.0 and float(self.bid_q[t, 0]) < 20000.0)
             and not (pos3600 <= 0.05 and float(self.pos_14400[t]) <= 0.05 and float(self.vel_b1_180[t]) <= -2.0 and ez25 < 0.0)
             and not (float(self.dd_900[t]) >= 8.0 and float(self.pos_14400[t]) >= 0.45 and ez25 < 0.0)
             and float(self.vel_b1_10[t]) >= -0.5
@@ -749,7 +753,23 @@ class SafeTradeL2ExecutionEnv:
                 and float(self.bid_q[t, 0]) < 1800.0
                 and float(self.buy_vol_10s[t]) < 100.0
             )
-            l1_crush = (sp < 1.5 and float(self.ask_q[t, 0]) > 5000.0 and float(self.bid_q[t, 0]) < 800.0 and inertia < 0.0) or l1_bid_erosion
+            stale_top_rollover = (
+                getattr(self, "enable_unfreeze", True)
+                and (t - self.bid_placed_t) >= 180
+                and sp < 1.5
+                and pos3600 <= 0.15
+                and float(self.pos_14400[t]) >= 0.50
+            )
+            staircase_ask_wall = (
+                getattr(self, "enable_unfreeze", True)
+                and pos3600 <= 0.05
+                and float(self.pos_14400[t]) <= 0.05
+                and float(self.rng_14400[t]) >= 10.0
+                and float(self.dd_900[t]) <= 3.5
+                and float(self.ask_q[t, 0]) > 1000.0
+                and float(self.bid_q[t, 0]) < 20000.0
+            )
+            l1_crush = (sp < 1.5 and float(self.ask_q[t, 0]) > 5000.0 and float(self.bid_q[t, 0]) < 800.0 and inertia < 0.0) or l1_bid_erosion or stale_top_rollover or staircase_ask_wall
             pre_dump = ((sp < 1.5 and ez25 < -0.15 and inertia < 0.08 and self.ask_q[t, 0] > 4000.0) or l1_crush) and not compressed_4h_floor
             front_q_hold = at_b1 and (self.q_ahead < 600.0) and not pre_dump and pos3600 <= 0.65 and inertia >= -0.10
             brk_hold = (brk_now or (at_b1 and (a1 - b1) >= 1.8 * self.tick_size and float(self.bid_q[t, 0]) >= 1500.0 and inertia >= -0.05)) and not pre_dump
@@ -778,7 +798,16 @@ class SafeTradeL2ExecutionEnv:
                 float(self.imb_l5[t]) > 0.25 and float(self.vel_10[t]) >= 1.0
             )
             opt_car_sell_p = round(min(floor_p, (a1 + self.tick_size) if car_step_up_ask else max(a1, b1 + self.tick_size)) / self.tick_size) * self.tick_size
-            unfreeze_mode = getattr(self, "enable_unfreeze", True) and ((self.avg_entry - b1) / self.tick_size >= 3.0 and (t - self.entry_t) >= 300)
+            early_wide_unfreeze = (
+                (self.avg_entry - b1) / self.tick_size >= 3.0
+                and a1 >= self.avg_entry - tol
+                and float(self.ask_q[t, 0]) <= 250.0
+                and float(self.dd_900[t]) >= 4.0
+            )
+            unfreeze_mode = getattr(self, "enable_unfreeze", True) and (
+                ((self.avg_entry - b1) / self.tick_size >= 3.0 and (t - self.entry_t) >= 300)
+                or early_wide_unfreeze
+            )
             wave_hold_ok = b1 >= self.avg_entry - tol or (
                 getattr(self, "enable_unfreeze", True)
                 and b1 >= self.avg_entry - 1.25 * self.tick_size
@@ -828,8 +857,10 @@ class SafeTradeL2ExecutionEnv:
                 and (ez25 >= 0.85 or hold_edge >= 3.80)
                 and inertia >= 1.25
                 and q_a1 < 1000.0
-                and q_a2 < 4500.0
-                and self.dd_900[t] >= 2.0
+                and (
+                    (q_a2 < 4500.0 and self.dd_900[t] >= 2.0)
+                    or (self.rng_14400[t] >= 19.0 and ez12 >= 1.25 and ez25 >= 0.90 and hold_edge >= 3.80 and inertia >= 1.50 and self.dd_900[t] >= 1.0)
+                )
             )
             is_super = (
                 (self.dd_300[t] >= 4.0 and sp < 1.5 and ez25 >= 0.20 and hold_edge >= 1.50 and q_a2 < 800.0)
@@ -1038,8 +1069,11 @@ class SafeTradeL2ExecutionEnv:
                         self.slot2_side = None
                         self.slot2_qty = 0.0
                     else:
-                        if getattr(self, "enable_unfreeze", True) and realized_ticks <= -2.0 and float(self.dd_900[nt]) >= 4.0:
-                            self.cooldown_until = nt + 600
+                        if getattr(self, "enable_unfreeze", True) and float(self.dd_900[nt]) >= 4.0:
+                            if realized_ticks <= -2.0:
+                                self.cooldown_until = nt + 600
+                            elif realized_ticks <= -0.8 and (self.avg_entry - nb1) / self.tick_size >= 2.8:
+                                self.cooldown_until = nt + 900
                         self.last_exit_t = nt
                         self.last_exit_price = self.order_price
                         self.pos_qty = 0.0

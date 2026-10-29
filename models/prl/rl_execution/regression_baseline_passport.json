@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-10-29 15:00:25",
+  "updated_at": "2026-10-29 16:08:16",
   "regimes": [
     {
       "id": "R1_PUMP_BREAKOUT",
@@ -19,7 +19,7 @@
       "n_trades": 13,
       "max_freeze_min": 7.8,
       "max_dd_usd": 1.0197,
-      "requotes": 107
+      "requotes": 104
     },
     {
       "id": "R3_WIDE_SPREAD_SCALP",
@@ -29,17 +29,17 @@
       "n_trades": 6,
       "max_freeze_min": 30.7,
       "max_dd_usd": 0.3174,
-      "requotes": 21
+      "requotes": 18
     },
     {
       "id": "R4_TIGHT_1TICK_CHOP",
       "title": "🧱 Вязкий флэт (спред 1т)",
-      "net_pnl_usd": 1.502,
-      "net_pnl_pct": 3.0,
-      "n_trades": 9,
-      "max_freeze_min": 44.3,
-      "max_dd_usd": 1.4462,
-      "requotes": 30
+      "net_pnl_usd": 2.7373,
+      "net_pnl_pct": 5.47,
+      "n_trades": 7,
+      "max_freeze_min": 14.6,
+      "max_dd_usd": 0.5791,
+      "requotes": 25
     },
     {
       "id": "R5_UNDERWATER_RECOVERY",
@@ -54,32 +54,32 @@
     {
       "id": "R6_V_SHAPE_REVERSAL",
       "title": "🎢 V-образный пролив и выкуп",
-      "net_pnl_usd": 2.9905,
-      "net_pnl_pct": 5.98,
+      "net_pnl_usd": 3.2576,
+      "net_pnl_pct": 6.52,
       "n_trades": 12,
-      "max_freeze_min": 9.4,
+      "max_freeze_min": 11.1,
       "max_dd_usd": 1.3589,
       "requotes": 87
     },
     {
       "id": "R7_WHIPSAW_SWING",
       "title": "⚡ Высоковолатильные качели",
-      "net_pnl_usd": 2.8856,
-      "net_pnl_pct": 5.77,
-      "n_trades": 15,
+      "net_pnl_usd": 3.3142,
+      "net_pnl_pct": 6.63,
+      "n_trades": 16,
       "max_freeze_min": 9.6,
       "max_dd_usd": 1.0971,
-      "requotes": 73
+      "requotes": 77
     },
     {
       "id": "R8_STAIRCASE_GRIND_DOWN",
       "title": "📉 Ступенчатый спуск (-9т)",
-      "net_pnl_usd": -0.0729,
-      "net_pnl_pct": -0.15,
+      "net_pnl_usd": 0.5721,
+      "net_pnl_pct": 1.14,
       "n_trades": 5,
-      "max_freeze_min": 21.3,
-      "max_dd_usd": 0.8973,
-      "requotes": 65
+      "max_freeze_min": 21.9,
+      "max_dd_usd": 0.4848,
+      "requotes": 70
     }
   ],
   "prev_frozen": [
