@@ -934,6 +934,8 @@ class SafeTradeL2ExecutionEnv:
                         self.slot2_side = None
                         self.slot2_qty = 0.0
                     else:
+                        if getattr(self, "enable_unfreeze", True) and realized_ticks <= -2.0 and float(self.dd_900[nt]) >= 4.0:
+                            self.cooldown_until = nt + 600
                         self.pos_qty = 0.0
                         self.avg_entry = 0.0
                         self.peak_bid = 0.0

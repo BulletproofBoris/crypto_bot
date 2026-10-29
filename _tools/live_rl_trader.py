@@ -514,6 +514,9 @@ class LiveTriadRLTrader:
                     self.realized_pnl_usd += pnl
                     self.pos_qty = max(0.0, math.floor((self.pos_qty - filled) * 10000.0) / 10000.0)
                     if self.pos_qty < 2.0:
+                        if eff_entry > 0.0 and (px - eff_entry) / self.tick_size <= -2.0 and getattr(self, "last_dd900", 0.0) >= 4.0:
+                            self.cooldown_until_ts = time.time() + 600.0
+                            print(f"  🛡️ [DUMP COOLDOWN] 10-мин пауза на вход после разморозки на проливе (realized={(px - eff_entry) / self.tick_size:.1f}t, dd900={self.last_dd900:.1f}t)")
                         self.pos_qty, self.avg_entry, self.hold_sec, self.peak_bid = 0.0, 0.0, 0, 0.0
                         self.split_done_for_pos = False
                         self.user_manual_ask = False
@@ -950,6 +953,7 @@ class LiveTriadRLTrader:
         in_dip_zone = in_dip_zone or in_breakout_zone
 
         mask = np.zeros(7, dtype=bool)
+        in_cooldown = time.time() < getattr(self, "cooldown_until_ts", 0.0)
         if not has_pos:
             mask[0] = True
             if has_bid:
@@ -958,13 +962,13 @@ class LiveTriadRLTrader:
                 need_cancel = (inertia < -0.10) or (pos_3600 > 0.82 and not brk_hold) or (imb_l5 < -0.55) or (b1 > self.active_bid_p + drift_limit)
                 if need_cancel:
                     mask[5] = True
-                    if in_dip_zone:
+                    if in_dip_zone and not in_cooldown:
                         mask[2] = True
                         if imb_l5 > -0.65:
                             mask[1] = True
-                elif getattr(self, "active_bid_act", 1) == 2 and in_dip_zone and imb_l5 > -0.65:
+                elif getattr(self, "active_bid_act", 1) == 2 and in_dip_zone and imb_l5 > -0.65 and not in_cooldown:
                     mask[1] = True
-            elif in_dip_zone:
+            elif in_dip_zone and not in_cooldown:
                 mask[2] = True
                 if imb_l5 > -0.65:
                     mask[1] = True
@@ -1159,10 +1163,7 @@ class LiveTriadRLTrader:
                 or (self.last_imb5 >= 0.22 and self.last_inertia >= 0.25)
             )
             car_step_up_ask = (self.last_sp_ticks < 1.5) and (
-                self.last_imb5 > 0.08
-                or getattr(self, "last_a1_q", self.last_q_a1) < 400.0
-                or self.last_vel10 > 0.0
-                or self.last_ez12 > 0.15
+                self.last_imb5 > 0.25 and self.last_vel10 >= 1.0
             )
             opt_car_sell_p = round(min(floor_p, (a1 + self.tick_size) if car_step_up_ask else max(a1, b1 + self.tick_size)) / self.tick_size) * self.tick_size
             if unfreeze_mode and (self.active_ask_id is None or self.slot2_ask_id is not None or self.active_bid_id is not None or self.active_ask_p > opt_car_sell_p + tol or (self.active_ask_p < opt_car_sell_p - tol and car_step_up_ask)):
