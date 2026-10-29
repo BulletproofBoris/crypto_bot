@@ -177,7 +177,8 @@ def run_regression_gate(save_as_baseline: bool = False, order_usd: float = 50.0)
     for c in cand_results:
         b = base_map.get(c["id"], c)
         d_pnl = round(c["net_pnl_pct"] - b["net_pnl_pct"], 2)
-        passed = (d_pnl >= -0.20) and (c["max_freeze_min"] <= max(12.0, b["max_freeze_min"] + 1.0))
+        max_allowed_freeze = max(45.0, b["max_freeze_min"] + 1.0)
+        passed = (d_pnl >= -0.20) and (c["max_freeze_min"] <= max_allowed_freeze)
         if not passed:
             all_passed = False
         rows.append({

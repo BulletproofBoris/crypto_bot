@@ -669,14 +669,23 @@ class SafeTradeL2ExecutionEnv:
         ez25 = float(self.X_market[t, 12])
         hold_edge = float(self.obs_hold_edge_norm[t] * 5.0)
         brk_now = bool(getattr(self, "in_breakout_arr", np.zeros(len(self.pos_3600), dtype=bool))[t])
-        if not self.legacy_v2 and self.pos_qty <= 1e-8 and self.order_side is None and action == 0 and brk_now and t >= self.cooldown_until:
-            action = 1 if self.can_buy_best_arr[t] else 2
+        wide_scalp_ok = bool(
+            getattr(self, "enable_unfreeze", True)
+            and (a1 - b1) >= 1.8 * self.tick_size
+            and float(self.bid_q[t, 0]) >= 2500.0
+            and float(self.ask_q[t, 0]) <= 2500.0
+            and pos3600 <= 0.75
+            and inertia >= 0.05
+            and float(self.vel_b1_10[t]) >= -0.5
+        )
+        if not self.legacy_v2 and self.pos_qty <= 1e-8 and self.order_side is None and action == 0 and (brk_now or wide_scalp_ok) and t >= self.cooldown_until:
+            action = 1 if (self.can_buy_best_arr[t] or wide_scalp_ok) else 2
         if not self.legacy_v2 and self.pos_qty <= 1e-8 and self.order_side == "BUY":
             at_b1 = (self.order_price >= b1 - tol) and (self.order_price <= b1 + self.tick_size + tol)
             compressed_4h_floor = (4.8 <= self.rng_14400[t] <= 5.5 and self.pos_14400[t] <= 0.05 and self.dd_900[t] <= 1.0)
             pre_dump = (sp < 1.5 and ez25 < -0.15 and inertia < 0.08 and self.ask_q[t, 0] > 4000.0) and not compressed_4h_floor
             front_q_hold = at_b1 and (self.q_ahead < 600.0) and not pre_dump and pos3600 <= 0.65 and inertia >= -0.10
-            brk_hold = brk_now
+            brk_hold = brk_now or (at_b1 and (a1 - b1) >= 1.8 * self.tick_size and float(self.bid_q[t, 0]) >= 1500.0 and inertia >= -0.05)
             v14_hold_q = at_b1 and ((pos3600 <= 0.25 and not pre_dump and self.bid_q[t, 0] >= 5000.0) or compressed_4h_floor or front_q_hold or brk_hold)
             bid_age = t - self.bid_placed_t
             if self.order_price > b1 + tol and self.vel_b1_10[t] <= -1.0 and hold_edge < 0.0 and self.ask_q[t, 0] > 500.0:
@@ -809,7 +818,7 @@ class SafeTradeL2ExecutionEnv:
                 action = 4
 
         if action in (1, 2) and self.pos_qty <= 1e-8:
-            step_in = (a1 - b1) >= 2.0 * self.tick_size and (self.legacy_v2 or inertia >= 0.35)
+            step_in = (a1 - b1) >= 1.8 * self.tick_size and (self.legacy_v2 or inertia >= 0.35 or wide_scalp_ok)
             target_p = (b1 + self.tick_size if step_in else b1) if action == 1 else max(self.tick_size, b1 - self.tick_size)
             if self.order_side != "BUY" or abs(self.order_price - target_p) > tol:
                 requote_penalty = 0.025 if self.order_side is not None else 0.005

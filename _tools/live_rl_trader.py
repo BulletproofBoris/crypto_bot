@@ -1080,12 +1080,23 @@ class LiveTriadRLTrader:
         if self.mode != "live":
             return
         tol = self.tick_size * 0.25
+        in_cooldown = time.time() < getattr(self, "cooldown_until_ts", 0.0)
+        wide_scalp_ok = bool(
+            (a1 - b1) >= 1.8 * self.tick_size
+            and float(getattr(self, "last_b1_q", 0.0)) >= 2500.0
+            and float(getattr(self, "last_a1_q", self.last_q_a1)) <= 2500.0
+            and self.last_pos3600 <= 0.75
+            and self.last_inertia >= 0.05
+            and self.last_vel10 >= -0.5
+        )
+        if self.pos_qty <= 1e-4 and self.active_bid_id is None and act == 0 and wide_scalp_ok and not in_cooldown:
+            act = 1
         if self.pos_qty <= 1e-4 and self.active_bid_id is not None:
             at_b1 = (self.active_bid_p >= b1 - tol) and (self.active_bid_p <= b1 + self.tick_size + tol)
             compressed_4h_floor = (4.8 <= getattr(self, "last_rng14400", 10.0) <= 5.5 and getattr(self, "last_pos14400", 0.5) <= 0.05 and self.last_dd900 <= 1.0)
             pre_dump = (self.last_sp_ticks < 1.5 and self.last_ez25 < -0.15 and self.last_inertia < 0.08 and getattr(self, "last_a1_q", self.last_q_a1) > 4000.0) and not compressed_4h_floor
             front_q_hold = at_b1 and ((0.0 <= self.q_ahead < 600.0) or getattr(self, "bid_partial_filled", 0.0) > 0.0) and not pre_dump and self.last_pos3600 <= 0.65 and self.last_inertia >= -0.10
-            brk_hold = getattr(self, "last_in_breakout", False)
+            brk_hold = getattr(self, "last_in_breakout", False) or (at_b1 and (a1 - b1) >= 1.8 * self.tick_size and float(getattr(self, "last_b1_q", 0.0)) >= 1500.0 and self.last_inertia >= -0.05)
             v14_hold_q = at_b1 and ((self.last_pos3600 <= 0.25 and not pre_dump and getattr(self, "last_b1_q", 0.0) >= 5000.0) or compressed_4h_floor or front_q_hold or brk_hold)
             bid_age = getattr(self, "bid_age_sec", 0)
             if self.active_bid_p > b1 + tol and self.last_vel10 <= -1.0 and self.last_hold_edge < 0.0 and getattr(self, "last_a1_q", self.last_q_a1) > 500.0:
@@ -1104,7 +1115,7 @@ class LiveTriadRLTrader:
                 act = 5
 
         if act in (1, 2) and self.pos_qty <= 1e-4:
-            step_in = (a1 - b1) >= 2.0 * self.tick_size and self.last_inertia >= 0.35
+            step_in = (a1 - b1) >= 1.8 * self.tick_size and (self.last_inertia >= 0.35 or wide_scalp_ok)
             target_p = round(((b1 + self.tick_size if step_in else b1) if act == 1 else max(self.tick_size, b1 - self.tick_size)) / self.tick_size) * self.tick_size
             if self.active_bid_id is not None and abs(self.active_bid_p - target_p) <= tol:
                 return

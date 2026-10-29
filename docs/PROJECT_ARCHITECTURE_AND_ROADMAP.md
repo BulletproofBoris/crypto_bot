@@ -8,7 +8,7 @@
 ## 1. Концепция и целевой инвариант
 
 Автономная высокочастотная и среднесрочная алгоритмическая система котирования для биржи **SafeTrade** по монетам:
-- **`PRL/USDT` (`pearlusdt`, Pearl):** `tick_size = 0.005 USDT`. Поводырь: **BigONE (`PRL-USDT`)** + ончейн **Pearl (`api.prlscan.com`)**.
+- **`PRL/USDT` (`pearlusdt`, Pearl):** `tick_size = 0.01 USDT`. Поводырь: **BigONE (`PRL-USDT`)** + ончейн **Pearl (`api.prlscan.com`)**.
 - **`QUANTUS/USDT` (`quantususdt`, Quantus):** `tick_size = 0.05 USDT`. Поводыри: **BigONE (`QTC-USDT`)**, **Rhea Finance DEX (`QTC/USDC`)** + ончейн **Quantus**.
 - **Макро-поводыри:** **Binance (`BTC/USDT`, `NEAR/USDT`)** 1s BBO и потоки сделок.
 
