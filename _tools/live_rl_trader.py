@@ -1146,7 +1146,8 @@ class LiveTriadRLTrader:
             self.sync_account_balances(b1)
             self._save_wallet()
         elif (act in (3, 4, 6) or (act == 0 and self.active_ask_id is not None)) and self.pos_qty >= 2.0:
-            if getattr(self, "user_manual_ask", False) and self.active_ask_id is not None and act != 6:
+            unfreeze_mode = ((self.avg_entry - b1) / self.tick_size >= 3.0 and self.hold_sec >= 300)
+            if getattr(self, "user_manual_ask", False) and self.active_ask_id is not None and act != 6 and not unfreeze_mode:
                 return
             floor_p = round((self.avg_entry + self.tick_size) / self.tick_size) * self.tick_size
             wave_p = round((self.avg_entry + 2.0 * self.tick_size) / self.tick_size) * self.tick_size
@@ -1164,6 +1165,37 @@ class LiveTriadRLTrader:
                 or self.last_ez12 > 0.15
             )
             opt_car_sell_p = round(min(floor_p, (a1 + self.tick_size) if car_step_up_ask else max(a1, b1 + self.tick_size)) / self.tick_size) * self.tick_size
+            if unfreeze_mode and (self.active_ask_id is None or self.slot2_ask_id is not None or self.active_bid_id is not None or self.active_ask_p > opt_car_sell_p + tol or (self.active_ask_p < opt_car_sell_p - tol and car_step_up_ask)):
+                for oid_attr in ("active_bid_id", "active_ask_id", "slot2_ask_id"):
+                    oid = getattr(self, oid_attr)
+                    if oid is not None:
+                        try:
+                            self.client.cancel_order(oid)
+                        except Exception:
+                            pass
+                self.sync_live_orders(b1)
+                self.active_bid_id, self.active_bid_p, self.active_bid_q = None, 0.0, 0.0
+                self.active_ask_id, self.active_ask_p, self.active_ask_q = None, 0.0, 0.0
+                self.slot2_ask_id, self.slot2_ask_p, self.slot2_ask_q = None, 0.0, 0.0
+                self.car_state = 0
+                self.split_done_for_pos = False
+                self.user_manual_ask = False
+                self.sync_account_balances(b1)
+                sell_q = math.floor(min(self.pos_qty, self.ex_coin_free) * 10000.0) / 10000.0
+                if sell_q >= 2.0:
+                    try:
+                        ru = self.client.place_limit_order(self.market, "sell", sell_q, opt_car_sell_p)
+                        self.active_ask_id = ru.get("id")
+                        self.active_ask_p = float(ru.get("price", opt_car_sell_p))
+                        self.active_ask_q = float(ru.get("origin_amount", sell_q))
+                        self.q_ahead = -1.0
+                        self._save_wallet()
+                        print(f"  🔄 [UNFREEZE TO TURNOVER] id={self.active_ask_id} | Разморозка 100% поз ({self.active_ask_q:.4f} PRL) в оборот @ ${self.active_ask_p:.2f}")
+                    except Exception as eu:
+                        print(f"  ⚠️ [UNFREEZE SELL ERROR]: {eu}")
+                return
+            if unfreeze_mode and self.active_ask_id is not None:
+                return
             if getattr(self, "car_state", 0) in (1, 2) and (self.active_bid_id is not None or self.bot_cash_usd >= 3.5) and self.car_sell_px > 0:
                 step_back = self.tick_size if b1 >= self.car_sell_px + tol else 2.0 * self.tick_size
                 max_buy_p = round((self.car_sell_px - step_back) / self.tick_size) * self.tick_size
