@@ -534,6 +534,7 @@ class SafeTradeL2ExecutionEnv:
         self.car_q_ahead = 0.0
         self.car_sell_px = 0.0
         self.car_cycles = 0
+        self.unfreeze_active = False
         return self._get_obs()
 
     def _compute_adaptive_wave_weight(self, t: int, floor_p: float, wave_p: float) -> float:
@@ -690,7 +691,8 @@ class SafeTradeL2ExecutionEnv:
         if not self.legacy_v2 and self.pos_qty <= 1e-8 and self.order_side == "BUY":
             at_b1 = (self.order_price >= b1 - tol) and (self.order_price <= b1 + self.tick_size + tol)
             compressed_4h_floor = (4.8 <= self.rng_14400[t] <= 5.5 and self.pos_14400[t] <= 0.05 and self.dd_900[t] <= 1.0)
-            pre_dump = (sp < 1.5 and ez25 < -0.15 and inertia < 0.08 and self.ask_q[t, 0] > 4000.0) and not compressed_4h_floor
+            l1_crush = (sp < 1.5 and float(self.ask_q[t, 0]) > 5000.0 and float(self.bid_q[t, 0]) < 800.0 and inertia < 0.0)
+            pre_dump = ((sp < 1.5 and ez25 < -0.15 and inertia < 0.08 and self.ask_q[t, 0] > 4000.0) or l1_crush) and not compressed_4h_floor
             front_q_hold = at_b1 and (self.q_ahead < 600.0) and not pre_dump and pos3600 <= 0.65 and inertia >= -0.10
             brk_hold = brk_now or (at_b1 and (a1 - b1) >= 1.8 * self.tick_size and float(self.bid_q[t, 0]) >= 1500.0 and inertia >= -0.05)
             v14_hold_q = at_b1 and ((pos3600 <= 0.25 and not pre_dump and self.bid_q[t, 0] >= 5000.0) or compressed_4h_floor or front_q_hold or brk_hold)
@@ -731,12 +733,13 @@ class SafeTradeL2ExecutionEnv:
                     self.slot2_qty = 0.0
                     self.car_state = 0
                 action = 0
-            elif self.order_side == "SELL" and self.order_price >= wave_p - tol and b1 < self.avg_entry - tol and (hold_edge < -0.20 or (getattr(self, "enable_unfreeze", True) and (t - self.entry_t) >= 180)) and a1 <= floor_p + tol:
+            elif self.order_side == "SELL" and self.order_price >= wave_p - tol and b1 < self.avg_entry - tol and hold_edge < -0.20 and a1 <= floor_p + tol:
                 self.order_price = max(a1, floor_p)
                 self.order_qty = self.pos_qty
                 self.q_ahead, _ = self._get_lob_queue(t, "SELL", self.order_price)
                 self.slot2_side = None
                 self.slot2_qty = 0.0
+                action = 0
 
         if not self.legacy_v2 and self.pos_qty > 1e-8 and action in (3, 4):
             floor_p = round((self.avg_entry + self.tick_size) / self.tick_size) * self.tick_size
@@ -919,6 +922,7 @@ class SafeTradeL2ExecutionEnv:
                         self.slot2_side = None
                         self.slot2_qty = 0.0
                         self.split_done_for_pos = False
+                        self.unfreeze_active = False
                         self.n_trades += 1
                         if not self.legacy_v2:
                             self.total_pnl_usd -= self.pos_qty * self.avg_entry * 0.001  # Реальная комиссия SafeTrade Maker Buy (0.10%)
@@ -961,6 +965,7 @@ class SafeTradeL2ExecutionEnv:
                         self.order_side = None
                         self.slot2_side = None
                         self.slot2_qty = 0.0
+                        self.unfreeze_active = False
                 else:
                     if vol_at_px > 0:
                         self.q_ahead = max(0.0, self.q_ahead - vol_at_px)
