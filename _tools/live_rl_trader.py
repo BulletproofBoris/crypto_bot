@@ -366,6 +366,9 @@ class LiveTriadRLTrader:
             self.car_state = int(st.get("car_state", 0))
             self.car_sell_px = float(st.get("car_sell_px", 0.0))
             self.car_cycles = int(st.get("car_cycles", 0))
+            self.cooldown_until_ts = float(st.get("cooldown_until_ts", 0.0))
+            self.last_exit_ts = float(st.get("last_exit_ts", 0.0))
+            self.last_exit_price = float(st.get("last_exit_price", 0.0))
             if self.pos_qty < 2.0:
                 self.car_state = 0
             elif self.car_state == 1 and self.slot2_ask_id is None:
@@ -417,6 +420,9 @@ class LiveTriadRLTrader:
             "car_state": int(getattr(self, "car_state", 0)),
             "car_sell_px": round(float(getattr(self, "car_sell_px", 0.0)), 4),
             "car_cycles": int(getattr(self, "car_cycles", 0)),
+            "cooldown_until_ts": round(float(getattr(self, "cooldown_until_ts", 0.0)), 3),
+            "last_exit_ts": round(float(getattr(self, "last_exit_ts", 0.0)), 3),
+            "last_exit_price": round(float(getattr(self, "last_exit_price", 0.0)), 4),
         }
         try:
             self.wallet_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -515,7 +521,7 @@ class LiveTriadRLTrader:
                     self.realized_pnl_usd += pnl
                     self.pos_qty = max(0.0, math.floor((self.pos_qty - filled) * 10000.0) / 10000.0)
                     if self.pos_qty < 2.0:
-                        if eff_entry > 0.0 and getattr(self, "last_dd900", 0.0) >= 4.0:
+                        if eff_entry > 0.0 and (getattr(self, "last_dd900", 0.0) >= 4.0 or (self.hold_sec >= 600 and getattr(self, "last_dd900", 0.0) >= 3.0) or (b1 > 0.0 and (eff_entry - b1) / self.tick_size >= 2.8)):
                             real_t = (px - eff_entry) / self.tick_size
                             if real_t <= -2.0:
                                 self.cooldown_until_ts = time.time() + 600.0
@@ -523,6 +529,8 @@ class LiveTriadRLTrader:
                             elif real_t <= -0.8 and b1 > 0.0 and (eff_entry - b1) / self.tick_size >= 2.8:
                                 self.cooldown_until_ts = time.time() + 900.0
                                 print(f"  🛡️ [DUMP COOLDOWN] 15-мин пауза на вход после ранней разморозки (realized={real_t:.1f}t, dd900={self.last_dd900:.1f}t)")
+                        self.last_exit_ts = time.time()
+                        self.last_exit_price = float(px)
                         self.pos_qty, self.avg_entry, self.hold_sec, self.peak_bid = 0.0, 0.0, 0, 0.0
                         self.split_done_for_pos = False
                         self.user_manual_ask = False
@@ -960,6 +968,8 @@ class LiveTriadRLTrader:
         self.last_vel3 = vel_3
         self.last_ez5 = ez_5
         self.last_vel180 = vel_180
+        self.last_err12 = float(obs_err12_norm)
+        self.last_entry_edge = float(exp_entry_edge)
         safe_macro_4h = (rng_14400 < 6.0) or (pos_14400 <= 0.72)
         waterfall_trap = ((dd_900 >= 8.0) and (pos_14400 >= 0.45) and (ez_25 < 0.0)) or ((dd_900 >= 10.0) and (b1_q < 2500.0) and (a1_q > 800.0) and (ez_12 < 0.0))
         staircase_bleed = (
@@ -1177,6 +1187,9 @@ class LiveTriadRLTrader:
             and not (self.last_dd900 >= 8.0 and pos144_w >= 0.45 and self.last_ez25 < 0.0)
             and not (self.last_dd900 >= 10.0 and b1_q_w < 2500.0 and a1_q_w > 800.0 and self.last_ez12 < 0.0)
             and not (rng144_w >= 22.0 and self.last_ez12 <= 0.05 and self.last_ez25 <= 0.02 and a1_q_w > 400.0)
+            and not (float(getattr(self, "last_entry_edge", 0.0)) < -1.50 and self.last_hold_edge < -1.50 and float(getattr(self, "last_err12", 0.0)) < -1.0 and self.last_ez25 <= 0.0)
+            and not (float(getattr(self, "last_exit_ts", 0.0)) > 0.0 and (time.time() - float(getattr(self, "last_exit_ts", 0.0))) <= 15.0 and (b1 + self.tick_size) >= float(getattr(self, "last_exit_price", 0.0)) - tol and ez5_w < 0.0 and float(getattr(self, "last_err12", 0.0)) < -0.30)
+            and not (ez5_w < 0.10 and self.last_ez12 < 0.10 and self.last_ez25 < -0.05 and self.last_hold_edge < 0.0 and self.last_imb5 < 0.35)
             and self.last_vel10 >= -0.5
         )
         if self.pos_qty <= 1e-4 and self.active_bid_id is None and act == 0 and wide_scalp_ok and not in_cooldown:
@@ -1293,6 +1306,8 @@ class LiveTriadRLTrader:
             self.sync_account_balances(b1)
             max_cap = self.ex_usdt_free if (self.reserved_account_usdt <= 1e-4 and self.user_reserved_coin <= 1e-4) else self.order_usd
             usable_usd = min(max_cap, self.bot_cash_usd * 0.998, self.ex_usdt_free * 0.998)
+            if target_p > b1 + tol and usable_usd > 110.0 and not getattr(self, "last_in_breakout", False) and (self.last_ez25 < 0.20 or a1_q_cur > 1200.0):
+                usable_usd = max(110.0, usable_usd * 0.72)
             qty = math.floor((usable_usd / max(target_p, self.tick_size)) * 10000.0) / 10000.0
             if qty < 2.0:
                 return

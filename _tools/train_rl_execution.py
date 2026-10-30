@@ -773,6 +773,9 @@ class SafeTradeL2ExecutionEnv:
             and not (float(self.dd_900[t]) >= 8.0 and float(self.pos_14400[t]) >= 0.45 and ez25 < 0.0)
             and not (float(self.dd_900[t]) >= 10.0 and float(self.bid_q[t, 0]) < 2500.0 and float(self.ask_q[t, 0]) > 800.0 and float(self.X_market[t, 6]) < 0.0)
             and not (float(self.rng_14400[t]) >= 22.0 and float(self.X_market[t, 6]) <= 0.05 and ez25 <= 0.02 and float(self.ask_q[t, 0]) > 400.0)
+            and not (float(self.obs_entry_edge_norm[t] * 5.0) < -1.50 and hold_edge < -1.50 and float(self.obs_err12_norm[t]) < -1.0 and ez25 <= 0.0)
+            and not (self.last_exit_t > 0 and (t - self.last_exit_t) <= 15 and (b1 + self.tick_size) >= self.last_exit_price - tol and float(self.X_market[t, 0]) < 0.0 and float(self.obs_err12_norm[t]) < -0.30)
+            and not (float(self.X_market[t, 0]) < 0.10 and float(self.X_market[t, 6]) < 0.10 and ez25 < -0.05 and hold_edge < 0.0 and float(self.imb_l5[t]) < 0.35)
             and float(self.vel_b1_10[t]) >= -0.5
         )
         if not self.legacy_v2 and self.pos_qty <= 1e-8 and self.order_side is None and action == 0 and (brk_now or wide_scalp_ok) and t >= self.cooldown_until:
@@ -1146,7 +1149,7 @@ class SafeTradeL2ExecutionEnv:
                         self.slot2_side = None
                         self.slot2_qty = 0.0
                     else:
-                        if getattr(self, "enable_unfreeze", True) and float(self.dd_900[nt]) >= 4.0:
+                        if getattr(self, "enable_unfreeze", True) and (float(self.dd_900[nt]) >= 4.0 or ((nt - self.entry_t) >= 600 and float(self.dd_900[nt]) >= 3.0)):
                             if realized_ticks <= -2.0:
                                 self.cooldown_until = nt + 600
                             elif realized_ticks <= -0.8 and (self.avg_entry - nb1) / self.tick_size >= 2.8:
