@@ -1,24 +1,112 @@
 [
   {
+    "window_id": "win_00",
+    "model_type": "conv1d+gru",
+    "coin": "PRL",
+    "H": 25,
+    "seq_len": 75,
+    "train_ts_range": [
+      "2026-10-10 03:08:09",
+      "2026-10-14 11:18:08"
+    ],
+    "test_ts_range": [
+      "2026-10-14 11:24:34",
+      "2026-10-17 11:39:36"
+    ],
+    "metrics_oos": {
+      "ic_dt_ticks": 0.1576,
+      "roc_auc_ovr": 0.7276,
+      "log_loss": 1.151,
+      "top2pct_mean_ticks": 0.16
+    },
+    "weights_file": "model_win_00.keras"
+  },
+  {
     "window_id": "win_01",
     "model_type": "conv1d+gru",
     "coin": "PRL",
     "H": 25,
     "seq_len": 75,
     "train_ts_range": [
-      "2026-10-15 23:01:18",
-      "2026-10-18 09:21:17"
+      "2026-10-12 07:13:09",
+      "2026-10-17 11:33:11"
     ],
     "test_ts_range": [
-      "2026-10-18 09:27:30",
-      "2026-10-18 15:13:47"
+      "2026-10-17 11:39:37",
+      "2026-10-20 04:37:37"
     ],
     "metrics_oos": {
-      "ic_dt_ticks": 0.2299,
-      "roc_auc_ovr": 0.747,
-      "log_loss": 1.5724,
-      "top2pct_mean_ticks": 0.45
+      "ic_dt_ticks": 0.154,
+      "roc_auc_ovr": 0.7175,
+      "log_loss": 1.274,
+      "top2pct_mean_ticks": 0.12
     },
     "weights_file": "model_win_01.keras"
+  },
+  {
+    "window_id": "win_02",
+    "model_type": "conv1d+gru",
+    "coin": "PRL",
+    "H": 25,
+    "seq_len": 75,
+    "train_ts_range": [
+      "2026-10-14 11:18:09",
+      "2026-10-20 04:31:12"
+    ],
+    "test_ts_range": [
+      "2026-10-20 04:37:38",
+      "2026-10-22 08:42:37"
+    ],
+    "metrics_oos": {
+      "ic_dt_ticks": 0.1674,
+      "roc_auc_ovr": 0.7192,
+      "log_loss": 1.4028,
+      "top2pct_mean_ticks": 0.12
+    },
+    "weights_file": "model_win_02.keras"
+  },
+  {
+    "window_id": "win_03",
+    "model_type": "conv1d+gru",
+    "coin": "PRL",
+    "H": 25,
+    "seq_len": 75,
+    "train_ts_range": [
+      "2026-10-17 11:33:12",
+      "2026-10-22 08:36:12"
+    ],
+    "test_ts_range": [
+      "2026-10-22 08:42:38",
+      "2026-10-24 12:47:37"
+    ],
+    "metrics_oos": {
+      "ic_dt_ticks": 0.2057,
+      "roc_auc_ovr": 0.7064,
+      "log_loss": 1.5667,
+      "top2pct_mean_ticks": 0.15
+    },
+    "weights_file": "model_win_03.keras"
+  },
+  {
+    "window_id": "win_04",
+    "model_type": "conv1d+gru",
+    "coin": "PRL",
+    "H": 25,
+    "seq_len": 75,
+    "train_ts_range": [
+      "2026-10-20 03:05:57",
+      "2026-10-24 11:15:56"
+    ],
+    "test_ts_range": [
+      "2026-10-24 11:22:22",
+      "2026-10-26 15:27:21"
+    ],
+    "metrics_oos": {
+      "ic_dt_ticks": 0.2484,
+      "roc_auc_ovr": 0.7481,
+      "log_loss": 1.3361,
+      "top2pct_mean_ticks": 0.08
+    },
+    "weights_file": "model_win_04.keras"
   }
 ]

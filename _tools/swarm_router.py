@@ -105,6 +105,11 @@ class SwarmRegimeRouter:
                     n_dir = BASE_DIR / "models" / self.coin / f"{arch_dir_name}_h{H}s"
                     if not n_dir.exists():
                         continue
+                    lgb_date_map = {
+                        (str(item.get("train_ts_range", ["", ""])[0])[:19], str(item.get("train_ts_range", ["", ""])[1])[:19]): idx
+                        for idx, item in enumerate(self.manifest)
+                    }
+                    seen_arch_widx = set()
                     for k_file in sorted(n_dir.glob("model_win_*.keras")):
                         win_tag = k_file.stem.replace("model_", "")  # win_00, win_01...
                         win_idx = int(win_tag.split("_")[-1]) if win_tag.split("_")[-1].isdigit() else 0
@@ -112,10 +117,17 @@ class SwarmRegimeRouter:
                         if m_file.exists():
                             with open(m_file) as mf:
                                 n_meta = json.load(mf)
+                            tr_r = n_meta.get("train_ts_range", ["", ""])
+                            tr_key = (str(tr_r[0])[:19], str(tr_r[1])[:19])
+                            if tr_key in lgb_date_map:
+                                win_idx = lgb_date_map[tr_key]
+                            if (arch_key, win_idx) in seen_arch_widx:
+                                continue
+                            seen_arch_widx.add((arch_key, win_idx))
                             ic_val = float(n_meta.get("metrics_oos", {}).get("ic_dt_ticks", 0.1))
                             if ic_val >= 0.05:
                                 self.neural_experts.append({
-                                    "arch": f"{arch_key}_{win_tag}",
+                                    "arch": f"{arch_key}_win_{win_idx:02d}",
                                     "base_arch": arch_key,
                                     "win_idx": win_idx,
                                     "k_file": str(k_file),
