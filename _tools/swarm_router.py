@@ -379,13 +379,15 @@ class SwarmRegimeRouter:
                     cache_file = legacy_cache
 
                 if multi_win and not cache_file.exists():
-                    if n_samples > 300000 and c_rank is not None:
-                        act_idx = np.where(c_rank[:, w_idx] == 0.0)[0]
+                    if (n_samples > 300000 or len(self.neural_experts) > 24) and c_rank is not None:
+                        act_idx = np.where((c_rank[:, w_idx] == 0.0) | (reg_w >= 0.15))[0]
                     else:
                         act_idx = np.where(reg_w >= 0.08)[0]
                     if len(act_idx) == 0:
                         continue
                     s_act, e_act = int(act_idx[0]), int(act_idx[-1]) + 1
+                    if len(self.neural_experts) > 24 and float(np.mean(reg_w[s_act:e_act])) < 0.015 and float(np.max(reg_w)) < 0.20:
+                        continue
                 else:
                     s_act, e_act = 0, n_samples
 

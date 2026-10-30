@@ -42,7 +42,7 @@ def select_golden_regimes(data: dict, win_sec: int = 14400) -> list[dict]:
     s_vol = data["sell_vol"]
     b1_s = pd.Series(b1)
     dd_300 = (b1_s.rolling(300, min_periods=1).max().values - b1) / tick
-    n = len(b1)
+    n = min(len(b1), 1577872)
     step = 3600
     starts = [
         s for s in range(14400, n - win_sec - 600, step)
@@ -85,7 +85,7 @@ def select_golden_regimes(data: dict, win_sec: int = 14400) -> list[dict]:
     grind_cands = [s for s in range(14400, n - win_sec - 600, step) if all(abs(s - ex) >= win_sec for ex in (base_5 | {best_vshape, best_swing})) and (b1[s + win_sec] - b1[s]) / tick <= -6.0 and np.max(b1[s:s + win_sec]) <= b1[s] + tick]
     best_grind = min(grind_cands or rem_starts_3, key=lambda s: float((b1[s + win_sec] - b1[s]) / tick))
 
-    return [
+    regs = [
         {"id": "R1_PUMP_BREAKOUT", "title": "🚀 Памп и пробой вверх", "start": int(best_pump), "end": int(best_pump + win_sec), "force_underwater": False},
         {"id": "R2_TOXIC_DUMP", "title": "🩸 Токсичный пролив вниз", "start": int(best_dump), "end": int(best_dump + win_sec), "force_underwater": False},
         {"id": "R3_WIDE_SPREAD_SCALP", "title": "🦀 Живой коридор (спред >= 2т)", "start": int(best_wide), "end": int(best_wide + win_sec), "force_underwater": False},
@@ -95,6 +95,12 @@ def select_golden_regimes(data: dict, win_sec: int = 14400) -> list[dict]:
         {"id": "R7_WHIPSAW_SWING", "title": "⚡ Высоковолатильные качели", "start": int(best_swing), "end": int(best_swing + win_sec), "force_underwater": False},
         {"id": "R8_STAIRCASE_GRIND_DOWN", "title": "📉 Ступенчатый спуск (-9т)", "start": int(best_grind), "end": int(best_grind + win_sec), "force_underwater": False},
     ]
+    if len(b1) >= 1746000:
+        regs.extend([
+            {"id": "R9_WHIPSAW_OCT30", "title": "🌪️ Ночной распил (30 окт)", "start": 1713600, "end": 1728000, "force_underwater": False},
+            {"id": "R10_RECOV_OCT30", "title": "🌅 Свежий рынок + выход из -6т (30 окт)", "start": 1731600, "end": 1746000, "force_underwater": True},
+        ])
+    return regs
 
 
 def _slice_data(data: dict, start: int, end: int, pad: int = 14400) -> tuple[dict, int, int]:
