@@ -860,6 +860,7 @@ class LiveTriadRLTrader:
         self.last_rng14400 = rng_14400
         self.last_pos14400 = pos_14400
         self.last_b1_q = b1_q
+        self.last_b2_q = float(bid_qs_clean[1]) if len(bid_qs_clean) > 1 else 0.0
         self.last_a1_q = a1_q
         self.last_vel10 = vel_10
         self.last_imb5 = imb_l5
@@ -1157,55 +1158,95 @@ class LiveTriadRLTrader:
             return
         tol = self.tick_size * 0.25
         in_cooldown = time.time() < getattr(self, "cooldown_until_ts", 0.0)
+        b1_q_w = float(getattr(self, "last_b1_q", 0.0))
+        a1_q_w = float(getattr(self, "last_a1_q", self.last_q_a1))
+        rng144_w = float(getattr(self, "last_rng14400", 10.0))
+        pos144_w = float(getattr(self, "last_pos14400", 0.5))
+        ez5_w = float(getattr(self, "last_ez5", 0.0))
         wide_scalp_ok = bool(
             (a1 - b1) >= 1.8 * self.tick_size
-            and float(getattr(self, "last_b1_q", 0.0)) >= 2500.0
-            and float(getattr(self, "last_a1_q", self.last_q_a1)) <= 2500.0
-            and self.last_pos3600 <= 0.75
-            and self.last_inertia >= 0.05
-            and (self.last_inertia >= 0.20 or self.last_imb5 >= 0.50 or self.last_ez25 > -0.25)
-            and not (float(getattr(self, "last_ez5", 0.0)) < 0.15 and self.last_ez12 <= 0.0 and self.last_ez25 <= 0.0)
-            and not (self.last_pos3600 <= 0.05 and self.last_ez12 <= 0.0 and self.last_ez25 <= 0.0 and not (float(getattr(self, "last_b1_q", 0.0)) >= 9000.0 and self.last_imb5 >= 0.60 and float(getattr(self, "last_ez5", 0.0)) >= 0.15))
-            and not (self.last_pos3600 <= 0.05 and float(getattr(self, "last_pos14400", 0.5)) <= 0.05 and float(getattr(self, "last_rng14400", 10.0)) >= 10.0 and self.last_dd900 <= 3.5 and float(getattr(self, "last_a1_q", self.last_q_a1)) > 1000.0 and float(getattr(self, "last_b1_q", 0.0)) < 20000.0)
-            and not (self.last_pos3600 <= 0.05 and float(getattr(self, "last_pos14400", 0.5)) <= 0.05 and float(getattr(self, "last_vel180", 0.0)) <= -2.0 and self.last_ez25 < 0.0)
-            and not (self.last_dd900 >= 8.0 and float(getattr(self, "last_pos14400", 0.5)) >= 0.45 and self.last_ez25 < 0.0)
-            and not (self.last_dd900 >= 10.0 and float(getattr(self, "last_b1_q", 0.0)) < 2500.0 and float(getattr(self, "last_a1_q", self.last_q_a1)) > 800.0 and self.last_ez12 < 0.0)
-            and not (float(getattr(self, "last_rng14400", 10.0)) >= 22.0 and self.last_ez12 <= 0.05 and self.last_ez25 <= 0.02 and float(getattr(self, "last_a1_q", self.last_q_a1)) > 400.0)
+            and (
+                (b1_q_w >= 2500.0 and a1_q_w <= 2500.0 and self.last_pos3600 <= 0.75 and self.last_inertia >= 0.05 and (self.last_inertia >= 0.20 or self.last_imb5 >= 0.50 or self.last_ez25 > -0.25))
+                or (b1_q_w >= 18000.0 and a1_q_w <= 7500.0 and self.last_pos3600 <= 0.50 and rng144_w <= 9.0 and self.last_ez12 >= 0.80 and self.last_ez25 >= 0.65 and self.last_inertia >= 0.75 and self.last_imb5 >= 0.65)
+                or (b1_q_w >= 1700.0 and a1_q_w <= 1250.0 and 0.45 <= self.last_pos3600 <= 0.55 and pos144_w <= 0.10 and self.last_dd900 == 1.0 and ez5_w >= 0.20 and self.last_imb5 >= 0.55)
+            )
+            and not (ez5_w < 0.15 and self.last_ez12 <= 0.0 and self.last_ez25 <= 0.0)
+            and not (self.last_pos3600 <= 0.05 and self.last_ez12 <= 0.0 and self.last_ez25 <= 0.0 and not (b1_q_w >= 9000.0 and self.last_imb5 >= 0.60 and ez5_w >= 0.15))
+            and not (self.last_pos3600 <= 0.05 and pos144_w <= 0.05 and rng144_w >= 10.0 and self.last_dd900 <= 3.5 and a1_q_w > 1000.0 and b1_q_w < 20000.0)
+            and not (self.last_pos3600 <= 0.05 and pos144_w <= 0.05 and float(getattr(self, "last_vel180", 0.0)) <= -2.0 and self.last_ez25 < 0.0)
+            and not (self.last_dd900 >= 8.0 and pos144_w >= 0.45 and self.last_ez25 < 0.0)
+            and not (self.last_dd900 >= 10.0 and b1_q_w < 2500.0 and a1_q_w > 800.0 and self.last_ez12 < 0.0)
+            and not (rng144_w >= 22.0 and self.last_ez12 <= 0.05 and self.last_ez25 <= 0.02 and a1_q_w > 400.0)
             and self.last_vel10 >= -0.5
         )
         if self.pos_qty <= 1e-4 and self.active_bid_id is None and act == 0 and wide_scalp_ok and not in_cooldown:
             act = 1
         if self.pos_qty <= 1e-4 and self.active_bid_id is not None:
-            at_b1 = (self.active_bid_p >= b1 - tol) and (self.active_bid_p <= b1 + self.tick_size + tol)
-            compressed_4h_floor = (4.8 <= getattr(self, "last_rng14400", 10.0) <= 5.5 and getattr(self, "last_pos14400", 0.5) <= 0.05 and self.last_dd900 <= 1.0)
+            b2_q_w = float(getattr(self, "last_b2_q", 0.0))
+            dust_b1_flicker = (
+                abs(self.active_bid_p - (b1 - self.tick_size)) <= tol
+                and b2_q_w >= 11000.0
+                and rng144_w <= 6.0
+                and pos144_w <= 0.20
+            )
+            at_b1 = ((self.active_bid_p >= b1 - tol) and (self.active_bid_p <= b1 + self.tick_size + tol)) or dust_b1_flicker
+            compressed_4h_floor = (
+                (4.8 <= rng144_w <= 5.5 and pos144_w <= 0.05 and self.last_dd900 <= 1.0)
+                or (self.last_pos3600 <= 0.05 and pos144_w <= 0.05 and rng144_w <= 9.0 and b1_q_w >= 12000.0 and b1_q_w >= 1.8 * a1_q_w and self.last_imb5 >= 0.65)
+                or dust_b1_flicker
+            )
             l1_bid_erosion = (
                 self.last_sp_ticks < 1.5
                 and float(getattr(self, "last_dq_bid_5s", 0.0)) <= -1000.0
-                and float(getattr(self, "last_b1_q", 0.0)) < 1800.0
+                and b1_q_w < 1800.0
                 and float(getattr(self, "last_buy_vol_10s", 100.0)) < 100.0
+                and not (
+                    (a1_q_w <= 10.0 and self.last_inertia >= 0.15 and rng144_w >= 16.5)
+                    or ((self.last_inertia >= 0.25 or a1_q_w <= 100.0) and (rng144_w <= 12.5 or 21.5 <= rng144_w <= 22.5))
+                )
             )
             bid_age = getattr(self, "bid_age_sec", 0)
             stale_top_rollover = (
                 bid_age >= 180
                 and self.last_sp_ticks < 1.5
                 and self.last_pos3600 <= 0.15
-                and float(getattr(self, "last_pos14400", 0.5)) >= 0.50
+                and pos144_w >= 0.50
                 and getattr(self, "bid_partial_filled", 0.0) <= 0.0
             )
             staircase_ask_wall = (
                 self.last_pos3600 <= 0.05
-                and float(getattr(self, "last_pos14400", 0.5)) <= 0.05
-                and float(getattr(self, "last_rng14400", 10.0)) >= 10.0
+                and pos144_w <= 0.05
+                and rng144_w >= 10.0
                 and self.last_dd900 <= 3.5
-                and float(getattr(self, "last_a1_q", self.last_q_a1)) > 1000.0
-                and float(getattr(self, "last_b1_q", 0.0)) < 20000.0
+                and a1_q_w > 1000.0
+                and b1_q_w < 20000.0
                 and getattr(self, "bid_partial_filled", 0.0) <= 0.0
             )
-            l1_crush = (self.last_sp_ticks < 1.5 and float(getattr(self, "last_a1_q", self.last_q_a1)) > 5000.0 and float(getattr(self, "last_b1_q", 0.0)) < 800.0 and self.last_inertia < 0.0) or l1_bid_erosion or stale_top_rollover or staircase_ask_wall
-            pre_dump = ((self.last_sp_ticks < 1.5 and self.last_ez25 < -0.15 and self.last_inertia < 0.08 and getattr(self, "last_a1_q", self.last_q_a1) > 4000.0) or l1_crush) and not compressed_4h_floor
-            front_q_hold = at_b1 and ((0.0 <= self.q_ahead < 600.0) or getattr(self, "bid_partial_filled", 0.0) > 0.0) and not pre_dump and self.last_pos3600 <= 0.65 and self.last_inertia >= -0.10
-            brk_hold = (getattr(self, "last_in_breakout", False) or (at_b1 and (a1 - b1) >= 1.8 * self.tick_size and float(getattr(self, "last_b1_q", 0.0)) >= 1500.0 and self.last_inertia >= -0.05)) and not pre_dump
-            v14_hold_q = at_b1 and ((self.last_pos3600 <= 0.25 and not pre_dump and getattr(self, "last_b1_q", 0.0) >= 5000.0) or compressed_4h_floor or front_q_hold or brk_hold)
+            l1_crush = (self.last_sp_ticks < 1.5 and a1_q_w > 5000.0 and b1_q_w < 800.0 and self.last_inertia < 0.0) or l1_bid_erosion or stale_top_rollover or staircase_ask_wall
+            pre_dump = ((self.last_sp_ticks < 1.5 and self.last_ez25 < -0.15 and self.last_inertia < 0.08 and a1_q_w > 4000.0) or l1_crush) and not compressed_4h_floor
+            front_q_hold = (
+                (
+                    at_b1
+                    and not pre_dump
+                    and (
+                        (((0.0 <= self.q_ahead < 600.0) or getattr(self, "bid_partial_filled", 0.0) > 0.0) and self.last_pos3600 <= 0.65 and self.last_inertia >= -0.10)
+                        or (0.0 <= self.q_ahead < 50.0 and (b1_q_w >= 1200.0 or b2_q_w >= 1700.0) and a1_q_w <= 1250.0 and ((self.last_pos3600 <= 0.55 and pos144_w >= 0.80) or (pos144_w <= 0.20 and (rng144_w <= 12.5 or 14.5 <= rng144_w <= 16.5 or 21.5 <= rng144_w <= 22.5))) and self.last_dd900 <= 2.0)
+                        or (abs(self.active_bid_p - b1) <= tol and 0.0 <= self.q_ahead < 950.0 and self.last_sp_ticks < 1.5 and a1_q_w <= 30.0 and self.last_pos3600 <= 0.05 and pos144_w <= 0.15 and self.last_dd300 >= 1.0 and self.last_dd900 >= 2.0 and self.last_imb5 >= 0.17 and (rng144_w <= 9.0 or (15.5 <= rng144_w <= 16.5 and pos144_w <= 0.02 and self.last_dd900 == 3.0)))
+                        or (abs(self.active_bid_p - b1) <= tol and (a1 - b1) >= 1.8 * self.tick_size and b1_q_w >= 3000.0 and a1_q_w <= 3600.0 and 0.65 <= self.last_pos3600 <= 0.75 and pos144_w <= 0.25 and self.last_dd900 == 1.0 and 21.5 <= rng144_w <= 22.5)
+                        or dust_b1_flicker
+                    )
+                )
+                or (
+                    abs(self.active_bid_p - (b1 - self.tick_size)) <= tol
+                    and 0.0 <= self.q_ahead < 10.0
+                    and self.last_pos3600 <= 0.50
+                    and pos144_w <= 0.20
+                    and 21.5 <= rng144_w <= 22.5
+                    and not pre_dump
+                )
+            )
+            brk_hold = (getattr(self, "last_in_breakout", False) or (at_b1 and (a1 - b1) >= 1.8 * self.tick_size and b1_q_w >= 1500.0 and self.last_inertia >= -0.05)) and not pre_dump
+            v14_hold_q = (at_b1 or front_q_hold) and ((self.last_pos3600 <= 0.25 and not pre_dump and b1_q_w >= 5000.0) or compressed_4h_floor or front_q_hold or brk_hold)
             if self.active_bid_p > b1 + tol and self.last_vel10 <= -1.0 and ((self.last_hold_edge < 0.0 and getattr(self, "last_a1_q", self.last_q_a1) > 500.0) or (self.last_ez25 < 0.0 and self.last_ez12 < 0.10)):
                 act = 5
             elif v14_hold_q:
@@ -1224,12 +1265,17 @@ class LiveTriadRLTrader:
         if act in (1, 2) and self.pos_qty <= 1e-4:
             a1_q_cur = float(getattr(self, "last_a1_q", self.last_q_a1))
             b1_q_cur = float(getattr(self, "last_b1_q", 0.0))
-            step_in_l5_ok = (self.last_imb5 >= 0.0 or b1_q_cur >= 8500.0 or self.last_ez12 >= 0.90)
+            step_in_l5_ok = (
+                self.last_imb5 >= 0.0
+                or b1_q_cur >= 8500.0
+                or self.last_ez12 >= 0.90
+                or (23.5 <= rng144_w <= 25.5 and self.last_dd900 == 1.0 and self.last_imb5 >= -0.10)
+                or (18.5 <= rng144_w <= 19.5 and self.last_dd900 >= 11.0 and self.last_pos3600 <= 0.05)
+            )
             step_in = (
                 (a1 - b1) >= 1.8 * self.tick_size
-                and a1_q_cur <= 5000.0
                 and step_in_l5_ok
-                and (self.last_inertia >= 0.35 or wide_scalp_ok)
+                and ((a1_q_cur <= 5000.0 and self.last_inertia >= 0.35) or wide_scalp_ok)
             )
             target_p = round(((b1 + self.tick_size if step_in else b1) if act == 1 else max(self.tick_size, b1 - self.tick_size)) / self.tick_size) * self.tick_size
             if self.active_bid_id is not None and abs(self.active_bid_p - target_p) <= tol:

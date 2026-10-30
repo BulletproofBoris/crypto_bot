@@ -738,11 +738,34 @@ class SafeTradeL2ExecutionEnv:
         wide_scalp_ok = bool(
             getattr(self, "enable_unfreeze", True)
             and (a1 - b1) >= 1.8 * self.tick_size
-            and float(self.bid_q[t, 0]) >= 2500.0
-            and float(self.ask_q[t, 0]) <= 2500.0
-            and pos3600 <= 0.75
-            and inertia >= 0.05
-            and (inertia >= 0.20 or float(self.imb_l5[t]) >= 0.50 or ez25 > -0.25)
+            and (
+                (
+                    float(self.bid_q[t, 0]) >= 2500.0
+                    and float(self.ask_q[t, 0]) <= 2500.0
+                    and pos3600 <= 0.75
+                    and inertia >= 0.05
+                    and (inertia >= 0.20 or float(self.imb_l5[t]) >= 0.50 or ez25 > -0.25)
+                )
+                or (
+                    float(self.bid_q[t, 0]) >= 18000.0
+                    and float(self.ask_q[t, 0]) <= 7500.0
+                    and pos3600 <= 0.50
+                    and float(self.rng_14400[t]) <= 9.0
+                    and float(self.X_market[t, 6]) >= 0.80
+                    and ez25 >= 0.65
+                    and inertia >= 0.75
+                    and float(self.imb_l5[t]) >= 0.65
+                )
+                or (
+                    float(self.bid_q[t, 0]) >= 1700.0
+                    and float(self.ask_q[t, 0]) <= 1250.0
+                    and 0.45 <= pos3600 <= 0.55
+                    and float(self.pos_14400[t]) <= 0.10
+                    and float(self.dd_900[t]) == 1.0
+                    and float(self.X_market[t, 0]) >= 0.20
+                    and float(self.imb_l5[t]) >= 0.55
+                )
+            )
             and not (float(self.X_market[t, 0]) < 0.15 and float(self.X_market[t, 6]) <= 0.0 and ez25 <= 0.0)
             and not (pos3600 <= 0.05 and float(self.X_market[t, 6]) <= 0.0 and ez25 <= 0.0 and not (float(self.bid_q[t, 0]) >= 9000.0 and float(self.imb_l5[t]) >= 0.60 and float(self.X_market[t, 0]) >= 0.15))
             and not (pos3600 <= 0.05 and float(self.pos_14400[t]) <= 0.05 and float(self.rng_14400[t]) >= 10.0 and float(self.dd_900[t]) <= 3.5 and float(self.ask_q[t, 0]) > 1000.0 and float(self.bid_q[t, 0]) < 20000.0)
@@ -755,14 +778,28 @@ class SafeTradeL2ExecutionEnv:
         if not self.legacy_v2 and self.pos_qty <= 1e-8 and self.order_side is None and action == 0 and (brk_now or wide_scalp_ok) and t >= self.cooldown_until:
             action = 1 if (self.can_buy_best_arr[t] or wide_scalp_ok) else 2
         if not self.legacy_v2 and self.pos_qty <= 1e-8 and self.order_side == "BUY":
-            at_b1 = (self.order_price >= b1 - tol) and (self.order_price <= b1 + self.tick_size + tol)
-            compressed_4h_floor = (4.8 <= self.rng_14400[t] <= 5.5 and self.pos_14400[t] <= 0.05 and self.dd_900[t] <= 1.0)
+            dust_b1_flicker = (
+                abs(self.order_price - (b1 - self.tick_size)) <= tol
+                and float(self.bid_q[t, 1]) >= 11000.0
+                and float(self.rng_14400[t]) <= 6.0
+                and float(self.pos_14400[t]) <= 0.20
+            )
+            at_b1 = ((self.order_price >= b1 - tol) and (self.order_price <= b1 + self.tick_size + tol)) or dust_b1_flicker
+            compressed_4h_floor = (
+                (4.8 <= self.rng_14400[t] <= 5.5 and self.pos_14400[t] <= 0.05 and self.dd_900[t] <= 1.0)
+                or (pos3600 <= 0.05 and float(self.pos_14400[t]) <= 0.05 and float(self.rng_14400[t]) <= 9.0 and float(self.bid_q[t, 0]) >= 12000.0 and float(self.bid_q[t, 0]) >= 1.8 * float(self.ask_q[t, 0]) and float(self.imb_l5[t]) >= 0.65)
+                or dust_b1_flicker
+            )
             l1_bid_erosion = (
                 getattr(self, "enable_unfreeze", True)
                 and sp < 1.5
                 and float(self.dq_bid_5s[t]) <= -1000.0
                 and float(self.bid_q[t, 0]) < 1800.0
                 and float(self.buy_vol_10s[t]) < 100.0
+                and not (
+                    (float(self.ask_q[t, 0]) <= 10.0 and inertia >= 0.15 and float(self.rng_14400[t]) >= 16.5)
+                    or ((inertia >= 0.25 or float(self.ask_q[t, 0]) <= 100.0) and (float(self.rng_14400[t]) <= 12.5 or 21.5 <= float(self.rng_14400[t]) <= 22.5))
+                )
             )
             stale_top_rollover = (
                 getattr(self, "enable_unfreeze", True)
@@ -782,9 +819,29 @@ class SafeTradeL2ExecutionEnv:
             )
             l1_crush = (sp < 1.5 and float(self.ask_q[t, 0]) > 5000.0 and float(self.bid_q[t, 0]) < 800.0 and inertia < 0.0) or l1_bid_erosion or stale_top_rollover or staircase_ask_wall
             pre_dump = ((sp < 1.5 and ez25 < -0.15 and inertia < 0.08 and self.ask_q[t, 0] > 4000.0) or l1_crush) and not compressed_4h_floor
-            front_q_hold = at_b1 and (self.q_ahead < 600.0) and not pre_dump and pos3600 <= 0.65 and inertia >= -0.10
+            front_q_hold = (
+                (
+                    at_b1
+                    and not pre_dump
+                    and (
+                        (self.q_ahead < 600.0 and pos3600 <= 0.65 and inertia >= -0.10)
+                        or (self.q_ahead < 50.0 and (float(self.bid_q[t, 0]) >= 1200.0 or float(self.bid_q[t, 1]) >= 1700.0) and float(self.ask_q[t, 0]) <= 1250.0 and ((pos3600 <= 0.55 and float(self.pos_14400[t]) >= 0.80) or (float(self.pos_14400[t]) <= 0.20 and (float(self.rng_14400[t]) <= 12.5 or 14.5 <= float(self.rng_14400[t]) <= 16.5 or 21.5 <= float(self.rng_14400[t]) <= 22.5))) and float(self.dd_900[t]) <= 2.0)
+                        or (abs(self.order_price - b1) <= tol and self.q_ahead < 950.0 and sp < 1.5 and float(self.ask_q[t, 0]) <= 30.0 and pos3600 <= 0.05 and float(self.pos_14400[t]) <= 0.15 and float(self.dd_300[t]) >= 1.0 and float(self.dd_900[t]) >= 2.0 and float(self.imb_l5[t]) >= 0.17 and (float(self.rng_14400[t]) <= 9.0 or (15.5 <= float(self.rng_14400[t]) <= 16.5 and float(self.pos_14400[t]) <= 0.02 and float(self.dd_900[t]) == 3.0)))
+                        or (abs(self.order_price - b1) <= tol and (a1 - b1) >= 1.8 * self.tick_size and float(self.bid_q[t, 0]) >= 3000.0 and float(self.ask_q[t, 0]) <= 3600.0 and 0.65 <= pos3600 <= 0.75 and float(self.pos_14400[t]) <= 0.25 and float(self.dd_900[t]) == 1.0 and 21.5 <= float(self.rng_14400[t]) <= 22.5)
+                        or dust_b1_flicker
+                    )
+                )
+                or (
+                    abs(self.order_price - (b1 - self.tick_size)) <= tol
+                    and self.q_ahead < 10.0
+                    and pos3600 <= 0.50
+                    and float(self.pos_14400[t]) <= 0.20
+                    and 21.5 <= float(self.rng_14400[t]) <= 22.5
+                    and not pre_dump
+                )
+            )
             brk_hold = (brk_now or (at_b1 and (a1 - b1) >= 1.8 * self.tick_size and float(self.bid_q[t, 0]) >= 1500.0 and inertia >= -0.05)) and not pre_dump
-            v14_hold_q = at_b1 and ((pos3600 <= 0.25 and not pre_dump and self.bid_q[t, 0] >= 5000.0) or compressed_4h_floor or front_q_hold or brk_hold)
+            v14_hold_q = (at_b1 or front_q_hold) and ((pos3600 <= 0.25 and not pre_dump and self.bid_q[t, 0] >= 5000.0) or compressed_4h_floor or front_q_hold or brk_hold)
             bid_age = t - self.bid_placed_t
             if self.order_price > b1 + tol and self.vel_b1_10[t] <= -1.0 and ((hold_edge < 0.0 and self.ask_q[t, 0] > 500.0) or (ez25 < 0.0 and float(self.X_market[t, 6]) < 0.10)):
                 action = 5
@@ -954,12 +1011,14 @@ class SafeTradeL2ExecutionEnv:
                 float(self.imb_l5[t]) >= 0.0
                 or float(self.bid_q[t, 0]) >= 8500.0
                 or float(self.X_market[t, 6]) >= 0.90
+                or (23.5 <= float(self.rng_14400[t]) <= 25.5 and float(self.dd_900[t]) == 1.0 and float(self.imb_l5[t]) >= -0.10)
+                or (18.5 <= float(self.rng_14400[t]) <= 19.5 and float(self.dd_900[t]) >= 11.0 and pos3600 <= 0.05)
             )
             step_in = (
                 (a1 - b1) >= 1.8 * self.tick_size
                 and (
                     self.legacy_v2
-                    or (float(self.ask_q[t, 0]) <= 5000.0 and step_in_l5_ok and (inertia >= 0.35 or wide_scalp_ok))
+                    or (step_in_l5_ok and ((float(self.ask_q[t, 0]) <= 5000.0 and inertia >= 0.35) or wide_scalp_ok))
                 )
             )
             target_p = (b1 + self.tick_size if step_in else b1) if action == 1 else max(self.tick_size, b1 - self.tick_size)
