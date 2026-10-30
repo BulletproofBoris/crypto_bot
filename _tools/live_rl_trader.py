@@ -481,6 +481,7 @@ class LiveTriadRLTrader:
                         self.hold_sec = 0
                         self.peak_bid = max(px, b1 if b1 > 0 else px)
                         self.ez25_entry = self.last_ez25
+                        self.ez12_entry = self.last_ez12
                         self.split_done_for_pos = False
                         self.car_state = 0
                     self.q_ahead = 0.0
@@ -946,12 +947,13 @@ class LiveTriadRLTrader:
         self.last_ez5 = ez_5
         self.last_vel180 = vel_180
         safe_macro_4h = (rng_14400 < 6.0) or (pos_14400 <= 0.72)
-        waterfall_trap = (dd_900 >= 8.0) and (pos_14400 >= 0.45) and (ez_25 < 0.0)
+        waterfall_trap = ((dd_900 >= 8.0) and (pos_14400 >= 0.45) and (ez_25 < 0.0)) or ((dd_900 >= 10.0) and (b1_q < 2500.0) and (a1_q > 800.0) and (ez_12 < 0.0))
         staircase_bleed = (
             ((pos_3600 <= 0.05) and (pos_14400 <= 0.05) and (vel_180 <= -2.0) and (ez_25 < 0.0))
             or ((pos_3600 <= 0.05) and (pos_14400 <= 0.05) and (rng_14400 >= 10.0) and (dd_900 <= 3.5) and (a1_q > 1000.0) and (b1_q < 20000.0))
             or ((ez_5 < 0.15) and (ez_12 <= 0.0) and (ez_25 <= 0.0))
             or ((pos_3600 <= 0.05) and (ez_12 <= 0.0) and (ez_25 <= 0.0) and not ((b1_q >= 9000.0) and (imb_l5 >= 0.60) and (ez_5 >= 0.15)))
+            or ((rng_14400 >= 22.0) and (ez_12 <= 0.05) and (ez_25 <= 0.02) and (a1_q > 400.0))
         )
         top_rollover = (spread_ticks < 1.5) and (rng_14400 >= 16.0) and (pos_14400 >= 0.50) and (pos_3600 <= 0.15) and (dd_300 <= 1.0)
         self.last_waterfall_trap = waterfall_trap
@@ -1045,6 +1047,8 @@ class LiveTriadRLTrader:
             )
         )
         if self.avg_entry > 0 and b1_cur < self.avg_entry - self.tick_size * 0.25 and not step_in_supported:
+            return 0.0
+        if float(getattr(self, "last_pos14400", 0.5)) <= 0.15 and float(getattr(self, "ez12_entry", 0.0)) < -0.25 and float(getattr(self, "ez25_entry", 0.0)) < -0.25:
             return 0.0
         if (
             vel10 >= 1.0
@@ -1153,6 +1157,8 @@ class LiveTriadRLTrader:
             and not (self.last_pos3600 <= 0.05 and float(getattr(self, "last_pos14400", 0.5)) <= 0.05 and float(getattr(self, "last_rng14400", 10.0)) >= 10.0 and self.last_dd900 <= 3.5 and float(getattr(self, "last_a1_q", self.last_q_a1)) > 1000.0 and float(getattr(self, "last_b1_q", 0.0)) < 20000.0)
             and not (self.last_pos3600 <= 0.05 and float(getattr(self, "last_pos14400", 0.5)) <= 0.05 and float(getattr(self, "last_vel180", 0.0)) <= -2.0 and self.last_ez25 < 0.0)
             and not (self.last_dd900 >= 8.0 and float(getattr(self, "last_pos14400", 0.5)) >= 0.45 and self.last_ez25 < 0.0)
+            and not (self.last_dd900 >= 10.0 and float(getattr(self, "last_b1_q", 0.0)) < 2500.0 and float(getattr(self, "last_a1_q", self.last_q_a1)) > 800.0 and self.last_ez12 < 0.0)
+            and not (float(getattr(self, "last_rng14400", 10.0)) >= 22.0 and self.last_ez12 <= 0.05 and self.last_ez25 <= 0.02 and float(getattr(self, "last_a1_q", self.last_q_a1)) > 400.0)
             and self.last_vel10 >= -0.5
         )
         if self.pos_qty <= 1e-4 and self.active_bid_id is None and act == 0 and wide_scalp_ok and not in_cooldown:
@@ -1188,7 +1194,7 @@ class LiveTriadRLTrader:
             front_q_hold = at_b1 and ((0.0 <= self.q_ahead < 600.0) or getattr(self, "bid_partial_filled", 0.0) > 0.0) and not pre_dump and self.last_pos3600 <= 0.65 and self.last_inertia >= -0.10
             brk_hold = (getattr(self, "last_in_breakout", False) or (at_b1 and (a1 - b1) >= 1.8 * self.tick_size and float(getattr(self, "last_b1_q", 0.0)) >= 1500.0 and self.last_inertia >= -0.05)) and not pre_dump
             v14_hold_q = at_b1 and ((self.last_pos3600 <= 0.25 and not pre_dump and getattr(self, "last_b1_q", 0.0) >= 5000.0) or compressed_4h_floor or front_q_hold or brk_hold)
-            if self.active_bid_p > b1 + tol and self.last_vel10 <= -1.0 and self.last_hold_edge < 0.0 and getattr(self, "last_a1_q", self.last_q_a1) > 500.0:
+            if self.active_bid_p > b1 + tol and self.last_vel10 <= -1.0 and ((self.last_hold_edge < 0.0 and getattr(self, "last_a1_q", self.last_q_a1) > 500.0) or (self.last_ez25 < 0.0 and self.last_ez12 < 0.10)):
                 act = 5
             elif v14_hold_q:
                 if act == 5:
@@ -1264,7 +1270,8 @@ class LiveTriadRLTrader:
                 and float(getattr(self, "last_a1_q", self.last_q_a1)) <= 250.0
                 and self.last_dd900 >= 4.0
             )
-            unfreeze_mode = ((self.avg_entry - b1) / self.tick_size >= 3.0 and self.hold_sec >= 300) or early_wide_unfreeze
+            unfreeze_min_sec = 900 if (float(getattr(self, "last_rng14400", 10.0)) >= 25.0 and float(getattr(self, "last_pos14400", 0.5)) <= 0.25) else 300
+            unfreeze_mode = ((self.avg_entry - b1) / self.tick_size >= 3.0 and self.hold_sec >= unfreeze_min_sec) or early_wide_unfreeze
             if getattr(self, "user_manual_ask", False) and self.active_ask_id is not None and act != 6 and not unfreeze_mode:
                 return
             floor_p = round((self.avg_entry + self.tick_size) / self.tick_size) * self.tick_size

@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-10-29 16:08:16",
+  "updated_at": "2026-10-30 10:05:47",
   "regimes": [
     {
       "id": "R1_PUMP_BREAKOUT",
@@ -19,7 +19,7 @@
       "n_trades": 13,
       "max_freeze_min": 7.8,
       "max_dd_usd": 1.0197,
-      "requotes": 104
+      "requotes": 103
     },
     {
       "id": "R3_WIDE_SPREAD_SCALP",
@@ -59,7 +59,7 @@
       "n_trades": 12,
       "max_freeze_min": 11.1,
       "max_dd_usd": 1.3589,
-      "requotes": 87
+      "requotes": 88
     },
     {
       "id": "R7_WHIPSAW_SWING",
@@ -80,6 +80,26 @@
       "max_freeze_min": 21.9,
       "max_dd_usd": 0.4848,
       "requotes": 70
+    },
+    {
+      "id": "R9_WHIPSAW_OCT30",
+      "title": "🌪️ Ночной распил (30 окт)",
+      "net_pnl_usd": 3.778,
+      "net_pnl_pct": 7.56,
+      "n_trades": 12,
+      "max_freeze_min": 14.5,
+      "max_dd_usd": 1.5432,
+      "requotes": 117
+    },
+    {
+      "id": "R10_RECOV_OCT30",
+      "title": "🌅 Свежий рынок + выход из -6т (30 окт)",
+      "net_pnl_usd": 5.3329,
+      "net_pnl_pct": 10.67,
+      "n_trades": 11,
+      "max_freeze_min": 22.4,
+      "max_dd_usd": 0.7036,
+      "requotes": 71
     }
   ],
   "prev_frozen": [
@@ -162,6 +182,26 @@
       "max_freeze_min": 121.7,
       "max_dd_usd": 1.9133,
       "requotes": 29
+    },
+    {
+      "id": "R9_WHIPSAW_OCT30",
+      "title": "🌪️ Ночной распил (30 окт)",
+      "net_pnl_usd": 0.0398,
+      "net_pnl_pct": 0.08,
+      "n_trades": 8,
+      "max_freeze_min": 75.9,
+      "max_dd_usd": 2.3769,
+      "requotes": 72
+    },
+    {
+      "id": "R10_RECOV_OCT30",
+      "title": "🌅 Свежий рынок + выход из -6т (30 окт)",
+      "net_pnl_usd": 4.9044,
+      "net_pnl_pct": 9.81,
+      "n_trades": 12,
+      "max_freeze_min": 22.4,
+      "max_dd_usd": 0.7036,
+      "requotes": 69
     }
   ]
 }

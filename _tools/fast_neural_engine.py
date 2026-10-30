@@ -212,6 +212,7 @@ class FastKerasModel:
         и 1x1 проекцию (299 -> 32/64) один раз на 2D-последовательности до скользящего окна.
         """
         n_rows = len(x_2d_np)
+        torch.set_num_threads(SAFE_WORKERS if n_rows > 128 else 1)
         sl = int(seq_len)
         x_pad = np.vstack([np.repeat(x_2d_np[:1], sl - 1, axis=0), x_2d_np])
         xt_pad = torch.as_tensor(x_pad, dtype=torch.float32)

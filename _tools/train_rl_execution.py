@@ -101,14 +101,15 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
     if prev_cache_path.exists() and not force_rebuild:
         try:
             prev_c = np.load(prev_cache_path, allow_pickle=True)
-            prev_ts = prev_c["ts"].astype(str)
+            prev_ts_i8 = pd.DatetimeIndex(pd.to_datetime(prev_c["ts"], utc=True)).asi8
+            cur_ts_i8 = pd.DatetimeIndex(pd.to_datetime(df["timestamp"], utc=True)).asi8
             prev_triad = prev_c["X_market"][:, :18].astype(np.float32)
-            ts_to_idx = {s: i for i, s in enumerate(prev_ts)}
-            matched_idx = np.array([ts_to_idx.get(s, -1) for s in ts_str_all], dtype=np.int64)
+            ts_to_idx = {int(s): i for i, s in enumerate(prev_ts_i8)}
+            matched_idx = np.array([ts_to_idx.get(int(s), -1) for s in cur_ts_i8], dtype=np.int64)
             valid_mask = matched_idx >= 0
             if np.any(valid_mask):
                 last_match_pos = int(np.where(valid_mask)[0][-1])
-                if last_match_pos >= len(df) - 120000 and np.all(valid_mask[:last_match_pos + 1]):
+                if last_match_pos >= len(df) - 300000 and np.all(valid_mask[:last_match_pos + 1]):
                     n_tail = len(df) - (last_match_pos + 1)
                     print(f"⚡ Инкрементальное обновление кэша: переиспользуем {last_match_pos + 1:,} сек из {prev_cache_path.name}, досчитываем хвост {n_tail:,} сек ({n_tail/3600:.2f} ч)...")
                     X_triad_head = prev_triad[matched_idx[:last_match_pos + 1]]
@@ -370,12 +371,16 @@ class SafeTradeL2ExecutionEnv:
             # Освобождаем PPO от жестких эвристик: разрешаем входы по сигналам нейросетевого роя,
             # отсекая только физически опасные зоны (покупка на хаях часа pos_3600 > 0.80, вершине 4ч пампа pos_14400 > 0.72 или в отвесном обвале)
             safe_macro_4h = (self.rng_14400 < 6.0) | (self.pos_14400 <= 0.72)
-            waterfall_trap_vec = getattr(self, "enable_unfreeze", True) & (self.dd_900 >= 8.0) & (self.pos_14400 >= 0.45) & (ez25 < 0.0)
+            waterfall_trap_vec = getattr(self, "enable_unfreeze", True) & (
+                ((self.dd_900 >= 8.0) & (self.pos_14400 >= 0.45) & (ez25 < 0.0))
+                | ((self.dd_900 >= 10.0) & (self.bid_q[:, 0] < 2500.0) & (self.ask_q[:, 0] > 800.0) & (ez12 < 0.0))
+            )
             staircase_bleed_vec = getattr(self, "enable_unfreeze", True) & (
                 ((self.pos_3600 <= 0.05) & (self.pos_14400 <= 0.05) & (self.vel_b1_180 <= -2.0) & (ez25 < 0.0))
                 | ((self.pos_3600 <= 0.05) & (self.pos_14400 <= 0.05) & (self.rng_14400 >= 10.0) & (self.dd_900 <= 3.5) & (self.ask_q[:, 0] > 1000.0) & (self.bid_q[:, 0] < 20000.0))
                 | ((ez5 < 0.15) & (ez12 <= 0.0) & (ez25 <= 0.0))
                 | ((self.pos_3600 <= 0.05) & (ez12 <= 0.0) & (ez25 <= 0.0) & ~((self.bid_q[:, 0] >= 9000.0) & (imb5 >= 0.60) & (ez5 >= 0.15)))
+                | ((self.rng_14400 >= 22.0) & (ez12 <= 0.05) & (ez25 <= 0.02) & (self.ask_q[:, 0] > 400.0))
             )
             top_rollover_vec = getattr(self, "enable_unfreeze", True) & (spread_ticks < 1.5) & (self.rng_14400 >= 16.0) & (self.pos_14400 >= 0.50) & (self.pos_3600 <= 0.15) & (self.dd_300 <= 1.0)
             self.waterfall_trap_arr = waterfall_trap_vec
@@ -604,6 +609,9 @@ class SafeTradeL2ExecutionEnv:
         )
         if b1 < self.avg_entry - self.tick_size * 0.25 and not step_in_supported:
             return 0.0
+        et_prev = max(0, self.entry_t - 1)
+        if getattr(self, "enable_unfreeze", True) and float(self.pos_14400[t]) <= 0.15 and min(float(self.X_market[self.entry_t, 6]), float(self.X_market[et_prev, 6])) < -0.25 and min(float(self.X_market[self.entry_t, 12]), float(self.X_market[et_prev, 12])) < -0.25:
+            return 0.0
         if (
             vel10 >= 1.0
             or bool(self.in_breakout_zone[t])
@@ -739,6 +747,8 @@ class SafeTradeL2ExecutionEnv:
             and not (pos3600 <= 0.05 and float(self.pos_14400[t]) <= 0.05 and float(self.rng_14400[t]) >= 10.0 and float(self.dd_900[t]) <= 3.5 and float(self.ask_q[t, 0]) > 1000.0 and float(self.bid_q[t, 0]) < 20000.0)
             and not (pos3600 <= 0.05 and float(self.pos_14400[t]) <= 0.05 and float(self.vel_b1_180[t]) <= -2.0 and ez25 < 0.0)
             and not (float(self.dd_900[t]) >= 8.0 and float(self.pos_14400[t]) >= 0.45 and ez25 < 0.0)
+            and not (float(self.dd_900[t]) >= 10.0 and float(self.bid_q[t, 0]) < 2500.0 and float(self.ask_q[t, 0]) > 800.0 and float(self.X_market[t, 6]) < 0.0)
+            and not (float(self.rng_14400[t]) >= 22.0 and float(self.X_market[t, 6]) <= 0.05 and ez25 <= 0.02 and float(self.ask_q[t, 0]) > 400.0)
             and float(self.vel_b1_10[t]) >= -0.5
         )
         if not self.legacy_v2 and self.pos_qty <= 1e-8 and self.order_side is None and action == 0 and (brk_now or wide_scalp_ok) and t >= self.cooldown_until:
@@ -775,7 +785,7 @@ class SafeTradeL2ExecutionEnv:
             brk_hold = (brk_now or (at_b1 and (a1 - b1) >= 1.8 * self.tick_size and float(self.bid_q[t, 0]) >= 1500.0 and inertia >= -0.05)) and not pre_dump
             v14_hold_q = at_b1 and ((pos3600 <= 0.25 and not pre_dump and self.bid_q[t, 0] >= 5000.0) or compressed_4h_floor or front_q_hold or brk_hold)
             bid_age = t - self.bid_placed_t
-            if self.order_price > b1 + tol and self.vel_b1_10[t] <= -1.0 and hold_edge < 0.0 and self.ask_q[t, 0] > 500.0:
+            if self.order_price > b1 + tol and self.vel_b1_10[t] <= -1.0 and ((hold_edge < 0.0 and self.ask_q[t, 0] > 500.0) or (ez25 < 0.0 and float(self.X_market[t, 6]) < 0.10)):
                 action = 5
             elif v14_hold_q:
                 if action == 5:
@@ -804,8 +814,9 @@ class SafeTradeL2ExecutionEnv:
                 and float(self.ask_q[t, 0]) <= 250.0
                 and float(self.dd_900[t]) >= 4.0
             )
+            unfreeze_min_sec = 900 if (float(self.rng_14400[t]) >= 25.0 and float(self.pos_14400[t]) <= 0.25) else 300
             unfreeze_mode = getattr(self, "enable_unfreeze", True) and (
-                ((self.avg_entry - b1) / self.tick_size >= 3.0 and (t - self.entry_t) >= 300)
+                ((self.avg_entry - b1) / self.tick_size >= 3.0 and (t - self.entry_t) >= unfreeze_min_sec)
                 or early_wide_unfreeze
             )
             wave_hold_ok = b1 >= self.avg_entry - tol or (
