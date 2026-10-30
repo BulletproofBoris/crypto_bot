@@ -267,7 +267,8 @@ class LiveTriadRLTrader:
         from _tools.swarm_router import SwarmRegimeRouter
         from _tools.train_rl_execution import MaskableActorCritic
         print(f"🧠 Инициализация боевого ядра LiveTriadRLTrader ({self.coin.upper()}, режим={self.mode.upper()}, бюджет=${self.initial_budget_usd:.2f})...")
-        self._triad_pool = ThreadPoolExecutor(max_workers=3)
+        self._triad_pool = ThreadPoolExecutor(max_workers=4)
+        self._io_pool = ThreadPoolExecutor(max_workers=3)
         self.routers = [
             (5, 3.0, SwarmRegimeRouter(self.coin, 5, 3.0, temperature=0.5, use_neural=use_neural, neural_weight=0.15)),
             (12, 3.5, SwarmRegimeRouter(self.coin, 12, 3.5, temperature=0.5, use_neural=use_neural, neural_weight=0.15)),
@@ -440,27 +441,69 @@ class LiveTriadRLTrader:
             self.car_state = 2 if (self.active_bid_id is not None or self.bot_cash_usd >= 3.5) else 0
         elif getattr(self, "car_state", 0) == 2 and self.active_bid_id is None and self.bot_cash_usd < 3.5:
             self.car_state = 0
+        oid_map = {}
+        active_oids = [oid for oid in (self.active_bid_id, self.active_ask_id, self.slot2_ask_id) if oid is not None]
+        if len(active_oids) > 1 and hasattr(self, "_io_pool"):
+            def _fetch_one(oid):
+                try:
+                    return oid, self.client.get_order(oid)
+                except Exception as e:
+                    return oid, e
+            for k_id, v_res in self._io_pool.map(_fetch_one, active_oids):
+                oid_map[k_id] = v_res
         if self.active_bid_id is not None:
             if count_hold:
                 self.bid_age_sec = getattr(self, "bid_age_sec", 0) + 1
             try:
-                o = self.client.get_order(self.active_bid_id)
+                o = oid_map.get(self.active_bid_id)
+                if isinstance(o, Exception):
+                    raise o
+                if o is None:
+                    o = self.client.get_order(self.active_bid_id)
                 filled = float(o.get("filled_amount", 0.0))
                 st = o.get("state", "")
+                prev_acc = float(getattr(self, "bid_accounted_filled", 0.0))
                 self.bid_partial_filled = filled if st == "wait" else 0.0
-                if filled > 0 and st in ("done", "cancel"):
+                if st == "wait" and (filled - prev_acc) >= 2.0:
+                    d_fill = filled - prev_acc
                     px = float(o.get("avg_price", 0.0)) or float(o.get("price", self.active_bid_p))
                     fee_rate = float(o.get("maker_fee", 0.001) or 0.001)
-                    cost = filled * px
-                    net_filled = math.floor(filled * (1.0 - fee_rate) * 10000.0) / 10000.0
+                    cost = d_fill * px
+                    net_d = math.floor(d_fill * (1.0 - fee_rate) * 10000.0) / 10000.0
+                    self.bot_cash_usd = max(0.0, self.bot_cash_usd - cost)
+                    self.avg_entry = (self.pos_qty * self.avg_entry + net_d * px) / max(1e-6, self.pos_qty + net_d)
+                    self.pos_qty = math.floor((self.pos_qty + net_d) * 10000.0) / 10000.0
+                    self.bid_accounted_filled = filled
+                    self.ex_coin_free = max(0.0, self.ex_coin_free + net_d)
+                    if self.active_ask_id is None and self.pos_qty >= 2.0:
+                        fl_p = round(math.ceil((self.avg_entry + 0.75 * self.tick_size) / self.tick_size - 1e-4) * self.tick_size, 2)
+                        ask_px = max(b1 + self.tick_size, fl_p) if b1 > 0 else fl_p
+                        try:
+                            ra = self.client.place_limit_order(self.market, "sell", self.pos_qty, ask_px)
+                            self.active_ask_id = ra.get("id")
+                            self.active_ask_p = float(ra.get("price", ask_px))
+                            self.active_ask_q = float(ra.get("origin_amount", self.pos_qty))
+                            self.ex_coin_free = max(0.0, self.ex_coin_free - self.active_ask_q)
+                            print(f"  ⚡ [PARTIAL BID -> INSTANT ASK] +{net_d:.4f} PRL @ ${px:.2f} сразу выставлены в Ask @ ${self.active_ask_p:.2f} (бид продолжает наливаться)")
+                        except Exception:
+                            pass
+                    self._save_wallet()
+                elif filled > 0 and st in ("done", "cancel"):
+                    rem_fill = max(0.0, filled - prev_acc)
+                    px = float(o.get("avg_price", 0.0)) or float(o.get("price", self.active_bid_p))
+                    fee_rate = float(o.get("maker_fee", 0.001) or 0.001)
+                    cost = rem_fill * px
+                    net_filled = math.floor(rem_fill * (1.0 - fee_rate) * 10000.0) / 10000.0
+                    tot_net_filled = math.floor(filled * (1.0 - fee_rate) * 10000.0) / 10000.0
                     self.bot_cash_usd = max(0.0, self.bot_cash_usd - cost)
                     if getattr(self, "car_state", 0) in (1, 2) and self.pos_qty >= 2.0:
-                        self.avg_entry = round((self.pos_qty * self.avg_entry + net_filled * px) / max(1e-6, self.pos_qty + net_filled), 4)
-                        self.pos_qty = math.floor((self.pos_qty + net_filled) * 10000.0) / 10000.0
+                        if net_filled > 0:
+                            self.avg_entry = round((self.pos_qty * self.avg_entry + net_filled * px) / max(1e-6, self.pos_qty + net_filled), 4)
+                            self.pos_qty = math.floor((self.pos_qty + net_filled) * 10000.0) / 10000.0
                         self.car_cycles = getattr(self, "car_cycles", 0) + 1
                         self.car_state = 0
                         self.split_done_for_pos = False
-                        print(f"  🎠 [CAROUSEL BUYBACK #{self.car_cycles}] +{net_filled:.4f} PRL @ ${px:.2f} (после продажи @ ${self.car_sell_px:.2f}) | Поз={self.pos_qty:.4f} PRL | Новый avg_entry=${self.avg_entry:.4f}")
+                        print(f"  🎠 [CAROUSEL BUYBACK #{self.car_cycles}] +{tot_net_filled:.4f} PRL @ ${px:.2f} (после продажи @ ${self.car_sell_px:.2f}) | Поз={self.pos_qty:.4f} PRL | Новый avg_entry=${self.avg_entry:.4f}")
                         for oid_attr in ("active_ask_id", "slot2_ask_id"):
                             oid = getattr(self, oid_attr)
                             if oid is not None:
@@ -482,8 +525,15 @@ class LiveTriadRLTrader:
                             except Exception:
                                 pass
                     else:
-                        self.avg_entry = (self.pos_qty * self.avg_entry + net_filled * px) / max(1e-6, self.pos_qty + net_filled)
-                        self.pos_qty = math.floor((self.pos_qty + net_filled) * 10000.0) / 10000.0
+                        if net_filled > 0:
+                            self.avg_entry = (self.pos_qty * self.avg_entry + net_filled * px) / max(1e-6, self.pos_qty + net_filled)
+                            self.pos_qty = math.floor((self.pos_qty + net_filled) * 10000.0) / 10000.0
+                        if self.active_ask_id is not None and self.active_ask_q < self.pos_qty - 1.0:
+                            try:
+                                self.client.cancel_order(self.active_ask_id)
+                            except Exception:
+                                pass
+                            self.active_ask_id, self.active_ask_p, self.active_ask_q = None, 0.0, 0.0
                         self.hold_sec = 0
                         self.peak_bid = max(px, b1 if b1 > 0 else px)
                         self.ez25_entry = self.last_ez25
@@ -493,21 +543,27 @@ class LiveTriadRLTrader:
                     self.q_ahead = 0.0
                     self.bid_age_sec = 0
                     self.bid_partial_filled = 0.0
+                    self.bid_accounted_filled = 0.0
                     self.active_bid_id, self.active_bid_p, self.active_bid_q = None, 0.0, 0.0
                     self.sync_account_balances(b1, from_trade_fill=True)
                     self._save_wallet()
-                    print(f"  🟢 [FILL BUY] +{net_filled:.4f} PRL (брутто {filled:.4f}) @ ${px:.2f} | Остаток кэша бота=${self.bot_cash_usd:.2f}")
+                    print(f"  🟢 [FILL BUY] +{tot_net_filled:.4f} PRL (брутто {filled:.4f}) @ ${px:.2f} | Остаток кэша бота=${self.bot_cash_usd:.2f}")
                 elif st == "cancel":
                     self.q_ahead = 0.0
                     self.bid_age_sec = 0
                     self.bid_partial_filled = 0.0
+                    self.bid_accounted_filled = 0.0
                     self.active_bid_id, self.active_bid_p, self.active_bid_q = None, 0.0, 0.0
                     self._save_wallet()
             except Exception as e:
                 print(f"  ⚠️ [SYNC BID WARN] id={self.active_bid_id}: {e}")
         if self.active_ask_id is not None:
             try:
-                o = self.client.get_order(self.active_ask_id)
+                o = oid_map.get(self.active_ask_id)
+                if isinstance(o, Exception):
+                    raise o
+                if o is None:
+                    o = self.client.get_order(self.active_ask_id)
                 filled = float(o.get("filled_amount", 0.0))
                 st = o.get("state", "")
                 if filled > 0 and st in ("done", "cancel"):
@@ -558,7 +614,11 @@ class LiveTriadRLTrader:
                 print(f"  ⚠️ [SYNC ASK WARN] id={self.active_ask_id}: {e}")
         if self.slot2_ask_id is not None:
             try:
-                o2 = self.client.get_order(self.slot2_ask_id)
+                o2 = oid_map.get(self.slot2_ask_id)
+                if isinstance(o2, Exception):
+                    raise o2
+                if o2 is None:
+                    o2 = self.client.get_order(self.slot2_ask_id)
                 filled2 = float(o2.get("filled_amount", 0.0))
                 st2 = o2.get("state", "")
                 if filled2 > 0 and st2 in ("done", "cancel"):
@@ -746,7 +806,7 @@ class LiveTriadRLTrader:
     def compute_obs_and_mask(self, X_seq_2d: np.ndarray, row_df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
         triad_vec = []
         triad_probs = []
-        for _, _, router in self.routers:
+        for h, name, router in self.routers:
             res = router.predict_live_tick(X_seq_2d, row_df)
             p = res["probs"]
             triad_probs.append(np.asarray(p, dtype=np.float32))
@@ -899,11 +959,17 @@ class LiveTriadRLTrader:
         else:
             self.last_q_a1, self.last_q_a2 = a1_q, (ask_qs_clean[1] if len(ask_qs_clean) > 1 else 0.0)
 
-        has_pos = 1.0 if self.pos_qty > 1e-8 else 0.0
+        self.micro_pos_parked = bool(
+            self.pos_qty >= 1.95
+            and self.active_ask_id is not None
+            and self.bot_cash_usd >= 25.0
+            and (self.pos_qty * b1) < 0.28 * (self.bot_cash_usd + self.pos_qty * b1)
+        )
+        has_pos = 1.0 if (self.pos_qty > 1e-8 and not self.micro_pos_parked) else 0.0
         unr_ticks = ((b1 - self.avg_entry) / self.tick_size) if has_pos else 0.0
         hold_ratio = min(self.hold_sec / 45.0, 2.0) if has_pos else 0.0
         has_bid = 1.0 if self.active_bid_q > 0 else 0.0
-        has_ask = 1.0 if self.active_ask_q > 0 else 0.0
+        has_ask = 1.0 if (self.active_ask_q > 0 and not self.micro_pos_parked) else 0.0
         tol = self.tick_size * 0.25
         if has_bid:
             q_at, q_better = 0.0, 0.0
@@ -1108,7 +1174,8 @@ class LiveTriadRLTrader:
         оценивает математическое ожидание E[PnL] и вероятность исполнения P(fill) для QUOTE_BID_1 vs QUOTE_BID_2
         перед выставлением ордера в стакан.
         """
-        if act not in (1, 2) or self.pos_qty > 1e-4:
+        can_buy_more = (self.pos_qty <= 1e-4) or bool(getattr(self, "micro_pos_parked", False))
+        if act not in (1, 2) or not can_buy_more:
             return act
         probs_list = getattr(self, "last_triad_probs", None)
         if not probs_list or len(probs_list) < 3:
@@ -1155,7 +1222,8 @@ class LiveTriadRLTrader:
             mask_t = torch.as_tensor(mask, dtype=torch.bool).unsqueeze(0)
             logits, val = self.agent(obs_t, mask_t)
             act = int(torch.argmax(logits, dim=-1).item())
-            if act == 0 and self.pos_qty <= 1e-4 and self.active_bid_id is None and getattr(self, "last_in_breakout", False):
+            can_buy_more = (self.pos_qty <= 1e-4) or bool(getattr(self, "micro_pos_parked", False))
+            if act == 0 and can_buy_more and self.active_bid_id is None and getattr(self, "last_in_breakout", False):
                 if mask[1]:
                     act = 1
                 elif mask[2]:
@@ -1168,6 +1236,7 @@ class LiveTriadRLTrader:
             return
         tol = self.tick_size * 0.25
         in_cooldown = time.time() < getattr(self, "cooldown_until_ts", 0.0)
+        can_buy_more = (self.pos_qty <= 1e-4) or bool(getattr(self, "micro_pos_parked", False))
         b1_q_w = float(getattr(self, "last_b1_q", 0.0))
         a1_q_w = float(getattr(self, "last_a1_q", self.last_q_a1))
         rng144_w = float(getattr(self, "last_rng14400", 10.0))
@@ -1192,9 +1261,9 @@ class LiveTriadRLTrader:
             and not (ez5_w < 0.10 and self.last_ez12 < 0.10 and self.last_ez25 < -0.05 and self.last_hold_edge < 0.0 and self.last_imb5 < 0.35)
             and self.last_vel10 >= -0.5
         )
-        if self.pos_qty <= 1e-4 and self.active_bid_id is None and act == 0 and wide_scalp_ok and not in_cooldown:
+        if can_buy_more and self.active_bid_id is None and act == 0 and wide_scalp_ok and not in_cooldown:
             act = 1
-        if self.pos_qty <= 1e-4 and self.active_bid_id is not None:
+        if can_buy_more and self.active_bid_id is not None:
             b2_q_w = float(getattr(self, "last_b2_q", 0.0))
             dust_b1_flicker = (
                 abs(self.active_bid_p - (b1 - self.tick_size)) <= tol
@@ -1275,7 +1344,7 @@ class LiveTriadRLTrader:
             elif pre_dump:
                 act = 5
 
-        if act in (1, 2) and self.pos_qty <= 1e-4:
+        if act in (1, 2) and can_buy_more:
             a1_q_cur = float(getattr(self, "last_a1_q", self.last_q_a1))
             b1_q_cur = float(getattr(self, "last_b1_q", 0.0))
             step_in_l5_ok = (
@@ -1294,18 +1363,38 @@ class LiveTriadRLTrader:
             if self.active_bid_id is not None and abs(self.active_bid_p - target_p) <= tol:
                 return
             if self.active_bid_id is not None:
+                had_part = float(getattr(self, "bid_partial_filled", 0.0)) > 0.0
+                old_bid_usd = self.active_bid_q * self.active_bid_p
                 try:
-                    self.client.cancel_order(self.active_bid_id)
+                    c_res = self.client.cancel_order(self.active_bid_id)
+                    if isinstance(c_res, dict) and float(c_res.get("filled_amount", 0.0)) > float(getattr(self, "bid_accounted_filled", 0.0)):
+                        had_part = True
                 except Exception as e:
                     print(f"  ⚠️ [CANCEL BUY WARN] id={self.active_bid_id}: {e}")
-                self.sync_live_orders(b1)
-                self.active_bid_id, self.active_bid_p, self.active_bid_q = None, 0.0, 0.0
+                    had_part = True
+                if had_part:
+                    self.sync_live_orders(b1)
+                    self.active_bid_id, self.active_bid_p, self.active_bid_q = None, 0.0, 0.0
+                    self.sync_account_balances(b1)
+                    can_buy_more = (self.pos_qty <= 1e-4) or (
+                        self.pos_qty >= 1.95
+                        and self.active_ask_id is not None
+                        and self.bot_cash_usd >= 25.0
+                        and (self.pos_qty * b1) < 0.28 * (self.bot_cash_usd + self.pos_qty * b1)
+                    )
+                    if not can_buy_more:
+                        return
+                else:
+                    self.ex_usdt_free = max(self.ex_usdt_free, min(self.bot_cash_usd, self.ex_usdt_free + old_bid_usd))
+                    self.active_bid_id, self.active_bid_p, self.active_bid_q = None, 0.0, 0.0
+                    self.q_ahead = 0.0
+                    self.bid_age_sec = 0
+                    self.bid_partial_filled = 0.0
+                    self.bid_accounted_filled = 0.0
+            elif self.ex_usdt_free < self.bot_cash_usd * 0.90:
                 self.sync_account_balances(b1)
-                if self.pos_qty > 1e-4:
-                    return
-            self.sync_account_balances(b1)
             max_cap = self.ex_usdt_free if (self.reserved_account_usdt <= 1e-4 and self.user_reserved_coin <= 1e-4) else self.order_usd
-            usable_usd = min(max_cap, self.bot_cash_usd * 0.998, self.ex_usdt_free * 0.998)
+            usable_usd = min(max_cap, self.bot_cash_usd * 0.998, max(self.ex_usdt_free, self.bot_cash_usd if self.active_bid_id is None else 0.0) * 0.998)
             if target_p > b1 + tol and usable_usd > 110.0 and not getattr(self, "last_in_breakout", False) and (self.last_ez25 < 0.20 or a1_q_cur > 1200.0):
                 usable_usd = max(110.0, usable_usd * 0.72)
             qty = math.floor((usable_usd / max(target_p, self.tick_size)) * 10000.0) / 10000.0
@@ -1317,24 +1406,38 @@ class LiveTriadRLTrader:
                 self.active_bid_p = float(res.get("price", target_p))
                 self.active_bid_q = float(res.get("origin_amount", qty))
                 self.active_bid_act = int(act)
+                self.ex_usdt_free = max(0.0, self.ex_usdt_free - self.active_bid_q * self.active_bid_p)
                 self.q_ahead = -1.0
                 self.bid_age_sec = 0
                 self.bid_partial_filled = 0.0
+                self.bid_accounted_filled = 0.0
                 self._save_wallet()
                 print(f"  📥 [LIVE ORDER BUY] id={self.active_bid_id} | {self.active_bid_q:.4f} PRL @ ${self.active_bid_p:.2f} (${self.active_bid_q*self.active_bid_p:.2f})")
             except Exception as e:
                 print(f"  ⚠️ [ORDER BUY ERROR] qty={qty:.4f} @ ${target_p:.2f}: {e}")
+                self.sync_account_balances(b1)
         elif act == 5 and self.active_bid_id is not None:
             old_id = self.active_bid_id
+            old_bid_usd = self.active_bid_q * self.active_bid_p
+            had_part = float(getattr(self, "bid_partial_filled", 0.0)) > 0.0
             try:
-                self.client.cancel_order(old_id)
+                c_res = self.client.cancel_order(old_id)
+                if isinstance(c_res, dict) and float(c_res.get("filled_amount", 0.0)) > float(getattr(self, "bid_accounted_filled", 0.0)):
+                    had_part = True
                 print(f"  ✖️ [LIVE CANCEL BUY] id={old_id}")
             except Exception as e:
                 print(f"  ⚠️ [CANCEL BUY WARN] id={old_id}: {e}")
-            self.sync_live_orders(b1)
+                had_part = True
+            if had_part:
+                self.sync_live_orders(b1)
+                self.sync_account_balances(b1)
+            else:
+                self.ex_usdt_free = max(self.ex_usdt_free, min(self.bot_cash_usd, self.ex_usdt_free + old_bid_usd))
             self.active_bid_id, self.active_bid_p, self.active_bid_q = None, 0.0, 0.0
             self.q_ahead = 0.0
-            self.sync_account_balances(b1)
+            self.bid_age_sec = 0
+            self.bid_partial_filled = 0.0
+            self.bid_accounted_filled = 0.0
             self._save_wallet()
         elif (act in (3, 4, 6) or (act == 0 and self.active_ask_id is not None)) and self.pos_qty >= 1.95:
             early_wide_unfreeze = (
@@ -1652,19 +1755,32 @@ class LiveTriadRLTrader:
             target_p = round(target_p / self.tick_size) * self.tick_size
             if self.active_ask_id is not None and self.slot2_ask_id is None and abs(self.active_ask_p - target_p) <= tol:
                 return
-            for oid_attr in ("active_ask_id", "slot2_ask_id"):
+            had_sell_fill = False
+            freed_q = 0.0
+            for oid_attr, q_attr in (("active_ask_id", "active_ask_q"), ("slot2_ask_id", "slot2_ask_q")):
                 oid = getattr(self, oid_attr)
                 if oid is not None:
+                    freed_q += float(getattr(self, q_attr, 0.0))
                     try:
-                        self.client.cancel_order(oid)
+                        c_res = self.client.cancel_order(oid)
+                        if isinstance(c_res, dict) and float(c_res.get("filled_amount", 0.0)) > 0.0:
+                            had_sell_fill = True
                     except Exception as e:
                         print(f"  ⚠️ [CANCEL SELL WARN] id={oid}: {e}")
-            self.sync_live_orders(b1)
-            self.active_ask_id, self.active_ask_p, self.active_ask_q = None, 0.0, 0.0
-            self.slot2_ask_id, self.slot2_ask_p, self.slot2_ask_q = None, 0.0, 0.0
+                        had_sell_fill = True
+            if had_sell_fill or (self.ex_coin_free + freed_q) < self.pos_qty * 0.95:
+                self.sync_live_orders(b1)
+                self.active_ask_id, self.active_ask_p, self.active_ask_q = None, 0.0, 0.0
+                self.slot2_ask_id, self.slot2_ask_p, self.slot2_ask_q = None, 0.0, 0.0
+                if self.pos_qty < 1.95:
+                    return
+                self.sync_account_balances(b1)
+            else:
+                self.ex_coin_free = max(self.ex_coin_free, min(self.pos_qty, self.ex_coin_free + freed_q))
+                self.active_ask_id, self.active_ask_p, self.active_ask_q = None, 0.0, 0.0
+                self.slot2_ask_id, self.slot2_ask_p, self.slot2_ask_q = None, 0.0, 0.0
             if self.pos_qty < 1.95:
                 return
-            self.sync_account_balances(b1)
             sell_qty = math.floor(min(self.pos_qty, self.ex_coin_free) * 10000.0) / 10000.0
             if sell_qty < 1.95:
                 return
@@ -1673,6 +1789,7 @@ class LiveTriadRLTrader:
                 self.active_ask_id = res.get("id")
                 self.active_ask_p = float(res.get("price", target_p))
                 self.active_ask_q = float(res.get("origin_amount", sell_qty))
+                self.ex_coin_free = max(0.0, self.ex_coin_free - self.active_ask_q)
                 self.q_ahead = -1.0
                 self._save_wallet()
                 print(f"  📤 [LIVE ORDER SELL] id={self.active_ask_id} | {self.active_ask_q:.4f} PRL @ ${self.active_ask_p:.2f}")
