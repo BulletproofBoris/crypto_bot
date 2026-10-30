@@ -630,8 +630,21 @@ class LiveTriadRLTrader:
             if self.reserved_account_usdt <= 1e-4 and self.user_reserved_coin <= 1e-4:
                 prev_pos = self.pos_qty
                 prev_cash_tot = self.bot_cash_usd
-                real_pos = math.floor(c_tot * 10000.0) / 10000.0 if c_tot >= 2.0 else 0.0
+                real_pos = math.floor(c_tot * 10000.0) / 10000.0 if c_tot >= 1.95 else 0.0
                 px_ref = b1 if b1 > 0 else (self.avg_entry if self.avg_entry > 0 else (self.active_bid_p if self.active_bid_p > 0 else 1.77))
+                prev_eq_est = prev_cash_tot + prev_pos * px_ref
+                cur_eq_est = u_tot + real_pos * px_ref
+                if not init_mode and prev_eq_est >= 5.0 and cur_eq_est < prev_eq_est * 0.5:
+                    time.sleep(0.15)
+                    raw_bals = self.client.get_spot_balances()
+                    b_map = {b["currency"]: (float(b.get("balance", 0.0)), float(b.get("locked", 0.0))) for b in raw_bals}
+                    u_free, u_lock = b_map.get("usdt", (0.0, 0.0))
+                    c_free, c_lock = b_map.get(self.base_currency, (0.0, 0.0))
+                    u_tot, c_tot = u_free + u_lock, c_free + c_lock
+                    self.ex_usdt_free, self.ex_coin_free = u_free, c_free
+                    real_pos = math.floor(c_tot * 10000.0) / 10000.0 if c_tot >= 1.95 else 0.0
+                    if (u_tot + real_pos * px_ref) < prev_eq_est * 0.5:
+                        return
 
                 # Автоматический учет внешних пополнений монетами (PRL) или кэшем (USDT) без искажения PnL
                 if not from_trade_fill and self.initial_budget_usd > 0.0:
@@ -641,7 +654,7 @@ class LiveTriadRLTrader:
                         dep_usd = round(dc_ext * px_ref, 6)
                         self.net_deposits_usd = round(self.net_deposits_usd + dep_usd, 6)
                         self.initial_budget_usd = round(self.initial_budget_usd + dep_usd, 6)
-                        if prev_pos < 2.0:
+                        if prev_pos < 1.95:
                             self.avg_entry = px_ref
                             self.hold_sec = 0
                             self.peak_bid = px_ref
@@ -677,12 +690,12 @@ class LiveTriadRLTrader:
                         )
 
                 self.bot_cash_usd = u_tot
-                if real_pos >= 2.0 and prev_pos < 2.0:
+                if real_pos >= 1.95 and prev_pos < 1.95:
                     self.avg_entry = self.avg_entry if self.avg_entry > 0 else px_ref
                     self.peak_bid = max(self.peak_bid, self.avg_entry, px_ref)
                     if not init_mode:
                         print(f"  🔄 [SPOT SYNC] Позиция на споте активна: {real_pos:.4f} PRL (вход=${self.avg_entry:.2f}) | Свободный USDT=${u_free:.2f}")
-                elif real_pos < 2.0 and prev_pos >= 2.0:
+                elif real_pos < 1.95 and prev_pos >= 1.95:
                     self.avg_entry, self.hold_sec, self.peak_bid = 0.0, 0, 0.0
                     self.n_trades += 1
                     self.realized_pnl_usd = u_tot - self.initial_budget_usd
@@ -870,8 +883,8 @@ class LiveTriadRLTrader:
         obs_hold_edge_norm = float(np.clip(exp_hold_edge / 5.0, -3.0, 3.0))
         self.last_hold_edge = float(obs_hold_edge_norm * 5.0)
         if self.pos_qty > 1e-8 and self.avg_entry > 0:
-            fl_p = round((self.avg_entry + self.tick_size) / self.tick_size) * self.tick_size
-            wv_p = round((self.avg_entry + 2.0 * self.tick_size) / self.tick_size) * self.tick_size
+            fl_p = round(math.ceil((self.avg_entry + 0.75 * self.tick_size) / self.tick_size - 1e-4) * self.tick_size, 2)
+            wv_p = round(fl_p + self.tick_size, 2)
             self.last_q_a1 = sum(aq for ap, aq in zip(ask_ps, ask_qs_clean) if abs(ap - fl_p) <= tol)
             self.last_q_a2 = sum(aq for ap, aq in zip(ask_ps, ask_qs_clean) if abs(ap - wv_p) <= tol)
         else:
@@ -1052,7 +1065,6 @@ class LiveTriadRLTrader:
             return 0.0
         if (
             vel10 >= 1.0
-            or vel3 >= 1.0
             or getattr(self, "last_in_breakout", False)
             or (self.avg_entry > 0 and b1_cur >= self.avg_entry + self.tick_size * 0.75 and inertia >= 0.0)
             or (imb5 >= 0.22 and inertia >= 0.25 and ez12 >= 0.15)
@@ -1263,23 +1275,31 @@ class LiveTriadRLTrader:
             self.q_ahead = 0.0
             self.sync_account_balances(b1)
             self._save_wallet()
-        elif (act in (3, 4, 6) or (act == 0 and self.active_ask_id is not None)) and self.pos_qty >= 2.0:
+        elif (act in (3, 4, 6) or (act == 0 and self.active_ask_id is not None)) and self.pos_qty >= 1.95:
             early_wide_unfreeze = (
                 (self.avg_entry - b1) / self.tick_size >= 3.0
                 and a1 >= self.avg_entry - tol
                 and float(getattr(self, "last_a1_q", self.last_q_a1)) <= 250.0
                 and self.last_dd900 >= 4.0
             )
+            bullish_triad_hold = (
+                (self.avg_entry - b1) / self.tick_size <= 4.0
+                and self.last_ez12 >= 0.45
+                and self.last_ez25 >= 0.45
+                and float(getattr(self, "last_ez5", 0.0)) >= 0.20
+            )
             unfreeze_min_sec = 900 if (float(getattr(self, "last_rng14400", 10.0)) >= 25.0 and float(getattr(self, "last_pos14400", 0.5)) <= 0.25) else 300
-            unfreeze_mode = ((self.avg_entry - b1) / self.tick_size >= 3.0 and self.hold_sec >= unfreeze_min_sec) or early_wide_unfreeze
+            unfreeze_mode = not bullish_triad_hold and (
+                ((self.avg_entry - b1) / self.tick_size >= 3.0 and self.hold_sec >= unfreeze_min_sec)
+                or early_wide_unfreeze
+            )
             if getattr(self, "user_manual_ask", False) and self.active_ask_id is not None and act != 6 and not unfreeze_mode:
                 return
-            floor_p = round((self.avg_entry + self.tick_size) / self.tick_size) * self.tick_size
-            wave_p = round((self.avg_entry + 2.0 * self.tick_size) / self.tick_size) * self.tick_size
-            super_p = round((self.avg_entry + 3.0 * self.tick_size) / self.tick_size) * self.tick_size
+            floor_p = round(math.ceil((self.avg_entry + 0.75 * self.tick_size) / self.tick_size - 1e-4) * self.tick_size, 2)
+            wave_p = round(floor_p + self.tick_size, 2)
+            super_p = round(floor_p + 2.0 * self.tick_size, 2)
             pump_up = (
                 self.last_vel10 >= 1.0
-                or getattr(self, "last_vel3", 0.0) >= 1.0
                 or getattr(self, "last_in_breakout", False)
                 or (self.last_imb5 >= 0.22 and self.last_inertia >= 0.25)
             )
@@ -1304,7 +1324,7 @@ class LiveTriadRLTrader:
                 self.user_manual_ask = False
                 self.sync_account_balances(b1)
                 sell_q = math.floor(min(self.pos_qty, self.ex_coin_free) * 10000.0) / 10000.0
-                if sell_q >= 2.0:
+                if sell_q >= 1.95:
                     try:
                         ru = self.client.place_limit_order(self.market, "sell", sell_q, opt_car_sell_p)
                         self.active_ask_id = ru.get("id")
@@ -1394,8 +1414,6 @@ class LiveTriadRLTrader:
                 else:
                     return
             if act in (3, 4):
-                if pump_up:
-                    act = 3
                 w2 = self._compute_adaptive_wave_weight()
                 q_a1 = float(self.last_q_a1)
                 q_a2 = float(self.last_q_a2)
@@ -1558,13 +1576,13 @@ class LiveTriadRLTrader:
                 elif self.active_ask_id is None and w2 > 0.85:
                     self.split_done_for_pos = True
                     act = 3
-                elif self.active_ask_id is None and w2 < 0.15 and not pump_up:
+                elif self.active_ask_id is None and w2 < 0.15 and not (self.last_vel10 >= 1.0 or getattr(self, "last_in_breakout", False)):
                     act = 4
 
             if act == 6:
                 target_p = max(self.tick_size, b1 - self.tick_size)
             elif act == 3:
-                is_sup_step = (self.last_vel10 >= 2.0 or getattr(self, "last_vel3", 0.0) >= 2.0 or getattr(self, "last_in_breakout", False))
+                is_sup_step = (self.last_vel10 >= 2.0 or getattr(self, "last_in_breakout", False))
                 target_p = max(a1 + (2.0 * self.tick_size if is_sup_step else 0.0), b1 + 2.0 * self.tick_size, super_p if is_sup_step else wave_p)
             else:
                 if self.active_ask_id is not None and abs(self.active_ask_p - floor_p) <= tol and b1 < floor_p - tol:
@@ -1583,11 +1601,11 @@ class LiveTriadRLTrader:
             self.sync_live_orders(b1)
             self.active_ask_id, self.active_ask_p, self.active_ask_q = None, 0.0, 0.0
             self.slot2_ask_id, self.slot2_ask_p, self.slot2_ask_q = None, 0.0, 0.0
-            if self.pos_qty < 2.0:
+            if self.pos_qty < 1.95:
                 return
             self.sync_account_balances(b1)
             sell_qty = math.floor(min(self.pos_qty, self.ex_coin_free) * 10000.0) / 10000.0
-            if sell_qty < 2.0:
+            if sell_qty < 1.95:
                 return
             try:
                 res = self.client.place_limit_order(self.market, "sell", sell_qty, target_p)
@@ -1609,7 +1627,7 @@ class LiveTriadRLTrader:
         """
         if self.mode != "live" or self.client is None:
             return
-        if self.active_bid_id is None and self.pos_qty < 2.0:
+        if self.active_bid_id is None and self.pos_qty < 1.95:
             return
         snap = streamer.peek_fast_bbo(rest_depth)
         b1, a1 = snap["b1"], snap["a1"]
@@ -1622,8 +1640,8 @@ class LiveTriadRLTrader:
             # Случай А: Цена пробила наш бид вниз внутри секунды -> проверяем налив и мгновенно ставим Ask
             if b1 < self.active_bid_p - tol:
                 self.sync_live_orders(b1, count_hold=False)
-                if self.pos_qty >= 2.0 and self.active_ask_id is None:
-                    act_exit = 3 if (self.last_vel10 >= 1.0 or getattr(self, "last_vel3", 0.0) >= 1.0 or getattr(self, "last_in_breakout", False) or self.last_inertia >= 0.25) else 4
+                if self.pos_qty >= 1.95 and self.active_ask_id is None:
+                    act_exit = 3 if (self.last_vel10 >= 1.0 or getattr(self, "last_in_breakout", False) or self.last_inertia >= 0.25) else 4
                     print(f"  ⚡ [SUB-SEC GUARDIAN] Мгновенный выход на продажу (act={act_exit}) после налива бида @ ${self.avg_entry:.2f} (<320 мс)")
                     self.execute_live_action(act_exit, b1, a1)
                 return

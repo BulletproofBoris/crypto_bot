@@ -7,6 +7,7 @@
 
 import os
 import sys
+import math
 import time
 import json
 import argparse
@@ -801,8 +802,8 @@ class SafeTradeL2ExecutionEnv:
                 action = 5
 
         if not self.legacy_v2 and self.pos_qty > 1e-8:
-            floor_p = round((self.avg_entry + self.tick_size) / self.tick_size) * self.tick_size
-            wave_p = round((self.avg_entry + 2.0 * self.tick_size) / self.tick_size) * self.tick_size
+            floor_p = round(math.ceil((self.avg_entry + 0.75 * self.tick_size) / self.tick_size - 1e-4) * self.tick_size, 2)
+            wave_p = round(floor_p + self.tick_size, 2)
             ez12_now = float(self.X_market[t, 6])
             car_step_up_ask = (sp < 1.5) and (
                 float(self.imb_l5[t]) > 0.25 and float(self.vel_10[t]) >= 1.0
@@ -814,8 +815,14 @@ class SafeTradeL2ExecutionEnv:
                 and float(self.ask_q[t, 0]) <= 250.0
                 and float(self.dd_900[t]) >= 4.0
             )
+            bullish_triad_hold = (
+                (self.avg_entry - b1) / self.tick_size <= 4.0
+                and ez12_now >= 0.45
+                and ez25 >= 0.45
+                and float(self.X_market[t, 0]) >= 0.20
+            )
             unfreeze_min_sec = 900 if (float(self.rng_14400[t]) >= 25.0 and float(self.pos_14400[t]) <= 0.25) else 300
-            unfreeze_mode = getattr(self, "enable_unfreeze", True) and (
+            unfreeze_mode = getattr(self, "enable_unfreeze", True) and not bullish_triad_hold and (
                 ((self.avg_entry - b1) / self.tick_size >= 3.0 and (t - self.entry_t) >= unfreeze_min_sec)
                 or early_wide_unfreeze
             )
@@ -852,9 +859,9 @@ class SafeTradeL2ExecutionEnv:
                 action = 0
 
         if not self.legacy_v2 and self.pos_qty > 1e-8 and action in (3, 4):
-            floor_p = round((self.avg_entry + self.tick_size) / self.tick_size) * self.tick_size
-            wave_p = round((self.avg_entry + 2.0 * self.tick_size) / self.tick_size) * self.tick_size
-            super_p = round((self.avg_entry + 3.0 * self.tick_size) / self.tick_size) * self.tick_size
+            floor_p = round(math.ceil((self.avg_entry + 0.75 * self.tick_size) / self.tick_size - 1e-4) * self.tick_size, 2)
+            wave_p = round(floor_p + self.tick_size, 2)
+            super_p = round(floor_p + 2.0 * self.tick_size, 2)
             q_a1, _ = self._get_lob_queue(t, "SELL", floor_p)
             q_a2, _ = self._get_lob_queue(t, "SELL", wave_p)
             w2 = self._compute_adaptive_wave_weight(t, floor_p, wave_p)
