@@ -66,7 +66,7 @@ ensure_mmap_cache("data/prl_neural_colab_data.npz")
 '
 
 for SPEC in \
-    "25:2,3,4,5,6" \
+    "25:3,4,5,6" \
     "60:0,1"; do
     H="${SPEC%%:*}"
     WINS="${SPEC#*:}"
