@@ -75,8 +75,10 @@ class SwarmRegimeRouter:
                 t_end_str = t_range[1] if isinstance(t_range, list) and len(t_range) > 1 else '1970-01-01'
                 self.train_end_sec.append(int(pd.Timestamp(t_end_str, tz='UTC').timestamp()))
         self.train_end_sec = np.array(self.train_end_sec, dtype=np.int64)
-
         self.num_models = len(self.models)
+        self.latest_idx = int(np.argmax(self.train_end_sec)) if self.num_models > 0 else 0
+        self.desc_order = np.argsort(-self.train_end_sec) if self.num_models > 0 else np.array([0], dtype=np.int64)
+        self.inv_desc_order = np.argsort(self.desc_order) if self.num_models > 0 else np.array([0], dtype=np.int64)
         if self.models and hasattr(self.models[0], 'feature_name'):
             self.feature_names = list(self.models[0].feature_name())
         else:
@@ -113,7 +115,7 @@ class SwarmRegimeRouter:
                             ic_val = float(n_meta.get("metrics_oos", {}).get("ic_dt_ticks", 0.1))
                             if ic_val >= 0.05:
                                 self.neural_experts.append({
-                                    "arch": arch_key if win_idx == 0 else f"{arch_key}_{win_tag}",
+                                    "arch": f"{arch_key}_{win_tag}",
                                     "base_arch": arch_key,
                                     "win_idx": win_idx,
                                     "k_file": str(k_file),
@@ -183,16 +185,19 @@ class SwarmRegimeRouter:
         # Приор свежести (-0.30*rank вместо жесткого -1.0*rank, чтобы задействовать релевантные окна пула) + каузальная маскировка
         if "timestamp" in current_regime_df.columns and n_samples > 10 and len(self.train_end_sec) == self.num_models:
             ts_sec = pd.to_datetime(current_regime_df["timestamp"], utc=True).dt.as_unit("s").astype("int64").values
-            avail = ts_sec[:, np.newaxis] > self.train_end_sec[np.newaxis, :]
-            no_avail = ~np.any(avail, axis=1)
+            avail_raw = ts_sec[:, np.newaxis] > self.train_end_sec[np.newaxis, :]
+            avail_desc = avail_raw[:, self.desc_order]
+            no_avail = ~np.any(avail_desc, axis=1)
             if np.any(no_avail):
-                avail[no_avail, -1] = True
-            causal_rank = (np.cumsum(avail, axis=1) - 1).astype(np.float32)
+                avail_desc[no_avail, -1] = True
+            rank_desc = (np.cumsum(avail_desc, axis=1) - 1).astype(np.float32)
+            avail = avail_desc[:, self.inv_desc_order]
+            causal_rank = rank_desc[:, self.inv_desc_order]
             self._last_causal_rank = np.where(avail, causal_rank, 999.0).astype(np.float32)
             recency_bonus = np.where(avail, -0.30 * causal_rank, -1e9).astype(np.float32)
         else:
             self._last_causal_rank = None
-            recency_bonus = -0.30 * np.arange(self.num_models, dtype=np.float32)[np.newaxis, :]
+            recency_bonus = -0.30 * self.inv_desc_order.astype(np.float32)[np.newaxis, :]
         online_log_bonus = np.log(np.maximum(self.online_lgb_scores, 0.25))[np.newaxis, :]
         logits = (-dist_sq / max(0.5, self.temperature)) + recency_bonus + online_log_bonus
         logits_max = np.max(logits, axis=-1, keepdims=True)
@@ -248,7 +253,7 @@ class SwarmRegimeRouter:
 
         if mode == "latest":
             weights = np.zeros((n_samples, self.num_models), dtype=np.float32)
-            weights[:, 0] = 1.0
+            weights[:, self.latest_idx] = 1.0
         elif mode == "uniform":
             weights = np.full((n_samples, self.num_models), 1.0 / self.num_models, dtype=np.float32)
         elif mode == "router":
@@ -263,7 +268,7 @@ class SwarmRegimeRouter:
                 idx_w = np.where(c_rank[:, i] <= 3.5)[0]
                 if len(idx_w) > 0:
                     act_slices.append((int(idx_w[0]), int(idx_w[-1]) + 1))
-                elif i == 0:
+                elif i == self.latest_idx:
                     act_slices.append((max(0, n_samples - 100000), n_samples))
                 else:
                     act_slices.append((0, 0))
@@ -306,26 +311,29 @@ class SwarmRegimeRouter:
 
         blend_probs = np.einsum('nm,mnc->nc', weights, all_probs)
 
-        # Ожидаемый импульс E[z] и векторизованная калибровка исторических окон к эталонному окну win_00
+        # Ожидаемый импульс E[z] и векторизованная калибровка исторических окон к эталонному свежему окну (self.latest_idx)
         class_values = np.array([-3, -2, -1, 0, 1, 2, 3], dtype=np.float32)
         ez_all = np.matmul(all_probs, class_values)  # (M, N)
         pb_all = all_probs[:, :, 5] + all_probs[:, :, 6]
         ps_all = all_probs[:, :, 0] + all_probs[:, :, 1]
 
-        s0, e0 = act_slices[0] if act_slices[0][1] > act_slices[0][0] else (0, n_samples)
-        ref_mean = float(np.mean(ez_all[0, s0:e0]))
-        ref_std = float(np.std(ez_all[0, s0:e0])) + 1e-6
-        ref_pb_mean = float(np.mean(pb_all[0, s0:e0])) + 1e-6
-        ref_ps_mean = float(np.mean(ps_all[0, s0:e0])) + 1e-6
+        ref_i = self.latest_idx
+        s0, e0 = act_slices[ref_i] if act_slices[ref_i][1] > act_slices[ref_i][0] else (0, n_samples)
+        ref_mean = float(np.mean(ez_all[ref_i, s0:e0]))
+        ref_std = float(np.std(ez_all[ref_i, s0:e0])) + 1e-6
+        ref_pb_mean = float(np.mean(pb_all[ref_i, s0:e0])) + 1e-6
+        ref_ps_mean = float(np.mean(ps_all[ref_i, s0:e0])) + 1e-6
 
         if self.num_models > 1:
             cal_ez_all = np.zeros_like(ez_all)
             cal_pb_all = np.zeros_like(pb_all)
             cal_ps_all = np.zeros_like(ps_all)
-            cal_ez_all[0] = ez_all[0]
-            cal_pb_all[0] = pb_all[0]
-            cal_ps_all[0] = ps_all[0]
-            for i in range(1, self.num_models):
+            cal_ez_all[ref_i] = ez_all[ref_i]
+            cal_pb_all[ref_i] = pb_all[ref_i]
+            cal_ps_all[ref_i] = ps_all[ref_i]
+            for i in range(self.num_models):
+                if i == ref_i:
+                    continue
                 s_l, e_l = act_slices[i]
                 if e_l <= s_l:
                     continue
@@ -523,7 +531,7 @@ class SwarmRegimeRouter:
 
         all_probs = np.zeros((self.num_models, 7), dtype=np.float32)
         for i, booster in enumerate(self.models):
-            if weights[i] < 0.002 and i > 0:
+            if weights[i] < 0.002 and i != self.latest_idx:
                 continue
             raw_p = booster.predict(x_last, num_threads=1)[0]
             all_probs[i, :min(7, len(raw_p))] = raw_p[:7]
@@ -540,7 +548,7 @@ class SwarmRegimeRouter:
             nn_probs_num = np.zeros(7, dtype=np.float32)
             nn_w_sum = 0.0
             norm_cache = {}
-            active_win_set = set(int(x) for x in np.argsort(weights)[-12:]) | {0}
+            active_win_set = set(int(x) for x in np.argsort(weights)[-12:]) | {self.latest_idx}
             for idx_e, exp in enumerate(self.neural_experts):
                 w_idx = min(exp.get("win_idx", 0), len(weights) - 1)
                 if w_idx not in active_win_set:
@@ -584,8 +592,8 @@ class SwarmRegimeRouter:
                 expected_z = (1.0 - w_nn) * expected_z + w_nn * nn_ez_blend
                 blend_probs = (1.0 - w_nn) * blend_probs + w_nn * nn_probs_blend
 
-        # 3. Сохранение дисперсии ансамблевого сигнала к эталонному окну win_00 (устраняет 25-35% сжатие амплитуды при блендинге)
-        ez_w0 = float(ez_models[0]) if len(ez_models) > 0 else expected_z
+        # 3. Сохранение дисперсии ансамблевого сигнала к эталонному свежему окну (устраняет 25-35% сжатие амплитуды при блендинге)
+        ez_w0 = float(ez_models[self.latest_idx]) if len(ez_models) > 0 else expected_z
         self._live_win0_var = 0.995 * self._live_win0_var + 0.005 * max(0.02, ez_w0 * ez_w0)
         self._live_blend_var = 0.995 * self._live_blend_var + 0.005 * max(0.02, expected_z * expected_z)
         var_scale = float(np.clip(np.sqrt(self._live_win0_var / max(1e-4, self._live_blend_var)), 1.0, 1.45))

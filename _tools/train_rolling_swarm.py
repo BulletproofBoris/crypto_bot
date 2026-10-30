@@ -99,18 +99,18 @@ def find_clean_segments(df: pd.DataFrame):
 
 def generate_rolling_windows_reverse(segments: list, H: int, K: float, n_target: int = 5000, oos_holdout_sec: int = 85600):
     """
-    Генерирует окна строго с конца временного ряда по сшитому массиву чистых индексов (Seam-Purged Stitching).
+    Генерирует окна строго с самого начала временного ряда (tr_s_pos = 0, step, 2*step, ...)
+    по сшитому массиву чистых индексов (Seam-Purged Stitching):
     - Разрывы связи полностью вырезаются с защитным буфером seam_purge = 360с на краях каждого сегмента;
-    - Самое свежее окно win_00 оставляет последние oos_holdout_sec (по умолчанию 43,200с = 12ч)
-      пост-разрывного сегмента под строгий неприкосновенный OOS-тест, а в обучение win_00 включает
-      первую половину пост-разрывного сегмента + чистую историю до разрыва.
+    - Каждое окно имеет длину обучения t_train = 5000 * L, защитный буфер H + 360с и шаг сдвига step = t_train // 2;
+    - Нумерация окон хронологическая с самого начала: win_00 (самое первое окно от индекса 0) -> win_{N-1} (самое свежее окно).
     """
     L = int(round(H * K))
     t_train = int(n_target * L)
-    t_test = int(t_train / 0.8)
+    step = t_train // 2
+    t_test = step
     buffer = H + 360
     W = t_train + buffer + t_test
-    step = t_train // 2
 
     seam_purge = 360
     chron_segs = sorted(segments, key=lambda x: x[0])
@@ -128,87 +128,18 @@ def generate_rolling_windows_reverse(segments: list, H: int, K: float, n_target:
     n_clean = len(clean_idx)
     windows = []
 
-    te0_len = min(oos_holdout_sec, len(clean_blocks[-1]))
-    te0_end_pos = n_clean
-    te0_start_pos = te0_end_pos - te0_len
-    tr0_end_pos = te0_start_pos - buffer
-
-    # Привязка сеток H=5, 12, 25, 60 к точным позициям строгих 100%-OOS окон (n_clean=1,458,648):
-    # H=5:  1 новое строгое окно (1385979, win_00) + 34 обученных окна (win_01..win_34) = 35 окон
-    # H=12: 11 строгих 100%-OOS обученных окон (1281203..272018, win_00..win_10) = 11 окон
-    # H=25: 5 строгих 100%-OOS обученных окон (1141694..422005, win_00..win_04) = 5 окон
-    # H=60: 1 строгое 100%-OOS окно (936560, win_00) = 1 окно
-    fixed_tr_ends_map = {
-        5: [
-            1434279, 1396779,
-            1359279, 1321779, 1284279, 1246779, 1209279, 1171779, 1134279, 1096779,
-            1059279, 1021779, 984279, 946779, 909279, 871779, 834279, 796779,
-            759279, 700544, 678734, 646779, 609279, 571779, 534279, 496779,
-            453156, 421704, 384204, 346704, 309204, 271704, 234204, 196704,
-            159204, 121704,
-        ],
-        12: [
-            1376636, 1281203,
-            1176203, 1071203, 996663, 902093, 797093, 689744, 587093, 482093, 377018, 272018,
-        ],
-        25: [
-            1294123, 1141694, 984580, 797080, 609580, 422005,
-        ],
-        60: [
-            936560,
-        ],
-    }
-    if int(H) in fixed_tr_ends_map and n_clean >= 1100000:
-        for tr_e_pos in fixed_tr_ends_map[int(H)]:
-            if tr_e_pos > n_clean - buffer - 3600 or tr_e_pos - t_train < 0:
-                continue
-            tr_s_pos = tr_e_pos - t_train
-            te_s_pos = tr_e_pos + buffer
-            te_e_pos = min(n_clean, te_s_pos + step)
-            windows.append({
-                'segment_id': len(windows),
-                'tr_idx': clean_idx[tr_s_pos:tr_e_pos],
-                'te_idx': clean_idx[te_s_pos:te_e_pos],
-                'tr_start': int(clean_idx[tr_s_pos]),
-                'tr_end': int(clean_idx[tr_e_pos - 1]) + 1,
-                'te_start': int(clean_idx[te_s_pos]),
-                'te_end': int(clean_idx[te_e_pos - 1]) + 1,
-                't_train': t_train,
-                't_test': te_e_pos - te_s_pos,
-                'W': t_train + buffer + (te_e_pos - te_s_pos),
-                'L': L,
-                'H': H,
-                'K': K
-            })
-        return windows, W, step, t_train, t_test
-
-    tr0_start_pos = tr0_end_pos - t_train
-
-    if tr0_start_pos >= 0:
-        windows.append({
-            'segment_id': 0,
-            'tr_idx': clean_idx[tr0_start_pos:tr0_end_pos],
-            'te_idx': clean_idx[te0_start_pos:te0_end_pos],
-            'tr_start': int(clean_idx[tr0_start_pos]),
-            'tr_end': int(clean_idx[tr0_end_pos - 1]) + 1,
-            'te_start': int(clean_idx[te0_start_pos]),
-            'te_end': int(clean_idx[te0_end_pos - 1]) + 1,
-            't_train': t_train,
-            't_test': te0_len,
-            'W': t_train + buffer + te0_len,
-            'L': L,
-            'H': H,
-            'K': K
-        })
-    max_wins = 32 if int(H) == 5 else 12
-    curr_tr_end = tr0_end_pos - step
-    while curr_tr_end - t_train >= 0 and len(windows) < max_wins:
-        tr_e_pos = curr_tr_end
-        tr_s_pos = tr_e_pos - t_train
+    min_test_sec = 18000  # минимум 5 часов чистого OOS-теста для финального окна
+    tr_s_pos = 0
+    while tr_s_pos + t_train + buffer + min_test_sec <= n_clean:
+        tr_e_pos = tr_s_pos + t_train
         te_s_pos = tr_e_pos + buffer
-        te_e_pos = min(n_clean, te_s_pos + step)
-        if te_e_pos - te_s_pos < 3600:
-            break
+        # Если следующее окно уже не поместится, расширяем тест последнего окна до конца чистых данных
+        next_tr_s = tr_s_pos + step
+        if next_tr_s + t_train + buffer + min_test_sec > n_clean:
+            te_e_pos = n_clean
+        else:
+            te_e_pos = min(n_clean, te_s_pos + step)
+
         windows.append({
             'segment_id': len(windows),
             'tr_idx': clean_idx[tr_s_pos:tr_e_pos],
@@ -224,7 +155,7 @@ def generate_rolling_windows_reverse(segments: list, H: int, K: float, n_target:
             'H': H,
             'K': K
         })
-        curr_tr_end -= step
+        tr_s_pos += step
 
     return windows, W, step, t_train, t_test
 

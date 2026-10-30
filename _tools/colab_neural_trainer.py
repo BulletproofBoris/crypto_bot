@@ -20,11 +20,28 @@ import subprocess
 from pathlib import Path
 import numpy as np
 import pandas as pd
-os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
+def _is_single_arch_worker() -> bool:
+    if "--no-isolate" not in sys.argv:
+        return False
+    for i, a in enumerate(sys.argv):
+        if a == "--archs" and i + 1 < len(sys.argv):
+            return "," not in sys.argv[i + 1]
+    return False
+
+
+if not _is_single_arch_worker():
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 import tensorflow as tf
+_gpu_mem_limit_mb = int(os.environ.get("TF_GPU_HARD_LIMIT_MB", "0"))
 for _gpu in tf.config.list_physical_devices("GPU"):
     try:
-        tf.config.experimental.set_memory_growth(_gpu, True)
+        if _gpu_mem_limit_mb > 0:
+            tf.config.set_logical_device_configuration(
+                _gpu,
+                [tf.config.LogicalDeviceConfiguration(memory_limit=_gpu_mem_limit_mb)],
+            )
+        else:
+            tf.config.experimental.set_memory_growth(_gpu, True)
     except Exception:
         pass
 from sklearn.metrics import roc_auc_score
@@ -72,6 +89,8 @@ def _sync_pack_after_run(
     """Упаковывает текущие модели, метаданные, прогресс и лог после каждого рана и выгружает в облако / Google Drive."""
     try:
         is_colab = os.path.exists("/content")
+        if not is_colab and not sync_cloud:
+            return
         if not is_colab and run_idx < runs_per_arch and int(horizon) < 60:
             return
         zip_path = shutil.make_archive(pack_dir, "zip", root_dir=".", base_dir=pack_dir)
@@ -112,7 +131,7 @@ def _sync_pack_after_run(
 def _auto_restore_pack(pack_dir: str, horizon: int, sync_bucket: str = None, resume_url: str = None):
     """Автоматически подтягивает ранее сохраненный прогресс с Google Drive или облачного бакета при старте на новом сервере."""
     is_colab = os.path.exists("/content")
-    if not is_colab and not resume_url and os.path.isdir(pack_dir) and any(Path(pack_dir).rglob("*.keras")):
+    if not is_colab and not resume_url:
         return
     zip_name = f"{pack_dir}.zip"
     bucket = sync_bucket or f"prl_h{int(horizon)}s_k3_ckpt"
@@ -228,8 +247,6 @@ def train_window_swarm(
 ) -> dict:
     if archs is None:
         archs = ["conv1d+gru", "causal_cnn", "attention", "mlp_bottleneck"]
-    has_gpu = len(tf.config.list_physical_devices("GPU")) > 0
-    tf.keras.mixed_precision.set_global_policy("mixed_float16" if has_gpu else "float32")
     k_ratio, seq_len = get_horizon_defaults(horizon)
     win_tag = f"win_{win_idx:02d}"
     pack_dir = pack_dir or f"prl_ensemble_pack_h{horizon}s"
@@ -260,6 +277,36 @@ def train_window_swarm(
     if not pending_archs:
         return {"window": win_tag, "leaderboard": leaderboard, "oos_predictions": {}}
 
+    if len(archs) > 1:
+        for single_arch in pending_archs:
+            cmd = [
+                sys.executable, "-u", "-m", "_tools.colab_neural_trainer",
+                "--data-file", str(raw_npz), "--horizon", str(horizon), "--windows", str(win_idx),
+                "--archs", single_arch, "--runs", str(runs_per_arch), "--epochs", str(max_epochs),
+                "--prune-epoch", str(hard_prune_epoch), "--top-k", str(top_k_per_arch),
+                "--batch-size", str(batch_size), "--lr", str(lr), "--l2-reg", str(l2_reg), "--no-isolate",
+            ]
+            if force_retrain:
+                cmd.append("--force-retrain")
+            child_env = {**os.environ, "CUDA_VISIBLE_DEVICES": os.environ.get("WORKER_GPU_ID", "0")}
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=child_env)
+            for line in proc.stdout:
+                if not any(skip in line for skip in ("oneDNN custom operations", "Unable to register cu", "computation_placer.cc", "prefetch_dataset_op.cc", "prefetch_autotuner.cc")):
+                    print(line, end="", flush=True)
+            proc.wait()
+            m_file = os.path.join(pack_dir, f"{single_arch.replace('+', '_')}_h{horizon}s", f"meta_{win_tag}.json")
+            if os.path.exists(m_file):
+                with open(m_file) as f:
+                    mo = json.load(f).get("metrics_oos", {})
+                leaderboard.append({
+                    "window": win_tag, "model": single_arch, "params": 0,
+                    "ic": mo.get("ic_dt_ticks", 0.0), "auc": mo.get("roc_auc_ovr", 0.5),
+                    "log_loss": mo.get("log_loss", 1.9), "top2_pnl": mo.get("top2pct_mean_ticks", 0.0)
+                })
+        return {"window": win_tag, "leaderboard": leaderboard, "oos_predictions": {}}
+
+    has_gpu = len(tf.config.list_physical_devices("GPU")) > 0
+    tf.keras.mixed_precision.set_global_policy("mixed_float16" if has_gpu else "float32")
     w_data = load_window_arrays(raw_npz, horizon, win_idx)
     X_tr, X_te = w_data["X_tr"], w_data["X_te"]
     y_tr, y_te, dt_te = w_data["y_tr"], w_data["y_te"], w_data["dt_te"]
@@ -520,8 +567,9 @@ def run_colab_pipeline(
     print("\n🏆 СВОДНЫЙ ЛИДЕРБОРД WALK-FORWARD ОКОН:")
     if len(df_lb) > 0:
         print(df_lb.to_string(index=False))
-    shutil.make_archive(pack_dir, "zip", root_dir=".", base_dir=pack_dir)
-    print(f"\n📦 Архив {pack_dir}.zip успешно собран!")
+    if os.path.exists("/content"):
+        shutil.make_archive(pack_dir, "zip", root_dir=".", base_dir=pack_dir)
+        print(f"\n📦 Архив {pack_dir}.zip успешно собран!")
     return df_lb
 
 
@@ -532,7 +580,7 @@ def main():
     parser.add_argument("--horizon", type=int, default=12, help="Горизонт H: 5, 12, 25 или 60")
     parser.add_argument("--windows", type=str, default="all", help="Окна через запятую (0,1,2) или all")
     parser.add_argument("--archs", type=str, default="conv1d+gru,causal_cnn,attention,mlp_bottleneck")
-    parser.add_argument("--runs", type=int, default=10, help="Ранов на архитектуру")
+    parser.add_argument("--runs", type=int, default=20, help="Ранов на архитектуру")
     parser.add_argument("--epochs", type=int, default=10, help="Макс. эпох на ран")
     parser.add_argument("--prune-epoch", type=int, default=5, help="Эпоха отсечения слабых ранов")
     parser.add_argument("--top-k", type=int, default=3, help="Топ-K ранов внутри архитектуры")
