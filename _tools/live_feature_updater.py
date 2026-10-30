@@ -589,8 +589,16 @@ class LiveFeatureStreamer:
         df_win = self._compute_window_features()
         return df_win.iloc[-1:].fillna(0.0).reset_index(drop=True)
 
+    _DROP_L2_11_50 = {
+        f"{p}_{side}_{i}_{k}"
+        for p in ("ST", "BO")
+        for side in ("bid", "ask")
+        for i in range(11, 51)
+        for k in ("price", "qty")
+    }
+
     def _compute_window_features(self) -> pd.DataFrame:
-        df_win = pd.DataFrame(list(self.raw_rows))
+        df_win = pd.DataFrame([{k: v for k, v in r.items() if k not in self._DROP_L2_11_50} for r in self.raw_rows])
         df_win = df_win.set_index("_ts")
         ssb_saved = df_win["onchain_seconds_since_block"].copy() if "onchain_seconds_since_block" in df_win.columns else None
         if "ST_mid_price" in df_win.columns:

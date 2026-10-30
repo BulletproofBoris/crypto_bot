@@ -208,7 +208,8 @@ def add_exchange_filter_bank(df_1s, prefix, coin="prl"):
             f"{prefix}_imbalance_ema_{w}s": df_1s[f"{prefix}_imbalance_top5"].ewm(span=w, adjust=False).mean(),
         }
 
-    for w_dict in _FILTER_POOL.map(_calc_window_bank, FILTER_WINDOWS):
+    w_iter = _FILTER_POOL.map(_calc_window_bank, FILTER_WINDOWS) if len(df_1s) > 1000 else (_calc_window_bank(w) for w in FILTER_WINDOWS)
+    for w_dict in w_iter:
         new_cols.update(w_dict)
 
     # 3. Ортогональные полосовые фильтры (Band-Pass разности между соседними частотами)

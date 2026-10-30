@@ -576,6 +576,7 @@ class SwarmRegimeRouter:
                 cache_key = (w_idx, sl)
                 x_batch = norm_cache.get(cache_key)
                 if x_batch is None:
+                    import torch
                     if len(X_clean) >= sl:
                         x_win = X_clean[-sl:, :]
                     else:
@@ -583,9 +584,9 @@ class SwarmRegimeRouter:
                         x_win = np.vstack([pad, X_clean])
                     x_norm = np.clip((x_win - exp["mean"]) / exp["std"], -5.0, 5.0).astype(np.float32)
                     x_norm = np.nan_to_num(x_norm, nan=0.0, posinf=5.0, neginf=-5.0)
-                    x_batch = x_norm[np.newaxis, :, :]
+                    x_batch = torch.from_numpy(x_norm[np.newaxis, :, :])
                     norm_cache[cache_key] = x_batch
-                p_raw = exp["fast_model"].predict_numpy(x_batch)[0]
+                p_raw = exp["fast_model"].predict_tensor(x_batch)[0].numpy()
                 p_raw = np.clip(p_raw, 1e-7, 1.0 - 1e-7)
                 ez_raw = float(np.dot(p_raw, class_values))
                 nn_ez_vec[idx_e] = ez_raw

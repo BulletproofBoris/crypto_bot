@@ -22,20 +22,24 @@ from _tools.system_resources import SAFE_WORKERS
 torch.set_num_threads(1)
 
 
+@torch.jit.script
 def _gelu(x: torch.Tensor) -> torch.Tensor:
     return F.gelu(x, approximate="none")
 
 
+@torch.jit.script
 def _layer_norm(x: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
     mean = x.mean(dim=-1, keepdim=True)
     var = x.var(dim=-1, unbiased=False, keepdim=True)
-    return (x - mean) / torch.sqrt(var + eps) * gamma + beta
+    return (x - mean) * torch.rsqrt(var + eps) * gamma + beta
 
 
 def _causal_conv1d(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor, dilation: int = 1, causal: bool = True) -> torch.Tensor:
     # x: (B, L, C_in), PyTorch w: (C_out, C_in, K)
-    x_t = x.transpose(1, 2)
     k_size = w.shape[2]
+    if k_size == 1:
+        return torch.matmul(x, w.squeeze(-1).T) + b
+    x_t = x.transpose(1, 2)
     if causal and k_size > 1:
         pad = (k_size - 1) * dilation
         x_t = F.pad(x_t, (pad, 0))
@@ -43,6 +47,7 @@ def _causal_conv1d(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor, dilation: 
     return y_t.transpose(1, 2)
 
 
+@torch.jit.script
 def _gru_last_step(x: torch.Tensor, kernel: torch.Tensor, rec_kernel: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     """
     Точная реализация Keras GRU(units, reset_after=True, return_sequences=False).

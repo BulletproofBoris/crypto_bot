@@ -1799,9 +1799,10 @@ class LiveTriadRLTrader:
 
     def subsecond_guardian_step(self, streamer, rest_depth: dict = None):
         """
-        Внутрисекундный Сторож Очереди (~320 мс / ~640 мс между тиками):
+        Внутрисекундный Сторож Очереди и Контур Исполнения ~2.8 Гц (+350 мс и +680 мс между тиками):
         1) Экстренно снимает лимитный бид при внезапном обвале подпорки b1_q или пробое на BigONE.
-        2) Мгновенно выставляет тейк-профит (Ask) в течение 320 мс после налива нашего бида.
+        2) Мгновенно обнаруживает полный/частичный налив нашего бида (даже без пробоя уровня b1 вниз!)
+           по уменьшению b1_q и выставляет тейк-профит (Ask) за <350 мс.
         """
         if self.mode != "live" or self.client is None:
             return
@@ -1814,15 +1815,25 @@ class LiveTriadRLTrader:
             return
         tol = self.tick_size * 0.25
 
+        # Если есть открытая позиция >= 1.95 PRL без активного Ask — мгновенно ставим Ask внутри секунды
+        if self.pos_qty >= 1.95 and self.active_ask_id is None and not getattr(self, "micro_pos_parked", False):
+            act_exit = 3 if (self.last_vel10 >= 1.0 or getattr(self, "last_in_breakout", False) or self.last_inertia >= 0.25) else 4
+            print(f"  ⚡ [SUB-SEC 2.8Hz] Мгновенная постановка Ask (act={act_exit}) на свободную позицию {self.pos_qty:.4f} PRL")
+            self.execute_live_action(act_exit, b1, a1)
+
         if self.active_bid_id is not None:
-            # Случай А: Цена пробила наш бид вниз внутри секунды -> проверяем налив и мгновенно ставим Ask
-            if b1 < self.active_bid_p - tol:
+            prev_b1_q = float(getattr(self, "_last_subsec_b1_q", b1_q))
+            self._last_subsec_b1_q = b1_q
+            # Случай А: Цена пробила наш бид вниз ИЛИ объем на нашем уровне b1 уменьшился >= 2.0 PRL (вероятный налив!)
+            bid_q_drained = (abs(self.active_bid_p - b1) <= tol) and ((prev_b1_q - b1_q) >= 2.0 or b1_q < self.active_bid_q - 0.5)
+            if b1 < self.active_bid_p - tol or bid_q_drained:
                 self.sync_live_orders(b1, count_hold=False)
                 if self.pos_qty >= 1.95 and self.active_ask_id is None:
                     act_exit = 3 if (self.last_vel10 >= 1.0 or getattr(self, "last_in_breakout", False) or self.last_inertia >= 0.25) else 4
-                    print(f"  ⚡ [SUB-SEC GUARDIAN] Мгновенный выход на продажу (act={act_exit}) после налива бида @ ${self.avg_entry:.2f} (<320 мс)")
+                    print(f"  ⚡ [SUB-SEC GUARDIAN] Мгновенный выход на продажу (act={act_exit}) после налива бида @ ${self.avg_entry:.2f} (<350 мс)")
                     self.execute_live_action(act_exit, b1, a1)
-                return
+                if self.active_bid_id is None:
+                    return
 
             # Случай Б: Мы стоим на лучшем биде b1, но внешняя защита очереди рухнула под лавиной аска или пробоем BigONE
             if abs(self.active_bid_p - b1) <= tol:
@@ -1837,7 +1848,7 @@ class LiveTriadRLTrader:
                     try:
                         self.client.cancel_order(oid)
                         print(
-                            f"  🛡️ [SUB-SEC GUARDIAN] Экстренное снятие бида id={oid} @ ${self.active_bid_p:.2f} за <320 мс "
+                            f"  🛡️ [SUB-SEC GUARDIAN] Экстренное снятие бида id={oid} @ ${self.active_bid_p:.2f} за <350 мс "
                             f"(ext_sup_q={ext_sup_q:.1f}, a1_q={a1_q:.1f}, BO_bid=${bo_b1:.3f})"
                         )
                     except Exception:
@@ -1934,13 +1945,17 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
     shared_depth = {"data": None, "ts": 0.0, "stop": False}
 
     def _async_depth_poller():
+        last_keepalive = 0.0
         while not shared_depth["stop"]:
             try:
-                if not (local_depth.exists() and (time.time() - local_depth.stat().st_mtime) < 1.2):
-                    d_res = trader.client.get_depth(trader.market, limit=50)
-                    if d_res and d_res.get("bids"):
+                now_t = time.time()
+                need_poll = not (local_depth.exists() and (now_t - local_depth.stat().st_mtime) < 1.2)
+                if need_poll or (trader.client is not None and (now_t - last_keepalive) >= 25.0):
+                    d_res = trader.client.get_depth(trader.market, limit=5 if not need_poll else 50)
+                    last_keepalive = now_t
+                    if need_poll and d_res and d_res.get("bids"):
                         shared_depth["data"] = d_res
-                        shared_depth["ts"] = time.time()
+                        shared_depth["ts"] = now_t
             except Exception:
                 pass
             time.sleep(0.35)
@@ -2014,14 +2029,19 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
                 flush=True,
             )
 
-        # Используем свободные ~750 мс между 1-секундными тиками для фоновой сверки ордеров/кошелька
-        # и 2 внутрисекундных проверок Сторожа Очереди (на +320 мс и +640 мс)
-        if step_idx % 2 == 0:
+        # Используем свободные ~800 мс между 1-секундными тиками для фоновой сверки ордеров/кошелька
+        # и 2 внутрисекундных проверок Контура Исполнения ~2.8 Гц (на +350 мс и +680 мс)
+        has_open_orders = (
+            trader.active_bid_id is not None
+            or trader.active_ask_id is not None
+            or trader.slot2_ask_id is not None
+        )
+        if has_open_orders or step_idx % 2 == 0:
             trader.sync_live_orders(b1, count_hold=False)
         if step_idx % 15 == 0:
             trader.sync_account_balances(b1)
 
-        for sub_target in (0.38, 0.70):
+        for sub_target in (0.35, 0.68):
             rem_sub = sub_target - (time.perf_counter() - t0)
             if rem_sub > 0.02:
                 time.sleep(rem_sub)
