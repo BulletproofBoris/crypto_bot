@@ -213,14 +213,19 @@ class FastKerasModel:
     @torch.no_grad()
     def predict_sequence_2d(self, x_2d_np: np.ndarray, seq_len: int) -> np.ndarray:
         """
-        Ускоренный пакетный инференс по 2D-матрице (N, F): выполняет поточечную LayerNorm
-        и 1x1 проекцию (299 -> 32/64) один раз на 2D-последовательности до скользящего окна.
+        Ускоренный пакетный инференс по 2D-матрице (N, F): автоматически использует GPU (CUDA)
+        на больших батчах (n_rows > 1024) и выполняет 1x1 проекцию один раз до скользящего окна.
         """
         n_rows = len(x_2d_np)
-        torch.set_num_threads(SAFE_WORKERS if n_rows > 128 else 1)
+        use_gpu = (n_rows > 1024) and torch.cuda.is_available()
+        dev = torch.device("cuda" if use_gpu else "cpu")
+        if use_gpu:
+            self.w = {k: v.to(dev) for k, v in self.w.items()}
+        else:
+            torch.set_num_threads(SAFE_WORKERS if n_rows > 128 else 1)
         sl = int(seq_len)
         x_pad = np.vstack([np.repeat(x_2d_np[:1], sl - 1, axis=0), x_2d_np])
-        xt_pad = torch.as_tensor(x_pad, dtype=torch.float32)
+        xt_pad = torch.as_tensor(x_pad, dtype=torch.float32, device=dev)
         xt_ln = self._ln(xt_pad, "layer_normalization")
 
         if self.base_arch in ("mlp_bottleneck", "conv1d+gru", "causal_cnn"):
@@ -236,7 +241,9 @@ class FastKerasModel:
                     sc = x
                     x = _gelu(self._ln(self._dense(x, "dense_1"), "layer_normalization_2"))
                     x = _gelu(self._ln(self._dense(sc + x, "dense_2"), "layer_normalization_3"))
-                    outs.append(self._dense(x, "dense_3", act="softmax").numpy())
+                    outs.append(self._dense(x, "dense_3", act="softmax").cpu().numpy())
+                if use_gpu:
+                    self.w = {k: v.cpu() for k, v in self.w.items()}
                 return np.vstack(outs)
 
             if self.base_arch == "conv1d+gru":
@@ -253,10 +260,10 @@ class FastKerasModel:
                 p_t1 = torch.matmul(self._ln(c_t1, "layer_normalization_1"), kernel) + in_b
                 units = rec_kernel.shape[0]
                 outs = []
-                for s_i in range(0, n_rows, 16384):
-                    e_i = min(n_rows, s_i + 16384)
+                for s_i in range(0, n_rows, 32768 if use_gpu else 16384):
+                    e_i = min(n_rows, s_i + (32768 if use_gpu else 16384))
                     bsz = e_i - s_i
-                    h = torch.zeros((bsz, units), dtype=torch.float32)
+                    h = torch.zeros((bsz, units), dtype=torch.float32, device=dev)
                     for t_step in range(sl):
                         xt = p_t0[s_i:e_i] if t_step == 0 else (p_t1[s_i:e_i] if t_step == 1 else p_full[s_i + t_step:e_i + t_step])
                         rt_all = torch.matmul(h, rec_kernel) + rec_b
@@ -265,7 +272,9 @@ class FastKerasModel:
                         hh = torch.tanh(xt[:, 2 * units:] + r * rt_all[:, 2 * units:])
                         h = z * h + (1.0 - z) * hh
                     x = self._dense(self._ln(h, "layer_normalization_2"), "dense", act="gelu")
-                    outs.append(self._dense(x, "dense_1", act="softmax").numpy())
+                    outs.append(self._dense(x, "dense_1", act="softmax").cpu().numpy())
+                if use_gpu:
+                    self.w = {k: v.cpu() for k, v in self.w.items()}
                 return np.vstack(outs)
 
             def _resblocks(x_in: torch.Tensor) -> torch.Tensor:
@@ -281,16 +290,18 @@ class FastKerasModel:
             tail_sum = None
             if sl > rf:
                 y_full = _resblocks(h_pad.unsqueeze(0)).squeeze(0)
-                cs = torch.vstack([torch.zeros((1, y_full.shape[1]), dtype=torch.float32), torch.cumsum(y_full, dim=0)])
-                idx = torch.arange(n_rows)
+                cs = torch.vstack([torch.zeros((1, y_full.shape[1]), dtype=torch.float32, device=dev), torch.cumsum(y_full, dim=0)])
+                idx = torch.arange(n_rows, device=dev)
                 tail_sum = cs[idx + sl] - cs[idx + rf]
             outs = []
-            for s_i in range(0, n_rows, 4096):
-                e_i = min(n_rows, s_i + 4096)
+            for s_i in range(0, n_rows, 8192 if use_gpu else 4096):
+                e_i = min(n_rows, s_i + (8192 if use_gpu else 4096))
                 x_rf = h_pad[s_i:e_i + rf - 1].unfold(0, rf, 1).transpose(1, 2).contiguous()
                 head_sum = _resblocks(x_rf).sum(dim=1)
                 x = (head_sum + tail_sum[s_i:e_i]) / float(sl) if tail_sum is not None else head_sum / float(sl)
-                outs.append(self._dense(self._dense(x, "dense", act="gelu"), "dense_1", act="softmax").numpy())
+                outs.append(self._dense(self._dense(x, "dense", act="gelu"), "dense_1", act="softmax").cpu().numpy())
+            if use_gpu:
+                self.w = {k: v.cpu() for k, v in self.w.items()}
             return np.vstack(outs)
 
         if self.base_arch == "attention":
@@ -303,8 +314,8 @@ class FastKerasModel:
             k_pad = torch.einsum("td,dhk->thk", h_pad, wk) + bk.unsqueeze(0)
             v_pad = torch.einsum("td,dhk->thk", h_pad, wv) + bv.unsqueeze(0)
             outs = []
-            for s_i in range(0, n_rows, 4096):
-                e_i = min(n_rows, s_i + 4096)
+            for s_i in range(0, n_rows, 8192 if use_gpu else 4096):
+                e_i = min(n_rows, s_i + (8192 if use_gpu else 4096))
                 x_w = h_pad[s_i:e_i + sl - 1].unfold(0, sl, 1).transpose(1, 2)
                 q = q_pad[s_i:e_i + sl - 1].unfold(0, sl, 1).transpose(2, 3)
                 k = k_pad[s_i:e_i + sl - 1].unfold(0, sl, 1)
@@ -313,7 +324,9 @@ class FastKerasModel:
                 attn_out = torch.einsum("bhtk,hkd->btd", torch.matmul(attn_w, v), wo) + bo
                 x = self._ln(x_w + attn_out, "layer_normalization_1").mean(dim=1)
                 x = self._ln(self._dense(x, "dense_1", act="gelu"), "layer_normalization_2")
-                outs.append(self._dense(x, "dense_2", act="softmax").numpy())
+                outs.append(self._dense(x, "dense_2", act="softmax").cpu().numpy())
+            if use_gpu:
+                self.w = {k: v.cpu() for k, v in self.w.items()}
             return np.vstack(outs)
 
         raise ValueError(f"Unknown base_arch: {self.base_arch}")

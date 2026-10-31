@@ -61,7 +61,8 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
     schema_cols = set(pf.schema_arrow.names)
     lob_and_meta_cols = [
         "timestamp", "ST_best_bid", "ST_best_ask", "ST_bid_qty_1", "ST_ask_qty_1",
-        "ST_vol_300s_ticks", "ST_ofi_norm_300s", "ST_spread_pct", "ST_cvd_5m",
+        "ST_spread", "ST_spread_pct", "ST_vol_60s_ticks", "ST_vol_300s_ticks",
+        "ST_ofi_norm_300s", "ST_cvd_norm_20s", "ST_cvd_5m",
         "BO_sec_since_tick", "ST_trade_vol", "ST_trade_vol_1s",
         "ST_buy_vol", "ST_buy_vol_1s", "ST_sell_vol", "ST_sell_vol_1s", "ST_vwap_1s",
     ]
@@ -109,7 +110,15 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
             matched_idx = np.array([ts_to_idx.get(int(s), -1) for s in cur_ts_i8], dtype=np.int64)
             valid_mask = matched_idx >= 0
             if np.any(valid_mask):
-                last_match_pos = int(np.where(valid_mask)[0][-1])
+                valid_positions = np.where(valid_mask)[0]
+                first_match_pos = int(valid_positions[0])
+                last_match_pos = int(valid_positions[-1])
+                if first_match_pos > 0 and first_match_pos <= 7200 and np.all(valid_mask[first_match_pos:last_match_pos + 1]):
+                    df = df.iloc[first_match_pos:].reset_index(drop=True)
+                    matched_idx = matched_idx[first_match_pos:]
+                    valid_mask = valid_mask[first_match_pos:]
+                    start_row += first_match_pos
+                    last_match_pos -= first_match_pos
                 if last_match_pos >= len(df) - 300000 and np.all(valid_mask[:last_match_pos + 1]):
                     n_tail = len(df) - (last_match_pos + 1)
                     print(f"⚡ Инкрементальное обновление кэша: переиспользуем {last_match_pos + 1:,} сек из {prev_cache_path.name}, досчитываем хвост {n_tail:,} сек ({n_tail/3600:.2f} ч)...")
@@ -131,7 +140,7 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
                         df_tail = df_tail.reset_index(drop=True)
                         tail_triad_list = []
                         for H, K in horizons:
-                            router = SwarmRegimeRouter(coin, H, K, temperature=0.5, use_neural=True, neural_weight=0.15)
+                            router = SwarmRegimeRouter(coin, H, K, temperature=0.25, use_neural=True, neural_weight=0.15)
                             X_cols = [df_tail[col].values.astype(np.float32) if col in df_tail.columns else np.zeros(len(df_tail), dtype=np.float32) for col in router.feature_names]
                             X_tail_in = np.nan_to_num(np.column_stack(X_cols), nan=0.0, posinf=0.0, neginf=0.0)
                             ens_out = router.predict_ensemble(X_tail_in, df_tail, mode="router")
@@ -160,7 +169,7 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
             df_full["timestamp"] = df_full.index
         df_full = df_full.reset_index(drop=True)
         for H, K in horizons:
-            router = SwarmRegimeRouter(coin, H, K, temperature=0.5, use_neural=True, neural_weight=0.15)
+            router = SwarmRegimeRouter(coin, H, K, temperature=0.25, use_neural=True, neural_weight=0.15)
             print(f"\n🔮 Расчёт ансамбля H={H}s (K={K})...")
             if cached_fnames != router.feature_names:
                 X_cols = [
@@ -1373,7 +1382,9 @@ def evaluate_policy(env: SafeTradeL2ExecutionEnv, model: MaskableActorCritic = N
         t_cur = env.t
         mask = env.get_action_mask()
         v_pred = 0.0
-        if model is None:
+        if not np.any(mask[1:]):
+            act = 0
+        elif model is None:
             act = teacher_heuristic_action(obs, mask)
         else:
             with torch.no_grad():
@@ -1495,17 +1506,19 @@ def load_live_telemetry_experiences(obs_dim: int = 38) -> tuple[np.ndarray, np.n
 
 def train_rl_agent(
     coin: str = "prl",
-    tail_hours: float = 72.0,
-    ppo_epochs: int = 25,
-    steps_per_epoch: int = 16384,
+    tail_hours: float = 508.0,
+    ppo_epochs: int = 30,
+    steps_per_epoch: int = 32768,
+    pop_size: int = 8,
     live_plot: bool = False,
     seed: int = 3,
     split_ts_msk: str = None,
+    force_rebuild: bool = False,
 ):
-    torch.set_num_threads(SAFE_WORKERS)
+    torch.set_num_threads(1)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    data = build_or_load_rl_cache(coin=coin, tail_hours=tail_hours)
+    data = build_or_load_rl_cache(coin=coin, tail_hours=tail_hours, force_rebuild=force_rebuild)
     n_total = len(data["X_market"])
     ts_msk = pd.to_datetime(data["ts"], utc=True).tz_convert("Europe/Moscow")
     if split_ts_msk is not None:
@@ -1521,6 +1534,8 @@ def train_rl_agent(
     base_env = SafeTradeL2ExecutionEnv(data, start_idx=split_idx, end_idx=n_total - 1, episode_len=n_total - split_idx - 2, legacy_v2=True)
 
     device = "cpu"
+    gpu_device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"⚡ Устройство RL: Rollout/Eval={device} ({SAFE_WORKERS} потоков) | Обучение батчей и популяции (pop_size={pop_size})={gpu_device}")
     out_dir = BASE_DIR / "models" / coin.lower() / "rl_execution"
     out_dir.mkdir(parents=True, exist_ok=True)
     base_ckpt = out_dir / "baseline_ppo_v2.pt"
@@ -1553,10 +1568,10 @@ def train_rl_agent(
     best_score = -1e9
 
     best_model_ref = MaskableActorCritic(obs_dim=train_env.obs_dim, n_actions=train_env.n_actions).to(device)
-    print("🎓 Behavioral Cloning Warm-Start (сбор 40,000 демонстраций селективного нейро-учителя + реальный опыт торговли)...")
+    print("🎓 Behavioral Cloning Warm-Start на GPU (сбор 80,000 демонстраций селективного нейро-учителя + реальный опыт торговли)...")
     bc_obs, bc_masks, bc_acts = [], [], []
     obs = train_env.reset()
-    for _ in range(40000):
+    for _ in range(80000):
         mask = train_env.get_action_mask()
         act = teacher_heuristic_action(obs, mask)
         bc_obs.append(obs); bc_masks.append(mask); bc_acts.append(act)
@@ -1572,22 +1587,25 @@ def train_rl_agent(
         bc_obs_np = np.array(bc_obs, dtype=np.float32)
         bc_masks_np = np.array(bc_masks, dtype=bool)
         bc_acts_np = np.array(bc_acts, dtype=np.int64)
-    t_obs = torch.as_tensor(bc_obs_np, dtype=torch.float32, device=device)
-    t_masks = torch.as_tensor(bc_masks_np, dtype=torch.bool, device=device)
-    t_acts = torch.as_tensor(bc_acts_np, dtype=torch.long, device=device)
-    T_live_obs = torch.as_tensor(live_obs, dtype=torch.float32, device=device) if len(live_obs) > 0 else None
-    T_live_masks = torch.as_tensor(live_masks, dtype=torch.bool, device=device) if len(live_obs) > 0 else None
-    T_live_acts = torch.as_tensor(live_acts, dtype=torch.long, device=device) if len(live_obs) > 0 else None
-    ce_w = torch.tensor([1.0, 20.0, 20.0, 3.0, 3.0, 8.0, 10.0], dtype=torch.float32, device=device)
-    bc_opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    for _ in range(12):
-        perm = torch.randperm(len(t_obs), device=device)
+    gpu_model = MaskableActorCritic(obs_dim=train_env.obs_dim, n_actions=train_env.n_actions).to(gpu_device)
+    gpu_model.load_state_dict(model.state_dict())
+    t_obs = torch.as_tensor(bc_obs_np, dtype=torch.float32, device=gpu_device)
+    t_masks = torch.as_tensor(bc_masks_np, dtype=torch.bool, device=gpu_device)
+    t_acts = torch.as_tensor(bc_acts_np, dtype=torch.long, device=gpu_device)
+    T_live_obs = torch.as_tensor(live_obs, dtype=torch.float32, device=gpu_device) if len(live_obs) > 0 else None
+    T_live_masks = torch.as_tensor(live_masks, dtype=torch.bool, device=gpu_device) if len(live_obs) > 0 else None
+    T_live_acts = torch.as_tensor(live_acts, dtype=torch.long, device=gpu_device) if len(live_obs) > 0 else None
+    ce_w = torch.tensor([1.0, 20.0, 20.0, 3.0, 3.0, 8.0, 10.0], dtype=torch.float32, device=gpu_device)
+    bc_opt = torch.optim.AdamW(gpu_model.parameters(), lr=1e-3, weight_decay=1e-4)
+    for _ in range(20):
+        perm = torch.randperm(len(t_obs), device=gpu_device)
         for i in range(0, len(t_obs), 1024):
             idx = perm[i:i + 1024]
-            logits, _ = model(t_obs[idx], t_masks[idx])
+            logits, _ = gpu_model(t_obs[idx], t_masks[idx])
             loss = F.cross_entropy(logits, t_acts[idx], weight=ce_w)
             bc_opt.zero_grad(); loss.backward(); bc_opt.step()
-    del bc_obs, bc_masks, bc_acts, bc_obs_np, bc_masks_np, bc_acts_np, t_obs, t_masks, t_acts, bc_opt
+    model.load_state_dict({k: v.cpu() for k, v in gpu_model.state_dict().items()})
+    del bc_obs, bc_masks, bc_acts, bc_obs_np, bc_masks_np, bc_acts_np, t_obs, t_masks, t_acts, bc_opt, gpu_model
 
     ws_res = evaluate_policy(test_env, model=model, device=device)
     if warm_ckpt.exists():
@@ -1657,42 +1675,36 @@ def train_rl_agent(
         T_advs = torch.as_tensor(advs, dtype=torch.float32, device=device)
         T_rets = torch.as_tensor(rets, dtype=torch.float32, device=device)
 
-        # На 1-й эпохе сначала калибруем голову Критика под новую шкалу наград без разрушения общего backbone
-        if ep == 1:
-            for p_name, p_val in model.named_parameters():
-                if not p_name.startswith("critic"):
-                    p_val.requires_grad_(False)
-            for _ in range(6):
-                perm = torch.randperm(steps_per_epoch, device=device)
-                for i in range(0, steps_per_epoch, 1024):
-                    idx = perm[i:i + 1024]
-                    _, vals = model(T_obs[idx], T_masks[idx])
-                    v_loss = F.mse_loss(vals, T_rets[idx])
-                    opt.zero_grad(); v_loss.backward(); opt.step()
-            for p_val in model.parameters():
-                p_val.requires_grad_(True)
-
-        for _ in range(3):
-            perm = torch.randperm(steps_per_epoch, device=device)
-            for i in range(0, steps_per_epoch, 1024):
-                idx = perm[i:i + 1024]
-                logits, vals = model(T_obs[idx], T_masks[idx])
-                dist = Categorical(logits=logits)
-                new_logp = dist.log_prob(T_acts[idx])
-                ratio = torch.exp(new_logp - T_old_logp[idx])
-                surr1 = ratio * T_advs[idx]
-                surr2 = torch.clamp(ratio, 0.85, 1.15) * T_advs[idx]
-                bc_anchor = F.cross_entropy(logits, T_tacts[idx], weight=ce_w)
-                if T_live_obs is not None and len(T_live_obs) >= 512:
-                    l_idx = torch.randint(0, len(T_live_obs), (512,), device=device)
-                    l_logits, _ = model(T_live_obs[l_idx], T_live_masks[l_idx])
-                    live_bc_loss = F.cross_entropy(l_logits, T_live_acts[l_idx], weight=ce_w)
-                    bc_anchor = 0.65 * bc_anchor + 0.35 * live_bc_loss
-                loss = -torch.min(surr1, surr2).mean() + 0.25 * F.mse_loss(vals, T_rets[idx]) + 0.15 * bc_anchor - 0.005 * dist.entropy().mean()
-                opt.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(model.parameters(), 0.5); opt.step()
+        from _tools.rl_gpu_population import run_gpu_population_step
+        best_cand, oos_res = run_gpu_population_step(
+            ep=ep,
+            pop_size=pop_size,
+            model_cls=MaskableActorCritic,
+            obs_dim=train_env.obs_dim,
+            n_actions=train_env.n_actions,
+            best_model_ref=best_model_ref,
+            T_obs=T_obs,
+            T_masks=T_masks,
+            T_acts=T_acts,
+            T_tacts=T_tacts,
+            T_old_logp=T_old_logp,
+            T_advs=T_advs,
+            T_rets=T_rets,
+            T_live_obs=T_live_obs,
+            T_live_masks=T_live_masks,
+            T_live_acts=T_live_acts,
+            ce_w=ce_w,
+            gpu_device=gpu_device,
+            data=data,
+            split_idx=split_idx,
+            n_total=n_total,
+            env_cls=SafeTradeL2ExecutionEnv,
+            evaluate_fn=evaluate_policy,
+            oracle_pnl=oracle_info["oracle_pnl_usd"],
+            template_test_env=test_env,
+        )
+        model.load_state_dict(best_cand.state_dict())
         sched.step()
-
-        oos_res = evaluate_policy(test_env, model=model, device=device)
         is_best = (oos_res["efficiency_score"] > best_score) and (oos_res["trades"] >= 2)
         if is_best:
             best_score = oos_res["efficiency_score"]
@@ -1885,15 +1897,19 @@ def inspect_and_plot_rl_oos(coin: str = "prl", tail_hours: float = 72.0, start_t
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--coin", type=str, default="prl")
-    parser.add_argument("--tail-hours", type=float, default=438.0)
-    parser.add_argument("--epochs", type=int, default=25)
-    parser.add_argument("--steps", type=int, default=16384)
-    parser.add_argument("--split-ts", type=str, default="2026-10-24 21:00:00+03:00")
+    parser.add_argument("--tail-hours", type=float, default=508.0)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--steps", type=int, default=32768)
+    parser.add_argument("--pop-size", type=int, default=8)
+    parser.add_argument("--split-ts", type=str, default="2026-10-28 00:00:00+03:00")
+    parser.add_argument("--force-rebuild", action="store_true", default=False)
     args = parser.parse_args()
     train_rl_agent(
         coin=args.coin,
         tail_hours=args.tail_hours,
         ppo_epochs=args.epochs,
         steps_per_epoch=args.steps,
+        pop_size=args.pop_size,
         split_ts_msk=args.split_ts,
+        force_rebuild=args.force_rebuild,
     )
