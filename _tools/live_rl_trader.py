@@ -2058,6 +2058,7 @@ def show_live_status(tail_lines: int = 25):
     ssh = create_ssh_client(timeout=12.0)
     cmd = (
         "PID=$(cat /opt/crypto_bot/data/logs/live_rl_trader.pid 2>/dev/null); "
+        "if [ -z \"$PID\" ] || ! kill -0 \"$PID\" 2>/dev/null; then PID=$(pgrep -f '[_]tools.live_rl_trader' 2>/dev/null | head -n 1); fi; "
         "if [ -n \"$PID\" ] && kill -0 \"$PID\" 2>/dev/null; then "
         "  echo \"RUNNING:$PID\"; ps -p \"$PID\" -o pcpu=,pmem=,rss=,etime= 2>/dev/null; "
         "else echo \"STOPPED\"; echo \"\"; fi; "
@@ -2136,8 +2137,9 @@ def stop_live_daemon(cancel_open_orders: bool = True):
     from _tools.vps_config import create_ssh_client
     ssh = create_ssh_client()
     _, out, _ = ssh.exec_command(
-        "PID=$(cat /opt/crypto_bot/data/logs/live_rl_trader.pid 2>/dev/null); "
-        "if [ -n \"$PID\" ] && kill -0 \"$PID\" 2>/dev/null; then kill -15 \"$PID\" && echo \"STOPPED:$PID\"; else echo \"NOT_RUNNING\"; fi"
+        "PIDS=$(pgrep -f '[_]tools.live_rl_trader' 2>/dev/null | tr '\\n' ' '); "
+        "if [ -n \"$PIDS\" ]; then kill -15 $PIDS 2>/dev/null; sleep 1; kill -9 $PIDS 2>/dev/null; echo \"STOPPED:$PIDS\"; "
+        "else echo \"NOT_RUNNING\"; fi; rm -f /opt/crypto_bot/data/logs/live_rl_trader.pid"
     )
     res_str = out.read().decode().strip()
     ssh.close()
@@ -2205,7 +2207,7 @@ def start_live_daemon(budget_usd: float = 54.0, order_usd: float = 54.0, steps: 
         env_local = BASE_DIR / ".env"
         if env_local.exists():
             sftp.put(str(env_local), "/opt/crypto_bot/.env")
-        for mod_name in ("system_resources.py", "live_rl_trader.py", "live_feature_updater.py", "microstructure_features.py", "swarm_router.py", "fast_neural_engine.py", "train_rl_execution.py"):
+        for mod_name in ("system_resources.py", "live_rl_trader.py", "live_feature_updater.py", "microstructure_features.py", "swarm_router.py", "fast_neural_engine.py", "train_rl_execution.py", "rl_gpu_population.py"):
             loc_mod = BASE_DIR / "_tools" / mod_name
             if loc_mod.exists():
                 sftp.put(str(loc_mod), f"/opt/crypto_bot/_tools/{mod_name}")
