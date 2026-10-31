@@ -94,19 +94,85 @@
     "H": 25,
     "seq_len": 75,
     "train_ts_range": [
-      "2026-10-20 03:05:57",
-      "2026-10-24 11:15:56"
+      "2026-10-20 04:31:13",
+      "2026-10-24 12:41:12"
     ],
     "test_ts_range": [
-      "2026-10-24 11:22:22",
-      "2026-10-26 15:27:21"
+      "2026-10-24 12:47:38",
+      "2026-10-26 16:52:37"
     ],
     "metrics_oos": {
-      "ic_dt_ticks": 0.1305,
-      "roc_auc_ovr": 0.6926,
-      "log_loss": 1.5189,
-      "top2pct_mean_ticks": 0.12
+      "ic_dt_ticks": 0.127,
+      "roc_auc_ovr": 0.7111,
+      "log_loss": 1.542,
+      "top2pct_mean_ticks": 0.09
     },
     "weights_file": "model_win_04.keras"
+  },
+  {
+    "window_id": "win_05",
+    "model_type": "attention",
+    "coin": "PRL",
+    "H": 25,
+    "seq_len": 75,
+    "train_ts_range": [
+      "2026-10-22 08:36:13",
+      "2026-10-26 16:46:12"
+    ],
+    "test_ts_range": [
+      "2026-10-26 16:52:38",
+      "2026-10-28 20:57:37"
+    ],
+    "metrics_oos": {
+      "ic_dt_ticks": 0.1566,
+      "roc_auc_ovr": 0.7317,
+      "log_loss": 1.2643,
+      "top2pct_mean_ticks": 0.08
+    },
+    "weights_file": "model_win_05.keras"
+  },
+  {
+    "window_id": "win_06",
+    "model_type": "attention",
+    "coin": "PRL",
+    "H": 25,
+    "seq_len": 75,
+    "train_ts_range": [
+      "2026-10-24 12:41:13",
+      "2026-10-28 20:51:12"
+    ],
+    "test_ts_range": [
+      "2026-10-28 20:57:38",
+      "2026-10-31 01:02:37"
+    ],
+    "metrics_oos": {
+      "ic_dt_ticks": 0.1517,
+      "roc_auc_ovr": 0.707,
+      "log_loss": 1.6245,
+      "top2pct_mean_ticks": 0.14
+    },
+    "weights_file": "model_win_06.keras"
+  },
+  {
+    "window_id": "win_07",
+    "model_type": "attention",
+    "coin": "PRL",
+    "H": 25,
+    "seq_len": 75,
+    "train_ts_range": [
+      "2026-10-26 16:46:13",
+      "2026-10-31 00:56:12"
+    ],
+    "test_ts_range": [
+      "2026-10-31 01:02:38",
+      "2026-10-31 07:14:29"
+    ],
+    "metrics_oos": {
+      "ic_dt_ticks": 0.1466,
+      "roc_auc_ovr": 0.6875,
+      "log_loss": 1.5299,
+      "top2pct_mean_ticks": 0.01
+    },
+    "weights_file": "model_win_07.keras"
   }
 ]

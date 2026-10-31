@@ -13,15 +13,16 @@ from tensorflow.keras.layers import (
 from tensorflow.keras.models import Model
 from tensorflow.keras import regularizers
 
-def make_gpu_sequence_dataset(X_gpu, y_gpu, seq_len=75, batch_size=2048, shuffle=True):
+def make_gpu_sequence_dataset(X_gpu, y_gpu, seq_len=75, batch_size=2048, shuffle=True, sample_stride=1):
     has_gpu = len(tf.config.list_physical_devices("GPU")) > 0
     X_gpu = tf.constant(X_gpu, dtype=tf.float16 if has_gpu else tf.float32)
     y_gpu = tf.constant(y_gpu, dtype=tf.float32)
     offsets_gpu = tf.range(seq_len, dtype=tf.int32)[tf.newaxis, :]
     n_win = int(X_gpu.shape[0]) - seq_len + 1
-    ds = tf.data.Dataset.from_tensor_slices(tf.range(n_win, dtype=tf.int32))
+    indices = tf.range(0, n_win, max(1, int(sample_stride)), dtype=tf.int32)
+    ds = tf.data.Dataset.from_tensor_slices(indices)
     if shuffle:
-        ds = ds.shuffle(buffer_size=n_win, reshuffle_each_iteration=True)
+        ds = ds.shuffle(buffer_size=int(indices.shape[0]), reshuffle_each_iteration=True)
     ds = ds.batch(batch_size)
     @tf.autograph.experimental.do_not_convert
     def _slice_batch(b_idx):

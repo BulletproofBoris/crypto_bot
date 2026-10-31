@@ -29,7 +29,9 @@ def _is_single_arch_worker() -> bool:
     return False
 
 
-if not _is_single_arch_worker():
+if _is_single_arch_worker():
+    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("WORKER_GPU_ID", "0")
+else:
     os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 import tensorflow as tf
 _gpu_mem_limit_mb = int(os.environ.get("TF_GPU_HARD_LIMIT_MB", "0"))
@@ -334,10 +336,12 @@ def train_window_swarm(
     custom_weights[1] *= 1.25
     custom_weights[2] *= 1.10
 
-    train_ds = make_gpu_sequence_dataset(X_tr_norm, y_tr_oh[seq_len - 1:], seq_len=seq_len, batch_size=batch_size, shuffle=True)
-    val_ds = make_gpu_sequence_dataset(X_te_norm, y_te_oh[seq_len - 1:], seq_len=seq_len, batch_size=batch_size, shuffle=False)
-    y_true_oos = y_te[seq_len - 1:]
-    dt_true_oos = dt_te[seq_len - 1:]
+    train_stride = 6 if int(horizon) >= 60 else (2 if int(horizon) >= 25 else 1)
+    val_stride = 4 if int(horizon) >= 60 else 1
+    train_ds = make_gpu_sequence_dataset(X_tr_norm, y_tr_oh[seq_len - 1:], seq_len=seq_len, batch_size=batch_size, shuffle=True, sample_stride=train_stride)
+    val_ds = make_gpu_sequence_dataset(X_te_norm, y_te_oh[seq_len - 1:], seq_len=seq_len, batch_size=batch_size, shuffle=False, sample_stride=val_stride)
+    y_true_oos = y_te[seq_len - 1::val_stride]
+    dt_true_oos = dt_te[seq_len - 1::val_stride]
 
     for arch in pending_archs:
         best_metric_tuple = (999.0, 999.0)

@@ -6,19 +6,41 @@
     "H": 60,
     "seq_len": 180,
     "train_ts_range": [
-      "2026-10-10 10:17:29",
-      "2026-10-22 05:20:32"
+      "2026-10-10 03:08:09",
+      "2026-10-21 22:11:12"
     ],
     "test_ts_range": [
-      "2026-10-22 05:27:33",
-      "2026-10-27 10:23:27"
+      "2026-10-21 22:18:13",
+      "2026-10-27 03:18:12"
     ],
     "metrics_oos": {
-      "ic_dt_ticks": 0.1646,
-      "roc_auc_ovr": 0.7061,
-      "log_loss": 1.8613,
-      "top2pct_mean_ticks": 0.1
+      "ic_dt_ticks": 0.1751,
+      "roc_auc_ovr": 0.7122,
+      "log_loss": 1.9824,
+      "top2pct_mean_ticks": 0.24
     },
     "weights_file": "model_win_00.keras"
+  },
+  {
+    "window_id": "win_01",
+    "model_type": "conv1d+gru",
+    "coin": "PRL",
+    "H": 60,
+    "seq_len": 180,
+    "train_ts_range": [
+      "2026-10-16 04:18:12",
+      "2026-10-27 03:11:12"
+    ],
+    "test_ts_range": [
+      "2026-10-27 03:18:13",
+      "2026-10-29 17:52:45"
+    ],
+    "metrics_oos": {
+      "ic_dt_ticks": 0.1686,
+      "roc_auc_ovr": 0.7385,
+      "log_loss": 1.6113,
+      "top2pct_mean_ticks": 0.13
+    },
+    "weights_file": "model_win_01.keras"
   }
 ]
