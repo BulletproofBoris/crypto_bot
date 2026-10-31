@@ -270,11 +270,11 @@ class LiveTriadRLTrader:
         self._triad_pool = ThreadPoolExecutor(max_workers=4)
         self._io_pool = ThreadPoolExecutor(max_workers=3)
         self.routers = [
-            (5, 3.0, SwarmRegimeRouter(self.coin, 5, 3.0, temperature=0.5, use_neural=use_neural, neural_weight=0.15)),
-            (12, 3.5, SwarmRegimeRouter(self.coin, 12, 3.5, temperature=0.5, use_neural=use_neural, neural_weight=0.15)),
-            (25, 3.0, SwarmRegimeRouter(self.coin, 25, 3.0, temperature=0.5, use_neural=use_neural, neural_weight=0.15)),
+            (5, 3.0, SwarmRegimeRouter(self.coin, 5, 3.0, temperature=0.25, use_neural=use_neural, neural_weight=0.15)),
+            (12, 3.5, SwarmRegimeRouter(self.coin, 12, 3.5, temperature=0.25, use_neural=use_neural, neural_weight=0.15)),
+            (25, 3.0, SwarmRegimeRouter(self.coin, 25, 3.0, temperature=0.25, use_neural=use_neural, neural_weight=0.15)),
         ]
-        self.router_60 = SwarmRegimeRouter(self.coin, 60, 3.0, temperature=0.5, use_neural=use_neural, neural_weight=0.15)
+        self.router_60 = SwarmRegimeRouter(self.coin, 60, 3.0, temperature=0.25, use_neural=use_neural, neural_weight=0.15)
         if use_neural:
             list(self._triad_pool.map(lambda r_item: r_item[2].preload_neural_models(), self.routers))
             self.router_60.preload_neural_models()
