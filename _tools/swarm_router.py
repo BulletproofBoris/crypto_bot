@@ -39,12 +39,12 @@ _SWARM_POOL = ThreadPoolExecutor(max_workers=SAFE_WORKERS)
 class SwarmRegimeRouter:
     """Контекстный роутер и блендер экспертов пула моделей."""
 
-    def __init__(self, coin: str, H: int, K: float = 3.0, temperature: float = 0.5, use_neural: bool = True, neural_weight: float = 0.15):
+    def __init__(self, coin: str, H: int, K: float = 3.0, temperature: float = 0.25, use_neural: bool = True, neural_weight: float = 0.15):
         self.coin = coin.lower()
         self.H = H
         self.K = float(K)
         self.L = int(round(H * self.K))
-        self.temperature = max(0.01, temperature)
+        self.temperature = max(0.05, temperature)
         self.use_neural = use_neural
         self.neural_weight = float(neural_weight)
         k_str = f"{self.K:g}"
@@ -148,11 +148,13 @@ class SwarmRegimeRouter:
         self._build_regime_matrix()
 
     def _build_regime_matrix(self):
-        """Формирует нормализованную матрицу профилей режимов для экспертов."""
+        """Формирует нормализованную матрицу профилей режимов для экспертов (6 стационарных осей: быстрые + средние)."""
         self.live_feature_map = [
-            ('mean_ST_spread_pct', 'std_ST_spread_pct', 'ST_spread_pct'),
+            ('mean_ST_spread', 'std_ST_spread', 'ST_spread'),
+            ('mean_ST_vol_60s_ticks', 'std_ST_vol_60s_ticks', 'ST_vol_60s_ticks'),
             ('mean_ST_vol_300s_ticks', 'std_ST_vol_300s_ticks', 'ST_vol_300s_ticks'),
             ('mean_ST_ofi_norm_300s', 'std_ST_ofi_norm_300s', 'ST_ofi_norm_300s'),
+            ('mean_ST_cvd_norm_20s', 'std_ST_cvd_norm_20s', 'ST_cvd_norm_20s'),
             ('mean_ST_cvd_5m', 'std_ST_cvd_5m', 'ST_cvd_5m'),
         ]
         means = []
@@ -176,7 +178,7 @@ class SwarmRegimeRouter:
     def compute_routing_weights(self, current_regime_df: pd.DataFrame) -> np.ndarray:
         """
         Вычисляет матрицу весов W (N x M) для каждой секунды на основе близости
-        текущего рыночного профиля к историческому профилю эксперта + приора свежести.
+        текущего рыночного профиля к историческому профилю эксперта + логарифмического приора свежести.
         """
         n_samples = len(current_regime_df)
         if self.num_models == 1:
@@ -194,7 +196,7 @@ class SwarmRegimeRouter:
         diff = np.clip(diff, -3.0, 3.0)
         dist_sq = np.mean(diff ** 2, axis=-1)
 
-        # Приор свежести (-0.30*rank вместо жесткого -1.0*rank, чтобы задействовать релевантные окна пула) + каузальная маскировка
+        # Логарифмический приор свежести (-0.35*ln(1+rank)) + каузальная маскировка для вовлечения всей глубины истории
         if "timestamp" in current_regime_df.columns and n_samples > 10 and len(self.train_end_sec) == self.num_models:
             ts_sec = pd.to_datetime(current_regime_df["timestamp"], utc=True).dt.as_unit("s").astype("int64").values
             avail_raw = ts_sec[:, np.newaxis] > self.train_end_sec[np.newaxis, :]
@@ -206,12 +208,12 @@ class SwarmRegimeRouter:
             avail = avail_desc[:, self.inv_desc_order]
             causal_rank = rank_desc[:, self.inv_desc_order]
             self._last_causal_rank = np.where(avail, causal_rank, 999.0).astype(np.float32)
-            recency_bonus = np.where(avail, -0.30 * causal_rank, -1e9).astype(np.float32)
+            recency_bonus = np.where(avail, -0.35 * np.log1p(np.maximum(0.0, causal_rank)), -1e9).astype(np.float32)
         else:
             self._last_causal_rank = None
-            recency_bonus = -0.30 * self.inv_desc_order.astype(np.float32)[np.newaxis, :]
+            recency_bonus = (-0.35 * np.log1p(self.inv_desc_order.astype(np.float32)))[np.newaxis, :]
         online_log_bonus = np.log(np.maximum(self.online_lgb_scores, 0.25))[np.newaxis, :]
-        logits = (-dist_sq / max(0.5, self.temperature)) + recency_bonus + online_log_bonus
+        logits = (-dist_sq / max(0.05, self.temperature)) + recency_bonus + online_log_bonus
         logits_max = np.max(logits, axis=-1, keepdims=True)
         exp_logits = np.exp(logits - logits_max)
         weights = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
@@ -275,9 +277,10 @@ class SwarmRegimeRouter:
 
         act_slices = []
         c_rank = getattr(self, "_last_causal_rank", None)
+        min_lgb_w = 0.25 / max(1, self.num_models)
         for i in range(self.num_models):
             if mode == "router" and n_samples > 300000 and c_rank is not None:
-                idx_w = np.where(c_rank[:, i] <= 3.5)[0]
+                idx_w = np.where((c_rank[:, i] < 900.0) & ((c_rank[:, i] <= 3.5) | (weights[:, i] >= min_lgb_w)))[0]
                 if len(idx_w) > 0:
                     act_slices.append((int(idx_w[0]), int(idx_w[-1]) + 1))
                 elif i == self.latest_idx:
@@ -378,6 +381,9 @@ class SwarmRegimeRouter:
             lgb_ez_std = float(np.std(expected_z)) + 1e-6
             multi_win = len(set(e.get("win_idx", 0) for e in self.neural_experts)) > 1
             X_nn = None
+            top_k_wins = min(10, weights.shape[1]) if multi_win else 1
+            top_k_thresh = np.partition(weights, -top_k_wins, axis=1)[:, -top_k_wins] if multi_win else None
+            min_nn_w = max(0.004, 1.15 / max(1, self.num_models))
 
             for exp in self.neural_experts:
                 w_idx = min(exp.get("win_idx", 0), weights.shape[1] - 1)
@@ -392,13 +398,13 @@ class SwarmRegimeRouter:
 
                 if multi_win and not cache_file.exists():
                     if (n_samples > 300000 or len(self.neural_experts) > 24) and c_rank is not None:
-                        act_idx = np.where((c_rank[:, w_idx] == 0.0) | (reg_w >= 0.15))[0]
+                        act_idx = np.where((c_rank[:, w_idx] == 0.0) | ((reg_w >= top_k_thresh) & (reg_w >= min_nn_w)))[0]
                     else:
-                        act_idx = np.where(reg_w >= 0.08)[0]
+                        act_idx = np.where((reg_w >= top_k_thresh) & (reg_w >= min_nn_w))[0]
                     if len(act_idx) == 0:
                         continue
                     s_act, e_act = int(act_idx[0]), int(act_idx[-1]) + 1
-                    if len(self.neural_experts) > 24 and float(np.mean(reg_w[s_act:e_act])) < 0.015 and float(np.max(reg_w)) < 0.20:
+                    if len(self.neural_experts) > 24 and float(np.mean(reg_w[s_act:e_act])) < 0.5 * min_nn_w and float(np.max(reg_w)) < 1.35 * min_nn_w:
                         continue
                 else:
                     s_act, e_act = 0, n_samples
@@ -644,7 +650,11 @@ def benchmark_router(coin: str, H: int, K: int):
     schema_cols = set(pq.read_schema(labeled_path).names)
     need_labeling = (target_c7_col not in schema_cols) or (target_dt_col not in schema_cols)
 
-    extra_cols = ['timestamp', 'sample_split', 'ST_spread_pct']
+    extra_cols = [
+        'timestamp', 'sample_split', 'ST_spread', 'ST_spread_pct',
+        'ST_vol_60s_ticks', 'ST_vol_300s_ticks',
+        'ST_ofi_norm_300s', 'ST_cvd_norm_20s', 'ST_cvd_5m'
+    ]
     if need_labeling:
         extra_cols += [
             'ST_mid_price', 'ST_spread', 'ST_bid_1_price', 'ST_ask_1_price',
