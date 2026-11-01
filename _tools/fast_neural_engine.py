@@ -204,6 +204,38 @@ class FastKerasModel:
             x = _gelu(self._ln(self._dense(x, "dense_2"), "layer_normalization_3"))
             return self._dense(x, "dense_3", act="softmax")
 
+        if self.base_arch == "wavenet_tcn":
+            x = self._ln(x, "layer_normalization")
+            x = self._conv(x, "conv1d", dilation=1, causal=False, act="gelu")
+            # Block 1 (d=1, filters=32)
+            f1 = torch.tanh(self._conv(x, "conv1d_1", dilation=1, causal=True))
+            g1 = torch.sigmoid(self._conv(x, "conv1d_2", dilation=1, causal=True))
+            z1 = self._ln(self._conv(f1 * g1, "conv1d_3", dilation=1, causal=False, act="gelu"), "layer_normalization_1")
+            x = x + z1
+            # Block 2 (d=2, filters=64 + shortcut conv1d_7)
+            f2 = torch.tanh(self._conv(x, "conv1d_4", dilation=2, causal=True))
+            g2 = torch.sigmoid(self._conv(x, "conv1d_5", dilation=2, causal=True))
+            z2 = self._ln(self._conv(f2 * g2, "conv1d_6", dilation=1, causal=False, act="gelu"), "layer_normalization_2")
+            x = self._conv(x, "conv1d_7", dilation=1, causal=False) + z2
+            # Block 3 (d=4, filters=64)
+            f3 = torch.tanh(self._conv(x, "conv1d_8", dilation=4, causal=True))
+            g3 = torch.sigmoid(self._conv(x, "conv1d_9", dilation=4, causal=True))
+            z3 = self._ln(self._conv(f3 * g3, "conv1d_10", dilation=1, causal=False, act="gelu"), "layer_normalization_3")
+            x = (x + z3).mean(dim=1)
+            x = self._ln(self._dense(x, "dense", act="gelu"), "layer_normalization_4")
+            return self._dense(x, "dense_1", act="softmax")
+
+        if self.base_arch == "cross_mixer":
+            x = self._ln(x, "layer_normalization")
+            f_val = self._dense(x, "dense", act="gelu")
+            f_gate = torch.sigmoid(self._dense(x, "dense_1"))
+            x = self._ln(f_val * f_gate, "layer_normalization_1")
+            t_loc = self._conv(x, "conv1d", dilation=1, causal=True, act="gelu")
+            t_wid = self._conv(x, "conv1d_1", dilation=3, causal=True, act="gelu")
+            x = self._ln(x + t_loc + t_wid, "layer_normalization_2").mean(dim=1)
+            x = self._ln(self._dense(x, "dense_2", act="gelu"), "layer_normalization_3")
+            return self._dense(x, "dense_3", act="softmax")
+
         raise ValueError(f"Unknown base_arch: {self.base_arch}")
 
     def predict_numpy(self, x_np: np.ndarray) -> np.ndarray:
@@ -333,6 +365,17 @@ class FastKerasModel:
                 self.w = {k: v.cpu() for k, v in self.w.items()}
                 del h_pad, q_pad, k_pad, v_pad, xt_pad, xt_ln
                 torch.cuda.empty_cache()
+            return np.vstack(outs)
+
+        if self.base_arch in ("wavenet_tcn", "cross_mixer"):
+            outs = []
+            chunk = 2048 if sl >= 120 else 4096
+            for s_i in range(0, n_rows, chunk):
+                e_i = min(n_rows, s_i + chunk)
+                x_w = xt_pad[s_i:e_i + sl - 1].unfold(0, sl, 1).transpose(1, 2).contiguous()
+                outs.append(self.predict_tensor(x_w).cpu().numpy())
+            if use_gpu:
+                self.w = {k: v.cpu() for k, v in self.w.items()}
             return np.vstack(outs)
 
         raise ValueError(f"Unknown base_arch: {self.base_arch}")

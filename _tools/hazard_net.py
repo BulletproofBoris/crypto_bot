@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""
+HazardNet (Этап 3): Двухголовая модель оценки микроструктурного риска:
+  1) Adverse Selection Hazard: P(Bid_1 Collapse within 5s | Fill) — риск токсичного сноса Bid_1 после налива,
+  2) Wave Exhaustion Hazard: P(Peak Reached within 10s) — вероятность затухания восходящего импульса.
+"""
+
+from pathlib import Path
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from _tools.carousel_net import build_carousel_features
+
+HAZARD_MODEL_PATH = Path("models/prl/rl_execution/hazard_net.pt")
+
+
+def compute_hazard_labels(data: dict) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Вычисляет физические метки из L2 FIFO истории:
+      - y_adverse (N,): 1.0, если в ближайшие 5с по Bid_1 прошел встречный поток продаж и Bid_1 упал >= 1 тика.
+      - y_exhaust (N,): 1.0, если цена выросла за последние 30с, но в следующие 10с не обновляет максимум и откатывает вниз.
+    """
+    bid_p = data["bid_p"][:, 0].astype(np.float32)
+    ask_p = data["ask_p"][:, 0].astype(np.float32)
+    sell_v = np.nan_to_num(data["sell_vol"].astype(np.float32), nan=0.0)
+    tick = float(data.get("tick_size", 0.01))
+    tol = tick * 0.25
+    n = len(bid_p)
+
+    y_adverse = np.zeros(n, dtype=np.float32)
+    y_exhaust = np.zeros(n, dtype=np.float32)
+
+    for t in range(30, n - 12):
+        b0 = bid_p[t]
+        a0 = ask_p[t]
+        # 1. Adverse Selection: удар продавцов в [t+1..t+5] со срывом b0 вниз
+        min_b_5s = float(np.min(bid_p[t + 1 : t + 6]))
+        sell_5s = float(np.sum(sell_v[t + 1 : t + 6]))
+        if min_b_5s <= b0 - tick + tol and (sell_5s > 10.0 or min_b_5s <= b0 - 2.0 * tick + tol):
+            y_adverse[t] = 1.0
+
+        # 2. Wave Exhaustion: локальный пик после подъема >= 1 тика за 30с
+        b_prev30 = float(np.min(bid_p[t - 30 : t]))
+        max_a_10s = float(np.max(ask_p[t + 1 : t + 11]))
+        min_b_10s = float(np.min(bid_p[t + 1 : t + 11]))
+        if (b0 - b_prev30) >= tick - tol and max_a_10s <= a0 + tol and min_b_10s <= b0 - tick + tol:
+            y_exhaust[t] = 1.0
+
+    return y_adverse, y_exhaust
+
+
+class MicrostructureHazardNet(nn.Module):
+    """Вентильная двухголовая сеть (GLU + ResMLP) для оценки вероятности токсичного пролива и пика волны."""
+
+    def __init__(self, in_dim: int = 44, hidden_dim: int = 96):
+        super().__init__()
+        self.in_norm = nn.LayerNorm(in_dim)
+        self.fc1 = nn.Linear(in_dim, hidden_dim)
+        self.gate1 = nn.Linear(in_dim, hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.ln2 = nn.LayerNorm(hidden_dim)
+        self.head_out = nn.Linear(hidden_dim, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        xn = self.in_norm(x)
+        h = self.ln1(F.gelu(self.fc1(xn)) * torch.sigmoid(self.gate1(xn)))
+        h = h + F.gelu(self.ln2(self.fc2(h)))
+        return self.head_out(h)
+
+
+class HazardPredictor:
+    """Быстрый инференс HazardNet для симулятора и боевого демона."""
+
+    def __init__(self, ckpt_path: Path = HAZARD_MODEL_PATH):
+        self.ready = False
+        self.mean = None
+        self.std = None
+        self.model = None
+        if ckpt_path.exists():
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            self.model = MicrostructureHazardNet(in_dim=int(ckpt.get("in_dim", 44)))
+            self.model.load_state_dict(ckpt["state_dict"])
+            self.model.eval()
+            self.mean = np.array(ckpt["mean"], dtype=np.float32)
+            self.std = np.array(ckpt["std"], dtype=np.float32)
+            self.ready = True
+
+    def predict_batch(self, X_feat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        X_norm = np.clip((X_feat - self.mean) / self.std, -5.0, 5.0).astype(np.float32)
+        with torch.no_grad():
+            probs = torch.sigmoid(self.model(torch.from_numpy(X_norm))).numpy()
+        return probs[:, 0], probs[:, 1]
+
+
+def train_hazard_net(cache_path: str = "data/cache/rl_triad_lob_cache_prl_176h.npz", epochs: int = 8) -> dict:
+    from sklearn.metrics import roc_auc_score
+
+    raw = np.load(cache_path, allow_pickle=True)
+    data = {k: raw[k] for k in raw.keys()}
+    X_all = build_carousel_features(data)
+    y_adv, y_exh = compute_hazard_labels(data)
+    Y_all = np.column_stack([y_adv, y_exh]).astype(np.float32)
+
+    n_total = len(X_all)
+    oos_len = 338472
+    split_idx = n_total - oos_len
+    tr_end = split_idx - 30
+
+    X_tr, Y_tr = X_all[:tr_end], Y_all[:tr_end]
+    X_te, Y_te = X_all[split_idx:-15], Y_all[split_idx:-15]
+
+    mean = np.mean(X_tr, axis=0)
+    std = np.std(X_tr, axis=0) + 1e-5
+    X_tr_n = np.clip((X_tr - mean) / std, -5.0, 5.0).astype(np.float32)
+    X_te_n = np.clip((X_te - mean) / std, -5.0, 5.0).astype(np.float32)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = MicrostructureHazardNet(in_dim=X_all.shape[1]).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=2.5e-3, weight_decay=1e-4)
+
+    pos_rates = np.clip(np.mean(Y_tr, axis=0), 0.005, 0.99)
+    pos_weight = torch.tensor((1.0 - pos_rates) / pos_rates, dtype=torch.float32, device=device).clamp(1.0, 15.0)
+    bce_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    batch_size = 4096
+    for _ in range(epochs):
+        model.train()
+        perm = np.random.permutation(len(X_tr_n))
+        for s in range(0, len(X_tr_n), batch_size):
+            b_idx = perm[s : s + batch_size]
+            xb = torch.from_numpy(X_tr_n[b_idx]).to(device)
+            yb = torch.from_numpy(Y_tr[b_idx]).to(device)
+            opt.zero_grad()
+            loss = bce_fn(model(xb), yb)
+            loss.backward()
+            opt.step()
+
+    model.eval()
+    with torch.no_grad():
+        probs = torch.sigmoid(model(torch.from_numpy(X_te_n).to(device))).cpu().numpy()
+    auc_adv = round(float(roc_auc_score(Y_te[:, 0], probs[:, 0])), 4)
+    auc_exh = round(float(roc_auc_score(Y_te[:, 1], probs[:, 1])), 4)
+    payload = {
+        "in_dim": X_all.shape[1],
+        "mean": mean.tolist(),
+        "std": std.tolist(),
+        "state_dict": model.cpu().state_dict(),
+        "oos_metrics": {"auc_adverse_5s": auc_adv, "auc_exhaustion_10s": auc_exh},
+    }
+    try:
+        HAZARD_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(payload, HAZARD_MODEL_PATH)
+    except OSError:
+        torch.save(payload, Path("/tmp/hazard_net.pt"))
+    print(f"✅ HazardNet сохранена в {HAZARD_MODEL_PATH} | OOS AUC(Adverse 5s)={auc_adv:.4f} | AUC(Exhaustion 10s)={auc_exh:.4f}")
+    return payload["oos_metrics"]
+
+
+if __name__ == "__main__":
+    train_hazard_net()

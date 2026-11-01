@@ -7,7 +7,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras.layers import (
     Input, Dense, Dropout, LayerNormalization, Conv1D, GaussianNoise,
-    GRU, Add, Activation, Flatten, GlobalAveragePooling1D,
+    GRU, Add, Multiply, Activation, Flatten, GlobalAveragePooling1D,
     MultiHeadAttention, SpatialDropout1D
 )
 from tensorflow.keras.models import Model
@@ -116,11 +116,62 @@ def build_mlp_bottleneck(seq_len, n_features, n_classes=7, l2_reg=1e-4):
     out = Dense(n_classes, activation='softmax', dtype='float32')(x)
     return Model(inp, out, name="mlp_bottleneck")
 
+
+def _gated_wavenet_block(x, filters, kernel_size, dilation, l2_reg):
+    f = Conv1D(filters, kernel_size, padding='causal', dilation_rate=dilation, activation='tanh', kernel_regularizer=regularizers.l2(l2_reg))(x)
+    g = Conv1D(filters, kernel_size, padding='causal', dilation_rate=dilation, activation='sigmoid', kernel_regularizer=regularizers.l2(l2_reg))(x)
+    z = Multiply()([f, g])
+    z = Conv1D(filters, 1, padding='valid', activation='gelu', kernel_regularizer=regularizers.l2(l2_reg))(z)
+    z = LayerNormalization()(z)
+    z = Dropout(0.12)(z)
+    sc = x if int(x.shape[-1]) == filters else Conv1D(filters, 1, padding='valid', kernel_regularizer=regularizers.l2(l2_reg))(x)
+    return Add()([sc, z])
+
+
+def build_wavenet_tcn(seq_len, n_features, n_classes=7, l2_reg=1e-4):
+    inp = Input(shape=(seq_len, n_features), name="input_layer")
+    x = GaussianNoise(0.01)(inp)
+    x = LayerNormalization()(x)
+    x = Conv1D(32, 1, activation='gelu', kernel_regularizer=regularizers.l2(l2_reg))(x)
+    x = _gated_wavenet_block(x, 32, 3, 1, l2_reg)
+    x = _gated_wavenet_block(x, 64, 3, 2, l2_reg)
+    x = _gated_wavenet_block(x, 64, 3, 4, l2_reg)
+    x = GlobalAveragePooling1D()(x)
+    x = Dense(64, activation='gelu', kernel_regularizer=regularizers.l2(l2_reg))(x)
+    x = LayerNormalization()(x)
+    x = Dropout(0.15)(x)
+    out = Dense(n_classes, activation='softmax', dtype='float32')(x)
+    return Model(inp, out, name="wavenet_tcn")
+
+
+def build_cross_mixer(seq_len, n_features, n_classes=7, l2_reg=1e-4):
+    inp = Input(shape=(seq_len, n_features), name="input_layer")
+    x = GaussianNoise(0.01)(inp)
+    x = LayerNormalization()(x)
+    # 1. Cross-Feature Gated Mixing (GLU по межбиржевым и стаканным группам признаков)
+    f_val = Dense(64, activation='gelu', kernel_regularizer=regularizers.l2(l2_reg))(x)
+    f_gate = Dense(64, activation='sigmoid', kernel_regularizer=regularizers.l2(l2_reg))(x)
+    x = LayerNormalization()(Multiply()([f_val, f_gate]))
+    x = Dropout(0.15)(x)
+    # 2. Каузальное многомасштабное сведение + нелинейный миксер признаков
+    t_local = Conv1D(64, 3, padding='causal', dilation_rate=1, activation='gelu', kernel_regularizer=regularizers.l2(l2_reg))(x)
+    t_wide = Conv1D(64, 3, padding='causal', dilation_rate=3, activation='gelu', kernel_regularizer=regularizers.l2(l2_reg))(x)
+    x = LayerNormalization()(Add()([x, t_local, t_wide]))
+    x = GlobalAveragePooling1D()(x)
+    x = Dense(64, activation='gelu', kernel_regularizer=regularizers.l2(l2_reg))(x)
+    x = LayerNormalization()(x)
+    x = Dropout(0.15)(x)
+    out = Dense(n_classes, activation='softmax', dtype='float32')(x)
+    return Model(inp, out, name="cross_mixer")
+
+
 MODEL_FACTORY = {
     "conv1d+gru": build_conv1d_gru,
     "causal_cnn": build_causal_cnn,
     "attention": build_attention,
-    "mlp_bottleneck": build_mlp_bottleneck
+    "mlp_bottleneck": build_mlp_bottleneck,
+    "wavenet_tcn": build_wavenet_tcn,
+    "cross_mixer": build_cross_mixer,
 }
 
 

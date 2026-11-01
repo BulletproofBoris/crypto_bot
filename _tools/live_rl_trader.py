@@ -292,6 +292,15 @@ class LiveTriadRLTrader:
         self.agent.eval()
         print(f"✅ Загружен чекпоинт RL-агента: {ckpt_path.name} (obs_dim={obs_dim}, hidden={h_dim})")
 
+        from _tools.carousel_net import CarouselPredictor
+        from _tools.hazard_net import HazardPredictor
+        self.carousel_net = CarouselPredictor(BASE_DIR / "models" / self.coin / "rl_execution" / "carousel_net.pt")
+        self.hazard_net = HazardPredictor(BASE_DIR / "models" / self.coin / "rl_execution" / "hazard_net.pt")
+        self.last_car_probs = np.full(5, 0.5, dtype=np.float32)
+        self.last_car_cap_prl = 120.0
+        self.last_p_adverse = 0.0
+        self.last_p_exhaust = 0.0
+
         self.bid_hist_1h = deque(maxlen=14400)
         self.ez12_hist = deque(maxlen=16)
 
@@ -820,6 +829,15 @@ class LiveTriadRLTrader:
         res60 = self.router_60.predict_live_tick(X_seq_2d, row_df)
         self.last_ez60 = float(res60["expected_z"])
         self.last_p60 = np.asarray(res60["probs"], dtype=np.float32)
+        p60 = self.last_p60
+        self.last_vec60 = [
+            self.last_ez60,
+            float(p60[4] + p60[5] + p60[6]),
+            float(p60[0] + p60[1] + p60[2]),
+            float(p60[5] + p60[6]),
+            float(p60[0] + p60[1]),
+            float(res60["entropy"]),
+        ]
 
         r = row_df.iloc[-1]
         tol = self.tick_size * 0.25
@@ -921,6 +939,30 @@ class LiveTriadRLTrader:
         a1q_5s_ago = fh[-6][1] if len(fh) >= 6 else fh[0][1]
         self.last_dq_bid_5s = float(b1_q - b1q_5s_ago) if same_b1_5s else 0.0
         self.last_buy_vol_10s = float(sum(x[2] for x in fh[-10:]))
+        sell_vol_10s = float(sum(x[3] for x in fh[-10:]))
+        buy_vol_30s = float(sum(x[2] for x in fh[-30:]))
+        sell_vol_30s = float(sum(x[3] for x in fh[-30:]))
+        if getattr(self, "carousel_net", None) is not None and self.carousel_net.ready:
+            two_sided = min(buy_vol_30s, sell_vol_30s) / (max(b1_q, a1_q) + 50.0)
+            feat44 = np.array(
+                triad_vec + lob_vec + self.last_vec60 + [
+                    math.log1p(max(0.0, b1_q)),
+                    math.log1p(max(0.0, a1_q)),
+                    math.log1p(max(0.0, float(sum(bid_qs_clean[:5])))),
+                    math.log1p(max(0.0, float(sum(ask_qs_clean[:5])))),
+                    math.log1p(max(0.0, self.last_buy_vol_10s)),
+                    math.log1p(max(0.0, sell_vol_10s)),
+                    math.log1p(max(0.0, buy_vol_30s)),
+                    math.log1p(max(0.0, sell_vol_30s)),
+                    float(np.clip(spread_ticks, 1.0, 20.0)),
+                    float(np.clip(two_sided, 0.0, 10.0)),
+                ],
+                dtype=np.float32,
+            )
+            self.last_car_probs, self.last_car_cap_prl = self.carousel_net.predict_single(feat44)
+            if getattr(self, "hazard_net", None) is not None and self.hazard_net.ready:
+                pa, pe = self.hazard_net.predict_batch(feat44[None, :])
+                self.last_p_adverse, self.last_p_exhaust = float(pa[0]), float(pe[0])
         self.last_ofi_5s = float(self.last_dq_bid_5s - (a1_q - a1q_5s_ago) + sum(x[2] - x[3] for x in fh[-5:]))
         self.last_ez25 = ez_25
         self.last_ez12 = ez_12
@@ -1420,24 +1462,38 @@ class LiveTriadRLTrader:
                 self.sync_account_balances(b1)
             max_cap = self.ex_usdt_free if (self.reserved_account_usdt <= 1e-4 and self.user_reserved_coin <= 1e-4) else self.order_usd
             avail_usd = min(max_cap, self.bot_cash_usd * 0.998, max(self.ex_usdt_free, self.bot_cash_usd if self.active_bid_id is None else 0.0) * 0.998)
-            # Адаптивное квантование бюджета с шагом 0.1% (0.001..1.000) по импульсу 4 горизонтов и пропускной способности стакана
+            # Адаптивное квантование бюджета с шагом 0.1% (0.001..1.000) с участием CarouselNet и HazardNet
+            p10_car = float(self.last_car_probs[0]) if hasattr(self, "last_car_probs") else 0.5
+            p50_car = float(self.last_car_probs[1]) if hasattr(self, "last_car_probs") else 0.5
+            p150_car = float(self.last_car_probs[2]) if hasattr(self, "last_car_probs") else 0.5
+            q_cap_prl = float(getattr(self, "last_car_cap_prl", 120.0))
+            p_adv_now = float(getattr(self, "last_p_adverse", 0.0))
             raw_conv = (
                 0.25 * max(0.0, float(getattr(self, "last_entry_edge", 0.0)))
                 + 0.35 * max(0.0, self.last_inertia)
-                + 0.25 * max(0.0, self.last_ez25 + self.last_ez12)
-                + 0.20 * max(0.0, self.last_imb5)
+                + 0.20 * max(0.0, self.last_ez25 + self.last_ez12)
+                + 0.20 * p50_car
             )
-            if getattr(self, "last_in_breakout", False) or (self.last_ez12 >= 0.70 and self.last_ez25 >= 0.60 and self.last_inertia >= 0.60):
+            if getattr(self, "last_in_breakout", False) or (self.last_ez12 >= 0.70 and self.last_ez25 >= 0.60 and self.last_inertia >= 0.60) or p150_car >= 0.65:
                 quant_w = 1.000
             else:
-                quant_w = float(np.clip(0.22 + 0.52 * raw_conv, 0.001, 0.880))
+                quant_w = float(np.clip(0.28 + 0.65 * raw_conv, 0.001, 0.950))
+            if p_adv_now >= 0.85 and float(getattr(self, "last_dd900", 0.0)) >= 3.0:
+                quant_w *= 0.55
             a1_q_usd = a1_q_cur * max(a1, self.tick_size)
             b1_q_usd = b1_q_cur * max(b1, self.tick_size)
-            flow_cap_usd = max(25.0, float(getattr(self, "last_buy_vol_10s", 100.0)) * 4.5 * b1 + 0.35 * min(b1_q_usd, 600.0))
-            if a1_q_usd > 120.0 and self.last_inertia < 0.35:
-                flow_cap_usd *= 0.55
-            cap_w = float(np.clip(flow_cap_usd / max(avail_usd, 1.0), 0.350, 1.000))
-            eff_w = quant_w if avail_usd <= 150.0 else (0.65 * quant_w + 0.35 * min(quant_w, cap_w))
+            if avail_usd <= 600.0:
+                flow_cap_usd = max(25.0, (q_cap_prl * 2.2 + 65.0 * p10_car + 180.0 * p50_car) * b1 + 0.25 * min(b1_q_usd, 600.0))
+                if a1_q_usd > 120.0 and self.last_inertia < 0.35:
+                    flow_cap_usd *= 0.55
+                cap_w = float(np.clip(flow_cap_usd / max(avail_usd, 1.0), 0.380, 1.000))
+                eff_w = quant_w if avail_usd <= 150.0 else (0.65 * quant_w + 0.35 * min(quant_w, cap_w))
+            else:
+                flow_cap_usd = max(35.0, (q_cap_prl * 2.6 + 85.0 * p10_car + 220.0 * p50_car) * b1 + 0.25 * min(b1_q_usd, 600.0))
+                if a1_q_usd > 120.0 and self.last_inertia < 0.35:
+                    flow_cap_usd *= 0.55
+                cap_w = float(np.clip(flow_cap_usd / max(avail_usd, 1.0), 0.420, 1.000))
+                eff_w = 0.72 * quant_w + 0.28 * min(quant_w, cap_w)
             quant_step_w = float(min(1.0, max(0.001, round(eff_w * 1000.0) / 1000.0)))
             usable_usd = max(min(avail_usd, 5.0), avail_usd * quant_step_w)
             qty = math.floor((usable_usd / max(target_p, self.tick_size)) * 10000.0) / 10000.0
@@ -2250,13 +2306,14 @@ def start_live_daemon(budget_usd: float = 54.0, order_usd: float = 54.0, steps: 
         env_local = BASE_DIR / ".env"
         if env_local.exists():
             sftp.put(str(env_local), "/opt/crypto_bot/.env")
-        for mod_name in ("system_resources.py", "live_rl_trader.py", "live_feature_updater.py", "microstructure_features.py", "swarm_router.py", "fast_neural_engine.py", "train_rl_execution.py", "rl_gpu_population.py"):
+        for mod_name in ("system_resources.py", "live_rl_trader.py", "live_feature_updater.py", "microstructure_features.py", "swarm_router.py", "fast_neural_engine.py", "train_rl_execution.py", "rl_gpu_population.py", "carousel_net.py", "hazard_net.py"):
             loc_mod = BASE_DIR / "_tools" / mod_name
             if loc_mod.exists():
                 sftp.put(str(loc_mod), f"/opt/crypto_bot/_tools/{mod_name}")
-        ppo_local = BASE_DIR / "models" / "prl" / "rl_execution" / "best_maskable_ppo.pt"
-        if ppo_local.exists():
-            sftp.put(str(ppo_local), "/opt/crypto_bot/models/prl/rl_execution/best_maskable_ppo.pt")
+        for pt_name in ("best_maskable_ppo.pt", "carousel_net.pt", "hazard_net.pt"):
+            pt_local = BASE_DIR / "models" / "prl" / "rl_execution" / pt_name
+            if pt_local.exists():
+                sftp.put(str(pt_local), f"/opt/crypto_bot/models/prl/rl_execution/{pt_name}")
         for af in (BASE_DIR / "models" / "prl").glob("ensemble_alliance_h*.json"):
             sftp.put(str(af), f"/opt/crypto_bot/models/prl/{af.name}")
         to_sync = []

@@ -100,7 +100,9 @@ class SwarmRegimeRouter:
                     ("conv1d_gru", "conv1d+gru"),
                     ("causal_cnn", "causal_cnn"),
                     ("mlp_bottleneck", "mlp_bottleneck"),
-                    ("attention", "attention")
+                    ("attention", "attention"),
+                    ("wavenet_tcn", "wavenet_tcn"),
+                    ("cross_mixer", "cross_mixer"),
                 ]:
                     n_dir = BASE_DIR / "models" / self.coin / f"{arch_dir_name}_h{H}s"
                     if not n_dir.exists():
