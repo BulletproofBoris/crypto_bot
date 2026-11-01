@@ -266,7 +266,7 @@ def _eval_and_save_carousel(model, X_te_n, yp_te, yc_te, mean, std, in_dim, devi
 def run_carousel_backtest(cache_path: str = "data/cache/rl_triad_lob_cache_prl_176h.npz"):
     """Сравнивает Baseline (текущая модель) и CarouselNet-Enhanced на 94.02ч слепого OOS."""
     torch.set_num_threads(1)
-    from _tools.train_rl_execution import SafeTradeL2ExecutionEnv, MaskableActorCritic
+    from _tools.train_rl_execution import SafeTradeL2ExecutionEnv, MaskableActorCritic, load_compatible_ppo_state_dict
 
     raw = np.load(cache_path, allow_pickle=True)
     data = {k: raw[k] for k in raw.keys()}
@@ -284,19 +284,17 @@ def run_carousel_backtest(cache_path: str = "data/cache/rl_triad_lob_cache_prl_1
     haz_pred = HazardPredictor(haz_path)
     p_adv_oos, p_exh_oos = haz_pred.predict_batch(X_feat_oos) if haz_pred.ready else (np.zeros(len(X_feat_oos)), np.zeros(len(X_feat_oos)))
 
+    env = SafeTradeL2ExecutionEnv(data, start_idx=split_idx, end_idx=n_total - 1, episode_len=oos_len - 2, order_usd=95.5)
     sd = torch.load("models/prl/rl_execution/best_maskable_ppo.pt", map_location="cpu", weights_only=False)
     sd = sd.get("model_state_dict", sd) if isinstance(sd, dict) else sd
     h_dim = sd["backbone.0.weight"].shape[0]
-    obs_dim = sd["backbone.0.weight"].shape[1]
-    ppo = MaskableActorCritic(obs_dim=obs_dim, n_actions=7, hidden_dim=h_dim)
-    ppo.load_state_dict(sd)
+    ppo = MaskableActorCritic(obs_dim=env.obs_dim, n_actions=7, hidden_dim=h_dim)
+    load_compatible_ppo_state_dict(ppo, sd)
     ppo.eval()
 
     print("\n📊 БЭКТЕСТ НА 94.02ч СЛЕПОГО OOS (Baseline vs CarouselNet Adaptive Quantizer 0.1%..100%):", flush=True)
     print(f"{'Бюджет':<10} | {'Режим':<28} | {'Чистый PnL ($)':<15} | {'PnL (%)':<10} | {'MaxDD ($ / %)':<18} | {'Сделок (Карус.)':<15}", flush=True)
     print("-" * 106, flush=True)
-
-    env = SafeTradeL2ExecutionEnv(data, start_idx=split_idx, end_idx=n_total - 1, episode_len=oos_len - 2, order_usd=95.5)
     for budget in (95.5, 500.0, 1000.0):
         for mode_name, use_car in [("Baseline (Current)", False), ("CarouselNet + 0.1% Quantizer", True)]:
             env.order_usd = budget

@@ -3,17 +3,19 @@
   "H": 60,
   "seq_len": 180,
   "optimal_weights": {
-    "lightgbm": 0.55,
-    "mlp_bottleneck": 0.2,
-    "conv1d+gru": 0.15,
-    "attention": 0.05,
-    "causal_cnn": 0.05
+    "lightgbm": 0.45,
+    "mlp_bottleneck": 0.14,
+    "conv1d+gru": 0.11,
+    "attention": 0.04,
+    "causal_cnn": 0.04,
+    "wavenet_tcn": 0.11,
+    "cross_mixer": 0.11
   },
   "ensemble_metrics_oos": {
-    "ic": 0.2745,
-    "auc": 0.778,
-    "log_loss": 1.12,
-    "top2_pnl": 0.82
+    "ic": 0.2812,
+    "auc": 0.7845,
+    "log_loss": 1.105,
+    "top2_pnl": 0.86
   },
   "leaderboard": [
     {
@@ -50,6 +52,24 @@
       "auc": 0.7369,
       "log_loss": 1.7683,
       "top2_pnl": 0.15
+    },
+    {
+      "model": "wavenet_tcn (3-win rolling)",
+      "params": 58407,
+      "time_s": 25.0,
+      "ic": 0.2318,
+      "mean_ic": 0.2217,
+      "auc": 0.7712,
+      "mean_auc": 0.741
+    },
+    {
+      "model": "cross_mixer (3-win rolling)",
+      "params": 54215,
+      "time_s": 24.0,
+      "ic": 0.2242,
+      "mean_ic": 0.2189,
+      "auc": 0.7561,
+      "mean_auc": 0.7419
     }
   ]
 }

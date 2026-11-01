@@ -125,6 +125,8 @@ def run_gpu_population_step(
             for p_name, p_val in cand_cpu.named_parameters():
                 if "actor" in p_name or "backbone.3" in p_name:
                     p_val.add_(torch.randn_like(p_val) * sigma)
+                elif "backbone.0.weight" in p_name and p_val.shape[1] >= 42:
+                    p_val[:, 28:32].add_(torch.randn_like(p_val[:, 28:32]) * (sigma * 3.0))
         cand_cpu.eval()
         candidates_cpu.append(cand_cpu)
 

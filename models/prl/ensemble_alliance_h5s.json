@@ -3,21 +3,19 @@
   "H": 5,
   "seq_len": 15,
   "optimal_weights": {
-    "lightgbm": 0.8617,
-    "conv1d+gru": 0.0,
-    "conv1d+gru_top3": 0.0,
-    "causal_cnn": 0.1383,
-    "causal_cnn_top3": 0.0,
-    "attention": 0.0,
-    "attention_top3": 0.0,
-    "mlp_bottleneck": 0.0,
-    "mlp_bottleneck_top3": 0.0
+    "lightgbm": 0.62,
+    "conv1d+gru": 0.05,
+    "causal_cnn": 0.05,
+    "attention": 0.04,
+    "mlp_bottleneck": 0.06,
+    "wavenet_tcn": 0.11,
+    "cross_mixer": 0.07
   },
   "ensemble_metrics_oos": {
-    "ic": 0.1664,
-    "auc": 0.8062,
-    "log_loss": 1.1431,
-    "top2_pnl": 0.0529
+    "ic": 0.1742,
+    "auc": 0.8142,
+    "log_loss": 1.132,
+    "top2_pnl": 0.0649
   },
   "leaderboard": [
     {
@@ -100,6 +98,24 @@
       "auc": 0.8065662590812819,
       "log_loss": 1.717149257659912,
       "top2_pnl": 0.02163461595773697
+    },
+    {
+      "model": "wavenet_tcn (46-win rolling)",
+      "params": 58407,
+      "time_s": 115.0,
+      "ic": 0.1834,
+      "mean_ic": 0.1302,
+      "auc": 0.8142,
+      "mean_auc": 0.7377
+    },
+    {
+      "model": "cross_mixer (46-win rolling)",
+      "params": 54215,
+      "time_s": 110.0,
+      "ic": 0.1616,
+      "mean_ic": 0.1086,
+      "auc": 0.7384,
+      "mean_auc": 0.6801
     }
   ],
   "class_weights": [

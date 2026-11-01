@@ -28,6 +28,36 @@ from _tools.swarm_router import SwarmRegimeRouter
 from _tools.data_labeler import COIN_CONFIG
 
 
+def _compute_v52_signals_matrix(data_dict: dict, coin: str = "prl") -> np.ndarray:
+    """Предвычисляет 4D матрицу сигналов [p_car_50, log_cap_norm, p_adverse, p_exhaust] из CarouselNet + HazardNet."""
+    n = len(data_dict["X_market"])
+    out = np.zeros((n, 4), dtype=np.float32)
+    out[:, 0] = 0.13
+    out[:, 1] = 0.02
+    out[:, 2] = 0.08
+    out[:, 3] = 0.04
+    try:
+        from _tools.carousel_net import build_carousel_features, CarouselPredictor
+        from _tools.hazard_net import HazardPredictor
+        c_path = BASE_DIR / "models" / coin.lower() / "rl_execution" / "carousel_net.pt"
+        h_path = BASE_DIR / "models" / coin.lower() / "rl_execution" / "hazard_net.pt"
+        if c_path.exists() and h_path.exists():
+            X44 = build_carousel_features(data_dict)
+            cp = CarouselPredictor(c_path)
+            hp = HazardPredictor(h_path)
+            probs_c, cap_c = cp.predict_batch(X44)
+            pa, pe = hp.predict_batch(X44)
+            out = np.column_stack([
+                probs_c[:, 1],
+                np.log1p(np.maximum(0.0, cap_c)) / 7.0,
+                pa,
+                pe,
+            ]).astype(np.float32)
+    except Exception as e:
+        print(f"⚠️ Precompute X_v52 warning: {e}")
+    return out
+
+
 def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 176.0, force_rebuild: bool = False) -> dict:
     """
     Этап 1: Предрасчёт и кэширование сигналов триады ансамблей (H=5s, 12s, 25s)
@@ -41,8 +71,16 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 176.0, force_r
     if rl_cache_path.exists() and not force_rebuild:
         data_raw = np.load(rl_cache_path, allow_pickle=True)
         if "X_h60" in data_raw.files:
-            print(f"⚡ Загрузка готового кэша RL-полигона (Триада H=5,12,25,60s): {rl_cache_path.name}")
-            return {k: data_raw[k] for k in data_raw.files}
+            res_dict = {k: data_raw[k] for k in data_raw.files}
+            if "X_v52" not in res_dict or len(res_dict["X_v52"]) != len(res_dict["X_market"]):
+                print(f"🧠 Досчет 4D матрицы CarouselNet + HazardNet (X_v52) для кэша {rl_cache_path.name}...")
+                res_dict["X_v52"] = _compute_v52_signals_matrix(res_dict, coin=coin)
+                try:
+                    np.savez_compressed(rl_cache_path, **res_dict)
+                except Exception:
+                    pass
+            print(f"⚡ Загрузка готового кэша RL-полигона (Триада H=5,12,25,60s + X_v52): {rl_cache_path.name}")
+            return res_dict
 
     labeled_path = BASE_DIR / "data" / "labeled" / coin / f"{coin}_labeled.parquet"
     feat_path = BASE_DIR / "data" / "features" / f"{coin}_1s_features.parquet"
@@ -293,8 +331,9 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 176.0, force_r
         "ts": ts_arr,
         "tick_size": np.array(tick_size, dtype=np.float64),
     }
+    payload["X_v52"] = _compute_v52_signals_matrix(payload, coin=coin)
     np.savez_compressed(rl_cache_path, **payload)
-    print(f"✅ Кэш RL-полигона сохранён в {rl_cache_path} ({X_market.shape[0]:,} строк x {X_market.shape[1]} признаков + H=60s)")
+    print(f"✅ Кэш RL-полигона сохранён в {rl_cache_path} ({X_market.shape[0]:,} строк x {X_market.shape[1]} признаков + H=60s + X_v52)")
     return payload
 
 
@@ -312,7 +351,7 @@ class SafeTradeL2ExecutionEnv:
       6: PANIC_TAKER_EXIT (мгновенный выход по рынку через 10 уровней стакана)
     """
 
-    def __init__(self, data: dict, start_idx: int, end_idx: int, episode_len: int = 3600, order_usd: float = 95.5, legacy_v2: bool = False, enable_unfreeze: bool = True):
+    def __init__(self, data: dict, start_idx: int, end_idx: int, episode_len: int = 3600, order_usd: float = 95.5, legacy_v2: bool = False, enable_unfreeze: bool = True, use_v52_obs: bool = True):
         self.enable_unfreeze = bool(enable_unfreeze)
         self.X_market = data["X_market"]
         self.X_h60 = data.get("X_h60", np.zeros((len(self.X_market), 6), dtype=np.float32))
@@ -330,7 +369,15 @@ class SafeTradeL2ExecutionEnv:
         self.episode_len = int(episode_len)
         self.order_usd = float(order_usd)
         self.legacy_v2 = bool(legacy_v2)
-        self.obs_dim = self.X_market.shape[1] + 10
+        self.use_v52_obs = bool(use_v52_obs) and (not self.legacy_v2)
+        if "X_v52" in data and len(data["X_v52"]) == len(self.X_market):
+            self.X_v52 = data["X_v52"].astype(np.float32)
+        elif self.use_v52_obs:
+            self.X_v52 = _compute_v52_signals_matrix(data)
+            data["X_v52"] = self.X_v52
+        else:
+            self.X_v52 = np.zeros((len(self.X_market), 4), dtype=np.float32)
+        self.obs_dim = self.X_market.shape[1] + (4 if self.use_v52_obs else 0) + 10
         self.n_actions = 7
 
         # Предрасчет каузальных индикаторов локальных экстремумов (5м / 15м / 60м) и вектора рыночной инерции
@@ -753,7 +800,10 @@ class SafeTradeL2ExecutionEnv:
         q_ratio = self.q_ahead / (self.q_ahead + self.order_qty + 1e-6) if self.order_side else 0.0
 
         buf = self._obs_buf
-        buf[:-10] = self.X_market[t]
+        m_dim = self.X_market.shape[1]
+        buf[:m_dim] = self.X_market[t]
+        if getattr(self, "use_v52_obs", False):
+            buf[m_dim : m_dim + 4] = self.X_v52[t]
         buf[-10] = has_pos
         buf[-9] = min(max(unr_ticks * 0.1, -3.0), 3.0)
         buf[-8] = hold_ratio
@@ -1352,12 +1402,35 @@ class MaskableActorCritic(nn.Module):
         return logits, val
 
 
+def load_compatible_ppo_state_dict(model: MaskableActorCritic, sd: dict) -> None:
+    """Загружает state_dict в MaskableActorCritic с хирургической адаптацией первого слоя при переходе 38D <-> 42D."""
+    sd = dict(sd.get("model_state_dict", sd) if isinstance(sd, dict) else sd)
+    target_w = model.backbone[0].weight.data
+    src_w = sd["backbone.0.weight"]
+    if src_w.shape != target_w.shape:
+        new_w = torch.zeros_like(target_w)
+        if src_w.shape[1] == 38 and target_w.shape[1] == 42:
+            new_w[:, :28] = src_w[:, :28]
+            new_w[:, 32:42] = src_w[:, 28:38]
+        elif src_w.shape[1] == 42 and target_w.shape[1] == 38:
+            new_w[:, :28] = src_w[:, :28]
+            new_w[:, 28:38] = src_w[:, 32:42]
+        else:
+            c_min = min(src_w.shape[1], target_w.shape[1])
+            new_w[:, :c_min] = src_w[:, :c_min]
+        sd["backbone.0.weight"] = new_w
+    model.load_state_dict(sd)
+
+
 def teacher_heuristic_action(obs: np.ndarray, mask: np.ndarray) -> int:
-    """Селективная нейросетевая политика-учитель (с учетом 0.20% round-trip комиссий Maker) для Warm-Start PPO."""
+    """Селективная нейросетевая политика-учитель (с учетом 0.20% round-trip комиссий Maker + CarouselNet/HazardNet) для Warm-Start PPO."""
     ez_5, p_up_5, p_dn_5, p_tp_5, p_tn_5 = obs[0], obs[1], obs[2], obs[3], obs[4]
     ez_12, p_up_12, p_dn_12 = obs[6], obs[7], obs[8]
     ez_25 = obs[12]
     imb5 = obs[20]
+    p_car_50 = float(obs[28]) if len(obs) >= 42 else 0.25
+    p_adv = float(obs[30]) if len(obs) >= 42 else 0.08
+    p_exh = float(obs[31]) if len(obs) >= 42 else 0.04
     has_pos = obs[-10] > 0.5
     unr_ticks = obs[-9] * 10.0
     hold_ratio = obs[-8]
@@ -1368,11 +1441,16 @@ def teacher_heuristic_action(obs: np.ndarray, mask: np.ndarray) -> int:
     exp_hold_edge = obs[-1] * 5.0
 
     if not has_pos:
+        if p_adv >= 0.65:
+            if has_bid and mask[5]:
+                return 5
+            return 0
         strong_buy = (
             exp_entry_edge >= 0.80 and model_err_12 > -1.5 and p_tn_5 < 0.26 and imb5 > -0.45
             and (
                 (ez_25 >= 0.08 and ez_12 >= 0.04 and ez_5 >= -0.02)
                 or (exp_entry_edge >= 1.35 and ez_12 >= 0.08 and ez_5 >= 0.35 and imb5 >= 0.50)
+                or (p_car_50 >= 0.55 and p_adv < 0.30 and exp_entry_edge >= 0.65)
             )
         )
         dip_buy = (
@@ -1385,7 +1463,7 @@ def teacher_heuristic_action(obs: np.ndarray, mask: np.ndarray) -> int:
         if dip_buy and mask[2]:
             return 0 if has_bid else 2
         if has_bid:
-            if (obs[-5] >= 0.22 or exp_entry_edge < 0.20 or model_err_12 < -2.5 or ez_12 < -0.15 or p_tn_5 > 0.35) and mask[5]:
+            if (obs[-5] >= 0.22 or exp_entry_edge < 0.20 or model_err_12 < -2.5 or ez_12 < -0.15 or p_tn_5 > 0.35 or p_adv >= 0.58) and mask[5]:
                 return 5
             return 0
         return 0
@@ -1394,7 +1472,7 @@ def teacher_heuristic_action(obs: np.ndarray, mask: np.ndarray) -> int:
             return 6
         if has_ask:
             return 0
-        if exp_hold_edge >= 0.90 and ez_25 >= 0.15 and ez_12 >= 0.08 and hold_ratio < 0.50 and mask[3]:
+        if p_exh < 0.72 and exp_hold_edge >= 0.90 and ez_25 >= 0.15 and ez_12 >= 0.08 and hold_ratio < 0.50 and mask[3]:
             return 3
         if mask[4]:
             return 4
@@ -1537,7 +1615,10 @@ def load_live_telemetry_experiences(obs_dim: int = 38) -> tuple[np.ndarray, np.n
         obs_arr = np.array([json.loads(x) for x in s15["obs_json"]], dtype=np.float32)
         mask_arr = np.array([json.loads(x) for x in s15["mask_json"]], dtype=bool)
         act_arr = s15["act"].values.astype(np.int64)
-        if obs_arr.shape[1] != obs_dim:
+        if obs_arr.shape[1] == 38 and obs_dim == 42:
+            v52_pad = np.tile(np.array([0.13, 0.02, 0.08, 0.04], dtype=np.float32), (len(obs_arr), 1))
+            obs_arr = np.hstack([obs_arr[:, :28], v52_pad, obs_arr[:, 28:38]]).astype(np.float32)
+        elif obs_arr.shape[1] != obs_dim:
             return np.empty((0, obs_dim), dtype=np.float32), np.empty((0, 7), dtype=bool), np.empty((0,), dtype=np.int64)
 
         # Разрешаем подтягивание пассивного бида (act=2 -> act=1) в маске и размечаем эталонным нейро-учителем
@@ -1689,11 +1770,10 @@ def train_rl_agent(
     if warm_ckpt.exists():
         cand_model = MaskableActorCritic(obs_dim=train_env.obs_dim, n_actions=train_env.n_actions).to(device)
         sd_w = torch.load(warm_ckpt, map_location=device, weights_only=False)
-        sd_w = sd_w.get("model_state_dict", sd_w) if isinstance(sd_w, dict) else sd_w
-        cand_model.load_state_dict(sd_w)
+        load_compatible_ppo_state_dict(cand_model, sd_w)
         cand_res = evaluate_policy(test_env, model=cand_model, device=device)
         if cand_res["efficiency_score"] > ws_res["efficiency_score"] and cand_res["trades"] >= 2:
-            print(f"🎓 Выбран существующий чекпоинт {warm_ckpt.name} (Score={cand_res['efficiency_score']:+.1f} vs BC={ws_res['efficiency_score']:+.1f})")
+            print(f"🎓 Выбран существующий чекпоинт {warm_ckpt.name} с хирургической адаптацией до {train_env.obs_dim}D (Score={cand_res['efficiency_score']:+.1f} vs BC={ws_res['efficiency_score']:+.1f})")
             model.load_state_dict(cand_model.state_dict())
             ws_res = cand_res
 
@@ -1856,7 +1936,7 @@ def inspect_and_plot_rl_oos(coin: str = "prl", tail_hours: float = 176.0, start_
     h3 = sd3["backbone.0.weight"].shape[0] if sd3 is not None else 128
     model = MaskableActorCritic(obs_dim=test_env.obs_dim, n_actions=test_env.n_actions, hidden_dim=h3).to(device)
     if sd3 is not None:
-        model.load_state_dict(sd3)
+        load_compatible_ppo_state_dict(model, sd3)
     model.eval()
 
     base_model = None

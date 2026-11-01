@@ -1078,8 +1078,16 @@ class LiveTriadRLTrader:
         q_val = max(0.0, self.q_ahead)
         q_ratio = q_val / (q_val + ord_q + 1e-6) if (has_bid or has_ask) else 0.0
 
+        v52_vec = []
+        if getattr(self.agent.backbone[0], "in_features", 38) == 42:
+            v52_vec = [
+                float(self.last_car_probs[1]),
+                float(math.log1p(max(0.0, self.last_car_cap_prl)) / 7.0),
+                float(self.last_p_adverse),
+                float(self.last_p_exhaust),
+            ]
         obs = np.array(
-            triad_vec + lob_vec + [
+            triad_vec + lob_vec + v52_vec + [
                 has_pos, float(np.clip(unr_ticks * 0.1, -3.0, 3.0)), hold_ratio,
                 has_bid, has_ask, float(np.clip(dist * 0.2, -2.0, 2.0)), q_ratio,
                 obs_err12_norm, obs_entry_edge_norm, obs_hold_edge_norm,
@@ -2118,6 +2126,10 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
             "active_ask_id": trader.active_ask_id,
             "active_ask_p": trader.active_ask_p,
             "active_ask_q": trader.active_ask_q,
+            "p_car50": round(float(trader.last_car_probs[1]), 4),
+            "cap_prl": round(float(trader.last_car_cap_prl), 1),
+            "p_adv": round(float(trader.last_p_adverse), 4),
+            "p_exh": round(float(trader.last_p_exhaust), 4),
         }
         telemetry_f.write(json.dumps(rec) + "\n")
         telemetry_f.flush()
@@ -2127,7 +2139,8 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
         if step_idx <= 5 or step_idx % 5 == 0 or act != 0:
             print(
                 f"  [{ts_msk_str} MSK | #{step_idx:04d}] Bid={b1:.2f} Ask={a1:.2f} | Act={trader.ACTION_NAMES[act]:<14} | "
-                f"V={v_pred:+.2f}t | Equity=${eq_usd:.2f} ({pnl_tot:+.2f}$) | {dt_ms:.1f} ms",
+                f"V={v_pred:+.2f}t | Car={trader.last_car_probs[1]:.0%}/{trader.last_car_cap_prl:.0f}p Adv={trader.last_p_adverse:.0%} | "
+                f"Equity=${eq_usd:.2f} ({pnl_tot:+.2f}$) | {dt_ms:.1f} ms",
                 flush=True,
             )
 
