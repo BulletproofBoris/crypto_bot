@@ -47,6 +47,7 @@ class SafeTradePrivateClient:
     BASE_URL = "https://safe.trade/api/v2"
 
     def __init__(self, api_key: str = None, api_secret: str = None, use_proxy: bool = True, use_vps_bridge: bool = True):
+        import threading
         _load_dotenv()
         self.api_key = api_key or os.environ.get("SAFETRADE_API_KEY", "")
         self.api_secret = api_secret or os.environ.get("SAFETRADE_API_SECRET", "")
@@ -56,6 +57,8 @@ class SafeTradePrivateClient:
             impersonate="chrome120",
             curl_options={CurlOpt.IPRESOLVE: 1},
         )
+        self._req_lock = threading.Lock()
+        self._last_nonce = int(time.time() * 1000)
         self.use_vps_bridge = use_vps_bridge
         self._ssh = None
         self._bridge_in = None
@@ -77,6 +80,7 @@ class SafeTradePrivateClient:
             "    with open(TEL_PATH, 'w', newline='', encoding='utf-8') as f:\n"
             "        csv.writer(f).writerow(COLS)\n"
             "sess = requests.Session(impersonate='chrome120', curl_options={CurlOpt.IPRESOLVE: 1})\n"
+            "last_n = int(time.time() * 1000)\n"
             "while True:\n"
             "    line = sys.stdin.readline()\n"
             "    if not line:\n"
@@ -89,15 +93,22 @@ class SafeTradePrivateClient:
             "        sys.stdout.write('{\"status\": 200, \"text\": \"ok\"}\\n')\n"
             "        sys.stdout.flush()\n"
             "        continue\n"
-            "    n = str(int(time.time() * 1000))\n"
-            "    sig = hmac.new(S.encode(), (n + K).encode(), hashlib.sha256).hexdigest()\n"
-            "    hdr = {'X-Auth-Apikey': K, 'X-Auth-Nonce': n, 'X-Auth-Signature': sig, 'Content-Type': 'application/json'}\n"
             "    try:\n"
-            "        if req['method'] == 'GET':\n"
-            "            r = sess.get(req['url'], headers=hdr if req.get('auth', True) else None, timeout=6)\n"
-            "        else:\n"
-            "            body = json.dumps(req['body']) if req.get('body') is not None else None\n"
-            "            r = sess.post(req['url'], headers=hdr, data=body, timeout=6)\n"
+            "        for att in range(3):\n"
+            "            last_n = max(int(time.time() * 1000), last_n + 1)\n"
+            "            n = str(last_n)\n"
+            "            sig = hmac.new(S.encode(), (n + K).encode(), hashlib.sha256).hexdigest()\n"
+            "            hdr = {'X-Auth-Apikey': K, 'X-Auth-Nonce': n, 'X-Auth-Signature': sig, 'Content-Type': 'application/json'}\n"
+            "            if req['method'] == 'GET':\n"
+            "                r = sess.get(req['url'], headers=hdr if req.get('auth', True) else None, timeout=6)\n"
+            "            else:\n"
+            "                body = json.dumps(req['body']) if req.get('body') is not None else None\n"
+            "                r = sess.post(req['url'], headers=hdr, data=body, timeout=6)\n"
+            "            if r.status_code in (401, 403, 429) and att < 2:\n"
+            "                time.sleep(0.25 * (att + 1))\n"
+            "                last_n = max(int(time.time() * 1000), last_n + 5)\n"
+            "                continue\n"
+            "            break\n"
             "        sys.stdout.write(json.dumps({'status': r.status_code, 'text': r.text}) + '\\n')\n"
             "    except Exception as e:\n"
             "        sys.stdout.write(json.dumps({'status': 599, 'text': str(e)}) + '\\n')\n"
@@ -136,40 +147,45 @@ class SafeTradePrivateClient:
 
     def _private_req(self, method: str, path: str, body: dict = None, auth: bool = True) -> dict | list:
         url = f"{self.BASE_URL}{path}"
-        if self.use_vps_bridge:
-            try:
-                self._bridge_in.write(json.dumps({"method": method, "url": url, "body": body, "auth": auth}) + "\n")
-                self._bridge_in.flush()
-                resp_line = self._bridge_out.readline()
-                if not resp_line:
-                    self._init_vps_bridge()
+        with self._req_lock:
+            if self.use_vps_bridge:
+                try:
                     self._bridge_in.write(json.dumps({"method": method, "url": url, "body": body, "auth": auth}) + "\n")
                     self._bridge_in.flush()
                     resp_line = self._bridge_out.readline()
-                res = json.loads(resp_line)
-                if res["status"] >= 400:
-                    raise RuntimeError(f"SafeTrade HTTP {res['status']}: {res['text']}")
-                return json.loads(res["text"]) if res["text"] else {}
-            except Exception as e:
-                if "SafeTrade HTTP" in str(e):
+                    if not resp_line:
+                        self._init_vps_bridge()
+                        self._bridge_in.write(json.dumps({"method": method, "url": url, "body": body, "auth": auth}) + "\n")
+                        self._bridge_in.flush()
+                        resp_line = self._bridge_out.readline()
+                    res = json.loads(resp_line)
+                    if res["status"] >= 400:
+                        raise RuntimeError(f"SafeTrade HTTP {res['status']}: {res['text']}")
+                    return json.loads(res["text"]) if res["text"] else {}
+                except Exception as e:
+                    if "SafeTrade HTTP" in str(e):
+                        raise
+                    self._init_vps_bridge()
                     raise
-                self._init_vps_bridge()
-                raise
-        for attempt in range(2):
-            if method == "GET":
-                r = self.session.get(url, headers=self._auth_headers() if auth else None, timeout=6)
-            else:
-                r = self.session.post(url, headers=self._auth_headers(), data=json.dumps(body) if body else None, timeout=6)
-            if r.status_code == 403 and attempt == 0:
-                time.sleep(0.35)
-                continue
-            break
-        if r.status_code >= 400:
-            raise RuntimeError(f"SafeTrade HTTP {r.status_code}: {r.text}")
-        return r.json() if r.text else {}
+            for attempt in range(3):
+                hdrs = self._auth_headers() if auth else None
+                if method == "GET":
+                    r = self.session.get(url, headers=hdrs, timeout=6)
+                else:
+                    r = self.session.post(url, headers=hdrs, data=json.dumps(body) if body else None, timeout=6)
+                if r.status_code in (401, 403, 429) and attempt < 2:
+                    time.sleep(0.25 * (attempt + 1))
+                    self._last_nonce = max(int(time.time() * 1000), self._last_nonce + 5)
+                    continue
+                break
+            if r.status_code >= 400:
+                raise RuntimeError(f"SafeTrade HTTP {r.status_code}: {r.text}")
+            return r.json() if r.text else {}
 
     def _auth_headers(self) -> dict:
-        nonce = str(int(time.time() * 1000))
+        now_ms = int(time.time() * 1000)
+        self._last_nonce = max(now_ms, self._last_nonce + 1)
+        nonce = str(self._last_nonce)
         msg = f"{nonce}{self.api_key}".encode("utf-8")
         sig = hmac.new(self.api_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
         return {
@@ -452,14 +468,15 @@ class LiveTriadRLTrader:
             self.car_state = 0
         oid_map = {}
         active_oids = [oid for oid in (self.active_bid_id, self.active_ask_id, self.slot2_ask_id) if oid is not None]
-        if len(active_oids) > 1 and hasattr(self, "_io_pool"):
-            def _fetch_one(oid):
-                try:
-                    return oid, self.client.get_order(oid)
-                except Exception as e:
-                    return oid, e
-            for k_id, v_res in self._io_pool.map(_fetch_one, active_oids):
-                oid_map[k_id] = v_res
+        if len(active_oids) > 1:
+            try:
+                open_list = self.client.get_open_orders(self.market)
+                for o_item in open_list:
+                    oid_k = o_item.get("id")
+                    if oid_k in active_oids:
+                        oid_map[oid_k] = o_item
+            except Exception:
+                pass
         if self.active_bid_id is not None:
             if count_hold:
                 self.bid_age_sec = getattr(self, "bid_age_sec", 0) + 1
@@ -685,9 +702,11 @@ class LiveTriadRLTrader:
                     self.active_ask_id = top_s.get("id")
                     self.active_ask_p = float(top_s.get("price", 0.0))
                     self.active_ask_q = float(top_s.get("remaining_volume", top_s.get("origin_amount", self.pos_qty)))
-                    self.user_manual_ask = True
+                    is_dedicated = (self.reserved_account_usdt <= 1e-4 and self.user_reserved_coin <= 1e-4)
+                    self.user_manual_ask = not is_dedicated
                     self._save_wallet()
-                    print(f"  🤝 [ADOPT USER SELL] Подхвачен ручной ордер продажи id={self.active_ask_id}: {self.active_ask_q:.4f} PRL @ ${self.active_ask_p:.2f}")
+                    tag = "RECOVER BOT SELL" if is_dedicated else "ADOPT USER SELL"
+                    print(f"  🤝 [{tag}] Подхвачен активный ордер продажи id={self.active_ask_id}: {self.active_ask_q:.4f} PRL @ ${self.active_ask_p:.2f}")
             except Exception:
                 pass
 
@@ -1659,7 +1678,28 @@ class LiveTriadRLTrader:
                             print(f"  🎠 [{tag}] id={self.active_bid_id} | Переставлен откуп {self.active_bid_q:.4f} PRL @ ${self.active_bid_p:.2f}")
                         except Exception as eb:
                             print(f"  ⚠️ [CAROUSEL TRAIL BUY ERROR]: {eb}")
+            if getattr(self, "car_state", 0) == 0 and not can_buy_more and self.active_bid_id is not None and b1 > self.active_bid_p + self.tick_size + tol:
+                old_b_id = self.active_bid_id
+                old_b_usd = self.active_bid_q * self.active_bid_p
+                try:
+                    self.client.cancel_order(old_b_id)
+                    print(f"  ✖️ [CANCEL STALE SCALE-IN BID] id={old_b_id} @ ${self.active_bid_p:.2f} (рынок ушел вверх Bid=${b1:.2f})")
+                except Exception as e:
+                    print(f"  ⚠️ [CANCEL STALE BID WARN] id={old_b_id}: {e}")
+                self.ex_usdt_free = max(self.ex_usdt_free, min(self.bot_cash_usd, self.ex_usdt_free + old_b_usd))
+                self.active_bid_id, self.active_bid_p, self.active_bid_q = None, 0.0, 0.0
+                self.q_ahead = 0.0
+                self.bid_age_sec = 0
+                self.bid_partial_filled = 0.0
+                self.bid_accounted_filled = 0.0
+                self._save_wallet()
             can_step_up_car = (getattr(self, "car_state", 0) == 2 and self.slot2_ask_id is None and a1 >= self.car_sell_px + 2.0 * self.tick_size - tol and self.pos_qty >= 20.0)
+            overhigh_ask = (
+                self.active_ask_id is not None
+                and self.slot2_ask_id is None
+                and self.active_ask_p > max(super_p, a1) + tol
+                and not pump_up
+            )
             if act == 0:
                 wave_hold_ok = b1 >= self.avg_entry - tol or (
                     b1 >= self.avg_entry - 1.25 * self.tick_size
@@ -1673,6 +1713,9 @@ class LiveTriadRLTrader:
                     )
                 )
                 if pump_up and self.active_ask_id is not None and a1 >= self.active_ask_p - tol and self.last_imb5 >= 0.20 and b1 >= self.avg_entry:
+                    self.split_done_for_pos = False
+                    act = 3
+                elif overhigh_ask:
                     self.split_done_for_pos = False
                     act = 3
                 elif self.active_ask_p >= wave_p - tol and not wave_hold_ok and self.last_hold_edge < -0.20 and a1 <= floor_p + tol:
@@ -1710,7 +1753,7 @@ class LiveTriadRLTrader:
                     or triad_super
                     or (pump_up and (self.last_vel10 >= 2.0 or getattr(self, "last_vel3", 0.0) >= 2.0 or getattr(self, "last_in_breakout", False)))
                 )
-                if self.active_ask_id is not None and self.active_ask_p >= wave_p - tol and self.split_done_for_pos:
+                if self.active_ask_id is not None and self.active_ask_p >= wave_p - tol and self.split_done_for_pos and not overhigh_ask:
                     if pump_up and a1 >= self.active_ask_p - tol and self.last_imb5 >= 0.20 and b1 >= self.avg_entry:
                         self.split_done_for_pos = False
                         act = 3
@@ -1795,6 +1838,8 @@ class LiveTriadRLTrader:
                             except Exception as ec:
                                 print(f"  ⚠️ [CAROUSEL LEG-1 ERROR]: {ec}")
                     if pump_up and a1 >= self.active_ask_p - tol and self.last_imb5 >= 0.20 and b1 >= self.avg_entry:
+                        act = 3
+                    elif overhigh_ask:
                         act = 3
                     elif self.active_ask_p >= wave_p - tol and b1 >= self.avg_entry - tol:
                         return
