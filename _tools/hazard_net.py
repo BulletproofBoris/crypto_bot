@@ -130,7 +130,7 @@ class HazardPredictor:
                 p_g_m, p_g_s = np.mean(probs, axis=0, keepdims=True), np.std(probs, axis=0, keepdims=True) + 1e-6
                 p_r_m, p_r_s = np.mean(p_routed, axis=0, keepdims=True), np.std(p_routed, axis=0, keepdims=True) + 1e-6
                 p_routed = np.clip((p_routed - p_r_m) * (p_g_s / p_r_s) + p_g_m, 0.0, 1.0)
-                probs = 0.85 * probs + 0.15 * p_routed
+                probs = 0.98 * probs + 0.02 * p_routed
         return probs[:, 0], probs[:, 1]
 
 

@@ -208,8 +208,8 @@ class CarouselPredictor:
                 p_r_m, p_r_s = np.mean(p_routed, axis=0, keepdims=True), np.std(p_routed, axis=0, keepdims=True) + 1e-6
                 p_routed = np.clip((p_routed - p_r_m) * (p_g_s / p_r_s) + p_g_m, 0.0, 1.0)
                 lc_routed = (lc_routed - float(np.mean(lc_routed))) * ((float(np.std(lc_blend)) + 1e-6) / (float(np.std(lc_routed)) + 1e-6)) + float(np.mean(lc_blend))
-                probs = 0.85 * probs + 0.15 * p_routed
-                lc_blend = 0.85 * lc_blend + 0.15 * lc_routed
+                probs = 0.98 * probs + 0.02 * p_routed
+                lc_blend = 0.98 * lc_blend + 0.02 * lc_routed
             q_cap = np.expm1(np.clip(lc_blend, 0.0, 8.6))
         return probs, q_cap
 
@@ -235,8 +235,8 @@ class CarouselPredictor:
                     lc_acc += w_i * float(lc_w[0].item())
                     w_sum += w_i
                 if w_sum > 1e-8:
-                    probs = 0.75 * probs + 0.25 * (p_acc / w_sum)
-                    lc_val = 0.75 * lc_val + 0.25 * (lc_acc / w_sum)
+                    probs = 0.98 * probs + 0.02 * (p_acc / w_sum)
+                    lc_val = 0.98 * lc_val + 0.02 * (lc_acc / w_sum)
             q_cap = float(np.expm1(np.clip(lc_val, 0.0, 8.6)))
         return probs, q_cap
 
@@ -461,7 +461,7 @@ def run_carousel_backtest(cache_path: str = "data/cache/rl_triad_lob_cache_prl_1
                                 env.car_q_ahead, _ = env._get_lob_queue(env.t, "SELL", env.car_px)
                                 env.car_state = 1
                     # 2) Амбивалентная докупка на просадке (v4.0 Scale-In) + Side-Pocket Carousel с шагом 0.1%
-                    if env.pos_qty > 1e-4 and p50 >= 0.60 and p_adv < 0.52 and float(env.dd_900[env.t]) <= 2.0:
+                    if env.pos_qty > 1e-4 and p50 >= 0.60 and p_adv < 0.55:
                         uw_t = (env.avg_entry - b1_now) / env.tick_size
                         if 1.0 <= uw_t <= 2.5 and float(env.inertia_arr[env.t]) >= 0.25 and float(obs[-2] * 5.0) >= 0.80 and not getattr(env, "_scaled_in", False):
                             add_w = min(0.450, max(0.001, round((0.25 + 0.20 * p50) * 1000.0) / 1000.0))
