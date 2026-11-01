@@ -14,6 +14,8 @@ import numpy as np
 import pandas as pd
 import torch
 
+torch.set_num_threads(1)
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 

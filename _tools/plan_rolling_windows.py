@@ -91,7 +91,8 @@ def analyze_horizon_windows(
             wins = sorted([p.stem.replace("model_", "") for p in ndir.glob("model_win_*.keras")])
             neural_trained[arch_dir] = wins
 
-    latest_tr_e_pos = mapped_existing[0]["tr_e_pos"] if mapped_existing else (n_clean - step - buffer)
+    latest_win = max(mapped_existing, key=lambda w: w["tr_e_pos"]) if mapped_existing else None
+    latest_tr_e_pos = latest_win["tr_e_pos"] if latest_win else (n_clean - step - buffer)
     avail_after_latest_tr = n_clean - latest_tr_e_pos
 
     # 1. Новые стандартные окна с шагом step = T_train // 2 вперед от последнего win_00
@@ -148,7 +149,7 @@ def analyze_horizon_windows(
     need_for_min_oos = max(0, (next_step_tr_e + buffer + min_test_sec) - n_clean)
     need_for_full_oos = max(0, (next_step_tr_e + buffer + step) - n_clean)
 
-    new_tr_ends = [w["tr_e_pos"] for w in reversed(new_step_windows)] + [w["tr_e_pos"] for w in mapped_existing]
+    new_tr_ends = [w["tr_e_pos"] for w in mapped_existing] + [w["tr_e_pos"] for w in new_step_windows]
 
     return {
         "H": H,
@@ -170,7 +171,7 @@ def analyze_horizon_windows(
     }
 
 
-def print_window_plan(coin: str = "prl", horizons: tuple = (5, 12, 25), min_test_sec: int = 21600):
+def print_window_plan(coin: str = "prl", horizons: tuple = (5, 12, 25, 60), min_test_sec: int = 21600):
     coin = coin.lower()
     labeled_path = BASE_DIR / "data" / "labeled" / coin / f"{coin}_labeled.parquet"
     features_path = BASE_DIR / "data" / "features" / f"{coin}_1s_features.parquet"
@@ -241,15 +242,14 @@ def print_window_plan(coin: str = "prl", horizons: tuple = (5, 12, 25), min_test
             f"Шаг (Step = Train/2) = {res['step']:,}с ({res['step']/3600:.1f}ч) | Buffer = {res['buffer']}с"
         )
         if existing:
-            w0 = existing[0]
-            w_last = existing[-1]
+            w_latest = max(existing, key=lambda w: w["tr_e_pos"])
             print(
                 f"   Обучено у Учителя (LightGBM): {n_ex} окон (win_00..win_{n_ex-1:02d}) | "
-                f"Свежее win_00: Train [{w0['tr_ts'][0]} ➔ {w0['tr_ts'][1]}] (tr_e_pos={w0['tr_e_pos']:,}), "
-                f"Test [{w0['te_ts'][0]} ➔ {w0['te_ts'][1]}] ({w0['n_test']:,}с)"
+                f"Свежее {w_latest['window_id']}: Train [{w_latest['tr_ts'][0]} ➔ {w_latest['tr_ts'][1]}] (tr_e_pos={w_latest['tr_e_pos']:,}), "
+                f"Test [{w_latest['te_ts'][0]} ➔ {w_latest['te_ts'][1]}] ({w_latest['n_test']:,}с)"
             )
             print(
-                f"   Накоплено чистых данных после Train win_00: +{res['avail_after_latest_tr']:,}с "
+                f"   Накоплено чистых данных после Train {w_latest['window_id']}: +{res['avail_after_latest_tr']:,}с "
                 f"({res['avail_after_latest_tr']/3600:.1f}ч)"
             )
         else:
@@ -309,7 +309,7 @@ def print_window_plan(coin: str = "prl", horizons: tuple = (5, 12, 25), min_test
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Калькулятор диапазонов новых окон Walk-Forward (Учитель + Ученик)")
     parser.add_argument("--coin", type=str, default="prl", help="Монета (prl или quantus)")
-    parser.add_argument("--horizons", type=str, default="5,12,25", help="Горизонты через запятую")
+    parser.add_argument("--horizons", type=str, default="5,12,25,60", help="Горизонты через запятую")
     parser.add_argument("--min-test-sec", type=int, default=21600, help="Минимальный OOS-тест для нового окна (по умолч. 21600с = 6ч)")
     args = parser.parse_args()
     h_tuple = tuple(int(x.strip()) for x in args.horizons.split(",") if x.strip())

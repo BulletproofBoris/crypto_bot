@@ -1,207 +1,167 @@
 {
-  "updated_at": "2026-10-30 13:18:45",
+  "updated_at": "2026-10-31 23:08:52",
   "regimes": [
     {
       "id": "R1_PUMP_BREAKOUT",
       "title": "🚀 Памп и пробой вверх",
-      "net_pnl_usd": 1.93,
-      "net_pnl_pct": 3.86,
-      "n_trades": 7,
-      "max_freeze_min": 11.3,
-      "max_dd_usd": 1.2405,
-      "requotes": 50
+      "net_pnl_usd": 1.1592,
+      "net_pnl_pct": 2.32,
+      "n_trades": 3,
+      "max_freeze_min": 4.7,
+      "max_dd_usd": 0.3606,
+      "requotes": 45
     },
     {
       "id": "R2_TOXIC_DUMP",
       "title": "🩸 Токсичный пролив вниз",
-      "net_pnl_usd": 2.0944,
-      "net_pnl_pct": 4.19,
-      "n_trades": 13,
-      "max_freeze_min": 7.8,
-      "max_dd_usd": 1.0197,
-      "requotes": 103
+      "net_pnl_usd": 0.1527,
+      "net_pnl_pct": 0.31,
+      "n_trades": 12,
+      "max_freeze_min": 14.5,
+      "max_dd_usd": 2.0367,
+      "requotes": 144
     },
     {
       "id": "R3_WIDE_SPREAD_SCALP",
       "title": "🦀 Живой коридор (спред >= 2т)",
-      "net_pnl_usd": 1.1669,
-      "net_pnl_pct": 2.33,
-      "n_trades": 7,
-      "max_freeze_min": 30.7,
-      "max_dd_usd": 0.3174,
-      "requotes": 20
+      "net_pnl_usd": 1.0207,
+      "net_pnl_pct": 2.04,
+      "n_trades": 4,
+      "max_freeze_min": 10.8,
+      "max_dd_usd": 0.5714,
+      "requotes": 92
     },
     {
       "id": "R4_TIGHT_1TICK_CHOP",
       "title": "🧱 Вязкий флэт (спред 1т)",
-      "net_pnl_usd": 2.7373,
-      "net_pnl_pct": 5.47,
-      "n_trades": 7,
-      "max_freeze_min": 14.6,
-      "max_dd_usd": 0.5791,
-      "requotes": 25
+      "net_pnl_usd": 0.1904,
+      "net_pnl_pct": 0.38,
+      "n_trades": 1,
+      "max_freeze_min": 44.6,
+      "max_dd_usd": 0.3407,
+      "requotes": 9
     },
     {
       "id": "R5_UNDERWATER_RECOVERY",
       "title": "🔄 Свежий рынок + выход из -6т",
-      "net_pnl_usd": 1.039,
-      "net_pnl_pct": 2.08,
-      "n_trades": 4,
-      "max_freeze_min": 41.6,
-      "max_dd_usd": 0.6524,
-      "requotes": 14
+      "net_pnl_usd": 0.0434,
+      "net_pnl_pct": 0.09,
+      "n_trades": 3,
+      "max_freeze_min": 72.0,
+      "max_dd_usd": 1.0917,
+      "requotes": 11
     },
     {
       "id": "R6_V_SHAPE_REVERSAL",
       "title": "🎢 V-образный пролив и выкуп",
-      "net_pnl_usd": 3.6752,
-      "net_pnl_pct": 7.35,
+      "net_pnl_usd": 1.0123,
+      "net_pnl_pct": 2.02,
       "n_trades": 13,
-      "max_freeze_min": 11.1,
-      "max_dd_usd": 1.3589,
-      "requotes": 88
+      "max_freeze_min": 22.2,
+      "max_dd_usd": 2.3983,
+      "requotes": 131
     },
     {
       "id": "R7_WHIPSAW_SWING",
       "title": "⚡ Высоковолатильные качели",
-      "net_pnl_usd": 3.469,
-      "net_pnl_pct": 6.94,
-      "n_trades": 17,
-      "max_freeze_min": 9.6,
-      "max_dd_usd": 1.0971,
-      "requotes": 78
+      "net_pnl_usd": 1.2876,
+      "net_pnl_pct": 2.58,
+      "n_trades": 8,
+      "max_freeze_min": 26.4,
+      "max_dd_usd": 2.7074,
+      "requotes": 94
     },
     {
       "id": "R8_STAIRCASE_GRIND_DOWN",
       "title": "📉 Ступенчатый спуск (-9т)",
-      "net_pnl_usd": 0.8019,
-      "net_pnl_pct": 1.6,
-      "n_trades": 7,
-      "max_freeze_min": 21.9,
-      "max_dd_usd": 0.4848,
-      "requotes": 70
-    },
-    {
-      "id": "R9_WHIPSAW_OCT30",
-      "title": "🌪️ Ночной распил (30 окт)",
-      "net_pnl_usd": 3.778,
-      "net_pnl_pct": 7.56,
-      "n_trades": 12,
-      "max_freeze_min": 14.5,
-      "max_dd_usd": 1.5432,
-      "requotes": 114
-    },
-    {
-      "id": "R10_RECOV_OCT30",
-      "title": "🌅 Свежий рынок + выход из -6т (30 окт)",
-      "net_pnl_usd": 5.3329,
-      "net_pnl_pct": 10.67,
-      "n_trades": 11,
-      "max_freeze_min": 22.4,
-      "max_dd_usd": 0.7036,
-      "requotes": 71
+      "net_pnl_usd": 1.0563,
+      "net_pnl_pct": 2.11,
+      "n_trades": 6,
+      "max_freeze_min": 6.4,
+      "max_dd_usd": 0.5876,
+      "requotes": 62
     }
   ],
   "prev_frozen": [
     {
       "id": "R1_PUMP_BREAKOUT",
       "title": "🚀 Памп и пробой вверх",
-      "net_pnl_usd": 0.1548,
-      "net_pnl_pct": 0.31,
+      "net_pnl_usd": 0.2102,
+      "net_pnl_pct": 0.42,
       "n_trades": 1,
       "max_freeze_min": 0.3,
-      "max_dd_usd": 0.3051,
-      "requotes": 49
+      "max_dd_usd": 0.3606,
+      "requotes": 31
     },
     {
       "id": "R2_TOXIC_DUMP",
       "title": "🩸 Токсичный пролив вниз",
-      "net_pnl_usd": -1.6549,
-      "net_pnl_pct": -3.31,
-      "n_trades": 6,
-      "max_freeze_min": 70.7,
-      "max_dd_usd": 3.444,
-      "requotes": 66
+      "net_pnl_usd": 2.3829,
+      "net_pnl_pct": 4.77,
+      "n_trades": 13,
+      "max_freeze_min": 26.1,
+      "max_dd_usd": 2.2372,
+      "requotes": 125
     },
     {
       "id": "R3_WIDE_SPREAD_SCALP",
       "title": "🦀 Живой коридор (спред >= 2т)",
-      "net_pnl_usd": 0.3328,
-      "net_pnl_pct": 0.67,
-      "n_trades": 2,
-      "max_freeze_min": 3.4,
-      "max_dd_usd": 0.3174,
-      "requotes": 20
+      "net_pnl_usd": 1.0207,
+      "net_pnl_pct": 2.04,
+      "n_trades": 4,
+      "max_freeze_min": 3.7,
+      "max_dd_usd": 0.5714,
+      "requotes": 89
     },
     {
       "id": "R4_TIGHT_1TICK_CHOP",
       "title": "🧱 Вязкий флэт (спред 1т)",
-      "net_pnl_usd": 0.2553,
-      "net_pnl_pct": 0.51,
-      "n_trades": 3,
-      "max_freeze_min": 118.3,
-      "max_dd_usd": 1.3863,
+      "net_pnl_usd": 0.1904,
+      "net_pnl_pct": 0.38,
+      "n_trades": 1,
+      "max_freeze_min": 44.6,
+      "max_dd_usd": 0.3407,
       "requotes": 9
     },
     {
       "id": "R5_UNDERWATER_RECOVERY",
       "title": "🔄 Свежий рынок + выход из -6т",
-      "net_pnl_usd": -0.6649,
-      "net_pnl_pct": -1.33,
+      "net_pnl_usd": -0.3378,
+      "net_pnl_pct": -0.68,
       "n_trades": 0,
       "max_freeze_min": 245.1,
-      "max_dd_usd": 0.9506,
-      "requotes": 1
+      "max_dd_usd": 1.6892,
+      "requotes": 0
     },
     {
       "id": "R6_V_SHAPE_REVERSAL",
       "title": "🎢 V-образный пролив и выкуп",
-      "net_pnl_usd": 0.9506,
-      "net_pnl_pct": 1.9,
-      "n_trades": 2,
-      "max_freeze_min": 196.3,
-      "max_dd_usd": 5.0377,
-      "requotes": 11
+      "net_pnl_usd": 1.111,
+      "net_pnl_pct": 2.22,
+      "n_trades": 8,
+      "max_freeze_min": 107.6,
+      "max_dd_usd": 3.4956,
+      "requotes": 35
     },
     {
       "id": "R7_WHIPSAW_SWING",
       "title": "⚡ Высоковолатильные качели",
-      "net_pnl_usd": 1.0687,
-      "net_pnl_pct": 2.14,
-      "n_trades": 8,
-      "max_freeze_min": 24.4,
-      "max_dd_usd": 1.0971,
-      "requotes": 53
+      "net_pnl_usd": 2.0209,
+      "net_pnl_pct": 4.04,
+      "n_trades": 7,
+      "max_freeze_min": 118.0,
+      "max_dd_usd": 2.9548,
+      "requotes": 67
     },
     {
       "id": "R8_STAIRCASE_GRIND_DOWN",
       "title": "📉 Ступенчатый спуск (-9т)",
-      "net_pnl_usd": -0.8316,
-      "net_pnl_pct": -1.66,
-      "n_trades": 3,
-      "max_freeze_min": 121.7,
-      "max_dd_usd": 1.9133,
-      "requotes": 30
-    },
-    {
-      "id": "R9_WHIPSAW_OCT30",
-      "title": "🌪️ Ночной распил (30 окт)",
-      "net_pnl_usd": 0.0398,
-      "net_pnl_pct": 0.08,
-      "n_trades": 8,
-      "max_freeze_min": 75.9,
-      "max_dd_usd": 2.3769,
-      "requotes": 72
-    },
-    {
-      "id": "R10_RECOV_OCT30",
-      "title": "🌅 Свежий рынок + выход из -6т (30 окт)",
-      "net_pnl_usd": 4.9044,
-      "net_pnl_pct": 9.81,
-      "n_trades": 12,
-      "max_freeze_min": 22.4,
-      "max_dd_usd": 0.7036,
-      "requotes": 69
+      "net_pnl_usd": 1.0563,
+      "net_pnl_pct": 2.11,
+      "n_trades": 6,
+      "max_freeze_min": 6.4,
+      "max_dd_usd": 0.5876,
+      "requotes": 56
     }
   ]
 }

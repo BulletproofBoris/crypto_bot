@@ -33,14 +33,36 @@
     ],
     "test_ts_range": [
       "2026-10-27 03:18:13",
-      "2026-10-29 17:52:45"
+      "2026-10-31 15:03:09"
     ],
     "metrics_oos": {
-      "ic_dt_ticks": 0.126,
-      "roc_auc_ovr": 0.7353,
-      "log_loss": 1.5617,
-      "top2pct_mean_ticks": 0.14
+      "ic_dt_ticks": 0.1055,
+      "roc_auc_ovr": 0.7084,
+      "log_loss": 1.6459,
+      "top2pct_mean_ticks": 0.24
     },
     "weights_file": "model_win_01.keras"
+  },
+  {
+    "window_id": "win_02",
+    "model_type": "attention",
+    "coin": "PRL",
+    "H": 60,
+    "seq_len": 180,
+    "train_ts_range": [
+      "2026-10-20 17:56:13",
+      "2026-10-31 03:56:12"
+    ],
+    "test_ts_range": [
+      "2026-10-31 04:03:13",
+      "2026-10-31 15:03:09"
+    ],
+    "metrics_oos": {
+      "ic_dt_ticks": 0.1285,
+      "roc_auc_ovr": 0.6988,
+      "log_loss": 1.6315,
+      "top2pct_mean_ticks": 0.44
+    },
+    "weights_file": "model_win_02.keras"
   }
 ]

@@ -531,10 +531,10 @@ def process_coin_labeling(
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-Asset Dynamic Dataset Labeling Engine")
-    parser.add_argument("--coin", type=str, default="all", choices=["prl", "quantus", "all"], help="Монета для разметки (по умолчанию all)")
+    parser.add_argument("--coin", type=str, default="prl", choices=["prl", "quantus", "all"], help="Монета для разметки (по умолчанию prl)")
     parser.add_argument("--horizon", type=str, default="5", help="Горизонт H или интервал (например: 5, '5,10,15', '5:Lmax:5', '5:30:5')")
     parser.add_argument("--ratio", type=str, default="4", help="Соотношение K=L/H или интервал (например: 4, '[3,4,5,6]', '3,4,5', '3:6')")
-    parser.add_argument("--pairs", type=str, default=None, help="Явный список пар H:K через запятую (например: '5:3,12:3.5,25:3')")
+    parser.add_argument("--pairs", type=str, default="5:3,12:3.5,25:3,60:3", help="Явный список пар H:K через запятую (по умолчанию: '5:3,12:3.5,25:3,60:3')")
     parser.add_argument("--outdir", type=str, default="data/labeled", help="Выходная директория")
     parser.add_argument("--split-ratio", type=float, default=0.8, help="Доля обучающей выборки Train (по умолчанию 0.8)")
     parser.add_argument("--n-target", type=int, default=5000, help="Минимум независимых отсчетов N для расчета L_max = T_train // N (по умолчанию 5000)")

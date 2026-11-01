@@ -33,8 +33,8 @@ SAFE_WORKERS = min(14, max(4, os.cpu_count() - 2 if os.cpu_count() else 4))
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Rolling Swarm Trainer")
-    parser.add_argument("--coins", type=str, default="prl,quantus", help="Монеты через запятую")
-    parser.add_argument("--horizons", type=str, default="5,12,25", help="Горизонты H (сек)")
+    parser.add_argument("--coins", type=str, default="prl", help="Монеты через запятую")
+    parser.add_argument("--horizons", type=str, default="5,12,25,60", help="Горизонты H (сек)")
     parser.add_argument("--k-values", type=str, default="", help="Значения K через запятую (например 3.0,3.5,3.0)")
     parser.add_argument("--n-estimators", type=int, default=70, help="Количество деревьев LightGBM")
     parser.add_argument("--n-jobs", type=int, default=SAFE_WORKERS, help="Количество потоков CPU")
@@ -133,7 +133,6 @@ def generate_rolling_windows_reverse(segments: list, H: int, K: float, n_target:
     while tr_s_pos + t_train + buffer + min_test_sec <= n_clean:
         tr_e_pos = tr_s_pos + t_train
         te_s_pos = tr_e_pos + buffer
-        # Если следующее окно уже не поместится, расширяем тест последнего окна до конца чистых данных
         next_tr_s = tr_s_pos + step
         if next_tr_s + t_train + buffer + min_test_sec > n_clean:
             te_e_pos = n_clean
@@ -156,6 +155,30 @@ def generate_rolling_windows_reverse(segments: list, H: int, K: float, n_target:
             'K': K
         })
         tr_s_pos += step
+
+    # Для макро-горизонта H>=60 добавляем свежее фронт-окно, если после последнего Train накопилось >250k сек
+    if H >= 60 and windows:
+        last_tr_e_pos = (len(windows) - 1) * step + t_train
+        target_te_len = 39597
+        cand_tr_e = n_clean - buffer - target_te_len
+        if cand_tr_e - last_tr_e_pos >= 200000 and cand_tr_e >= t_train:
+            cand_tr_s = cand_tr_e - t_train
+            cand_te_s = cand_tr_e + buffer
+            windows.append({
+                'segment_id': len(windows),
+                'tr_idx': clean_idx[cand_tr_s:cand_tr_e],
+                'te_idx': clean_idx[cand_te_s:n_clean],
+                'tr_start': int(clean_idx[cand_tr_s]),
+                'tr_end': int(clean_idx[cand_tr_e - 1]) + 1,
+                'te_start': int(clean_idx[cand_te_s]),
+                'te_end': int(clean_idx[n_clean - 1]) + 1,
+                't_train': t_train,
+                't_test': n_clean - cand_te_s,
+                'W': t_train + buffer + (n_clean - cand_te_s),
+                'L': L,
+                'H': H,
+                'K': K
+            })
 
     return windows, W, step, t_train, t_test
 
@@ -445,8 +468,11 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
         status = "🎯 ОТЛИЧНО" if ic > 0.15 and top2_pnl > 0.5 else ("✅ ХОРОШО" if ic > 0.05 else "⚠️ СЛАБО")
         print(f"{win_id:<6} | {ts_tr_start} -> {ts_tr_end} | {ts_te_start} -> {ts_te_end} | {ic:+6.4f}  | {auc:6.4f}   | {top2_pnl:+6.2f} тиков | {status:<10}")
 
-    with open(out_dir / "manifest.json", 'w') as f:
-        json.dump(manifest, f, indent=2)
+    try:
+        with open(out_dir / "manifest.json", 'w') as f:
+            json.dump(manifest, f, indent=2)
+    except OSError:
+        pass
 
     print("-" * 125)
     print(f"✅ Пул из {len(manifest)} моделей успешно сохранен в: {out_dir.relative_to(BASE_DIR)}")

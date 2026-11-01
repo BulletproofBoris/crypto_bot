@@ -28,7 +28,7 @@ from _tools.swarm_router import SwarmRegimeRouter
 from _tools.data_labeler import COIN_CONFIG
 
 
-def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_rebuild: bool = False) -> dict:
+def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 176.0, force_rebuild: bool = False) -> dict:
     """
     Этап 1: Предрасчёт и кэширование сигналов триады ансамблей (H=5s, 12s, 25s)
     и 10 уровней стакана L2 для мгновенной симуляции RL-среды.
@@ -39,9 +39,10 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
     rl_cache_path = cache_dir / f"rl_triad_lob_cache_{coin}_{int(tail_hours)}h.npz"
 
     if rl_cache_path.exists() and not force_rebuild:
-        print(f"⚡ Загрузка готового кэша RL-полигона (Триада H=5,12,25s): {rl_cache_path.name}")
-        data = np.load(rl_cache_path, allow_pickle=True)
-        return {k: data[k] for k in data.files}
+        data_raw = np.load(rl_cache_path, allow_pickle=True)
+        if "X_h60" in data_raw.files:
+            print(f"⚡ Загрузка готового кэша RL-полигона (Триада H=5,12,25,60s): {rl_cache_path.name}")
+            return {k: data_raw[k] for k in data_raw.files}
 
     labeled_path = BASE_DIR / "data" / "labeled" / coin / f"{coin}_labeled.parquet"
     feat_path = BASE_DIR / "data" / "features" / f"{coin}_1s_features.parquet"
@@ -57,7 +58,7 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
     n_rows = min(total_rows, int(tail_hours * 3600))
     start_row = max(0, total_rows - n_rows)
 
-    horizons = [(5, 3.0), (12, 3.5), (25, 3.0)]
+    horizons = [(5, 3.0), (12, 3.5), (25, 3.0), (60, 3.0)]
     schema_cols = set(pf.schema_arrow.names)
     lob_and_meta_cols = [
         "timestamp", "ST_best_bid", "ST_best_ask", "ST_bid_qty_1", "ST_ask_qty_1",
@@ -96,16 +97,18 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
     cached_fnames = None
     cached_X = None
     ts_str_all = df["timestamp"].astype(str).values
-    cand_caches = [p for p in cache_dir.glob(f"rl_triad_lob_cache_{coin}_*h.npz") if p != rl_cache_path]
+    cand_caches = list(cache_dir.glob(f"rl_triad_lob_cache_{coin}_*h.npz"))
     prev_cache_path = max(cand_caches, key=lambda p: p.stat().st_mtime) if cand_caches else (cache_dir / f"rl_triad_lob_cache_{coin}_438h.npz")
     X_triad_Incremental = None
+    X_h60 = None
 
-    if prev_cache_path.exists() and not force_rebuild:
+    if prev_cache_path.exists():
         try:
             prev_c = np.load(prev_cache_path, allow_pickle=True)
             prev_ts_i8 = pd.DatetimeIndex(pd.to_datetime(prev_c["ts"], utc=True)).asi8
             cur_ts_i8 = pd.DatetimeIndex(pd.to_datetime(df["timestamp"], utc=True)).asi8
             prev_triad = prev_c["X_market"][:, :18].astype(np.float32)
+            prev_h60 = prev_c["X_h60"].astype(np.float32) if "X_h60" in prev_c.files and len(prev_c["X_h60"]) == len(prev_triad) else None
             ts_to_idx = {int(s): i for i, s in enumerate(prev_ts_i8)}
             matched_idx = np.array([ts_to_idx.get(int(s), -1) for s in cur_ts_i8], dtype=np.int64)
             valid_mask = matched_idx >= 0
@@ -123,6 +126,7 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
                     n_tail = len(df) - (last_match_pos + 1)
                     print(f"⚡ Инкрементальное обновление кэша: переиспользуем {last_match_pos + 1:,} сек из {prev_cache_path.name}, досчитываем хвост {n_tail:,} сек ({n_tail/3600:.2f} ч)...")
                     X_triad_head = prev_triad[matched_idx[:last_match_pos + 1]]
+                    X_h60_head = prev_h60[matched_idx[:last_match_pos + 1]] if prev_h60 is not None else None
                     if n_tail > 0:
                         pad = min(360, last_match_pos + 1)
                         tail_start_abs = start_row + last_match_pos + 1 - pad
@@ -156,13 +160,33 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
                             tail_triad_list.append(np.column_stack([ez, p_up, p_down, p_tp, p_tn, ent]).astype(np.float32))
                         del df_tail
                         X_triad_Incremental = np.vstack([X_triad_head, np.hstack(tail_triad_list[:3])]).astype(np.float32)
+                        if X_h60_head is not None and len(tail_triad_list) > 3:
+                            X_h60 = np.vstack([X_h60_head, tail_triad_list[3]]).astype(np.float32)
                     else:
                         X_triad_Incremental = X_triad_head
+                        X_h60 = X_h60_head
         except Exception as e:
             print(f"⚠️ Не удалось применить инкрементальный кэш ({e}), выполняем полный расчёт...")
 
     if X_triad_Incremental is not None:
         X_triad = X_triad_Incremental
+        if X_h60 is None:
+            df_full = pf.read_row_groups(rg_indices).slice(first_rg_offset, len(X_triad)).to_pandas()
+            if "timestamp" not in df_full.columns:
+                df_full["timestamp"] = df_full.index
+            df_full = df_full.reset_index(drop=True)
+            router60 = SwarmRegimeRouter(coin, 60, 3.0, temperature=0.25, use_neural=True, neural_weight=0.15)
+            print(f"\n🔮 Досчёт макро-ансамбля H=60s (K=3.0) на {len(df_full):,} сек...")
+            X_cols60 = [df_full[col].values.astype(np.float32) if col in df_full.columns else np.zeros(len(df_full), dtype=np.float32) for col in router60.feature_names]
+            X_in60 = np.nan_to_num(np.column_stack(X_cols60), nan=0.0, posinf=0.0, neginf=0.0)
+            ens60 = router60.predict_ensemble(X_in60, df_full, mode="router")
+            probs60, ez60 = ens60["probs"], ens60["expected_z"]
+            p_clip60 = np.clip(probs60, 1e-7, 1.0)
+            X_h60 = np.column_stack([
+                ez60, probs60[:, 4] + probs60[:, 5] + probs60[:, 6], probs60[:, 0] + probs60[:, 1] + probs60[:, 2],
+                probs60[:, 5] + probs60[:, 6], probs60[:, 0] + probs60[:, 1], -np.sum(p_clip60 * np.log(p_clip60), axis=1) / np.log(7.0)
+            ]).astype(np.float32)
+            del df_full, router60, X_cols60, X_in60, ens60
     else:
         df_full = pf.read_row_groups(rg_indices).slice(first_rg_offset, n_rows).to_pandas()
         if "timestamp" not in df_full.columns:
@@ -195,6 +219,7 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
             triad_feats.append(np.column_stack([ez, p_up, p_down, p_tail_pos, p_tail_neg, entropy]).astype(np.float32))
         del cached_X, df_full
         X_triad = np.hstack(triad_feats[:3]).astype(np.float32)
+        X_h60 = triad_feats[3] if len(triad_feats) > 3 else np.zeros((len(X_triad), 6), dtype=np.float32)
 
     # 10 уровней стакана SafeTrade (реальный биржевой шаг цены PRL = 0.01 USDT)
     tick_size = 0.01 if coin == "prl" else float(COIN_CONFIG[coin]["tick_size"])
@@ -257,6 +282,7 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
 
     payload = {
         "X_market": X_market,
+        "X_h60": X_h60 if X_h60 is not None else np.zeros((len(X_market), 6), dtype=np.float32),
         "bid_p": bid_p,
         "bid_q": bid_q,
         "ask_p": ask_p,
@@ -268,7 +294,7 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 115.0, force_r
         "tick_size": np.array(tick_size, dtype=np.float64),
     }
     np.savez_compressed(rl_cache_path, **payload)
-    print(f"✅ Кэш RL-полигона сохранён в {rl_cache_path} ({X_market.shape[0]:,} строк x {X_market.shape[1]} признаков)")
+    print(f"✅ Кэш RL-полигона сохранён в {rl_cache_path} ({X_market.shape[0]:,} строк x {X_market.shape[1]} признаков + H=60s)")
     return payload
 
 
@@ -289,6 +315,7 @@ class SafeTradeL2ExecutionEnv:
     def __init__(self, data: dict, start_idx: int, end_idx: int, episode_len: int = 3600, order_usd: float = 95.5, legacy_v2: bool = False, enable_unfreeze: bool = True):
         self.enable_unfreeze = bool(enable_unfreeze)
         self.X_market = data["X_market"]
+        self.X_h60 = data.get("X_h60", np.zeros((len(self.X_market), 6), dtype=np.float32))
         self.bid_p = data["bid_p"]
         self.bid_q = data["bid_q"]
         self.ask_p = data["ask_p"]
@@ -331,6 +358,8 @@ class SafeTradeL2ExecutionEnv:
         self.reb_30 = np.round((self.bid_p[:, 0] - low_30) / self.tick_size, 4).astype(np.float32)
 
         ez5, ez12, ez25 = self.X_market[:, 0], self.X_market[:, 6], self.X_market[:, 12]
+        ez60 = self.X_h60[:, 0] if self.X_h60 is not None and len(self.X_h60) == len(ez25) else ez25
+        self.ez60_arr = ez60.astype(np.float32)
         p_tn_5 = self.X_market[:, 4]
         p_dn_12 = self.X_market[:, 8]
         spread_ticks = self.X_market[:, 18] * 10.0
@@ -349,11 +378,18 @@ class SafeTradeL2ExecutionEnv:
         net_trade_10s = pd.Series(self.buy_vol - self.sell_vol).rolling(10, min_periods=1).sum().values
         dq_10s = (b1q_s.diff(10).fillna(0.0).values - a1q_s.diff(10).fillna(0.0).values)
         fast_flow_10s = np.clip((net_trade_10s + 0.5 * dq_10s) / (b1q_s.values + a1q_s.values + 500.0) * 3.0, -3.0, 3.0).astype(np.float32)
-        self.inertia_arr = (
-            0.45 * ez25 + 0.35 * ez12 + 0.20 * ez5
-            + 0.25 * d_ez12 + 0.35 * imb5 + 0.15 * imb1
-            + 0.10 * np.clip(vel_b1_15, -3.0, 3.0) + 0.08 * np.maximum(0.0, fast_flow_10s)
-        ).astype(np.float32)
+        if self.legacy_v2:
+            self.inertia_arr = (
+                0.45 * ez25 + 0.35 * ez12 + 0.20 * ez5
+                + 0.25 * d_ez12 + 0.35 * imb5 + 0.15 * imb1
+                + 0.10 * np.clip(vel_b1_15, -3.0, 3.0) + 0.08 * np.maximum(0.0, fast_flow_10s)
+            ).astype(np.float32)
+        else:
+            self.inertia_arr = (
+                0.15 * ez60 + 0.35 * ez25 + 0.30 * ez12 + 0.20 * ez5
+                + 0.25 * d_ez12 + 0.35 * imb5 + 0.15 * imb1
+                + 0.10 * np.clip(vel_b1_15, -3.0, 3.0) + 0.08 * np.maximum(0.0, fast_flow_10s)
+            ).astype(np.float32)
 
         # Векторный предрасчет не зависящих от позиции компонент наблюдения и масок входа (Zero-Allocation Step Loop)
         b1_vec = np.maximum(self.bid_p[:, 0], self.tick_size)
@@ -375,7 +411,7 @@ class SafeTradeL2ExecutionEnv:
             ext_pos = 0.35 * np.minimum(self.dd_900, 10.0) * np.maximum(0.0, 1.0 - 1.5 * self.pos_900)
             ext_neg = -1.5 * np.maximum(0.0, self.pos_900 - 0.65)
             extremum_bonus = np.where(self.inertia_arr > 0.25, ext_pos, ext_neg)
-            exp_entry_edge = (0.5 * ez25 + 0.35 * ez12 + 0.15 * ez5) * 4.0 + 0.5 * spread_ticks - p_tn_5 * 3.0 - surprise_pen + extremum_bonus
+            exp_entry_edge = (0.15 * ez60 + 0.40 * ez25 + 0.30 * ez12 + 0.15 * ez5) * 4.0 + 0.5 * spread_ticks - p_tn_5 * 3.0 - surprise_pen + extremum_bonus
             exp_hold_edge = self.inertia_arr * 3.0 - p_dn_12 * spread_ticks - surprise_pen * 0.6
 
             # Освобождаем PPO от жестких эвристик: разрешаем входы по сигналам нейросетевого роя,
@@ -391,6 +427,7 @@ class SafeTradeL2ExecutionEnv:
                 | ((ez5 < 0.15) & (ez12 <= 0.0) & (ez25 <= 0.0))
                 | ((self.pos_3600 <= 0.05) & (ez12 <= 0.0) & (ez25 <= 0.0) & ~((self.bid_q[:, 0] >= 9000.0) & (imb5 >= 0.60) & (ez5 >= 0.15)))
                 | ((self.rng_14400 >= 22.0) & (ez12 <= 0.05) & (ez25 <= 0.02) & (self.ask_q[:, 0] > 400.0))
+                | ((ez60 <= -0.10) & (ez25 <= 0.05) & (self.dd_900 >= 2.0) & (self.bid_q[:, 0] < 8000.0))
             )
             top_rollover_vec = getattr(self, "enable_unfreeze", True) & (spread_ticks < 1.5) & (self.rng_14400 >= 16.0) & (self.pos_14400 >= 0.50) & (self.pos_3600 <= 0.15) & (self.dd_300 <= 1.0)
             self.waterfall_trap_arr = waterfall_trap_vec
@@ -579,6 +616,8 @@ class SafeTradeL2ExecutionEnv:
         self.bid_placed_t = 0
         self.last_exit_t = 0
         self.last_exit_price = 0.0
+        self.last_loss_exit_t = 0
+        self.last_loss_exit_price = 0.0
         self.car_state = 0  # 0: idle, 1: quoting sell @ local ask, 2: quoting buyback @ local bid
         self.car_qty = 0.0
         self.car_px = 0.0
@@ -1019,6 +1058,12 @@ class SafeTradeL2ExecutionEnv:
                 action = 4
 
         if action in (1, 2) and self.pos_qty <= 1e-8:
+            ez60_now = float(self.ez60_arr[t]) if hasattr(self, "ez60_arr") else ez25
+            in_post_loss_window = (not self.legacy_v2) and (self.last_loss_exit_t > 0) and ((t - self.last_loss_exit_t) <= 2700)
+            macro_step_in_ok = self.legacy_v2 or (
+                not in_post_loss_window
+                and not (ez60_now < 0.0 and float(self.dd_900[t]) >= 2.0 and float(self.bid_q[t, 0]) < 8500.0)
+            )
             step_in_l5_ok = (
                 float(self.imb_l5[t]) >= 0.0
                 or float(self.bid_q[t, 0]) >= 8500.0
@@ -1028,12 +1073,17 @@ class SafeTradeL2ExecutionEnv:
             )
             step_in = (
                 (a1 - b1) >= 1.8 * self.tick_size
+                and macro_step_in_ok
                 and (
                     self.legacy_v2
                     or (step_in_l5_ok and ((float(self.ask_q[t, 0]) <= 5000.0 and inertia >= 0.35) or wide_scalp_ok))
                 )
             )
             target_p = (b1 + self.tick_size if step_in else b1) if action == 1 else max(self.tick_size, b1 - self.tick_size)
+            if in_post_loss_window and target_p > self.last_loss_exit_price + tol and not (brk_now or (float(self.bid_q[t, 0]) >= 8500.0 and ez60_now >= 0.25 and ez25 >= 0.45)):
+                target_p = min(target_p, b1)
+                if target_p > self.last_loss_exit_price + tol:
+                    target_p = max(self.tick_size, b1 - self.tick_size)
             if self.order_side != "BUY" or abs(self.order_price - target_p) > tol:
                 requote_penalty = 0.025 if self.order_side is not None else 0.005
                 self.order_side = "BUY"
@@ -1127,6 +1177,9 @@ class SafeTradeL2ExecutionEnv:
                         self.n_trades += 1
                         if not self.legacy_v2:
                             self.total_pnl_usd -= self.pos_qty * self.avg_entry * 0.001  # Реальная комиссия SafeTrade Maker Buy (0.10%)
+                            ez60_nt = float(self.ez60_arr[nt]) if hasattr(self, "ez60_arr") else float(self.X_market[nt, 12])
+                            if self. avg_entry > nb1 + tol and (float(self.dd_900[nt]) >= 2.0 or ez60_nt < 0.05):
+                                requote_penalty += 0.35  # Эмпирический штраф adverse selection из 508,961 сек телеметрии SafeTrade
                 else:
                     if vol_at_px > 0:
                         self.q_ahead = max(0.0, self.q_ahead - vol_at_px)
@@ -1158,6 +1211,9 @@ class SafeTradeL2ExecutionEnv:
                         self.slot2_side = None
                         self.slot2_qty = 0.0
                     else:
+                        if realized_ticks <= -0.8:
+                            self.last_loss_exit_t = nt
+                            self.last_loss_exit_price = self.order_price
                         if getattr(self, "enable_unfreeze", True) and (float(self.dd_900[nt]) >= 4.0 or ((nt - self.entry_t) >= 600 and float(self.dd_900[nt]) >= 3.0)):
                             if realized_ticks <= -2.0:
                                 self.cooldown_until = nt + 600
@@ -1488,16 +1544,38 @@ def load_live_telemetry_experiences(obs_dim: int = 38) -> tuple[np.ndarray, np.n
         passive_bid_upgrade = (obs_arr[:, -10] <= 0.5) & (obs_arr[:, -7] > 0.5) & (obs_arr[:, -5] >= 0.15) & (obs_arr[:, 20] > -0.65)
         mask_arr[passive_bid_upgrade, 1] = True
         act_arr = np.array([teacher_heuristic_action(obs_arr[i], mask_arr[i]) for i in range(len(obs_arr))], dtype=np.int64)
+
+        # Калибровка по реальным результатам сделок: блокируем входы перед убыточными циклами (step_in / широкие спреды)
+        in_pos = (s15["pos_qty"].values >= 2.0)
+        starts = np.where(in_pos & ~np.roll(in_pos, 1))[0]
+        ends = np.where(~in_pos & np.roll(in_pos, 1))[0]
+        bad_pre_mask = np.zeros(len(s15), dtype=bool)
+        win_pre_list = []
+        for s_i in starts:
+            e_cand = ends[ends > s_i]
+            if len(e_cand) == 0:
+                continue
+            e_i = int(e_cand[0])
+            dpnl = float(s15["bot_cash_usd"].iloc[e_i] - s15["bot_cash_usd"].iloc[max(0, s_i - 1)])
+            if -15.0 < dpnl < -0.05:
+                w0 = max(0, s_i - 90)
+                bad_pre_mask[w0:s_i] = True
+                for j in range(w0, s_i):
+                    act_arr[j] = 5 if (obs_arr[j, -7] > 0.5 and mask_arr[j, 5]) else 0
+            elif 0.05 < dpnl < 15.0:
+                win_pre_list.append(np.arange(max(0, s_i - 20), s_i))
         n_fixed = int((act_arr != s15["act"].values).sum())
 
-        # Усиливаем реальные траектории работы с ордерами и позицией и отдельно доучиваем входы act=1 на разворотах
+        # Усиливаем реальные траектории профитных сделок и отмен токсичных бидов
         active_idx = np.where((obs_arr[:, -10] > 0.5) | (obs_arr[:, -7] > 0.5) | (act_arr > 0))[0]
-        buy1_idx = np.where(act_arr == 1)[0]
+        buy1_idx = np.where((act_arr == 1) & ~bad_pre_mask)[0]
+        bad_idx = np.where(bad_pre_mask)[0]
+        win_idx = np.concatenate(win_pre_list) if win_pre_list else np.empty((0,), dtype=np.int64)
         idle_idx = np.where((obs_arr[:, -10] <= 0.5) & (obs_arr[:, -7] <= 0.5) & (act_arr == 0))[0]
         if len(idle_idx) > 8000:
             idle_idx = np.random.choice(idle_idx, size=8000, replace=False)
-        sel_idx = np.concatenate([np.repeat(active_idx, 3), np.repeat(buy1_idx, 8), idle_idx])
-        print(f"📡 Подключен реальный опыт живой торговли: {len(sel_idx):,} переходов (из {len(s15):,} сек телеметрии, скорректировано {n_fixed:,} действий)")
+        sel_idx = np.concatenate([np.repeat(active_idx, 3), np.repeat(buy1_idx, 6), np.repeat(win_idx, 5), np.repeat(bad_idx, 6), idle_idx])
+        print(f"📡 Подключен реальный опыт живой торговли: {len(sel_idx):,} переходов (из {len(s15):,} сек телеметрии, скорректировано {n_fixed:,} действий, отфильтровано {len(bad_idx)} сек перед стопами)")
         return obs_arr[sel_idx], mask_arr[sel_idx], act_arr[sel_idx]
     except Exception as e:
         print(f"⚠️ Не удалось загрузить боевую телеметрию: {e}")
@@ -1506,7 +1584,7 @@ def load_live_telemetry_experiences(obs_dim: int = 38) -> tuple[np.ndarray, np.n
 
 def train_rl_agent(
     coin: str = "prl",
-    tail_hours: float = 508.0,
+    tail_hours: float = 176.0,
     ppo_epochs: int = 30,
     steps_per_epoch: int = 32768,
     pop_size: int = 8,
@@ -1704,7 +1782,6 @@ def train_rl_agent(
             template_test_env=test_env,
         )
         model.load_state_dict(best_cand.state_dict())
-        sched.step()
         is_best = (oos_res["efficiency_score"] > best_score) and (oos_res["trades"] >= 2)
         if is_best:
             best_score = oos_res["efficiency_score"]
@@ -1755,7 +1832,7 @@ def train_rl_agent(
     return {"baseline": base_res, "history": history}
 
 
-def inspect_and_plot_rl_oos(coin: str = "prl", tail_hours: float = 72.0, start_ts_msk: str = None):
+def inspect_and_plot_rl_oos(coin: str = "prl", tail_hours: float = 176.0, start_ts_msk: str = None):
     """Прогоняет лучший чекпоинт Maskable PPO и базовую эвристику на слепом OOS или чистом Форвард-тесте с визуализацией сделок и кривой капитала."""
     import matplotlib.pyplot as plt
     data = build_or_load_rl_cache(coin=coin, tail_hours=tail_hours)
@@ -1897,7 +1974,7 @@ def inspect_and_plot_rl_oos(coin: str = "prl", tail_hours: float = 72.0, start_t
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--coin", type=str, default="prl")
-    parser.add_argument("--tail-hours", type=float, default=508.0)
+    parser.add_argument("--tail-hours", type=float, default=176.0)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--steps", type=int, default=32768)
     parser.add_argument("--pop-size", type=int, default=8)

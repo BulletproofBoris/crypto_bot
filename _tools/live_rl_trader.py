@@ -908,8 +908,9 @@ class LiveTriadRLTrader:
         vel_180 = round((b1 - (b_arr[-181] if len(b_arr) >= 181 else b_arr[0])) / self.tick_size, 4)
 
         d_ez12 = ez_12 - (self.ez12_hist[-6] if len(self.ez12_hist) >= 6 else self.ez12_hist[0])
+        ez_60 = float(getattr(self, "last_ez60", ez_25))
         inertia = float(
-            0.45 * ez_25 + 0.35 * ez_12 + 0.20 * ez_5
+            0.15 * ez_60 + 0.35 * ez_25 + 0.30 * ez_12 + 0.20 * ez_5
             + 0.25 * d_ez12 + 0.35 * imb_l5 + 0.15 * imb_l1
             + 0.10 * np.clip(vel_15, -3.0, 3.0) + 0.08 * max(0.0, fast_flow_10s)
         )
@@ -944,7 +945,7 @@ class LiveTriadRLTrader:
         ext_pos = 0.35 * min(dd_900, 10.0) * max(0.0, 1.0 - 1.5 * pos_900)
         ext_neg = -1.5 * max(0.0, pos_900 - 0.65)
         extremum_bonus = ext_pos if inertia > 0.25 else ext_neg
-        exp_entry_edge = (0.5 * ez_25 + 0.35 * ez_12 + 0.15 * ez_5) * 4.0 + 0.5 * spread_ticks - p_tn_5 * 3.0 - surprise_pen + extremum_bonus
+        exp_entry_edge = (0.15 * ez_60 + 0.40 * ez_25 + 0.30 * ez_12 + 0.15 * ez_5) * 4.0 + 0.5 * spread_ticks - p_tn_5 * 3.0 - surprise_pen + extremum_bonus
         exp_hold_edge = inertia * 3.0 - p_dn_12 * spread_ticks - surprise_pen * 0.6
 
         obs_err12_norm = float(np.clip(model_err_12 / 5.0, -3.0, 3.0))
@@ -959,11 +960,25 @@ class LiveTriadRLTrader:
         else:
             self.last_q_a1, self.last_q_a2 = a1_q, (ask_qs_clean[1] if len(ask_qs_clean) > 1 else 0.0)
 
-        self.micro_pos_parked = bool(
+        tot_eq_now = max(1.0, self.bot_cash_usd + self.pos_qty * b1)
+        underwater_now = ((self.avg_entry - b1) / self.tick_size) if (self.pos_qty >= 1.95 and self.avg_entry > 0.0) else 0.0
+        ambivalent_scale_in = bool(
             self.pos_qty >= 1.95
             and self.active_ask_id is not None
-            and self.bot_cash_usd >= 25.0
-            and (self.pos_qty * b1) < 0.28 * (self.bot_cash_usd + self.pos_qty * b1)
+            and self.bot_cash_usd >= max(5.0, tot_eq_now * 0.05)
+            and underwater_now >= 1.0
+            and inertia >= 0.05
+            and exp_entry_edge >= 0.50
+            and not getattr(self, "last_waterfall_trap", False)
+        )
+        self.micro_pos_parked = bool(
+            (
+                self.pos_qty >= 1.95
+                and self.active_ask_id is not None
+                and self.bot_cash_usd >= 25.0
+                and (self.pos_qty * b1) < 0.28 * tot_eq_now
+            )
+            or ambivalent_scale_in
         )
         has_pos = 1.0 if (self.pos_qty > 1e-8 and not self.micro_pos_parked) else 0.0
         unr_ticks = ((b1 - self.avg_entry) / self.tick_size) if has_pos else 0.0
@@ -1044,6 +1059,7 @@ class LiveTriadRLTrader:
             or ((ez_5 < 0.15) and (ez_12 <= 0.0) and (ez_25 <= 0.0))
             or ((pos_3600 <= 0.05) and (ez_12 <= 0.0) and (ez_25 <= 0.0) and not ((b1_q >= 9000.0) and (imb_l5 >= 0.60) and (ez_5 >= 0.15)))
             or ((rng_14400 >= 22.0) and (ez_12 <= 0.05) and (ez_25 <= 0.02) and (a1_q > 400.0))
+            or ((ez_60 <= -0.10) and (ez_25 <= 0.05) and (dd_900 >= 2.0) and (b1_q < 8000.0))
         )
         top_rollover = (spread_ticks < 1.5) and (rng_14400 >= 16.0) and (pos_14400 >= 0.50) and (pos_3600 <= 0.15) and (dd_300 <= 1.0)
         self.last_waterfall_trap = waterfall_trap
@@ -1347,6 +1363,10 @@ class LiveTriadRLTrader:
         if act in (1, 2) and can_buy_more:
             a1_q_cur = float(getattr(self, "last_a1_q", self.last_q_a1))
             b1_q_cur = float(getattr(self, "last_b1_q", 0.0))
+            ez60_cur = float(getattr(self, "last_ez60", self.last_ez25))
+            was_loss_exit = float(getattr(self, "cooldown_until_ts", 0.0)) >= float(getattr(self, "last_exit_ts", 0.0)) + 25.0
+            in_post_loss_window = was_loss_exit and float(getattr(self, "last_exit_ts", 0.0)) > 0.0 and (now_ts - float(self.last_exit_ts)) <= 2700.0
+            macro_step_in_ok = not in_post_loss_window and not (ez60_cur < 0.0 and self.last_dd900 >= 2.0 and b1_q_cur < 8500.0)
             step_in_l5_ok = (
                 self.last_imb5 >= 0.0
                 or b1_q_cur >= 8500.0
@@ -1356,10 +1376,15 @@ class LiveTriadRLTrader:
             )
             step_in = (
                 (a1 - b1) >= 1.8 * self.tick_size
+                and macro_step_in_ok
                 and step_in_l5_ok
                 and ((a1_q_cur <= 5000.0 and self.last_inertia >= 0.35) or wide_scalp_ok)
             )
             target_p = round(((b1 + self.tick_size if step_in else b1) if act == 1 else max(self.tick_size, b1 - self.tick_size)) / self.tick_size) * self.tick_size
+            if in_post_loss_window and self.last_exit_price > 0.0 and target_p > self.last_exit_price + tol and not (getattr(self, "last_in_breakout", False) or (b1_q_cur >= 8500.0 and ez60_cur >= 0.25 and self.last_ez25 >= 0.45)):
+                target_p = min(target_p, b1)
+                if target_p > self.last_exit_price + tol:
+                    target_p = round(max(self.tick_size, b1 - self.tick_size) / self.tick_size) * self.tick_size
             if self.active_bid_id is not None and abs(self.active_bid_p - target_p) <= tol:
                 return
             if self.active_bid_id is not None:
@@ -1394,9 +1419,27 @@ class LiveTriadRLTrader:
             elif self.ex_usdt_free < self.bot_cash_usd * 0.90:
                 self.sync_account_balances(b1)
             max_cap = self.ex_usdt_free if (self.reserved_account_usdt <= 1e-4 and self.user_reserved_coin <= 1e-4) else self.order_usd
-            usable_usd = min(max_cap, self.bot_cash_usd * 0.998, max(self.ex_usdt_free, self.bot_cash_usd if self.active_bid_id is None else 0.0) * 0.998)
-            if target_p > b1 + tol and usable_usd > 110.0 and not getattr(self, "last_in_breakout", False) and (self.last_ez25 < 0.20 or a1_q_cur > 1200.0):
-                usable_usd = max(110.0, usable_usd * 0.72)
+            avail_usd = min(max_cap, self.bot_cash_usd * 0.998, max(self.ex_usdt_free, self.bot_cash_usd if self.active_bid_id is None else 0.0) * 0.998)
+            # Адаптивное квантование бюджета с шагом 0.1% (0.001..1.000) по импульсу 4 горизонтов и пропускной способности стакана
+            raw_conv = (
+                0.25 * max(0.0, float(getattr(self, "last_entry_edge", 0.0)))
+                + 0.35 * max(0.0, self.last_inertia)
+                + 0.25 * max(0.0, self.last_ez25 + self.last_ez12)
+                + 0.20 * max(0.0, self.last_imb5)
+            )
+            if getattr(self, "last_in_breakout", False) or (self.last_ez12 >= 0.70 and self.last_ez25 >= 0.60 and self.last_inertia >= 0.60):
+                quant_w = 1.000
+            else:
+                quant_w = float(np.clip(0.22 + 0.52 * raw_conv, 0.001, 0.880))
+            a1_q_usd = a1_q_cur * max(a1, self.tick_size)
+            b1_q_usd = b1_q_cur * max(b1, self.tick_size)
+            flow_cap_usd = max(25.0, float(getattr(self, "last_buy_vol_10s", 100.0)) * 4.5 * b1 + 0.35 * min(b1_q_usd, 600.0))
+            if a1_q_usd > 120.0 and self.last_inertia < 0.35:
+                flow_cap_usd *= 0.55
+            cap_w = float(np.clip(flow_cap_usd / max(avail_usd, 1.0), 0.350, 1.000))
+            eff_w = quant_w if avail_usd <= 150.0 else (0.65 * quant_w + 0.35 * min(quant_w, cap_w))
+            quant_step_w = float(min(1.0, max(0.001, round(eff_w * 1000.0) / 1000.0)))
+            usable_usd = max(min(avail_usd, 5.0), avail_usd * quant_step_w)
             qty = math.floor((usable_usd / max(target_p, self.tick_size)) * 10000.0) / 10000.0
             if qty < 2.0:
                 return
@@ -2207,7 +2250,7 @@ def start_live_daemon(budget_usd: float = 54.0, order_usd: float = 54.0, steps: 
         env_local = BASE_DIR / ".env"
         if env_local.exists():
             sftp.put(str(env_local), "/opt/crypto_bot/.env")
-        for mod_name in ("system_resources.py", "live_rl_trader.py", "live_feature_updater.py", "microstructure_features.py", "swarm_router.py", "fast_neural_engine.py", "train_rl_execution.py", "rl_gpu_population.py"):
+        for mod_name in ("system_resources.py", "live_rl_trader.py", "live_feature_updater.py", "microstructure_features.py", "swarm_router.py", "fast_neural_engine.py", "train_rl_execution.py", "rl_gpu_population.py", "adaptive_quantizer.py"):
             loc_mod = BASE_DIR / "_tools" / mod_name
             if loc_mod.exists():
                 sftp.put(str(loc_mod), f"/opt/crypto_bot/_tools/{mod_name}")

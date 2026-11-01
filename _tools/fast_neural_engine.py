@@ -294,14 +294,17 @@ class FastKerasModel:
                 idx = torch.arange(n_rows, device=dev)
                 tail_sum = cs[idx + sl] - cs[idx + rf]
             outs = []
-            for s_i in range(0, n_rows, 8192 if use_gpu else 4096):
-                e_i = min(n_rows, s_i + (8192 if use_gpu else 4096))
+            attn_chunk = 2048 if sl >= 120 else (8192 if use_gpu else 4096)
+            for s_i in range(0, n_rows, attn_chunk):
+                e_i = min(n_rows, s_i + attn_chunk)
                 x_rf = h_pad[s_i:e_i + rf - 1].unfold(0, rf, 1).transpose(1, 2).contiguous()
                 head_sum = _resblocks(x_rf).sum(dim=1)
                 x = (head_sum + tail_sum[s_i:e_i]) / float(sl) if tail_sum is not None else head_sum / float(sl)
                 outs.append(self._dense(self._dense(x, "dense", act="gelu"), "dense_1", act="softmax").cpu().numpy())
             if use_gpu:
                 self.w = {k: v.cpu() for k, v in self.w.items()}
+                del h_pad, xt_pad, xt_ln
+                torch.cuda.empty_cache()
             return np.vstack(outs)
 
         if self.base_arch == "attention":
@@ -314,8 +317,9 @@ class FastKerasModel:
             k_pad = torch.einsum("td,dhk->thk", h_pad, wk) + bk.unsqueeze(0)
             v_pad = torch.einsum("td,dhk->thk", h_pad, wv) + bv.unsqueeze(0)
             outs = []
-            for s_i in range(0, n_rows, 8192 if use_gpu else 4096):
-                e_i = min(n_rows, s_i + (8192 if use_gpu else 4096))
+            attn_chunk = 2048 if sl >= 120 else (8192 if use_gpu else 4096)
+            for s_i in range(0, n_rows, attn_chunk):
+                e_i = min(n_rows, s_i + attn_chunk)
                 x_w = h_pad[s_i:e_i + sl - 1].unfold(0, sl, 1).transpose(1, 2)
                 q = q_pad[s_i:e_i + sl - 1].unfold(0, sl, 1).transpose(2, 3)
                 k = k_pad[s_i:e_i + sl - 1].unfold(0, sl, 1)
@@ -327,6 +331,8 @@ class FastKerasModel:
                 outs.append(self._dense(x, "dense_2", act="softmax").cpu().numpy())
             if use_gpu:
                 self.w = {k: v.cpu() for k, v in self.w.items()}
+                del h_pad, q_pad, k_pad, v_pad, xt_pad, xt_ln
+                torch.cuda.empty_cache()
             return np.vstack(outs)
 
         raise ValueError(f"Unknown base_arch: {self.base_arch}")
