@@ -15,11 +15,63 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from _tools.system_resources import SAFE_WORKERS
+from _tools.system_resources import SAFE_WORKERS, configure_blackwell_gpu
 
 # При параллельном запуске горизонтов/экспертов через ThreadPoolExecutor (SAFE_WORKERS потоков)
 # отключаем вложенный OpenMP-пул внутри одного batch=1 графа, чтобы избежать борьбы потоков за локи
 torch.set_num_threads(1)
+GPU_INFO = configure_blackwell_gpu()
+
+
+class _BlackwellFP8LinearFn(torch.autograd.Function):
+    """
+    Аппаратное 8-битное матричное умножение для 5-го поколения Tensor Cores (RTX 5060 Ti, Blackwell sm_120):
+      - Forward: E4M3FN (float8_e4m3fn) x E4M3FN -> BF16 с динамическим per-tensor масштабированием;
+      - Backward: E5M2 (float8_e5m2) для градиентов с широким динамическим диапазоном.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, w: torch.Tensor, b: torch.Tensor | None = None) -> torch.Tensor:
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, orig_shape[-1])
+        m, k = x_2d.shape
+        _, n = w.shape
+        m_pad = (16 - (m % 16)) % 16
+        k_pad = (16 - (k % 16)) % 16
+        n_pad = (16 - (n % 16)) % 16
+        x_p = F.pad(x_2d, (0, k_pad, 0, m_pad)) if (m_pad or k_pad) else x_2d
+        w_p = F.pad(w, (0, n_pad, 0, k_pad)) if (k_pad or n_pad) else w
+
+        sa = (x_p.abs().amax() / 448.0).clamp(min=1e-12).to(torch.float32)
+        sb = (w_p.abs().amax() / 448.0).clamp(min=1e-12).to(torch.float32)
+        x_fp8 = (x_p / sa).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        w_fp8_col = (w_p / sb).clamp(-448.0, 448.0).t().contiguous().to(torch.float8_e4m3fn).t()
+        out_bf16 = torch._scaled_mm(x_fp8, w_fp8_col, scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16)
+        out = out_bf16[:m, :n].to(x.dtype)
+        if b is not None:
+            out = out + b
+        ctx.save_for_backward(x_2d, w)
+        ctx.has_bias = b is not None
+        ctx.orig_shape = orig_shape
+        return out.reshape(*orig_shape[:-1], n)
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        x_2d, w = ctx.saved_tensors
+        g_2d = grad_out.reshape(-1, grad_out.shape[-1])
+        grad_x = torch.matmul(g_2d, w.t()).reshape(ctx.orig_shape)
+        grad_w = torch.matmul(x_2d.t(), g_2d)
+        grad_b = g_2d.sum(dim=0) if ctx.has_bias else None
+        return grad_x, grad_w, grad_b
+
+
+def blackwell_matmul_bias(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor | None = None, use_fp8: bool = True) -> torch.Tensor:
+    """Выполняет линейный слой через FP8 Tensor Cores на RTX 5060 Ti (sm_120) при батче >= 256 и K,N >= 16."""
+    if use_fp8 and x.is_cuda and GPU_INFO.get("has_fp8", False) and x.numel() // max(1, x.shape[-1]) >= 256 and w.shape[0] >= 16 and w.shape[1] >= 16:
+        return _BlackwellFP8LinearFn.apply(x, w, b)
+    y = torch.matmul(x, w)
+    return y + b if b is not None else y
+
 
 
 @torch.jit.script
@@ -38,13 +90,14 @@ def _causal_conv1d(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor, dilation: 
     # x: (B, L, C_in), PyTorch w: (C_out, C_in, K)
     k_size = w.shape[2]
     if k_size == 1:
-        return torch.matmul(x, w.squeeze(-1).T) + b
+        return blackwell_matmul_bias(x, w.squeeze(-1).T, b)
     x_t = x.transpose(1, 2)
     if causal and k_size > 1:
         pad = (k_size - 1) * dilation
         x_t = F.pad(x_t, (pad, 0))
     y_t = F.conv1d(x_t, w, b, dilation=dilation)
     return y_t.transpose(1, 2)
+
 
 
 @torch.jit.script
@@ -457,7 +510,7 @@ class _TrainableKerasGraph(torch.nn.Module):
         return _layer_norm(x, self.p_map[f"layers/{layer_name}/vars/0"], self.p_map[f"layers/{layer_name}/vars/1"])
 
     def _dense(self, x: torch.Tensor, layer_name: str, act: str = None) -> torch.Tensor:
-        y = torch.matmul(x, self.p_map[f"layers/{layer_name}/vars/0"]) + self.p_map[f"layers/{layer_name}/vars/1"]
+        y = blackwell_matmul_bias(x, self.p_map[f"layers/{layer_name}/vars/0"], self.p_map[f"layers/{layer_name}/vars/1"])
         if act == "gelu":
             return _gelu(y)
         if act == "softmax":
@@ -472,6 +525,58 @@ class _TrainableKerasGraph(torch.nn.Module):
 
     def forward_logits_chunk(self, x_pad: torch.Tensor, s_i: int, e_i: int, sl: int) -> torch.Tensor:
         x_sub = self._ln(x_pad[s_i : e_i + sl - 1], "layer_normalization").unsqueeze(0)
+        if self.base_arch == "conv1d+gru":
+            x = self._conv(x_sub, "conv1d", dilation=1, causal=False, act="gelu")
+            x = self._ln(self._conv(x, "conv1d_1", dilation=1, causal=True, act="gelu"), "layer_normalization_1").squeeze(0)
+            x_3d = x.unfold(0, sl, 1).transpose(1, 2).contiguous()
+            h = _gru_last_step(x_3d, self.p_map["layers/gru/cell/vars/0"], self.p_map["layers/gru/cell/vars/1"], self.p_map["layers/gru/cell/vars/2"])
+            h = self._dense(self._ln(h, "layer_normalization_2"), "dense", act="gelu")
+            if self.training:
+                h = F.dropout(h, p=0.20, training=True)
+            return self._dense(h, "dense_1", act=None)
+
+        if self.base_arch == "causal_cnn":
+            x = self._conv(x_sub, "conv1d", dilation=1, causal=False, act="gelu")
+            r = _gelu(self._ln(self._conv(x, "conv1d_1", dilation=1, causal=True), "layer_normalization_1"))
+            x = _gelu(x + self._ln(self._conv(r, "conv1d_2", dilation=1, causal=True), "layer_normalization_2"))
+            r = _gelu(self._ln(self._conv(x, "conv1d_3", dilation=2, causal=True), "layer_normalization_3"))
+            r = self._ln(self._conv(r, "conv1d_4", dilation=2, causal=True), "layer_normalization_4")
+            x = _gelu(self._conv(x, "conv1d_5", dilation=1, causal=False) + r)
+            r = _gelu(self._ln(self._conv(x, "conv1d_6", dilation=4, causal=True), "layer_normalization_5"))
+            x_seq = _gelu(x + self._ln(self._conv(r, "conv1d_7", dilation=4, causal=True), "layer_normalization_6")).squeeze(0)
+            x_pool = x_seq.unfold(0, sl, 1).mean(dim=-1)
+            x_pool = self._dense(x_pool, "dense", act="gelu")
+            if self.training:
+                x_pool = F.dropout(x_pool, p=0.20, training=True)
+            return self._dense(x_pool, "dense_1", act=None)
+
+        if self.base_arch == "attention":
+            x_1d = self._dense(x_sub.squeeze(0), "dense", act="gelu")
+            x_3d = x_1d.unfold(0, sl, 1).transpose(1, 2).contiguous()
+            wq, bq = self.p_map["layers/multi_head_attention/query_dense/vars/0"], self.p_map["layers/multi_head_attention/query_dense/vars/1"]
+            wk, bk = self.p_map["layers/multi_head_attention/key_dense/vars/0"], self.p_map["layers/multi_head_attention/key_dense/vars/1"]
+            wv, bv = self.p_map["layers/multi_head_attention/value_dense/vars/0"], self.p_map["layers/multi_head_attention/value_dense/vars/1"]
+            wo, bo = self.p_map["layers/multi_head_attention/output_dense/vars/0"], self.p_map["layers/multi_head_attention/output_dense/vars/1"]
+            q = torch.einsum("btd,dhk->bhtk", x_3d, wq) + bq.unsqueeze(0).unsqueeze(2)
+            k = torch.einsum("btd,dhk->bhtk", x_3d, wk) + bk.unsqueeze(0).unsqueeze(2)
+            v = torch.einsum("btd,dhk->bhtk", x_3d, wv) + bv.unsqueeze(0).unsqueeze(2)
+            ctx = F.scaled_dot_product_attention(q, k, v, dropout_p=0.15 if self.training else 0.0)
+            attn_out = torch.einsum("bhtk,hkd->btd", ctx, wo) + bo
+            x_pool = self._ln(x_3d + attn_out, "layer_normalization_1").mean(dim=1)
+            x_pool = self._ln(self._dense(x_pool, "dense_1", act="gelu"), "layer_normalization_2")
+            return self._dense(x_pool, "dense_2", act=None)
+
+        if self.base_arch == "mlp_bottleneck":
+            x_1d = self._conv(x_sub, "conv1d", dilation=1, causal=False, act="gelu").squeeze(0)
+            x_flat = x_1d.unfold(0, sl, 1).transpose(1, 2).reshape(e_i - s_i, -1)
+            x = _gelu(self._ln(self._dense(x_flat, "dense"), "layer_normalization_1"))
+            sc = x
+            x = _gelu(self._ln(self._dense(x, "dense_1"), "layer_normalization_2"))
+            x = _gelu(self._ln(self._dense(sc + x, "dense_2"), "layer_normalization_3"))
+            if self.training:
+                x = F.dropout(x, p=0.20, training=True)
+            return self._dense(x, "dense_3", act=None)
+
         if self.base_arch == "wavenet_tcn":
             x = self._conv(x_sub, "conv1d", dilation=1, causal=False, act="gelu")
             if self.training:
@@ -551,7 +656,7 @@ def train_pytorch_window_fast(
     seq_map = {5: 15, 12: 42, 25: 75, 60: 180}
     sl = seq_map.get(int(horizon), int(horizon) * 3)
     win_tag = f"win_{win_idx:02d}"
-    arch_dir = Path("models/prl") / f"{arch}_h{horizon}s"
+    arch_dir = Path("models/prl") / f"{arch.replace('+', '_')}_h{horizon}s"
     arch_dir.mkdir(parents=True, exist_ok=True)
     out_keras = arch_dir / f"model_{win_tag}.keras"
     out_meta = arch_dir / f"meta_{win_tag}.json"

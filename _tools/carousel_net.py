@@ -133,11 +133,20 @@ class CarouselCapacityNet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         xn = self.in_norm(x)
-        h = self.ln1(F.gelu(self.fc1(xn)) * torch.sigmoid(self.gate1(xn)))
-        h = h + F.gelu(self.ln2(self.fc2(h)))
+        if xn.is_cuda and xn.shape[0] >= 256:
+            from _tools.fast_neural_engine import blackwell_matmul_bias
+            h1 = blackwell_matmul_bias(xn, self.fc1.weight.t(), self.fc1.bias)
+            g1 = blackwell_matmul_bias(xn, self.gate1.weight.t(), self.gate1.bias)
+            h = self.ln1(F.gelu(h1) * torch.sigmoid(g1))
+            h2 = blackwell_matmul_bias(h, self.fc2.weight.t(), self.fc2.bias)
+            h = h + F.gelu(self.ln2(h2))
+        else:
+            h = self.ln1(F.gelu(self.fc1(xn)) * torch.sigmoid(self.gate1(xn)))
+            h = h + F.gelu(self.ln2(self.fc2(h)))
         logits = self.head_probs(h)
         log_cap = F.softplus(self.head_log_cap(h)).squeeze(-1)
         return logits, log_cap
+
 
 
 class CarouselPredictor:
@@ -199,6 +208,8 @@ def train_carousel_net(cache_path: str = "data/cache/rl_triad_lob_cache_prl_176h
     X_tr_n = np.clip((X_tr - mean) / std, -5.0, 5.0).astype(np.float32)
     X_te_n = np.clip((X_te - mean) / std, -5.0, 5.0).astype(np.float32)
 
+    from _tools.system_resources import configure_blackwell_gpu
+    configure_blackwell_gpu()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = CarouselCapacityNet(in_dim=X_all.shape[1]).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=2.5e-3, weight_decay=1e-4)
@@ -207,18 +218,21 @@ def train_carousel_net(cache_path: str = "data/cache/rl_triad_lob_cache_prl_176h
     pos_weight = torch.tensor((1.0 - pos_rates) / pos_rates, dtype=torch.float32, device=device).clamp(1.0, 12.0)
     bce_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    batch_size = 4096
+    batch_size = 8192
     n_tr = len(X_tr_n)
+    X_tr_g = torch.from_numpy(X_tr_n).to(device)
+    yp_tr_g = torch.from_numpy(yp_tr).to(device)
+    yc_tr_g = torch.from_numpy(yc_tr).to(device)
     for ep in range(epochs):
         model.train()
-        perm = np.random.permutation(n_tr)
+        perm = torch.randperm(n_tr, device=device)
         tot_loss = 0.0
         steps = 0
         for s in range(0, n_tr, batch_size):
             b_idx = perm[s : s + batch_size]
-            xb = torch.from_numpy(X_tr_n[b_idx]).to(device)
-            ypb = torch.from_numpy(yp_tr[b_idx]).to(device)
-            ycb = torch.from_numpy(yc_tr[b_idx]).to(device)
+            xb = X_tr_g[b_idx]
+            ypb = yp_tr_g[b_idx]
+            ycb = yc_tr_g[b_idx]
             opt.zero_grad()
             logits, pred_cap = model(xb)
             loss = bce_fn(logits, ypb) + 0.25 * F.smooth_l1_loss(pred_cap, ycb)
@@ -228,6 +242,7 @@ def train_carousel_net(cache_path: str = "data/cache/rl_triad_lob_cache_prl_176h
             steps += 1
     model.eval()
     return _eval_and_save_carousel(model, X_te_n, yp_te, yc_te, mean, std, X_all.shape[1], device)
+
 
 
 def _eval_and_save_carousel(model, X_te_n, yp_te, yc_te, mean, std, in_dim, device) -> dict:

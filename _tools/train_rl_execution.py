@@ -1394,12 +1394,20 @@ class MaskableActorCritic(nn.Module):
         self.critic = nn.Linear(hidden_dim, 1)
 
     def forward(self, obs: torch.Tensor, mask: torch.Tensor = None):
-        h = self.backbone(obs)
+        if obs.is_cuda and obs.shape[0] >= 256:
+            from _tools.fast_neural_engine import blackwell_matmul_bias
+            h = blackwell_matmul_bias(obs, self.backbone[0].weight.t(), self.backbone[0].bias)
+            h = self.backbone[2](self.backbone[1](h))
+            h = blackwell_matmul_bias(h, self.backbone[3].weight.t(), self.backbone[3].bias)
+            h = self.backbone[5](self.backbone[4](h))
+        else:
+            h = self.backbone(obs)
         logits = self.actor(h)
         if mask is not None:
             logits = logits.masked_fill(~mask, -1e9)
         val = self.critic(h).squeeze(-1)
         return logits, val
+
 
 
 def load_compatible_ppo_state_dict(model: MaskableActorCritic, sd: dict) -> None:

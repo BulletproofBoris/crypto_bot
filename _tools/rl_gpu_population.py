@@ -4,8 +4,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
-from _tools.system_resources import SAFE_WORKERS
+from _tools.system_resources import SAFE_WORKERS, configure_blackwell_gpu
 
+configure_blackwell_gpu()
 _POP_POOL = ThreadPoolExecutor(max_workers=min(8, SAFE_WORKERS))
 
 
