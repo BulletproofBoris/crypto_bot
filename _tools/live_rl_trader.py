@@ -2250,7 +2250,7 @@ def start_live_daemon(budget_usd: float = 54.0, order_usd: float = 54.0, steps: 
         env_local = BASE_DIR / ".env"
         if env_local.exists():
             sftp.put(str(env_local), "/opt/crypto_bot/.env")
-        for mod_name in ("system_resources.py", "live_rl_trader.py", "live_feature_updater.py", "microstructure_features.py", "swarm_router.py", "fast_neural_engine.py", "train_rl_execution.py", "rl_gpu_population.py", "adaptive_quantizer.py"):
+        for mod_name in ("system_resources.py", "live_rl_trader.py", "live_feature_updater.py", "microstructure_features.py", "swarm_router.py", "fast_neural_engine.py", "train_rl_execution.py", "rl_gpu_population.py"):
             loc_mod = BASE_DIR / "_tools" / mod_name
             if loc_mod.exists():
                 sftp.put(str(loc_mod), f"/opt/crypto_bot/_tools/{mod_name}")

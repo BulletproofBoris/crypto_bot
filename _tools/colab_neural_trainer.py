@@ -251,8 +251,10 @@ def train_window_swarm(
         archs = ["conv1d+gru", "causal_cnn", "attention", "mlp_bottleneck"]
     k_ratio, seq_len = get_horizon_defaults(horizon)
     win_tag = f"win_{win_idx:02d}"
-    pack_dir = pack_dir or f"prl_ensemble_pack_h{horizon}s"
-    os.makedirs("trained_models", exist_ok=True)
+    default_pack = "models/prl" if os.path.isdir("models/prl") else f"prl_ensemble_pack_h{horizon}s"
+    pack_dir = pack_dir or default_pack
+    tmp_weights_dir = "/tmp/crypto_bot_tmp_weights"
+    os.makedirs(tmp_weights_dir, exist_ok=True)
     os.makedirs(pack_dir, exist_ok=True)
 
     # Проверяем, какие архитектуры уже обучены (Resume после сбоя/перезапуска)
@@ -384,7 +386,7 @@ def train_window_swarm(
             opt = tf.keras.optimizers.AdamW(learning_rate=lr, weight_decay=1e-4, clipnorm=1.0)
             model.compile(optimizer=opt, loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.06), metrics=["accuracy"])
 
-            temp_w = f"trained_models/tmp_{arch.replace('+', '_')}_{win_tag}_r{run_idx}.weights.h5"
+            temp_w = f"{tmp_weights_dir}/tmp_{arch.replace('+', '_')}_{win_tag}_r{run_idx}.weights.h5"
             profiler = ElasticPatienceProfiler(arch_losses, max_epochs=max_epochs, hard_prune_epoch=hard_prune_epoch, hard_prune_z=4.0, max_z_score=2.0)
             cbs = [
                 tf.keras.callbacks.ModelCheckpoint(filepath=temp_w, save_weights_only=True, monitor="val_loss", mode="min", save_best_only=True, verbose=0),
@@ -462,7 +464,7 @@ def train_window_swarm(
             json.dump(meta, f, indent=2)
         if os.path.exists(prog_path):
             os.remove(prog_path)
-        if os.path.isdir("models/prl"):
+        if os.path.isdir("models/prl") and os.path.abspath(pack_dir) != os.path.abspath("models/prl"):
             canon_dir = os.path.join("models/prl", f"{arch.replace('+', '_')}_h{horizon}s")
             os.makedirs(canon_dir, exist_ok=True)
             shutil.copy2(final_keras_path, os.path.join(canon_dir, f"model_{win_tag}.keras"))
@@ -495,8 +497,8 @@ def run_colab_pipeline(
     sync_bucket: str = None,
 ):
     """Запускает полный цикл загрузки данных, обучения выбранных окон (с изоляцией RAM/VRAM между окнами) и упаковки архива."""
-    pack_dir = f"prl_ensemble_pack_h{horizon}s"
-    if not force_retrain:
+    pack_dir = "models/prl" if os.path.isdir("models/prl") else f"prl_ensemble_pack_h{horizon}s"
+    if not force_retrain and pack_dir != "models/prl":
         _auto_restore_pack(pack_dir, int(horizon), sync_bucket=sync_bucket, resume_url=resume_url)
     for cand in [data_file, f"data/{data_file}", f"/content/{data_file}", f"/content/drive/MyDrive/{data_file}"]:
         if os.path.exists(cand):
@@ -521,7 +523,6 @@ def run_colab_pipeline(
         win_list = [int(x.strip()) for x in windows.split(",") if x.strip()]
 
     arch_list = [a.strip() for a in archs.split(",") if a.strip()]
-    pack_dir = f"prl_ensemble_pack_h{horizon}s"
     all_lb = []
 
     for w_idx in win_list:
