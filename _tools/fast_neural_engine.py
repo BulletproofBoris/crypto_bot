@@ -221,7 +221,8 @@ class FastKerasModel:
             f3 = torch.tanh(self._conv(x, "conv1d_8", dilation=4, causal=True))
             g3 = torch.sigmoid(self._conv(x, "conv1d_9", dilation=4, causal=True))
             z3 = self._ln(self._conv(f3 * g3, "conv1d_10", dilation=1, causal=False, act="gelu"), "layer_normalization_3")
-            x = (x + z3).mean(dim=1)
+            x_seq = x + z3
+            x = x_seq[:, -1, :] + x_seq.mean(dim=1)
             x = self._ln(self._dense(x, "dense", act="gelu"), "layer_normalization_4")
             return self._dense(x, "dense_1", act="softmax")
 
@@ -232,7 +233,8 @@ class FastKerasModel:
             x = self._ln(f_val * f_gate, "layer_normalization_1")
             t_loc = self._conv(x, "conv1d", dilation=1, causal=True, act="gelu")
             t_wid = self._conv(x, "conv1d_1", dilation=3, causal=True, act="gelu")
-            x = self._ln(x + t_loc + t_wid, "layer_normalization_2").mean(dim=1)
+            x_seq = self._ln(x + t_loc + t_wid, "layer_normalization_2")
+            x = x_seq[:, -1, :] + x_seq.mean(dim=1)
             x = self._ln(self._dense(x, "dense_2", act="gelu"), "layer_normalization_3")
             return self._dense(x, "dense_3", act="softmax")
 

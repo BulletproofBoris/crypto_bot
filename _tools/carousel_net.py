@@ -317,17 +317,21 @@ def run_carousel_backtest(cache_path: str = "data/cache/rl_triad_lob_cache_prl_1
                     p_adv = float(p_adv_oos[step_i])
                     b1_now = max(0.01, float(env.bid_p[env.t, 0]))
                     conv = max(0.0, float(obs[-2] * 5.0)) * 0.30 + max(0.0, float(env.inertia_arr[env.t])) * 0.40 + 0.30 * p50
-                    raw_w = 1.000 if (conv >= 0.68 or p150 >= 0.65) else float(np.clip(0.28 + 0.65 * conv, 0.001, 0.950))
-                    if p_adv >= 0.85 and float(env.dd_900[env.t]) >= 3.0:
-                        raw_w *= 0.55
-                    if budget <= 600.0:
-                        cap_usd = max(25.0, (q_c * 2.2 + 65.0 * p10 + 180.0 * p50) * b1_now)
-                        cap_w = float(np.clip(cap_usd / max(budget, 1.0), 0.380, 1.000))
-                        eff_w = raw_w if budget <= 150.0 else (0.65 * raw_w + 0.35 * min(raw_w, cap_w))
+                    cap_usd = max(35.0, (q_c * 2.6 + 85.0 * p10 + 220.0 * p50) * b1_now)
+                    # Если стакан с запасом переваривает весь малый бюджет, не урезаем базовый трендовый вход
+                    if budget <= 150.0 and cap_usd >= budget * 1.15 and p_adv < 0.75:
+                        eff_w = 1.000
                     else:
-                        cap_usd = max(35.0, (q_c * 2.6 + 85.0 * p10 + 220.0 * p50) * b1_now)
-                        cap_w = float(np.clip(cap_usd / max(budget, 1.0), 0.420, 1.000))
-                        eff_w = 0.72 * raw_w + 0.28 * min(raw_w, cap_w)
+                        raw_w = 1.000 if (conv >= 0.68 or p150 >= 0.65) else float(np.clip(0.28 + 0.65 * conv, 0.001, 0.950))
+                        if p_adv >= 0.85 and float(env.dd_900[env.t]) >= 3.0:
+                            raw_w *= 0.55
+                        if budget <= 600.0:
+                            cap_usd_m = max(25.0, (q_c * 2.2 + 65.0 * p10 + 180.0 * p50) * b1_now)
+                            cap_w = float(np.clip(cap_usd_m / max(budget, 1.0), 0.380, 1.000))
+                            eff_w = 0.65 * raw_w + 0.35 * min(raw_w, cap_w)
+                        else:
+                            cap_w = float(np.clip(cap_usd / max(budget, 1.0), 0.420, 1.000))
+                            eff_w = 0.72 * raw_w + 0.28 * min(raw_w, cap_w)
                     w_q = min(1.0, max(0.001, round(eff_w * 1000.0) / 1000.0))
                     env.order_usd = max(5.0, budget * w_q)
                     # 1) Усиление восстановительной карусели (M4) по прогнозу CarouselNet
@@ -340,7 +344,20 @@ def run_carousel_backtest(cache_path: str = "data/cache/rl_triad_lob_cache_prl_1
                                 env.car_px = max(env.ask_p[env.t, 0], b1_now + env.tick_size)
                                 env.car_q_ahead, _ = env._get_lob_queue(env.t, "SELL", env.car_px)
                                 env.car_state = 1
-                    # 2) Амбивалентный оборот свободного остатка капитала (Side-Pocket Carousel) с шагом 0.1%
+                    # 2) Амбивалентная докупка на просадке (v4.0 Scale-In) + Side-Pocket Carousel с шагом 0.1%
+                    if env.pos_qty > 1e-4 and p50 >= 0.60 and p_adv < 0.55:
+                        uw_t = (env.avg_entry - b1_now) / env.tick_size
+                        if 1.0 <= uw_t <= 2.5 and float(env.inertia_arr[env.t]) >= 0.25 and float(obs[-2] * 5.0) >= 0.80 and not getattr(env, "_scaled_in", False):
+                            add_w = min(0.450, max(0.001, round((0.25 + 0.20 * p50) * 1000.0) / 1000.0))
+                            add_qty = (budget * add_w) / b1_now
+                            tot_q = env.pos_qty + add_qty
+                            env.avg_entry = (env.pos_qty * env.avg_entry + add_qty * b1_now) / tot_q
+                            env.pos_qty = tot_q
+                            env.total_pnl_usd -= add_qty * b1_now * 0.001
+                            env._scaled_in = True
+                            extra_car_cycles += 1
+                    elif env.pos_qty <= 1e-4:
+                        env._scaled_in = False
                     if p50 >= 0.68 and q_c >= 60.0 and float(env.dd_900[env.t]) <= 1.5 and float(env.buy_vol[env.t]) > 15.0 and float(env.sell_vol[env.t]) > 15.0:
                         idle_usd = budget * min(0.350, max(0.001, round((0.18 * p50 * min(1.0, (q_c * b1_now) / budget)) * 1000.0) / 1000.0))
                         if idle_usd >= 5.0 and (step_i - extra_car_cycles * 180) >= 180:

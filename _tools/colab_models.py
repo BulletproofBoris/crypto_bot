@@ -6,7 +6,7 @@ import subprocess
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.layers import (
-    Input, Dense, Dropout, LayerNormalization, Conv1D, GaussianNoise,
+    Input, Dense, Dropout, LayerNormalization, Conv1D, Cropping1D, GaussianNoise,
     GRU, Add, Multiply, Activation, Flatten, GlobalAveragePooling1D,
     MultiHeadAttention, SpatialDropout1D
 )
@@ -136,7 +136,9 @@ def build_wavenet_tcn(seq_len, n_features, n_classes=7, l2_reg=1e-4):
     x = _gated_wavenet_block(x, 32, 3, 1, l2_reg)
     x = _gated_wavenet_block(x, 64, 3, 2, l2_reg)
     x = _gated_wavenet_block(x, 64, 3, 4, l2_reg)
-    x = GlobalAveragePooling1D()(x)
+    x_last = Flatten()(Cropping1D((seq_len - 1, 0))(x))
+    x_mean = GlobalAveragePooling1D()(x)
+    x = Add()([x_last, x_mean])
     x = Dense(64, activation='gelu', kernel_regularizer=regularizers.l2(l2_reg))(x)
     x = LayerNormalization()(x)
     x = Dropout(0.15)(x)
@@ -153,11 +155,13 @@ def build_cross_mixer(seq_len, n_features, n_classes=7, l2_reg=1e-4):
     f_gate = Dense(64, activation='sigmoid', kernel_regularizer=regularizers.l2(l2_reg))(x)
     x = LayerNormalization()(Multiply()([f_val, f_gate]))
     x = Dropout(0.15)(x)
-    # 2. Каузальное многомасштабное сведение + нелинейный миксер признаков
+    # 2. Каузальное многомасштабное сведение + Last-Step & Context Pooling
     t_local = Conv1D(64, 3, padding='causal', dilation_rate=1, activation='gelu', kernel_regularizer=regularizers.l2(l2_reg))(x)
     t_wide = Conv1D(64, 3, padding='causal', dilation_rate=3, activation='gelu', kernel_regularizer=regularizers.l2(l2_reg))(x)
     x = LayerNormalization()(Add()([x, t_local, t_wide]))
-    x = GlobalAveragePooling1D()(x)
+    x_last = Flatten()(Cropping1D((seq_len - 1, 0))(x))
+    x_mean = GlobalAveragePooling1D()(x)
+    x = Add()([x_last, x_mean])
     x = Dense(64, activation='gelu', kernel_regularizer=regularizers.l2(l2_reg))(x)
     x = LayerNormalization()(x)
     x = Dropout(0.15)(x)

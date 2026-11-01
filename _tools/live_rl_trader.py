@@ -1482,14 +1482,17 @@ class LiveTriadRLTrader:
                 quant_w *= 0.55
             a1_q_usd = a1_q_cur * max(a1, self.tick_size)
             b1_q_usd = b1_q_cur * max(b1, self.tick_size)
-            if avail_usd <= 600.0:
+            flow_cap_full = max(35.0, (q_cap_prl * 2.6 + 85.0 * p10_car + 220.0 * p50_car) * b1 + 0.25 * min(b1_q_usd, 600.0))
+            if avail_usd <= 150.0 and flow_cap_full >= avail_usd * 1.15 and p_adv_now < 0.75:
+                eff_w = 1.000
+            elif avail_usd <= 600.0:
                 flow_cap_usd = max(25.0, (q_cap_prl * 2.2 + 65.0 * p10_car + 180.0 * p50_car) * b1 + 0.25 * min(b1_q_usd, 600.0))
                 if a1_q_usd > 120.0 and self.last_inertia < 0.35:
                     flow_cap_usd *= 0.55
                 cap_w = float(np.clip(flow_cap_usd / max(avail_usd, 1.0), 0.380, 1.000))
-                eff_w = quant_w if avail_usd <= 150.0 else (0.65 * quant_w + 0.35 * min(quant_w, cap_w))
+                eff_w = 0.65 * quant_w + 0.35 * min(quant_w, cap_w)
             else:
-                flow_cap_usd = max(35.0, (q_cap_prl * 2.6 + 85.0 * p10_car + 220.0 * p50_car) * b1 + 0.25 * min(b1_q_usd, 600.0))
+                flow_cap_usd = flow_cap_full
                 if a1_q_usd > 120.0 and self.last_inertia < 0.35:
                     flow_cap_usd *= 0.55
                 cap_w = float(np.clip(flow_cap_usd / max(avail_usd, 1.0), 0.420, 1.000))
@@ -2325,14 +2328,18 @@ def start_live_daemon(budget_usd: float = 54.0, order_usd: float = 54.0, steps: 
                     for root, _, files in os.walk(h_dir):
                         rel_r = Path(root).relative_to(BASE_DIR / "models" / "prl")
                         rem_d = f"/opt/crypto_bot/models/prl/{rel_r}"
+                        rem_attrs = {}
+                        rem_mtimes = {}
                         try:
-                            rem_attrs = {a.filename: a.st_size for a in sftp.listdir_attr(rem_d)}
+                            for a in sftp.listdir_attr(rem_d):
+                                rem_attrs[a.filename] = a.st_size
+                                rem_mtimes[a.filename] = getattr(a, "st_mtime", 0) or 0
                         except Exception:
                             ssh.exec_command(f"mkdir -p {rem_d}")[1].read()
-                            rem_attrs = {}
                         for fn in files:
                             lf = Path(root) / fn
-                            if rem_attrs.get(fn) == lf.stat().st_size and not fn.endswith(".json"):
+                            st = lf.stat()
+                            if rem_attrs.get(fn) == st.st_size and abs(rem_mtimes.get(fn, 0) - st.st_mtime) < 2 and not fn.endswith(".json") and "wavenet_tcn" not in str(rel_r) and "cross_mixer" not in str(rel_r):
                                 continue
                             to_sync.append((lf, f"{rel_r}/{fn}", f"{rem_d}/{fn}"))
         if len(to_sync) <= 15:
