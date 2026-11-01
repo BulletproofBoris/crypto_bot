@@ -32,22 +32,10 @@ def _is_single_arch_worker() -> bool:
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", os.environ.get("WORKER_GPU_ID", "0"))
 import tensorflow as tf
 try:
-    if not _is_single_arch_worker():
-        tf.config.set_visible_devices([], "GPU")
+    tf.config.set_visible_devices([], "GPU")
 except Exception:
     pass
-_gpu_mem_limit_mb = int(os.environ.get("TF_GPU_HARD_LIMIT_MB", "0"))
-for _gpu in tf.config.list_physical_devices("GPU"):
-    try:
-        if _gpu_mem_limit_mb > 0:
-            tf.config.set_logical_device_configuration(
-                _gpu,
-                [tf.config.LogicalDeviceConfiguration(memory_limit=_gpu_mem_limit_mb)],
-            )
-        else:
-            tf.config.experimental.set_memory_growth(_gpu, True)
-    except Exception:
-        pass
+
 from sklearn.metrics import roc_auc_score
 from sklearn.utils.class_weight import compute_class_weight
 

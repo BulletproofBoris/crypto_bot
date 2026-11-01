@@ -150,13 +150,14 @@ class CarouselCapacityNet(nn.Module):
 
 
 class CarouselPredictor:
-    """Обёртка для быстрого инференса CarouselNet в симуляторе и боевом демоне."""
+    """Обёртка для быстрого инференса CarouselNet (Global Anchor + Regime-Routed Rolling Windows) в симуляторе и боевом демоне."""
 
     def __init__(self, ckpt_path: Path = CAROUSEL_MODEL_PATH):
         self.ready = False
         self.mean = None
         self.std = None
         self.model = None
+        self.win_experts = []
         if ckpt_path.exists():
             ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
             in_dim = int(ckpt.get("in_dim", 44))
@@ -165,14 +166,51 @@ class CarouselPredictor:
             self.model.eval()
             self.mean = np.array(ckpt["mean"], dtype=np.float32)
             self.std = np.array(ckpt["std"], dtype=np.float32)
+            for w_item in ckpt.get("window_experts", []):
+                m_w = CarouselCapacityNet(in_dim=in_dim)
+                m_w.load_state_dict(w_item["state_dict"])
+                m_w.eval()
+                self.win_experts.append({
+                    "model": m_w,
+                    "mean": np.array(w_item["mean"], dtype=np.float32),
+                    "std": np.array(w_item["std"], dtype=np.float32),
+                    "reg_center": np.array(w_item["reg_center"], dtype=np.float32),
+                    "reg_scale": np.array(w_item["reg_scale"], dtype=np.float32),
+                    "quality_w": float(w_item.get("quality_w", 1.0)),
+                })
             self.ready = True
 
     def predict_batch(self, X_feat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         X_norm = np.clip((X_feat - self.mean) / self.std, -5.0, 5.0).astype(np.float32)
         with torch.no_grad():
-            logits, log_cap = self.model(torch.from_numpy(X_norm))
-            probs = torch.sigmoid(logits).numpy()
-            q_cap = np.expm1(np.clip(log_cap.numpy(), 0.0, 8.6))
+            logits_g, log_cap_g = self.model(torch.from_numpy(X_norm))
+            probs = torch.sigmoid(logits_g).numpy()
+            lc_blend = log_cap_g.numpy()
+            if self.win_experts:
+                n = len(X_feat)
+                reg_x = X_feat[:, -10:]
+                w_mat = np.zeros((n, len(self.win_experts)), dtype=np.float32)
+                p_wins = np.zeros((len(self.win_experts), n, probs.shape[1]), dtype=np.float32)
+                lc_wins = np.zeros((len(self.win_experts), n), dtype=np.float32)
+                for i, exp in enumerate(self.win_experts):
+                    dist2 = np.mean(((reg_x - exp["reg_center"]) / exp["reg_scale"]) ** 2, axis=1)
+                    w_mat[:, i] = exp["quality_w"] * np.exp(-0.5 * np.clip(dist2, 0.0, 25.0))
+                    xw_n = np.clip((X_feat - exp["mean"]) / exp["std"], -5.0, 5.0).astype(np.float32)
+                    lg_w, lc_w = exp["model"](torch.from_numpy(xw_n))
+                    p_wins[i] = torch.sigmoid(lg_w).numpy()
+                    lc_wins[i] = lc_w.numpy()
+                w_sum = np.sum(w_mat, axis=1, keepdims=True) + 1e-8
+                w_norm = w_mat / w_sum
+                p_routed = np.einsum("ni,inb->nb", w_norm, p_wins)
+                lc_routed = np.einsum("ni,in->n", w_norm, lc_wins)
+                # Калибровка масштаба режимного роя к глобальному якорю (сохранение порогов квантователя)
+                p_g_m, p_g_s = np.mean(probs, axis=0, keepdims=True), np.std(probs, axis=0, keepdims=True) + 1e-6
+                p_r_m, p_r_s = np.mean(p_routed, axis=0, keepdims=True), np.std(p_routed, axis=0, keepdims=True) + 1e-6
+                p_routed = np.clip((p_routed - p_r_m) * (p_g_s / p_r_s) + p_g_m, 0.0, 1.0)
+                lc_routed = (lc_routed - float(np.mean(lc_routed))) * ((float(np.std(lc_blend)) + 1e-6) / (float(np.std(lc_routed)) + 1e-6)) + float(np.mean(lc_blend))
+                probs = 0.85 * probs + 0.15 * p_routed
+                lc_blend = 0.85 * lc_blend + 0.15 * lc_routed
+            q_cap = np.expm1(np.clip(lc_blend, 0.0, 8.6))
         return probs, q_cap
 
     def predict_single(self, feat_1d: np.ndarray) -> tuple[np.ndarray, float]:
@@ -182,8 +220,26 @@ class CarouselPredictor:
         with torch.no_grad():
             logits, log_cap = self.model(torch.from_numpy(x_norm[None, :]))
             probs = torch.sigmoid(logits[0]).numpy()
-            q_cap = float(np.expm1(np.clip(float(log_cap[0].item()), 0.0, 8.6)))
+            lc_val = float(log_cap[0].item())
+            if self.win_experts:
+                reg_x = feat_1d[-10:]
+                w_sum = 0.0
+                p_acc = np.zeros_like(probs)
+                lc_acc = 0.0
+                for exp in self.win_experts:
+                    dist2 = float(np.mean(((reg_x - exp["reg_center"]) / exp["reg_scale"]) ** 2))
+                    w_i = exp["quality_w"] * math.exp(-0.5 * min(25.0, dist2))
+                    xw_n = np.clip((feat_1d - exp["mean"]) / exp["std"], -5.0, 5.0).astype(np.float32)
+                    lg_w, lc_w = exp["model"](torch.from_numpy(xw_n[None, :]))
+                    p_acc += w_i * torch.sigmoid(lg_w[0]).numpy()
+                    lc_acc += w_i * float(lc_w[0].item())
+                    w_sum += w_i
+                if w_sum > 1e-8:
+                    probs = 0.75 * probs + 0.25 * (p_acc / w_sum)
+                    lc_val = 0.75 * lc_val + 0.25 * (lc_acc / w_sum)
+            q_cap = float(np.expm1(np.clip(lc_val, 0.0, 8.6)))
         return probs, q_cap
+
 
 
 def train_carousel_net(cache_path: str = "data/cache/rl_triad_lob_cache_prl_176h.npz", epochs: int = 8) -> dict:
@@ -241,23 +297,57 @@ def train_carousel_net(cache_path: str = "data/cache/rl_triad_lob_cache_prl_176h
             tot_loss += float(loss.item())
             steps += 1
     model.eval()
-    return _eval_and_save_carousel(model, X_te_n, yp_te, yc_te, mean, std, X_all.shape[1], device)
+
+    win_len = 90000
+    win_step = 40000
+    win_experts_payload = []
+    win_starts = list(range(0, max(1, tr_end - win_len + 1), win_step))
+    if win_starts[-1] != max(0, tr_end - win_len):
+        win_starts.append(max(0, tr_end - win_len))
+    for w_i, ws in enumerate(win_starts):
+        we = min(tr_end, ws + win_len)
+        Xw = X_tr[ws:we]
+        ypw, ycw = yp_tr[ws:we], yc_tr[ws:we]
+        mw = np.mean(Xw, axis=0)
+        sw = np.std(Xw, axis=0) + 1e-5
+        Xw_n = np.clip((Xw - mw) / sw, -5.0, 5.0).astype(np.float32)
+        reg_c = np.mean(Xw[:, -10:], axis=0)
+        reg_s = np.std(Xw[:, -10:], axis=0) + 1e-4
+
+        m_win = CarouselCapacityNet(in_dim=X_all.shape[1]).to(device)
+        opt_w = torch.optim.AdamW(m_win.parameters(), lr=2.5e-3, weight_decay=1e-4)
+        Xw_g = torch.from_numpy(Xw_n).to(device)
+        ypw_g = torch.from_numpy(ypw).to(device)
+        ycw_g = torch.from_numpy(ycw).to(device)
+        nw = len(Xw_n)
+        for _ in range(epochs):
+            m_win.train()
+            p_w = torch.randperm(nw, device=device)
+            for s in range(0, nw, batch_size):
+                bi = p_w[s : s + batch_size]
+                opt_w.zero_grad()
+                lg_b, pc_b = m_win(Xw_g[bi])
+                l_w = bce_fn(lg_b, ypw_g[bi]) + 0.25 * F.smooth_l1_loss(pc_b, ycw_g[bi])
+                l_w.backward()
+                opt_w.step()
+        m_win.eval()
+        with torch.no_grad():
+            _, pc_val = m_win(Xw_g)
+            ic_w = float(np.corrcoef(pc_val.cpu().numpy(), ycw)[0, 1]) if np.std(ycw) > 1e-6 else 0.2
+        win_experts_payload.append({
+            "win_idx": w_i,
+            "mean": mw.tolist(),
+            "std": sw.tolist(),
+            "reg_center": reg_c.tolist(),
+            "reg_scale": reg_s.tolist(),
+            "quality_w": round(max(0.05, ic_w ** 2), 4),
+            "state_dict": m_win.cpu().state_dict(),
+        })
+    return _eval_and_save_carousel(model, X_te, X_te_n, yp_te, yc_te, mean, std, X_all.shape[1], device, win_experts_payload)
 
 
-
-def _eval_and_save_carousel(model, X_te_n, yp_te, yc_te, mean, std, in_dim, device) -> dict:
+def _eval_and_save_carousel(model, X_te_raw, X_te_n, yp_te, yc_te, mean, std, in_dim, device, win_experts_payload=None) -> dict:
     from sklearn.metrics import roc_auc_score
-
-    with torch.no_grad():
-        logits, pred_cap = model(torch.from_numpy(X_te_n).to(device))
-        probs = torch.sigmoid(logits).cpu().numpy()
-        p_cap = pred_cap.cpu().numpy()
-
-    aucs = {}
-    for i, b_q in enumerate(VOLUME_BUCKETS_PRL):
-        if 0 < np.sum(yp_te[:, i]) < len(yp_te):
-            aucs[f"AUC_{int(b_q)}PRL"] = round(float(roc_auc_score(yp_te[:, i], probs[:, i])), 4)
-    ic_cap = float(np.corrcoef(p_cap, yc_te)[0, 1])
 
     payload = {
         "in_dim": in_dim,
@@ -265,7 +355,7 @@ def _eval_and_save_carousel(model, X_te_n, yp_te, yc_te, mean, std, in_dim, devi
         "mean": mean.tolist(),
         "std": std.tolist(),
         "state_dict": model.cpu().state_dict(),
-        "oos_metrics": {"aucs": aucs, "ic_log_cap": round(ic_cap, 4)},
+        "window_experts": win_experts_payload or [],
     }
     save_p = CAROUSEL_MODEL_PATH
     try:
@@ -274,8 +364,21 @@ def _eval_and_save_carousel(model, X_te_n, yp_te, yc_te, mean, std, in_dim, devi
     except OSError:
         save_p = Path("/tmp/carousel_net.pt")
         torch.save(payload, save_p)
-    print(f"✅ CarouselNet сохранена в {save_p} | OOS IC(log_cap)={ic_cap:+.4f} | AUCs={aucs}")
+
+    pred_ens = CarouselPredictor(save_p)
+    probs, q_cap = pred_ens.predict_batch(X_te_raw)
+    p_cap = np.log1p(q_cap)
+
+    aucs = {}
+    for i, b_q in enumerate(VOLUME_BUCKETS_PRL):
+        if 0 < np.sum(yp_te[:, i]) < len(yp_te):
+            aucs[f"AUC_{int(b_q)}PRL"] = round(float(roc_auc_score(yp_te[:, i], probs[:, i])), 4)
+    ic_cap = float(np.corrcoef(p_cap, yc_te)[0, 1])
+    payload["oos_metrics"] = {"aucs": aucs, "ic_log_cap": round(ic_cap, 4), "n_windows": len(win_experts_payload or [])}
+    torch.save(payload, save_p)
+    print(f"✅ CarouselNet ({1 + len(win_experts_payload or [])} экспертов) сохранена в {save_p} | OOS IC(log_cap)={ic_cap:+.4f} | AUCs={aucs}")
     return {"aucs": aucs, "ic_log_cap": round(ic_cap, 4), "saved_path": str(save_p)}
+
 
 
 def run_carousel_backtest(cache_path: str = "data/cache/rl_triad_lob_cache_prl_176h.npz"):
@@ -358,7 +461,7 @@ def run_carousel_backtest(cache_path: str = "data/cache/rl_triad_lob_cache_prl_1
                                 env.car_q_ahead, _ = env._get_lob_queue(env.t, "SELL", env.car_px)
                                 env.car_state = 1
                     # 2) Амбивалентная докупка на просадке (v4.0 Scale-In) + Side-Pocket Carousel с шагом 0.1%
-                    if env.pos_qty > 1e-4 and p50 >= 0.60 and p_adv < 0.55:
+                    if env.pos_qty > 1e-4 and p50 >= 0.60 and p_adv < 0.52 and float(env.dd_900[env.t]) <= 2.0:
                         uw_t = (env.avg_entry - b1_now) / env.tick_size
                         if 1.0 <= uw_t <= 2.5 and float(env.inertia_arr[env.t]) >= 0.25 and float(obs[-2] * 5.0) >= 0.80 and not getattr(env, "_scaled_in", False):
                             add_w = min(0.450, max(0.001, round((0.25 + 0.20 * p50) * 1000.0) / 1000.0))

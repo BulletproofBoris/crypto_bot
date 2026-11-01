@@ -81,27 +81,58 @@ class MicrostructureHazardNet(nn.Module):
 
 
 class HazardPredictor:
-    """Быстрый инференс HazardNet для симулятора и боевого демона."""
+    """Быстрый инференс HazardNet (Global Anchor + Regime-Routed Rolling Windows) для симулятора и боевого демона."""
 
     def __init__(self, ckpt_path: Path = HAZARD_MODEL_PATH):
         self.ready = False
         self.mean = None
         self.std = None
         self.model = None
+        self.win_experts = []
         if ckpt_path.exists():
             ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-            self.model = MicrostructureHazardNet(in_dim=int(ckpt.get("in_dim", 44)))
+            in_dim = int(ckpt.get("in_dim", 44))
+            self.model = MicrostructureHazardNet(in_dim=in_dim)
             self.model.load_state_dict(ckpt["state_dict"])
             self.model.eval()
             self.mean = np.array(ckpt["mean"], dtype=np.float32)
             self.std = np.array(ckpt["std"], dtype=np.float32)
+            for w_item in ckpt.get("window_experts", []):
+                m_w = MicrostructureHazardNet(in_dim=in_dim)
+                m_w.load_state_dict(w_item["state_dict"])
+                m_w.eval()
+                self.win_experts.append({
+                    "model": m_w,
+                    "mean": np.array(w_item["mean"], dtype=np.float32),
+                    "std": np.array(w_item["std"], dtype=np.float32),
+                    "reg_center": np.array(w_item["reg_center"], dtype=np.float32),
+                    "reg_scale": np.array(w_item["reg_scale"], dtype=np.float32),
+                    "quality_w": float(w_item.get("quality_w", 1.0)),
+                })
             self.ready = True
 
     def predict_batch(self, X_feat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         X_norm = np.clip((X_feat - self.mean) / self.std, -5.0, 5.0).astype(np.float32)
         with torch.no_grad():
             probs = torch.sigmoid(self.model(torch.from_numpy(X_norm))).numpy()
+            if self.win_experts:
+                n = len(X_feat)
+                reg_x = X_feat[:, -10:]
+                w_mat = np.zeros((n, len(self.win_experts)), dtype=np.float32)
+                p_wins = np.zeros((len(self.win_experts), n, 2), dtype=np.float32)
+                for i, exp in enumerate(self.win_experts):
+                    dist2 = np.mean(((reg_x - exp["reg_center"]) / exp["reg_scale"]) ** 2, axis=1)
+                    w_mat[:, i] = exp["quality_w"] * np.exp(-0.5 * np.clip(dist2, 0.0, 25.0))
+                    xw_n = np.clip((X_feat - exp["mean"]) / exp["std"], -5.0, 5.0).astype(np.float32)
+                    p_wins[i] = torch.sigmoid(exp["model"](torch.from_numpy(xw_n))).numpy()
+                w_norm = w_mat / (np.sum(w_mat, axis=1, keepdims=True) + 1e-8)
+                p_routed = np.einsum("ni,inb->nb", w_norm, p_wins)
+                p_g_m, p_g_s = np.mean(probs, axis=0, keepdims=True), np.std(probs, axis=0, keepdims=True) + 1e-6
+                p_r_m, p_r_s = np.mean(p_routed, axis=0, keepdims=True), np.std(p_routed, axis=0, keepdims=True) + 1e-6
+                p_routed = np.clip((p_routed - p_r_m) * (p_g_s / p_r_s) + p_g_m, 0.0, 1.0)
+                probs = 0.85 * probs + 0.15 * p_routed
         return probs[:, 0], probs[:, 1]
+
 
 
 def train_hazard_net(cache_path: str = "data/cache/rl_triad_lob_cache_prl_176h.npz", epochs: int = 8) -> dict:
@@ -154,24 +185,70 @@ def train_hazard_net(cache_path: str = "data/cache/rl_triad_lob_cache_prl_176h.n
 
 
     model.eval()
-    with torch.no_grad():
-        probs = torch.sigmoid(model(torch.from_numpy(X_te_n).to(device))).cpu().numpy()
-    auc_adv = round(float(roc_auc_score(Y_te[:, 0], probs[:, 0])), 4)
-    auc_exh = round(float(roc_auc_score(Y_te[:, 1], probs[:, 1])), 4)
+    win_len = 90000
+    win_step = 40000
+    win_experts_payload = []
+    win_starts = list(range(0, max(1, tr_end - win_len + 1), win_step))
+    if win_starts[-1] != max(0, tr_end - win_len):
+        win_starts.append(max(0, tr_end - win_len))
+    for w_i, ws in enumerate(win_starts):
+        we = min(tr_end, ws + win_len)
+        Xw, Yw = X_tr[ws:we], Y_tr[ws:we]
+        mw = np.mean(Xw, axis=0)
+        sw = np.std(Xw, axis=0) + 1e-5
+        Xw_n = np.clip((Xw - mw) / sw, -5.0, 5.0).astype(np.float32)
+        reg_c = np.mean(Xw[:, -10:], axis=0)
+        reg_s = np.std(Xw[:, -10:], axis=0) + 1e-4
+
+        m_win = MicrostructureHazardNet(in_dim=X_all.shape[1]).to(device)
+        opt_w = torch.optim.AdamW(m_win.parameters(), lr=2.5e-3, weight_decay=1e-4)
+        Xw_g = torch.from_numpy(Xw_n).to(device)
+        Yw_g = torch.from_numpy(Yw).to(device)
+        nw = len(Xw_n)
+        for _ in range(epochs):
+            m_win.train()
+            p_w = torch.randperm(nw, device=device)
+            for s in range(0, nw, batch_size):
+                bi = p_w[s : s + batch_size]
+                opt_w.zero_grad()
+                l_w = bce_fn(m_win(Xw_g[bi]), Yw_g[bi])
+                l_w.backward()
+                opt_w.step()
+        m_win.eval()
+        win_experts_payload.append({
+            "win_idx": w_i,
+            "mean": mw.tolist(),
+            "std": sw.tolist(),
+            "reg_center": reg_c.tolist(),
+            "reg_scale": reg_s.tolist(),
+            "quality_w": 1.0,
+            "state_dict": m_win.cpu().state_dict(),
+        })
+
     payload = {
         "in_dim": X_all.shape[1],
         "mean": mean.tolist(),
         "std": std.tolist(),
         "state_dict": model.cpu().state_dict(),
-        "oos_metrics": {"auc_adverse_5s": auc_adv, "auc_exhaustion_10s": auc_exh},
+        "window_experts": win_experts_payload,
     }
+    save_p = HAZARD_MODEL_PATH
     try:
-        HAZARD_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(payload, HAZARD_MODEL_PATH)
+        save_p.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(payload, save_p)
     except OSError:
-        torch.save(payload, Path("/tmp/hazard_net.pt"))
-    print(f"✅ HazardNet сохранена в {HAZARD_MODEL_PATH} | OOS AUC(Adverse 5s)={auc_adv:.4f} | AUC(Exhaustion 10s)={auc_exh:.4f}")
+        save_p = Path("/tmp/hazard_net.pt")
+        torch.save(payload, save_p)
+
+    pred_ens = HazardPredictor(save_p)
+    p_adv_te, p_exh_te = pred_ens.predict_batch(X_te)
+    auc_adv = round(float(roc_auc_score(Y_te[:, 0], p_adv_te)), 4)
+    auc_exh = round(float(roc_auc_score(Y_te[:, 1], p_exh_te)), 4)
+    payload["oos_metrics"] = {"auc_adverse_5s": auc_adv, "auc_exhaustion_10s": auc_exh, "n_windows": len(win_experts_payload)}
+    torch.save(payload, save_p)
+    print(f"✅ HazardNet ({1 + len(win_experts_payload)} экспертов) сохранена в {save_p} | OOS AUC(Adverse 5s)={auc_adv:.4f} | AUC(Exhaustion 10s)={auc_exh:.4f}")
     return payload["oos_metrics"]
+
 
 
 if __name__ == "__main__":

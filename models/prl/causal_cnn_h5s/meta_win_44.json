@@ -10,13 +10,13 @@
   ],
   "test_ts_range": [
     "2026-10-31 11:27:18",
-    "2026-10-31 22:00:07"
+    "2026-10-31 21:52:17"
   ],
   "metrics_oos": {
-    "ic_dt_ticks": 0.1107,
-    "roc_auc_ovr": 0.7053,
-    "log_loss": 0.7017,
-    "top2pct_mean_ticks": 0.17
+    "ic_dt_ticks": 0.0725,
+    "roc_auc_ovr": 0.6562,
+    "log_loss": 1.7529,
+    "top2pct_mean_ticks": 0.02
   },
   "feature_norm": {
     "mean": [

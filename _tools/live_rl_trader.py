@@ -2352,7 +2352,7 @@ def start_live_daemon(budget_usd: float = 54.0, order_usd: float = 54.0, steps: 
                         for fn in files:
                             lf = Path(root) / fn
                             st = lf.stat()
-                            if rem_attrs.get(fn) == st.st_size and abs(rem_mtimes.get(fn, 0) - st.st_mtime) < 2 and not fn.endswith(".json") and "wavenet_tcn" not in str(rel_r) and "cross_mixer" not in str(rel_r):
+                            if rem_attrs.get(fn) == st.st_size and abs(rem_mtimes.get(fn, 0) - st.st_mtime) < 2 and not fn.endswith(".json") and "wavenet_tcn" not in str(rel_r) and "cross_mixer" not in str(rel_r) and "causal_cnn" not in str(rel_r) and "attention" not in str(rel_r):
                                 continue
                             to_sync.append((lf, f"{rel_r}/{fn}", f"{rem_d}/{fn}"))
         if len(to_sync) <= 15:

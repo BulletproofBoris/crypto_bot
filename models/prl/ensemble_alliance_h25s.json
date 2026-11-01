@@ -37,22 +37,22 @@
       "top2_pnl": 0.45301204919815063
     },
     {
-      "model": "causal_cnn",
+      "model": "causal_cnn (8-win rolling v5.3)",
       "params": 67037,
-      "time_s": 335.6,
-      "ic": 0.16098381426427125,
-      "auc": 0.6770374288401692,
-      "log_loss": 1.7967740282419673,
-      "top2_pnl": 0.026506023481488228
+      "time_s": 15.5,
+      "ic": 0.267,
+      "auc": 0.8009,
+      "log_loss": 1.6655,
+      "top2_pnl": 0.5
     },
     {
-      "model": "attention",
+      "model": "attention (8-win rolling v5.3)",
       "params": 41309,
-      "time_s": 110.2,
-      "ic": 0.0722506210788372,
-      "auc": 0.6740746751327302,
-      "log_loss": 1.6615261372466323,
-      "top2_pnl": -0.0746987983584404
+      "time_s": 40.2,
+      "ic": 0.2446,
+      "auc": 0.794,
+      "log_loss": 1.4871,
+      "top2_pnl": 0.3
     },
     {
       "model": "mlp_bottleneck",

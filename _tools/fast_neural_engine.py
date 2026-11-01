@@ -216,7 +216,7 @@ class FastKerasModel:
             r = self._conv(r, "conv1d_7", dilation=4, causal=True)
             r = self._ln(r, "layer_normalization_6")
             x = _gelu(x + r)
-            x = x.mean(dim=1)
+            x = x[:, -1, :] + x.mean(dim=1)
             x = self._dense(x, "dense", act="gelu")
             return self._dense(x, "dense_1", act="softmax")
 
@@ -242,9 +242,10 @@ class FastKerasModel:
             ctx = torch.matmul(attn_w, v)  # (B, H, T, K)
             attn_out = torch.einsum("bhtk,hkd->btd", ctx, wo) + bo
             x = self._ln(x + attn_out, "layer_normalization_1")
-            x = x.mean(dim=1)
+            x = x[:, -1, :] + x.mean(dim=1)
             x = self._ln(self._dense(x, "dense_1", act="gelu"), "layer_normalization_2")
             return self._dense(x, "dense_2", act="softmax")
+
 
         if self.base_arch == "mlp_bottleneck":
             x = self._ln(x, "layer_normalization")
@@ -373,24 +374,17 @@ class FastKerasModel:
                 r = _gelu(self._ln(self._conv(x_m, "conv1d_6", dilation=4, causal=True), "layer_normalization_5"))
                 return _gelu(x_m + self._ln(self._conv(r, "conv1d_7", dilation=4, causal=True), "layer_normalization_6"))
 
-            rf = min(sl, 28)
-            tail_sum = None
-            if sl > rf:
-                y_full = _resblocks(h_pad.unsqueeze(0)).squeeze(0)
-                cs = torch.vstack([torch.zeros((1, y_full.shape[1]), dtype=torch.float32, device=dev), torch.cumsum(y_full, dim=0)])
-                idx = torch.arange(n_rows, device=dev)
-                tail_sum = cs[idx + sl] - cs[idx + rf]
+            y_full = _resblocks(h_pad.unsqueeze(0)).squeeze(0)
             outs = []
-            attn_chunk = 2048 if sl >= 120 else (8192 if use_gpu else 4096)
+            attn_chunk = 8192 if use_gpu else 4096
             for s_i in range(0, n_rows, attn_chunk):
                 e_i = min(n_rows, s_i + attn_chunk)
-                x_rf = h_pad[s_i:e_i + rf - 1].unfold(0, rf, 1).transpose(1, 2).contiguous()
-                head_sum = _resblocks(x_rf).sum(dim=1)
-                x = (head_sum + tail_sum[s_i:e_i]) / float(sl) if tail_sum is not None else head_sum / float(sl)
+                y_sub = y_full[s_i : e_i + sl - 1]
+                x = y_sub[sl - 1:] + y_sub.unfold(0, sl, 1).mean(dim=-1)
                 outs.append(self._dense(self._dense(x, "dense", act="gelu"), "dense_1", act="softmax").cpu().numpy())
             if use_gpu:
                 self.w = {k: v.cpu() for k, v in self.w.items()}
-                del h_pad, xt_pad, xt_ln
+                del h_pad, y_full, xt_pad, xt_ln
                 torch.cuda.empty_cache()
             return np.vstack(outs)
 
@@ -413,9 +407,11 @@ class FastKerasModel:
                 v = v_pad[s_i:e_i + sl - 1].unfold(0, sl, 1).transpose(2, 3)
                 attn_w = F.softmax(torch.matmul(q, k) * (16.0 ** -0.5), dim=-1)
                 attn_out = torch.einsum("bhtk,hkd->btd", torch.matmul(attn_w, v), wo) + bo
-                x = self._ln(x_w + attn_out, "layer_normalization_1").mean(dim=1)
+                x_seq = self._ln(x_w + attn_out, "layer_normalization_1")
+                x = x_seq[:, -1, :] + x_seq.mean(dim=1)
                 x = self._ln(self._dense(x, "dense_1", act="gelu"), "layer_normalization_2")
                 outs.append(self._dense(x, "dense_2", act="softmax").cpu().numpy())
+
             if use_gpu:
                 self.w = {k: v.cpu() for k, v in self.w.items()}
                 del h_pad, q_pad, k_pad, v_pad, xt_pad, xt_ln
@@ -544,7 +540,7 @@ class _TrainableKerasGraph(torch.nn.Module):
             x = _gelu(self._conv(x, "conv1d_5", dilation=1, causal=False) + r)
             r = _gelu(self._ln(self._conv(x, "conv1d_6", dilation=4, causal=True), "layer_normalization_5"))
             x_seq = _gelu(x + self._ln(self._conv(r, "conv1d_7", dilation=4, causal=True), "layer_normalization_6")).squeeze(0)
-            x_pool = x_seq.unfold(0, sl, 1).mean(dim=-1)
+            x_pool = x_seq[sl - 1:] + x_seq.unfold(0, sl, 1).mean(dim=-1)
             x_pool = self._dense(x_pool, "dense", act="gelu")
             if self.training:
                 x_pool = F.dropout(x_pool, p=0.20, training=True)
@@ -562,9 +558,11 @@ class _TrainableKerasGraph(torch.nn.Module):
             v = torch.einsum("btd,dhk->bhtk", x_3d, wv) + bv.unsqueeze(0).unsqueeze(2)
             ctx = F.scaled_dot_product_attention(q, k, v, dropout_p=0.15 if self.training else 0.0)
             attn_out = torch.einsum("bhtk,hkd->btd", ctx, wo) + bo
-            x_pool = self._ln(x_3d + attn_out, "layer_normalization_1").mean(dim=1)
+            x_seq = self._ln(x_3d + attn_out, "layer_normalization_1")
+            x_pool = x_seq[:, -1, :] + x_seq.mean(dim=1)
             x_pool = self._ln(self._dense(x_pool, "dense_1", act="gelu"), "layer_normalization_2")
             return self._dense(x_pool, "dense_2", act=None)
+
 
         if self.base_arch == "mlp_bottleneck":
             x_1d = self._conv(x_sub, "conv1d", dilation=1, causal=False, act="gelu").squeeze(0)

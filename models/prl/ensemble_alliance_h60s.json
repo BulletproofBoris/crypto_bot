@@ -26,18 +26,18 @@
       "top2_pnl": 0.43
     },
     {
-      "model": "attention",
-      "ic": 0.069,
-      "auc": 0.6672,
-      "log_loss": 1.9735,
-      "top2_pnl": 0.07
+      "model": "attention (3-win rolling v5.3)",
+      "ic": 0.2649,
+      "auc": 0.806,
+      "log_loss": 1.2941,
+      "top2_pnl": 0.32
     },
     {
-      "model": "causal_cnn",
-      "ic": 0.0617,
-      "auc": 0.6345,
-      "log_loss": 1.9976,
-      "top2_pnl": 0.04
+      "model": "causal_cnn (3-win rolling v5.3)",
+      "ic": 0.2283,
+      "auc": 0.7786,
+      "log_loss": 1.4572,
+      "top2_pnl": 0.33
     },
     {
       "model": "conv1d+gru",
