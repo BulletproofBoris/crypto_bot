@@ -1032,6 +1032,16 @@ class LiveTriadRLTrader:
             and exp_entry_edge >= 0.50
             and not getattr(self, "last_waterfall_trap", False)
         )
+        half_pos_ready_to_buy = bool(
+            self.pos_qty >= 1.95
+            and self.active_ask_id is not None
+            and self.bot_cash_usd >= 25.0
+            and (self.pos_qty * b1) < 0.55 * tot_eq_now
+            and (
+                self.active_bid_id is not None
+                or (inertia >= 0.15 and exp_entry_edge >= 0.60 and not getattr(self, "last_waterfall_trap", False))
+            )
+        )
         self.micro_pos_parked = bool(
             (
                 self.pos_qty >= 1.95
@@ -1039,6 +1049,7 @@ class LiveTriadRLTrader:
                 and self.bot_cash_usd >= 25.0
                 and (self.pos_qty * b1) < 0.28 * tot_eq_now
             )
+            or half_pos_ready_to_buy
             or ambivalent_scale_in
         )
         has_pos = 1.0 if (self.pos_qty > 1e-8 and not self.micro_pos_parked) else 0.0
@@ -1474,7 +1485,7 @@ class LiveTriadRLTrader:
                         self.pos_qty >= 1.95
                         and self.active_ask_id is not None
                         and self.bot_cash_usd >= 25.0
-                        and (self.pos_qty * b1) < 0.28 * (self.bot_cash_usd + self.pos_qty * b1)
+                        and (self.pos_qty * b1) < 0.55 * (self.bot_cash_usd + self.pos_qty * b1)
                     )
                     if not can_buy_more:
                         return
@@ -1694,11 +1705,20 @@ class LiveTriadRLTrader:
                 self.bid_accounted_filled = 0.0
                 self._save_wallet()
             can_step_up_car = (getattr(self, "car_state", 0) == 2 and self.slot2_ask_id is None and a1 >= self.car_sell_px + 2.0 * self.tick_size - tol and self.pos_qty >= 20.0)
+            empty_spread_ask_p = round((b1 + self.tick_size) / self.tick_size) * self.tick_size
+            empty_spread_step_ask = (
+                (a1 - b1) >= 1.8 * self.tick_size
+                and empty_spread_ask_p >= floor_p - tol
+                and not pump_up
+                and self.last_hold_edge < 0.20
+            )
             overhigh_ask = (
                 self.active_ask_id is not None
                 and self.slot2_ask_id is None
-                and self.active_ask_p > max(super_p, a1) + tol
-                and not pump_up
+                and (
+                    (self.active_ask_p > max(super_p, a1) + tol and not pump_up)
+                    or (empty_spread_step_ask and self.active_ask_p > empty_spread_ask_p + tol)
+                )
             )
             if act == 0:
                 wave_hold_ok = b1 >= self.avg_entry - tol or (
@@ -1717,7 +1737,7 @@ class LiveTriadRLTrader:
                     act = 3
                 elif overhigh_ask:
                     self.split_done_for_pos = False
-                    act = 3
+                    act = 4 if empty_spread_step_ask else 3
                 elif self.active_ask_p >= wave_p - tol and not wave_hold_ok and self.last_hold_edge < -0.20 and a1 <= floor_p + tol:
                     act = 4
                 elif (getattr(self, "car_state", 0) == 0 or can_step_up_car) and (self.avg_entry - b1) / self.tick_size >= 3.0 and self.hold_sec >= 60 and self.slot2_ask_id is None:
@@ -1840,7 +1860,7 @@ class LiveTriadRLTrader:
                     if pump_up and a1 >= self.active_ask_p - tol and self.last_imb5 >= 0.20 and b1 >= self.avg_entry:
                         act = 3
                     elif overhigh_ask:
-                        act = 3
+                        act = 4 if empty_spread_step_ask else 3
                     elif self.active_ask_p >= wave_p - tol and b1 >= self.avg_entry - tol:
                         return
                     elif abs(self.active_ask_p - floor_p) <= tol:
@@ -1906,7 +1926,7 @@ class LiveTriadRLTrader:
             else:
                 if self.active_ask_id is not None and abs(self.active_ask_p - floor_p) <= tol and b1 < floor_p - tol:
                     return
-                target_p = max(a1, floor_p)
+                target_p = max(empty_spread_ask_p if empty_spread_step_ask else a1, floor_p)
             target_p = round(target_p / self.tick_size) * self.tick_size
             if self.active_ask_id is not None and self.slot2_ask_id is None and abs(self.active_ask_p - target_p) <= tol:
                 return
