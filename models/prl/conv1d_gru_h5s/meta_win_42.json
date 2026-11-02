@@ -14,9 +14,9 @@
   ],
   "metrics_oos": {
     "ic_dt_ticks": 0.1623,
-    "roc_auc_ovr": 0.7016,
-    "log_loss": 1.4462,
-    "top2pct_mean_ticks": 0.16
+    "roc_auc_ovr": 0.7436,
+    "log_loss": 1.7483,
+    "top2pct_mean_ticks": 0.06
   },
   "feature_norm": {
     "mean": [
