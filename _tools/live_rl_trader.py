@@ -757,6 +757,18 @@ class LiveTriadRLTrader:
                         else:
                             self.avg_entry = round((prev_pos * self.avg_entry + dc_ext * px_ref) / real_pos, 6)
                             self.peak_bid = max(self.peak_bid, self.avg_entry, px_ref)
+                            if self.active_ask_id is not None or self.slot2_ask_id is not None:
+                                for oid_attr in ("active_ask_id", "slot2_ask_id"):
+                                    oid = getattr(self, oid_attr)
+                                    if oid is not None:
+                                        try:
+                                            self.client.cancel_order(oid)
+                                        except Exception:
+                                            pass
+                                self.active_ask_id, self.active_ask_p, self.active_ask_q = None, 0.0, 0.0
+                                self.slot2_ask_id, self.slot2_ask_p, self.slot2_ask_q = None, 0.0, 0.0
+                                self.split_done_for_pos = False
+                                self.ex_coin_free = real_pos
                         self.deposits_log.append({
                             "ts_utc": datetime.now(timezone.utc).isoformat(),
                             "asset": self.coin.upper(),
