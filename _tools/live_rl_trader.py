@@ -992,8 +992,8 @@ class LiveTriadRLTrader:
             )
             self.last_car_probs, self.last_car_cap_prl = self.carousel_net.predict_single(feat44)
             if getattr(self, "hazard_net", None) is not None and self.hazard_net.ready:
-                pa, pe = self.hazard_net.predict_batch(feat44[None, :])
-                self.last_p_adverse, self.last_p_exhaust = float(pa[0]), float(pe[0])
+                pa, pe, ps = self.hazard_net.predict_batch_v2(feat44[None, :])
+                self.last_p_adverse, self.last_p_exhaust, self.last_p_ask_sweep = float(pa[0]), float(pe[0]), float(ps[0])
         self.last_ofi_5s = float(self.last_dq_bid_5s - (a1_q - a1q_5s_ago) + sum(x[2] - x[3] for x in fh[-5:]))
         self.last_ez25 = ez_25
         self.last_ez12 = ez_12
@@ -1471,7 +1471,7 @@ class LiveTriadRLTrader:
                 (a1 - b1) >= 1.8 * self.tick_size
                 and macro_step_in_ok
                 and step_in_l5_ok
-                and ((a1_q_cur <= 5000.0 and self.last_inertia >= 0.35) or wide_scalp_ok)
+                and ((a1_q_cur <= 5000.0 and self.last_inertia >= 0.35) or wide_scalp_ok or float(getattr(self, "last_p_ask_sweep", 0.0)) >= 0.72)
             )
             target_p = round(((b1 + self.tick_size if step_in else b1) if act == 1 else max(self.tick_size, b1 - self.tick_size)) / self.tick_size) * self.tick_size
             if in_post_loss_window and self.last_exit_price > 0.0 and target_p > self.last_exit_price + tol and not (getattr(self, "last_in_breakout", False) or (b1_q_cur >= 8500.0 and ez60_cur >= 0.25 and self.last_ez25 >= 0.45)):
@@ -1621,6 +1621,7 @@ class LiveTriadRLTrader:
                 self.last_vel10 >= 1.0
                 or getattr(self, "last_in_breakout", False)
                 or (self.last_imb5 >= 0.22 and self.last_inertia >= 0.25)
+                or (float(getattr(self, "last_p_ask_sweep", 0.0)) >= 0.78 and self.last_inertia >= 0.20)
             )
             car_step_up_ask = (self.last_sp_ticks < 1.5) and (
                 self.last_imb5 > 0.25 and self.last_vel10 >= 1.0

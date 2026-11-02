@@ -1,0 +1,21 @@
+{
+  "coin": "PRL",
+  "horizon_sec": 120,
+  "n_windows": 1,
+  "selected_models": [
+    "mlp_bottleneck_win_00",
+    "wavenet_tcn_win_00",
+    "cross_mixer_win_00",
+    "causal_cnn_win_00",
+    "attention_win_00",
+    "conv1d+gru_win_00"
+  ],
+  "weights": {
+    "mlp_bottleneck_win_00": 0.154243,
+    "wavenet_tcn_win_00": 0.212688,
+    "cross_mixer_win_00": 0.172413,
+    "causal_cnn_win_00": 0.115226,
+    "attention_win_00": 0.167975,
+    "conv1d+gru_win_00": 0.177456
+  }
+}

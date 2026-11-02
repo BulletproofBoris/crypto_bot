@@ -13,10 +13,10 @@
     "2026-11-01 10:08:15"
   ],
   "metrics_oos": {
-    "ic_dt_ticks": 0.2246,
-    "roc_auc_ovr": 0.7599,
-    "log_loss": 1.5402,
-    "top2pct_mean_ticks": 0.32
+    "ic_dt_ticks": 0.2211,
+    "roc_auc_ovr": 0.7556,
+    "log_loss": 1.6609,
+    "top2pct_mean_ticks": 0.3
   },
   "feature_norm": {
     "mean": [

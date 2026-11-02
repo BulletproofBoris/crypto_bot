@@ -354,7 +354,7 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
         if model_path.exists() and meta_path.exists():
             try:
                 old_meta = json.loads(meta_path.read_text())
-                if old_meta.get("train_ts_range") == [ts_tr_start, ts_tr_end]:
+                if old_meta.get("train_ts_range") == [ts_tr_start, ts_tr_end] or idx < len(windows) - 2:
                     manifest.append(old_meta)
                     mo = old_meta.get("metrics_oos", {})
                     ic, auc, top2_pnl = mo.get("ic_dt_ticks", 0.0), mo.get("roc_auc_ovr", 0.5), mo.get("top2pct_mean_ticks", 0.0)

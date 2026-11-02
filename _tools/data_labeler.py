@@ -375,7 +375,7 @@ def process_coin_labeling(
         raw_gap = (df['is_data_gap'].values > 0)
         if np.any(raw_gap):
             post_gap_warmup = min(int(max_L), 300)
-            pre_gap_purge = int(max_H)
+            pre_gap_purge = min(int(max_H), 60)
             # Расширяем маску разрыва назад на pre_gap_purge и вперед на post_gap_warmup
             gap_series = pd.Series(raw_gap.astype(np.int32))
             fwd_mask = gap_series.rolling(post_gap_warmup + 1, min_periods=1).max().values > 0

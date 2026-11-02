@@ -85,9 +85,7 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 176.0, force_r
     labeled_path = BASE_DIR / "data" / "labeled" / coin / f"{coin}_labeled.parquet"
     feat_path = BASE_DIR / "data" / "features" / f"{coin}_1s_features.parquet"
     if feat_path.exists() and labeled_path.exists():
-        n_feat = pq.ParquetFile(feat_path).metadata.num_rows
-        n_lab = pq.ParquetFile(labeled_path).metadata.num_rows
-        parquet_path = feat_path if n_feat >= n_lab else labeled_path
+        parquet_path = labeled_path if labeled_path.stat().st_mtime >= feat_path.stat().st_mtime else feat_path
     else:
         parquet_path = feat_path if feat_path.exists() else labeled_path
 
@@ -407,6 +405,8 @@ class SafeTradeL2ExecutionEnv:
         ez5, ez12, ez25 = self.X_market[:, 0], self.X_market[:, 6], self.X_market[:, 12]
         ez60 = self.X_h60[:, 0] if self.X_h60 is not None and len(self.X_h60) == len(ez25) else ez25
         self.ez60_arr = ez60.astype(np.float32)
+        self.min_ez60_30s = pd.Series(self.ez60_arr).rolling(30, min_periods=1).min().values.astype(np.float32)
+        self.min_ez25_30s = pd.Series(ez25).rolling(30, min_periods=1).min().values.astype(np.float32)
         p_tn_5 = self.X_market[:, 4]
         p_dn_12 = self.X_market[:, 8]
         spread_ticks = self.X_market[:, 18] * 10.0

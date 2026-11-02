@@ -1,75 +1,45 @@
 {
   "coin": "PRL",
-  "H": 60,
-  "seq_len": 180,
-  "optimal_weights": {
-    "lightgbm": 0.45,
-    "mlp_bottleneck": 0.14,
-    "conv1d+gru": 0.11,
-    "attention": 0.04,
-    "causal_cnn": 0.04,
-    "wavenet_tcn": 0.11,
-    "cross_mixer": 0.11
-  },
-  "ensemble_metrics_oos": {
-    "ic": 0.2812,
-    "auc": 0.7845,
-    "log_loss": 1.105,
-    "top2_pnl": 0.86
-  },
-  "leaderboard": [
-    {
-      "model": "lightgbm",
-      "ic": 0.3124,
-      "auc": 0.7885,
-      "log_loss": 1.18,
-      "top2_pnl": 0.43
-    },
-    {
-      "model": "attention (3-win rolling v5.3)",
-      "ic": 0.2649,
-      "auc": 0.806,
-      "log_loss": 1.2941,
-      "top2_pnl": 0.32
-    },
-    {
-      "model": "causal_cnn (3-win rolling v5.3)",
-      "ic": 0.2283,
-      "auc": 0.7786,
-      "log_loss": 1.4572,
-      "top2_pnl": 0.33
-    },
-    {
-      "model": "conv1d+gru",
-      "ic": 0.1646,
-      "auc": 0.7061,
-      "log_loss": 1.8613,
-      "top2_pnl": 0.1
-    },
-    {
-      "model": "mlp_bottleneck",
-      "ic": 0.1956,
-      "auc": 0.7369,
-      "log_loss": 1.7683,
-      "top2_pnl": 0.15
-    },
-    {
-      "model": "wavenet_tcn (3-win rolling)",
-      "params": 58407,
-      "time_s": 25.0,
-      "ic": 0.2318,
-      "mean_ic": 0.2217,
-      "auc": 0.7712,
-      "mean_auc": 0.741
-    },
-    {
-      "model": "cross_mixer (3-win rolling)",
-      "params": 54215,
-      "time_s": 24.0,
-      "ic": 0.2242,
-      "mean_ic": 0.2189,
-      "auc": 0.7561,
-      "mean_auc": 0.7419
-    }
-  ]
+  "horizon_sec": 60,
+  "n_windows": 3,
+  "selected_models": [
+    "mlp_bottleneck_win_00",
+    "mlp_bottleneck_win_01",
+    "mlp_bottleneck_win_02",
+    "conv1d+gru_win_00",
+    "conv1d+gru_win_01",
+    "conv1d+gru_win_02",
+    "wavenet_tcn_win_00",
+    "wavenet_tcn_win_01",
+    "wavenet_tcn_win_02",
+    "cross_mixer_win_00",
+    "cross_mixer_win_01",
+    "cross_mixer_win_02",
+    "causal_cnn_win_00",
+    "causal_cnn_win_01",
+    "causal_cnn_win_02",
+    "attention_win_00",
+    "attention_win_01",
+    "attention_win_02"
+  ],
+  "weights": {
+    "mlp_bottleneck_win_00": 0.043266,
+    "mlp_bottleneck_win_01": 0.057409,
+    "mlp_bottleneck_win_02": 0.051847,
+    "conv1d+gru_win_00": 0.054913,
+    "conv1d+gru_win_01": 0.060529,
+    "conv1d+gru_win_02": 0.052763,
+    "wavenet_tcn_win_00": 0.046797,
+    "wavenet_tcn_win_01": 0.056754,
+    "wavenet_tcn_win_02": 0.051943,
+    "cross_mixer_win_00": 0.053297,
+    "cross_mixer_win_01": 0.05393,
+    "cross_mixer_win_02": 0.078484,
+    "causal_cnn_win_00": 0.046615,
+    "causal_cnn_win_01": 0.056956,
+    "causal_cnn_win_02": 0.060996,
+    "attention_win_00": 0.040085,
+    "attention_win_01": 0.054224,
+    "attention_win_02": 0.079194
+  }
 }

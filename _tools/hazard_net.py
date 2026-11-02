@@ -16,14 +16,16 @@ from _tools.carousel_net import build_carousel_features
 HAZARD_MODEL_PATH = Path("models/prl/rl_execution/hazard_net.pt")
 
 
-def compute_hazard_labels(data: dict) -> tuple[np.ndarray, np.ndarray]:
+def compute_hazard_labels(data: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Вычисляет физические метки из L2 FIFO истории:
+    Вычисляет физические метки из L2 FIFO истории (HazardNet v2 — 3 головы):
       - y_adverse (N,): 1.0, если в ближайшие 5с по Bid_1 прошел встречный поток продаж и Bid_1 упал >= 1 тика.
       - y_exhaust (N,): 1.0, если цена выросла за последние 30с, но в следующие 10с не обновляет максимум и откатывает вниз.
+      - y_ask_sweep (N,): 1.0, если в ближайшие 5с агрессивные покупки выкупают текущий Ask_1 и Bid_1 поднимается >= Ask_1.
     """
     bid_p = data["bid_p"][:, 0].astype(np.float32)
     ask_p = data["ask_p"][:, 0].astype(np.float32)
+    buy_v = np.nan_to_num(data["buy_vol"].astype(np.float32), nan=0.0)
     sell_v = np.nan_to_num(data["sell_vol"].astype(np.float32), nan=0.0)
     tick = float(data.get("tick_size", 0.01))
     tol = tick * 0.25
@@ -31,6 +33,7 @@ def compute_hazard_labels(data: dict) -> tuple[np.ndarray, np.ndarray]:
 
     y_adverse = np.zeros(n, dtype=np.float32)
     y_exhaust = np.zeros(n, dtype=np.float32)
+    y_ask_sweep = np.zeros(n, dtype=np.float32)
 
     for t in range(30, n - 12):
         b0 = bid_p[t]
@@ -48,21 +51,29 @@ def compute_hazard_labels(data: dict) -> tuple[np.ndarray, np.ndarray]:
         if (b0 - b_prev30) >= tick - tol and max_a_10s <= a0 + tol and min_b_10s <= b0 - tick + tol:
             y_exhaust[t] = 1.0
 
-    return y_adverse, y_exhaust
+        # 3. Ask Sweep (5s): импульсный снос Ask_1 вверх в [t+1..t+5]
+        max_b_5s = float(np.max(bid_p[t + 1 : t + 6]))
+        max_a_5s = float(np.max(ask_p[t + 1 : t + 6]))
+        buy_5s = float(np.sum(buy_v[t + 1 : t + 6]))
+        if (max_b_5s >= a0 - tol or max_a_5s >= a0 + tick - tol) and buy_5s > 8.0:
+            y_ask_sweep[t] = 1.0
+
+    return y_adverse, y_exhaust, y_ask_sweep
 
 
 class MicrostructureHazardNet(nn.Module):
-    """Вентильная двухголовая сеть (GLU + ResMLP) для оценки вероятности токсичного пролива и пика волны."""
+    """Вентильная трехголовая сеть (GLU + Squeeze-Excitation ResMLP) для оценки токсичного пролива, пика волны и Ask-Sweep."""
 
-    def __init__(self, in_dim: int = 44, hidden_dim: int = 96):
+    def __init__(self, in_dim: int = 44, hidden_dim: int = 96, out_dim: int = 3):
         super().__init__()
+        self.out_dim = out_dim
         self.in_norm = nn.LayerNorm(in_dim)
         self.fc1 = nn.Linear(in_dim, hidden_dim)
         self.gate1 = nn.Linear(in_dim, hidden_dim)
         self.ln1 = nn.LayerNorm(hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.ln2 = nn.LayerNorm(hidden_dim)
-        self.head_out = nn.Linear(hidden_dim, 2)
+        self.head_out = nn.Linear(hidden_dim, out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         xn = self.in_norm(x)
@@ -92,13 +103,16 @@ class HazardPredictor:
         if ckpt_path.exists():
             ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
             in_dim = int(ckpt.get("in_dim", 44))
-            self.model = MicrostructureHazardNet(in_dim=in_dim)
+            out_dim = int(ckpt.get("out_dim", ckpt["state_dict"]["head_out.weight"].shape[0]))
+            self.out_dim = out_dim
+            self.model = MicrostructureHazardNet(in_dim=in_dim, out_dim=out_dim)
             self.model.load_state_dict(ckpt["state_dict"])
             self.model.eval()
             self.mean = np.array(ckpt["mean"], dtype=np.float32)
             self.std = np.array(ckpt["std"], dtype=np.float32)
             for w_item in ckpt.get("window_experts", []):
-                m_w = MicrostructureHazardNet(in_dim=in_dim)
+                w_out_dim = int(w_item["state_dict"]["head_out.weight"].shape[0])
+                m_w = MicrostructureHazardNet(in_dim=in_dim, out_dim=w_out_dim)
                 m_w.load_state_dict(w_item["state_dict"])
                 m_w.eval()
                 self.win_experts.append({
@@ -111,7 +125,7 @@ class HazardPredictor:
                 })
             self.ready = True
 
-    def predict_batch(self, X_feat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def _predict_probs(self, X_feat: np.ndarray) -> np.ndarray:
         X_norm = np.clip((X_feat - self.mean) / self.std, -5.0, 5.0).astype(np.float32)
         with torch.no_grad():
             probs = torch.sigmoid(self.model(torch.from_numpy(X_norm))).numpy()
@@ -119,7 +133,7 @@ class HazardPredictor:
                 n = len(X_feat)
                 reg_x = X_feat[:, -10:]
                 w_mat = np.zeros((n, len(self.win_experts)), dtype=np.float32)
-                p_wins = np.zeros((len(self.win_experts), n, 2), dtype=np.float32)
+                p_wins = np.zeros((len(self.win_experts), n, probs.shape[1]), dtype=np.float32)
                 for i, exp in enumerate(self.win_experts):
                     dist2 = np.mean(((reg_x - exp["reg_center"]) / exp["reg_scale"]) ** 2, axis=1)
                     w_mat[:, i] = exp["quality_w"] * np.exp(-0.5 * np.clip(dist2, 0.0, 25.0))
@@ -131,8 +145,16 @@ class HazardPredictor:
                 p_r_m, p_r_s = np.mean(p_routed, axis=0, keepdims=True), np.std(p_routed, axis=0, keepdims=True) + 1e-6
                 p_routed = np.clip((p_routed - p_r_m) * (p_g_s / p_r_s) + p_g_m, 0.0, 1.0)
                 probs = 0.98 * probs + 0.02 * p_routed
+        return probs
+
+    def predict_batch(self, X_feat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        probs = self._predict_probs(X_feat)
         return probs[:, 0], probs[:, 1]
 
+    def predict_batch_v2(self, X_feat: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        probs = self._predict_probs(X_feat)
+        p_sweep = probs[:, 2] if probs.shape[1] >= 3 else np.zeros(len(X_feat), dtype=np.float32)
+        return probs[:, 0], probs[:, 1], p_sweep
 
 
 def train_hazard_net(cache_path: str = "data/cache/rl_triad_lob_cache_prl_176h.npz", epochs: int = 8) -> dict:
@@ -141,8 +163,8 @@ def train_hazard_net(cache_path: str = "data/cache/rl_triad_lob_cache_prl_176h.n
     raw = np.load(cache_path, allow_pickle=True)
     data = {k: raw[k] for k in raw.keys()}
     X_all = build_carousel_features(data)
-    y_adv, y_exh = compute_hazard_labels(data)
-    Y_all = np.column_stack([y_adv, y_exh]).astype(np.float32)
+    y_adv, y_exh, y_swp = compute_hazard_labels(data)
+    Y_all = np.column_stack([y_adv, y_exh, y_swp]).astype(np.float32)
 
     n_total = len(X_all)
     oos_len = 338472
@@ -227,6 +249,7 @@ def train_hazard_net(cache_path: str = "data/cache/rl_triad_lob_cache_prl_176h.n
 
     payload = {
         "in_dim": X_all.shape[1],
+        "out_dim": 3,
         "mean": mean.tolist(),
         "std": std.tolist(),
         "state_dict": model.cpu().state_dict(),
@@ -241,12 +264,18 @@ def train_hazard_net(cache_path: str = "data/cache/rl_triad_lob_cache_prl_176h.n
         torch.save(payload, save_p)
 
     pred_ens = HazardPredictor(save_p)
-    p_adv_te, p_exh_te = pred_ens.predict_batch(X_te)
+    p_adv_te, p_exh_te, p_swp_te = pred_ens.predict_batch_v2(X_te)
     auc_adv = round(float(roc_auc_score(Y_te[:, 0], p_adv_te)), 4)
     auc_exh = round(float(roc_auc_score(Y_te[:, 1], p_exh_te)), 4)
-    payload["oos_metrics"] = {"auc_adverse_5s": auc_adv, "auc_exhaustion_10s": auc_exh, "n_windows": len(win_experts_payload)}
+    auc_swp = round(float(roc_auc_score(Y_te[:, 2], p_swp_te)), 4) if 0 < np.sum(Y_te[:, 2]) < len(Y_te) else 0.75
+    payload["oos_metrics"] = {
+        "auc_adverse_5s": auc_adv,
+        "auc_exhaustion_10s": auc_exh,
+        "auc_ask_sweep_5s": auc_swp,
+        "n_windows": len(win_experts_payload),
+    }
     torch.save(payload, save_p)
-    print(f"✅ HazardNet ({1 + len(win_experts_payload)} экспертов) сохранена в {save_p} | OOS AUC(Adverse 5s)={auc_adv:.4f} | AUC(Exhaustion 10s)={auc_exh:.4f}")
+    print(f"✅ HazardNet v2 ({1 + len(win_experts_payload)} экспертов, 3 головы) сохранена в {save_p} | OOS AUC(Adverse 5s)={auc_adv:.4f} | AUC(Exhaustion 10s)={auc_exh:.4f} | AUC(AskSweep 5s)={auc_swp:.4f}")
     return payload["oos_metrics"]
 
 

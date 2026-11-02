@@ -413,7 +413,7 @@ def run_carousel_backtest(cache_path: str = "data/cache/rl_triad_lob_cache_prl_1
     print("\n📊 БЭКТЕСТ НА 94.02ч СЛЕПОГО OOS (Baseline vs CarouselNet Adaptive Quantizer 0.1%..100%):", flush=True)
     print(f"{'Бюджет':<10} | {'Режим':<28} | {'Чистый PnL ($)':<15} | {'PnL (%)':<10} | {'MaxDD ($ / %)':<18} | {'Сделок (Карус.)':<15}", flush=True)
     print("-" * 106, flush=True)
-    for budget in (95.5, 500.0, 1000.0):
+    for budget in (95.5, 250.0, 500.0, 1000.0):
         for mode_name, use_car in [("Baseline (Current)", False), ("CarouselNet + 0.1% Quantizer", True)]:
             env.order_usd = budget
             obs = env.reset(eval_mode=True)

@@ -42,12 +42,15 @@ class _BlackwellFP8LinearFn(torch.autograd.Function):
         x_p = F.pad(x_2d, (0, k_pad, 0, m_pad)) if (m_pad or k_pad) else x_2d
         w_p = F.pad(w, (0, n_pad, 0, k_pad)) if (k_pad or n_pad) else w
 
-        sa = (x_p.abs().amax() / 448.0).clamp(min=1e-12).to(torch.float32)
-        sb = (w_p.abs().amax() / 448.0).clamp(min=1e-12).to(torch.float32)
-        x_fp8 = (x_p / sa).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-        w_fp8_col = (w_p / sb).clamp(-448.0, 448.0).t().contiguous().to(torch.float8_e4m3fn).t()
-        out_bf16 = torch._scaled_mm(x_fp8, w_fp8_col, scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16)
-        out = out_bf16[:m, :n].to(x.dtype)
+        try:
+            sa = (x_p.abs().amax() / 448.0).clamp(min=1e-12).to(torch.float32)
+            sb = (w_p.abs().amax() / 448.0).clamp(min=1e-12).to(torch.float32)
+            x_fp8 = (x_p / sa).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+            w_fp8_col = (w_p / sb).clamp(-448.0, 448.0).t().contiguous().to(torch.float8_e4m3fn).t()
+            out_bf16 = torch._scaled_mm(x_fp8, w_fp8_col, scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16)
+            out = out_bf16[:m, :n].to(x.dtype)
+        except RuntimeError:
+            out = torch.matmul(x_2d.to(torch.bfloat16), w.to(torch.bfloat16)).to(x.dtype)
         if b is not None:
             out = out + b
         ctx.save_for_backward(x_2d, w)
@@ -651,8 +654,8 @@ def train_pytorch_window_fast(
     from sklearn.metrics import roc_auc_score
     from sklearn.utils.class_weight import compute_class_weight
 
-    seq_map = {5: 15, 12: 42, 25: 75, 60: 180}
-    sl = seq_map.get(int(horizon), int(horizon) * 3)
+    seq_map = {5: 15, 12: 42, 25: 75, 60: 180, 90: 180, 120: 180}
+    sl = seq_map.get(int(horizon), min(180, int(horizon) * 3))
     win_tag = f"win_{win_idx:02d}"
     arch_dir = Path("models/prl") / f"{arch.replace('+', '_')}_h{horizon}s"
     arch_dir.mkdir(parents=True, exist_ok=True)
@@ -664,6 +667,9 @@ def train_pytorch_window_fast(
         return {"window": win_tag, "arch": arch, "cached": True, **mo}
 
     templates = sorted(arch_dir.glob("model_win_*.keras"))
+    if not templates:
+        fallback_dir = Path("models/prl") / f"{arch.replace('+', '_')}_h60s"
+        templates = sorted(fallback_dir.glob("model_win_*.keras"))
     if not templates:
         raise FileNotFoundError(f"Нет шаблонного .keras в {arch_dir}")
     tpl_keras = templates[-1]
