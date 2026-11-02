@@ -346,6 +346,9 @@ class LiveTriadRLTrader:
         self.slot2_ask_p = 0.0
         self.slot2_ask_q = 0.0
         self.slot2_ask_id = None
+        self.max_slots = 10
+        self.extra_slots = []
+        self.last_buy_fill_ts = 0.0
         self.split_done_for_pos = False
         self.last_dd300 = 0.0
         self.last_dd900 = 0.0
@@ -387,6 +390,8 @@ class LiveTriadRLTrader:
             self.slot2_ask_id = st.get("slot2_ask_id")
             self.slot2_ask_p = float(st.get("slot2_ask_p", 0.0))
             self.slot2_ask_q = float(st.get("slot2_ask_q", 0.0))
+            self.extra_slots = list(st.get("extra_slots", []))
+            self.last_buy_fill_ts = float(st.get("last_buy_fill_ts", 0.0))
             self.split_done_for_pos = bool(st.get("split_done_for_pos", False))
             self.hold_sec = int(st.get("hold_sec", 120 if self.pos_qty >= 2.0 else 0))
             self.car_state = int(st.get("car_state", 0))
@@ -442,6 +447,8 @@ class LiveTriadRLTrader:
             "slot2_ask_id": self.slot2_ask_id,
             "slot2_ask_p": round(self.slot2_ask_p, 4),
             "slot2_ask_q": round(self.slot2_ask_q, 4),
+            "extra_slots": getattr(self, "extra_slots", []),
+            "last_buy_fill_ts": round(float(getattr(self, "last_buy_fill_ts", 0.0)), 3),
             "split_done_for_pos": bool(self.split_done_for_pos),
             "car_state": int(getattr(self, "car_state", 0)),
             "car_sell_px": round(float(getattr(self, "car_sell_px", 0.0)), 4),
@@ -467,7 +474,8 @@ class LiveTriadRLTrader:
         elif getattr(self, "car_state", 0) == 2 and self.active_bid_id is None and self.bot_cash_usd < 3.5:
             self.car_state = 0
         oid_map = {}
-        active_oids = [oid for oid in (self.active_bid_id, self.active_ask_id, self.slot2_ask_id) if oid is not None]
+        extra_oids = [s.get("id") for s in getattr(self, "extra_slots", []) if s.get("id") is not None]
+        active_oids = [oid for oid in (self.active_bid_id, self.active_ask_id, self.slot2_ask_id, *extra_oids) if oid is not None]
         if len(active_oids) > 1:
             try:
                 open_list = self.client.get_open_orders(self.market)
@@ -551,21 +559,45 @@ class LiveTriadRLTrader:
                             except Exception:
                                 pass
                     else:
+                        is_dip_scale = (self.pos_qty >= 2.0 and self.avg_entry > 0.0 and px <= self.avg_entry - 0.75 * self.tick_size and len(getattr(self, "extra_slots", [])) < 8)
                         if net_filled > 0:
-                            self.avg_entry = (self.pos_qty * self.avg_entry + net_filled * px) / max(1e-6, self.pos_qty + net_filled)
-                            self.pos_qty = math.floor((self.pos_qty + net_filled) * 10000.0) / 10000.0
-                        if self.active_ask_id is not None and self.active_ask_q < self.pos_qty - 1.0:
+                            if is_dip_scale and net_filled >= 4.0:
+                                q_ind = math.floor((net_filled * 0.50) * 10000.0) / 10000.0
+                                q_merge = math.floor((net_filled - q_ind) * 10000.0) / 10000.0
+                                self.avg_entry = (self.pos_qty * self.avg_entry + q_merge * px) / max(1e-6, self.pos_qty + q_merge)
+                                self.pos_qty = math.floor((self.pos_qty + net_filled) * 10000.0) / 10000.0
+                                ind_ask_p = round(math.ceil((px + 0.75 * self.tick_size) / self.tick_size - 1e-4) * self.tick_size, 2)
+                                ind_ask_p = max(b1 + self.tick_size if b1 > 0 else ind_ask_p, ind_ask_p)
+                                try:
+                                    r_ind = self.client.place_limit_order(self.market, "sell", q_ind, ind_ask_p)
+                                    self.extra_slots.append({
+                                        "id": r_ind.get("id"),
+                                        "p": float(r_ind.get("price", ind_ask_p)),
+                                        "q": float(r_ind.get("origin_amount", q_ind)),
+                                        "entry_px": px,
+                                        "entry_ts": time.time(),
+                                    })
+                                    print(f"  ⚡ [10-SLOT INDEPENDENT ASK #{len(self.extra_slots)+2}] +{q_ind:.4f} PRL (вход @ ${px:.2f}) выставлен автономно @ ${ind_ask_p:.2f} | Остальные +{q_merge:.4f} PRL снизили avg_entry до ${self.avg_entry:.4f}")
+                                except Exception as e_ind:
+                                    print(f"  ⚠️ [10-SLOT ASK WARN]: {e_ind}")
+                            else:
+                                self.avg_entry = (self.pos_qty * self.avg_entry + net_filled * px) / max(1e-6, self.pos_qty + net_filled)
+                                self.pos_qty = math.floor((self.pos_qty + net_filled) * 10000.0) / 10000.0
+                        ind_locked_q = sum(float(s.get("q", 0.0)) for s in getattr(self, "extra_slots", []))
+                        if self.active_ask_id is not None and (self.active_ask_q + self.slot2_ask_q + ind_locked_q) < self.pos_qty - 1.0:
                             try:
                                 self.client.cancel_order(self.active_ask_id)
                             except Exception:
                                 pass
                             self.active_ask_id, self.active_ask_p, self.active_ask_q = None, 0.0, 0.0
-                        self.hold_sec = 0
+                        if not is_dip_scale:
+                            self.hold_sec = 0
                         self.peak_bid = max(px, b1 if b1 > 0 else px)
                         self.ez25_entry = self.last_ez25
                         self.ez12_entry = self.last_ez12
                         self.split_done_for_pos = False
                         self.car_state = 0
+                    self.last_buy_fill_ts = time.time()
                     self.q_ahead = 0.0
                     self.bid_age_sec = 0
                     self.bid_partial_filled = 0.0
@@ -692,6 +724,40 @@ class LiveTriadRLTrader:
                     self._save_wallet()
             except Exception as e:
                 print(f"  ⚠️ [SYNC ASK-2 WARN] id={self.slot2_ask_id}: {e}")
+        if getattr(self, "extra_slots", None):
+            rem_extra = []
+            for idx_s, s_item in enumerate(self.extra_slots):
+                sid = s_item.get("id")
+                if sid is None:
+                    continue
+                try:
+                    os_ord = oid_map.get(sid)
+                    if os_ord is None:
+                        os_ord = self.client.get_order(sid)
+                    s_filled = float(os_ord.get("filled_amount", 0.0))
+                    s_st = os_ord.get("state", "")
+                    if s_filled > 0 and s_st in ("done", "cancel"):
+                        s_px = float(os_ord.get("avg_price", 0.0)) or float(os_ord.get("price", s_item.get("p", 0.0)))
+                        s_fee = float(os_ord.get("maker_fee", 0.001) or 0.001)
+                        s_proc = s_filled * s_px * (1.0 - s_fee)
+                        s_ent = float(s_item.get("entry_px", self.avg_entry or s_px))
+                        s_cost = (s_filled / max(1e-6, 1.0 - s_fee)) * s_ent
+                        s_pnl = s_proc - s_cost
+                        self.bot_cash_usd += s_proc
+                        self.realized_pnl_usd += s_pnl
+                        self.pos_qty = max(0.0, math.floor((self.pos_qty - s_filled) * 10000.0) / 10000.0)
+                        if s_pnl > 0 and self.pos_qty >= 2.0 and b1 > 0 and (self.avg_entry - b1) / self.tick_size >= 1.5:
+                            self.avg_entry = round(max(b1, self.avg_entry - (s_pnl * 0.45) / self.pos_qty), 4)
+                        self.n_trades += 1
+                        self.sync_account_balances(b1, from_trade_fill=True)
+                        print(f"  💰 [FILL SELL SLOT-{idx_s+3}] -{s_filled:.4f} PRL @ ${s_px:.2f} (вход=${s_ent:.2f}) | PnL={s_pnl:+.4f}$ | Остаток поз={self.pos_qty:.4f} PRL | Кэш=${self.bot_cash_usd:.2f}")
+                    elif s_st != "cancel":
+                        rem_extra.append(s_item)
+                except Exception as es:
+                    print(f"  ⚠️ [SYNC EXTRA SLOT WARN] id={sid}: {es}")
+                    rem_extra.append(s_item)
+            self.extra_slots = rem_extra
+            self._save_wallet()
         if self.pos_qty >= 2.0 and self.active_ask_id is None and self.slot2_ask_id is None:
             try:
                 open_ords = self.client.get_open_orders(self.market)
@@ -893,6 +959,10 @@ class LiveTriadRLTrader:
                 aq = max(0.0, aq - self.active_ask_q)
             if not already_cleaned and self.slot2_ask_q > 0 and abs(ap - self.slot2_ask_p) <= tol:
                 aq = max(0.0, aq - self.slot2_ask_q)
+            if not already_cleaned and getattr(self, "extra_slots", None):
+                for s_ex in self.extra_slots:
+                    if float(s_ex.get("q", 0.0)) > 0 and abs(ap - float(s_ex.get("p", 0.0))) <= tol:
+                        aq = max(0.0, aq - float(s_ex.get("q", 0.0)))
             if ap > 0 and (aq > 1e-4 or i == 11):
                 ask_ps.append(ap)
                 ask_qs_clean.append(aq)
@@ -1036,31 +1106,48 @@ class LiveTriadRLTrader:
 
         tot_eq_now = max(1.0, self.bot_cash_usd + self.pos_qty * b1)
         underwater_now = ((self.avg_entry - b1) / self.tick_size) if (self.pos_qty >= 1.95 and self.avg_entry > 0.0) else 0.0
+        min_open_px = min([self.avg_entry] + [float(s.get("entry_px", self.avg_entry)) for s in getattr(self, "extra_slots", []) if float(s.get("entry_px", 0.0)) > 0]) if (self.pos_qty >= 1.95 and self.avg_entry > 0.0) else 0.0
+        dt_since_buy = time.time() - float(getattr(self, "last_buy_fill_ts", 0.0))
+        slot_spacing_ok = bool(
+            self.active_bid_id is not None
+            or (
+                dt_since_buy >= 25.0
+                and float(getattr(self, "last_p_adverse", 0.0)) < 0.52
+                and len(getattr(self, "extra_slots", [])) < 8
+                and (
+                    b1 <= min_open_px - self.tick_size + tol
+                    or (dt_since_buy >= 150.0 and pos_3600 <= 0.48 and b1_q >= 3500.0 and float(getattr(self, "last_p_adverse", 0.0)) < 0.40)
+                )
+            )
+        )
         ambivalent_scale_in = bool(
             self.pos_qty >= 1.95
-            and self.active_ask_id is not None
-            and self.bot_cash_usd >= max(5.0, tot_eq_now * 0.05)
+            and (self.active_ask_id is not None or len(getattr(self, "extra_slots", [])) > 0)
+            and self.bot_cash_usd >= max(5.0, tot_eq_now * 0.08)
+            and slot_spacing_ok
             and underwater_now >= 1.0
-            and inertia >= 0.05
-            and exp_entry_edge >= 0.50
+            and inertia >= 0.15
+            and exp_entry_edge >= 0.65
             and not getattr(self, "last_waterfall_trap", False)
         )
         half_pos_ready_to_buy = bool(
             self.pos_qty >= 1.95
-            and self.active_ask_id is not None
-            and self.bot_cash_usd >= 25.0
-            and (self.pos_qty * b1) < 0.55 * tot_eq_now
+            and (self.active_ask_id is not None or len(getattr(self, "extra_slots", [])) > 0)
+            and self.bot_cash_usd >= max(15.0, tot_eq_now * 0.10)
+            and (self.pos_qty * b1) < 0.65 * tot_eq_now
+            and slot_spacing_ok
             and (
                 self.active_bid_id is not None
-                or (inertia >= 0.15 and exp_entry_edge >= 0.60 and not getattr(self, "last_waterfall_trap", False))
+                or (inertia >= 0.18 and exp_entry_edge >= 0.65 and not getattr(self, "last_waterfall_trap", False))
             )
         )
         self.micro_pos_parked = bool(
             (
                 self.pos_qty >= 1.95
-                and self.active_ask_id is not None
-                and self.bot_cash_usd >= 25.0
-                and (self.pos_qty * b1) < 0.28 * tot_eq_now
+                and (self.active_ask_id is not None or len(getattr(self, "extra_slots", [])) > 0)
+                and self.bot_cash_usd >= max(15.0, tot_eq_now * 0.10)
+                and (self.pos_qty * b1) < 0.35 * tot_eq_now
+                and slot_spacing_ok
             )
             or half_pos_ready_to_buy
             or ambivalent_scale_in
@@ -1467,13 +1554,27 @@ class LiveTriadRLTrader:
                 or (23.5 <= rng144_w <= 25.5 and self.last_dd900 == 1.0 and self.last_imb5 >= -0.10)
                 or (18.5 <= rng144_w <= 19.5 and self.last_dd900 >= 11.0 and self.last_pos3600 <= 0.05)
             )
+            top_step_risk = bool(
+                (a1 - b1) >= 1.8 * self.tick_size
+                and self.last_pos3600 > 0.62
+                and self.last_dd300 < 1.0
+                and b1_q_cur < 4500.0
+                and not getattr(self, "last_in_breakout", False)
+            )
             step_in = (
                 (a1 - b1) >= 1.8 * self.tick_size
+                and self.pos_qty < 1.95
+                and not top_step_risk
+                and float(getattr(self, "last_p_adverse", 0.0)) < 0.45
                 and macro_step_in_ok
                 and step_in_l5_ok
                 and ((a1_q_cur <= 5000.0 and self.last_inertia >= 0.35) or wide_scalp_ok or float(getattr(self, "last_p_ask_sweep", 0.0)) >= 0.72)
             )
             target_p = round(((b1 + self.tick_size if step_in else b1) if act == 1 else max(self.tick_size, b1 - self.tick_size)) / self.tick_size) * self.tick_size
+            if self.pos_qty >= 1.95 and self.avg_entry > 0.0:
+                min_open_px = min([self.avg_entry] + [float(s.get("entry_px", self.avg_entry)) for s in getattr(self, "extra_slots", []) if float(s.get("entry_px", 0.0)) > 0])
+                if (time.time() - float(getattr(self, "last_buy_fill_ts", 0.0))) < 150.0 or self.last_pos3600 > 0.48:
+                    target_p = min(target_p, round((min_open_px - self.tick_size) / self.tick_size) * self.tick_size)
             if in_post_loss_window and self.last_exit_price > 0.0 and target_p > self.last_exit_price + tol and not (getattr(self, "last_in_breakout", False) or (b1_q_cur >= 8500.0 and ez60_cur >= 0.25 and self.last_ez25 >= 0.45)):
                 target_p = min(target_p, b1)
                 if target_p > self.last_exit_price + tol:
@@ -1548,8 +1649,16 @@ class LiveTriadRLTrader:
                     flow_cap_usd *= 0.55
                 cap_w = float(np.clip(flow_cap_usd / max(avail_usd, 1.0), 0.420, 1.000))
                 eff_w = 0.72 * quant_w + 0.28 * min(quant_w, cap_w)
-            quant_step_w = float(min(1.0, max(0.001, round(eff_w * 1000.0) / 1000.0)))
-            usable_usd = max(min(avail_usd, 5.0), avail_usd * quant_step_w)
+            if top_step_risk and p_adv_now >= 0.35:
+                eff_w = min(eff_w, 0.500)
+            if self.pos_qty >= 1.95:
+                # 10-Slot Scale-In Allocation: 2..4 slots (20%..40% of total equity) per price level
+                tot_eq_s = max(1.0, self.bot_cash_usd + self.pos_qty * b1)
+                slot_scale_usd = tot_eq_s * min(0.420, max(0.200, 0.22 + 0.18 * p50_car))
+                usable_usd = min(avail_usd, max(5.0, slot_scale_usd))
+            else:
+                quant_step_w = float(min(1.0, max(0.001, round(eff_w * 1000.0) / 1000.0)))
+                usable_usd = max(min(avail_usd, 5.0), avail_usd * quant_step_w)
             qty = math.floor((usable_usd / max(target_p, self.tick_size)) * 10000.0) / 10000.0
             if qty < 2.0:
                 return
@@ -1605,7 +1714,15 @@ class LiveTriadRLTrader:
                 and self.last_ez25 >= 0.45
                 and float(getattr(self, "last_ez5", 0.0)) >= 0.20
             )
-            unfreeze_min_sec = 900 if (float(getattr(self, "last_rng14400", 10.0)) >= 25.0 and float(getattr(self, "last_pos14400", 0.5)) <= 0.25) else 300
+            has_rebound_support = (
+                len(getattr(self, "extra_slots", [])) > 0
+                or (
+                    float(self.last_car_probs[1]) >= 0.58
+                    and float(getattr(self, "last_p_adverse", 0.0)) < 0.42
+                    and float(getattr(self, "last_b1_q", 0.0)) >= 3500.0
+                )
+            )
+            unfreeze_min_sec = 900 if (float(getattr(self, "last_rng14400", 10.0)) >= 25.0 and float(getattr(self, "last_pos14400", 0.5)) <= 0.25) else (540 if has_rebound_support else 360)
             unfreeze_mode = not bullish_triad_hold and (
                 ((self.avg_entry - b1) / self.tick_size >= 3.0 and self.hold_sec >= unfreeze_min_sec)
                 or early_wide_unfreeze
@@ -2165,7 +2282,11 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
         own_orders = {
             "bid_p": trader.active_bid_p,
             "bid_q": trader.active_bid_q,
-            "asks": [(trader.active_ask_p, trader.active_ask_q), (trader.slot2_ask_p, trader.slot2_ask_q)],
+            "asks": [
+                (trader.active_ask_p, trader.active_ask_q),
+                (trader.slot2_ask_p, trader.slot2_ask_q),
+                *[(float(s.get("p", 0.0)), float(s.get("q", 0.0))) for s in getattr(trader, "extra_slots", [])],
+            ],
             "tick_size": trader.tick_size,
         }
         last_row = streamer.step(depth, now_utc, own_orders=own_orders)
@@ -2232,6 +2353,7 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
             trader.active_bid_id is not None
             or trader.active_ask_id is not None
             or trader.slot2_ask_id is not None
+            or len(getattr(trader, "extra_slots", [])) > 0
         )
         if has_open_orders or step_idx % 2 == 0:
             trader.sync_live_orders(b1, count_hold=False)

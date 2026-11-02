@@ -1,11 +1,11 @@
 {
-  "updated_at": "2026-11-02T16:50:00+00:00",
+  "updated_at": "2026-11-02T18:50:18.213260+00:00",
   "initial_budget_usd": 262.163705,
-  "bot_cash_usd": 305.395512,
-  "pos_qty": 0.0,
-  "avg_entry": 0.0,
-  "hold_sec": 0,
-  "realized_pnl_usd": 43.231807,
+  "bot_cash_usd": 0.15318,
+  "pos_qty": 204.6739,
+  "avg_entry": 1.496092,
+  "hold_sec": 309,
+  "realized_pnl_usd": 44.274957,
   "net_deposits_usd": 167.369111,
   "deposits_log": [
     {
@@ -33,23 +33,25 @@
       "new_budget_usd": 262.1637
     }
   ],
-  "n_trades": 138,
+  "n_trades": 139,
   "reserved_account_usdt": 0.0,
   "user_reserved_coin": 0.0,
   "active_bid_id": null,
   "active_bid_p": 0.0,
   "active_bid_q": 0.0,
-  "active_ask_id": null,
-  "active_ask_p": 0.0,
-  "active_ask_q": 0.0,
+  "active_ask_id": 717355145,
+  "active_ask_p": 1.5,
+  "active_ask_q": 51.5836,
   "slot2_ask_id": null,
   "slot2_ask_p": 0.0,
   "slot2_ask_q": 0.0,
   "split_done_for_pos": false,
   "car_state": 0,
-  "car_sell_px": 1.46,
-  "car_cycles": 4,
+  "car_sell_px": 1.49,
+  "car_cycles": 5,
   "cooldown_until_ts": 1793470695.313,
-  "last_exit_ts": 1793552605.648,
-  "last_exit_price": 1.51
+  "last_exit_ts": 1793645065.67,
+  "last_exit_price": 1.51,
+  "extra_slots": [],
+  "last_buy_fill_ts": 0.0
 }
