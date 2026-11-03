@@ -65,14 +65,15 @@ def schnorr_sign(msg32: bytes, seckey_int: int) -> tuple[str, str]:
 
 class PearlAutoTopup:
     PROJ_ID = "P30rTUyDempsUkhVeeuyZhIehE5D"
-    ACT_BUILD_TX = "7f89a8d0eddbc090b296fa50da829901e1339b25d9"
-    ACT_SEND_TX = "7f27948951068913121ca16d9aaca5c568a83f695d"
-    ACT_MAX_SPENDABLE = "7fe908a8245f6454a41c0e9e46cf12cf55a858a14f"
+    ACT_BUILD_TX = "7fecea36e1aaab66fda670fd2a5f34001ea4ddd93b"
+    ACT_SEND_TX = "7f29b39adece436db22533ed2a274bb1e71477da8b"
+    ACT_MAX_SPENDABLE = "7f49048cc5b5afc424ea1e405dbc8affd03b564e48"
 
     def __init__(self):
         self._load_config()
         self.sess = requests.Session(impersonate="chrome120")
         self._derive_keys()
+        self._actions_discovered = False
 
     def _load_config(self):
         env_file = BASE_DIR / ".env"
@@ -144,8 +145,40 @@ class PearlAutoTopup:
         except Exception:
             pass
 
-    def _call_action(self, action_id: str, payload: list):
+    def _discover_actions(self, ds: str):
+        if self._actions_discovered:
+            return
+        self._actions_discovered = True
+        try:
+            r = self.sess.get(
+                "https://compute.pearlresearch.ai/wallet",
+                headers={"Cookie": f"DS={ds}; DSR={self.dsr}"},
+                timeout=15,
+            )
+            scripts = re.findall(r'src="(/_next/static/[^"]+\.js)"', r.text)
+            for sc in scripts:
+                jr = self.sess.get("https://compute.pearlresearch.ai" + sc, timeout=15)
+                for m in re.finditer(
+                    r'createServerReference\)\("([0-9a-f]+)"[^\)]*"(fetchWalletMaxSpendable|buildTransaction|sendSignedTransaction)"',
+                    jr.text,
+                ):
+                    act_id, act_name = m.group(1), m.group(2)
+                    if act_name == "fetchWalletMaxSpendable":
+                        self.ACT_MAX_SPENDABLE = act_id
+                    elif act_name == "buildTransaction":
+                        self.ACT_BUILD_TX = act_id
+                    elif act_name == "sendSignedTransaction":
+                        self.ACT_SEND_TX = act_id
+            logger.info(
+                f"Автообнаружение Next-Action IDs: maxSpendable={self.ACT_MAX_SPENDABLE[:10]}..., "
+                f"buildTx={self.ACT_BUILD_TX[:10]}..., sendTx={self.ACT_SEND_TX[:10]}..."
+            )
+        except Exception as e:
+            logger.warning(f"Ошибка автообнаружения Next-Action IDs: {e}")
+
+    def _call_action(self, action_attr: str, payload: list):
         ds = self._refresh_ds()
+        action_id = getattr(self, action_attr, action_attr)
         r = self.sess.post(
             "https://compute.pearlresearch.ai/wallet",
             headers={
@@ -157,6 +190,21 @@ class PearlAutoTopup:
             data=json.dumps(payload),
             timeout=20,
         )
+        if r.status_code == 404 and not self._actions_discovered:
+            logger.info("Next-Action ID устарел после редеплоя сайта, запускаю автообнаружение...")
+            self._discover_actions(ds)
+            action_id = getattr(self, action_attr, action_attr)
+            r = self.sess.post(
+                "https://compute.pearlresearch.ai/wallet",
+                headers={
+                    "Accept": "text/x-component",
+                    "Content-Type": "text/plain;charset=UTF-8",
+                    "Next-Action": action_id,
+                    "Cookie": f"DS={ds}; DSR={self.dsr}",
+                },
+                data=json.dumps(payload),
+                timeout=20,
+            )
         if r.status_code != 200:
             raise RuntimeError(f"Action HTTP {r.status_code}: {r.text[:200]}")
         
@@ -172,11 +220,11 @@ class PearlAutoTopup:
             except Exception:
                 pass
 
-        # 2. Если psbtBase64 указывает на $2, извлекаем chunk 2
+        # 2. Если psbtBase64 указывает на $2, извлекаем chunk 2 (формат "2:T<hex_len>,<payload>1:{...")
         ref = str(json_obj.get("psbtBase64", ""))
         if ref.startswith("$"):
             chunk_num = ref.lstrip("$")
-            patt = f"{chunk_num}:Td"
+            patt = f"{chunk_num}:T"
             if patt in text:
                 s_idx = text.find(patt)
                 comma_idx = text.find(",", s_idx)
@@ -190,7 +238,7 @@ class PearlAutoTopup:
         return json_obj
 
     def get_max_spendable(self) -> float:
-        res = self._call_action(self.ACT_MAX_SPENDABLE, [self.src_addr])
+        res = self._call_action("ACT_MAX_SPENDABLE", [self.src_addr])
         return float(res.get("maxSpendable", 0.0))
 
     def transfer(self, amount: float = None) -> dict:
@@ -204,7 +252,7 @@ class PearlAutoTopup:
         send_amt = max_sp if amount is None else min(amount, max_sp)
         logger.info(f"Подготовка транзакции: {send_amt:.8f} PRL -> {self.dst_addr}")
 
-        build_res = self._call_action(self.ACT_BUILD_TX, [{
+        build_res = self._call_action("ACT_BUILD_TX", [{
             "senderAddress": self.src_addr,
             "senderPublicKey": self.pub_hex,
             "recipientAddress": self.dst_addr,
@@ -224,7 +272,7 @@ class PearlAutoTopup:
             signatures.append({"r": r_h, "s": s_h})
 
         logger.info("Отправка подписанной транзакции в сеть...")
-        send_res = self._call_action(self.ACT_SEND_TX, [{
+        send_res = self._call_action("ACT_SEND_TX", [{
             "psbtBase64": psbt_b64,
             "signatures": signatures,
         }])
@@ -235,6 +283,9 @@ class PearlAutoTopup:
 
 def main():
     bot = PearlAutoTopup()
+    if "--keepalive" in sys.argv:
+        bot._refresh_ds()
+        return
     if "--loop" in sys.argv:
         logger.info("Запуск демона автопополнения (цикл раз в 3 часа)...")
         while True:
