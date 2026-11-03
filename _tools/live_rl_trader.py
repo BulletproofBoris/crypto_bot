@@ -1431,7 +1431,8 @@ class LiveTriadRLTrader:
         if self.mode != "live":
             return
         tol = self.tick_size * 0.25
-        in_cooldown = time.time() < getattr(self, "cooldown_until_ts", 0.0)
+        now_ts = time.time()
+        in_cooldown = now_ts < getattr(self, "cooldown_until_ts", 0.0)
         can_buy_more = (self.pos_qty <= 1e-4) or bool(getattr(self, "micro_pos_parked", False))
         b1_q_w = float(getattr(self, "last_b1_q", 0.0))
         a1_q_w = float(getattr(self, "last_a1_q", self.last_q_a1))
