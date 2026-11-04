@@ -315,9 +315,12 @@ class LiveTriadRLTrader:
         from _tools.carousel_net import CarouselPredictor
         from _tools.hazard_net import HazardPredictor
         from _tools.execution_realism_net import ExecutionRealismPredictor
+        from _tools.microstructure_regime_gate import RegimeGatePredictor, REGIME_GATE_MODEL_PATH
         self.carousel_net = CarouselPredictor(BASE_DIR / "models" / self.coin / "rl_execution" / "carousel_net.pt")
         self.hazard_net = HazardPredictor(BASE_DIR / "models" / self.coin / "rl_execution" / "hazard_net.pt")
         self.realism_net = ExecutionRealismPredictor(BASE_DIR / "models" / self.coin / "rl_execution" / "execution_realism_net.pt")
+        self.regime_gate = RegimeGatePredictor(REGIME_GATE_MODEL_PATH)
+        self.last_regime_probs = np.array([0.9, 0.05, 0.0, 0.05], dtype=np.float32)
         self.last_car_probs = np.full(5, 0.5, dtype=np.float32)
         self.last_car_cap_prl = 120.0
         self.last_p_adverse = 0.0
@@ -1433,8 +1436,45 @@ class LiveTriadRLTrader:
             or brk_wide
         )
         self.last_in_breakout = in_breakout_zone
-        in_dip_zone = in_dip_zone or in_breakout_zone
-        self.last_can_buy_best = bool(in_dip_zone and imb_l5 > -0.65)
+
+        # v8.0 Neural Regime Gate: адаптивное расширение шлюза входа без жестких барьеров
+        b1_dom = b1_q / max(1.0, b1_q + a1_q)
+        feat24 = np.array([
+            float(b1_dom - 0.5),
+            float(imb_l5 * 0.5),
+            float(imb_l5 * 0.5),
+            0.0,
+            0.0,
+            float((spread_ticks - 1.0) * 0.5),
+            float(vel_10 * 0.2),
+            float(vel_180 * 0.1),
+            float(inertia * 0.33),
+            float(getattr(self, "last_cvd_norm", 0.0)),
+            float(getattr(self, "last_log_vol", 0.0)),
+            float(self.last_car_probs[1] - 0.2),
+            float(self.last_p_adverse),
+            float(self.last_p_exhaust),
+            0.0,
+            float(np.clip(ez_90 * 0.5, -3.0, 3.0)),
+            float(np.clip(ez_120 * 0.5, -3.0, 3.0)),
+            float(np.log1p(b1_q) / 8.0),
+            float(np.log1p(a1_q) / 8.0),
+            float(np.log1p(b1_q * 4.0) / 10.0),
+            float(np.log1p(a1_q * 4.0) / 10.0),
+            0.0,
+            float(vel_3 * 0.3),
+            0.0,
+        ], dtype=np.float32)
+
+        reg_probs = self.regime_gate.predict_single(feat24)
+        self.last_regime_probs = reg_probs
+        p_flat, p_acc, p_brk, p_tox = float(reg_probs[0]), float(reg_probs[1]), float(reg_probs[2]), float(reg_probs[3])
+        is_accum_zone = (p_acc >= 0.35) and (p_tox < 0.45) and (self.last_p_adverse < 0.45)
+        is_break_zone = (p_brk >= 0.42) and (p_tox < 0.35)
+        is_toxic_block = (p_tox >= 0.50) or (self.last_p_adverse >= 0.65)
+
+        in_dip_zone = (in_dip_zone or in_breakout_zone or is_accum_zone or is_break_zone) and not is_toxic_block
+        self.last_can_buy_best = bool(in_dip_zone and (b1_dom >= 0.38) and (imb_l5 > -0.65))
 
         mask = np.zeros(7, dtype=bool)
         in_cooldown = time.time() < getattr(self, "cooldown_until_ts", 0.0)
@@ -2592,9 +2632,12 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
             trader.client.append_vps_telemetry(rec)
 
         if step_idx <= 5 or step_idx % 5 == 0 or act != 0:
+            reg_idx = int(np.argmax(getattr(trader, "last_regime_probs", [1, 0, 0, 0])))
+            reg_tag = ["FLAT", "ACC", "BRK", "TOX"][reg_idx]
+            reg_acc_p = float(getattr(trader, "last_regime_probs", [0, 0, 0, 0])[1])
             print(
                 f"  [{ts_msk_str} MSK | #{step_idx:04d}] Bid={b1:.2f} Ask={a1:.2f} | Act={trader.ACTION_NAMES[act]:<14} | "
-                f"V={v_pred:+.2f}t | Car={trader.last_car_probs[1]:.0%}/{trader.last_car_cap_prl:.0f}p Adv={trader.last_p_adverse:.0%} | "
+                f"V={v_pred:+.2f}t | Reg={reg_tag}({reg_acc_p:.0%}) Adv={trader.last_p_adverse:.0%} | "
                 f"Equity=${eq_usd:.2f} ({pnl_tot:+.2f}$) | {dt_ms:.1f} ms",
                 flush=True,
             )
