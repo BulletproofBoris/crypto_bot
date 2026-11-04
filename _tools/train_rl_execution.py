@@ -58,6 +58,23 @@ def _compute_v52_signals_matrix(data_dict: dict, coin: str = "prl") -> np.ndarra
     return out
 
 
+def _compute_v70_realism_matrix(data_dict: dict, coin: str = "prl") -> np.ndarray:
+    """Предвычисляет 2D матрицу [p_fill_real, p_frontrun] из ExecutionRealismNet."""
+    n = len(data_dict["X_market"])
+    out = np.column_stack([np.full(n, 0.35, dtype=np.float32), np.full(n, 0.15, dtype=np.float32)])
+    try:
+        from _tools.execution_realism_net import build_exec_realism_features_from_cache, ExecutionRealismPredictor
+        r_path = BASE_DIR / "models" / coin.lower() / "rl_execution" / "execution_realism_net.pt"
+        if r_path.exists():
+            X16 = build_exec_realism_features_from_cache(data_dict, order_qty_prl=150.0)
+            rp = ExecutionRealismPredictor(r_path)
+            pf, pfr = rp.predict_batch(X16)
+            out = np.column_stack([pf, pfr]).astype(np.float32)
+    except Exception as e:
+        print(f"⚠️ Precompute X_v70_realism warning: {e}")
+    return out
+
+
 def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 176.0, force_rebuild: bool = False) -> dict:
     """
     Этап 1: Предрасчёт и кэширование сигналов триады ансамблей (H=5s, 12s, 25s)
@@ -67,19 +84,19 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 176.0, force_r
     cache_dir = BASE_DIR / "data" / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     rl_cache_path = cache_dir / f"rl_triad_lob_cache_{coin}_{int(tail_hours)}h.npz"
+    tmp_cache_path = Path(f"/tmp/rl_triad_lob_cache_{coin}_{int(tail_hours)}h.npz")
+    read_cache_path = tmp_cache_path if (tmp_cache_path.exists() and (not rl_cache_path.exists() or tmp_cache_path.stat().st_mtime >= rl_cache_path.stat().st_mtime)) else rl_cache_path
 
-    if rl_cache_path.exists() and not force_rebuild:
-        data_raw = np.load(rl_cache_path, allow_pickle=True)
-        if "X_h60" in data_raw.files:
+    if read_cache_path.exists() and not force_rebuild:
+        data_raw = np.load(read_cache_path, allow_pickle=True)
+        if "X_h60" in data_raw.files and "X_h90" in data_raw.files and "X_h120" in data_raw.files:
             res_dict = {k: data_raw[k] for k in data_raw.files}
             if "X_v52" not in res_dict or len(res_dict["X_v52"]) != len(res_dict["X_market"]):
-                print(f"🧠 Досчет 4D матрицы CarouselNet + HazardNet (X_v52) для кэша {rl_cache_path.name}...")
+                print(f"🧠 Досчет 4D матрицы CarouselNet + HazardNet (X_v52) для кэша {read_cache_path.name}...")
                 res_dict["X_v52"] = _compute_v52_signals_matrix(res_dict, coin=coin)
-                try:
-                    np.savez_compressed(rl_cache_path, **res_dict)
-                except Exception:
-                    pass
-            print(f"⚡ Загрузка готового кэша RL-полигона (Триада H=5,12,25,60s + X_v52): {rl_cache_path.name}")
+            if "X_v70_realism" not in res_dict or len(res_dict["X_v70_realism"]) != len(res_dict["X_market"]):
+                res_dict["X_v70_realism"] = _compute_v70_realism_matrix(res_dict, coin=coin)
+            print(f"⚡ Загрузка готового кэша RL-полигона (H=5..120s + X_v52 + X_v70): {read_cache_path}")
             return res_dict
 
     labeled_path = BASE_DIR / "data" / "labeled" / coin / f"{coin}_labeled.parquet"
@@ -94,7 +111,7 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 176.0, force_r
     n_rows = min(total_rows, int(tail_hours * 3600))
     start_row = max(0, total_rows - n_rows)
 
-    horizons = [(5, 3.0), (12, 3.5), (25, 3.0), (60, 3.0)]
+    horizons = [(5, 3.0), (12, 3.5), (25, 3.0), (60, 3.0), (90, 3.0), (120, 3.0)]
     schema_cols = set(pf.schema_arrow.names)
     lob_and_meta_cols = [
         "timestamp", "ST_best_bid", "ST_best_ask", "ST_bid_qty_1", "ST_ask_qty_1",
@@ -137,6 +154,8 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 176.0, force_r
     prev_cache_path = max(cand_caches, key=lambda p: p.stat().st_mtime) if cand_caches else (cache_dir / f"rl_triad_lob_cache_{coin}_438h.npz")
     X_triad_Incremental = None
     X_h60 = None
+    X_h90 = None
+    X_h120 = None
 
     if prev_cache_path.exists():
         try:
@@ -145,6 +164,8 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 176.0, force_r
             cur_ts_i8 = pd.DatetimeIndex(pd.to_datetime(df["timestamp"], utc=True)).asi8
             prev_triad = prev_c["X_market"][:, :18].astype(np.float32)
             prev_h60 = prev_c["X_h60"].astype(np.float32) if "X_h60" in prev_c.files and len(prev_c["X_h60"]) == len(prev_triad) else None
+            prev_h90 = prev_c["X_h90"].astype(np.float32) if "X_h90" in prev_c.files and len(prev_c["X_h90"]) == len(prev_triad) else None
+            prev_h120 = prev_c["X_h120"].astype(np.float32) if "X_h120" in prev_c.files and len(prev_c["X_h120"]) == len(prev_triad) else None
             ts_to_idx = {int(s): i for i, s in enumerate(prev_ts_i8)}
             matched_idx = np.array([ts_to_idx.get(int(s), -1) for s in cur_ts_i8], dtype=np.int64)
             valid_mask = matched_idx >= 0
@@ -163,6 +184,8 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 176.0, force_r
                     print(f"⚡ Инкрементальное обновление кэша: переиспользуем {last_match_pos + 1:,} сек из {prev_cache_path.name}, досчитываем хвост {n_tail:,} сек ({n_tail/3600:.2f} ч)...")
                     X_triad_head = prev_triad[matched_idx[:last_match_pos + 1]]
                     X_h60_head = prev_h60[matched_idx[:last_match_pos + 1]] if prev_h60 is not None else None
+                    X_h90_head = prev_h90[matched_idx[:last_match_pos + 1]] if prev_h90 is not None else None
+                    X_h120_head = prev_h120[matched_idx[:last_match_pos + 1]] if prev_h120 is not None else None
                     if n_tail > 0:
                         pad = min(360, last_match_pos + 1)
                         tail_start_abs = start_row + last_match_pos + 1 - pad
@@ -198,9 +221,15 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 176.0, force_r
                         X_triad_Incremental = np.vstack([X_triad_head, np.hstack(tail_triad_list[:3])]).astype(np.float32)
                         if X_h60_head is not None and len(tail_triad_list) > 3:
                             X_h60 = np.vstack([X_h60_head, tail_triad_list[3]]).astype(np.float32)
+                        if X_h90_head is not None and len(tail_triad_list) > 4:
+                            X_h90 = np.vstack([X_h90_head, tail_triad_list[4]]).astype(np.float32)
+                        if X_h120_head is not None and len(tail_triad_list) > 5:
+                            X_h120 = np.vstack([X_h120_head, tail_triad_list[5]]).astype(np.float32)
                     else:
                         X_triad_Incremental = X_triad_head
                         X_h60 = X_h60_head
+                        X_h90 = X_h90_head
+                        X_h120 = X_h120_head
         except Exception as e:
             print(f"⚠️ Не удалось применить инкрементальный кэш ({e}), выполняем полный расчёт...")
 
@@ -256,6 +285,8 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 176.0, force_r
         del cached_X, df_full
         X_triad = np.hstack(triad_feats[:3]).astype(np.float32)
         X_h60 = triad_feats[3] if len(triad_feats) > 3 else np.zeros((len(X_triad), 6), dtype=np.float32)
+        X_h90 = triad_feats[4] if len(triad_feats) > 4 else X_h60.copy()
+        X_h120 = triad_feats[5] if len(triad_feats) > 5 else X_h60.copy()
 
     # 10 уровней стакана SafeTrade (реальный биржевой шаг цены PRL = 0.01 USDT)
     tick_size = 0.01 if coin == "prl" else float(COIN_CONFIG[coin]["tick_size"])
@@ -316,9 +347,35 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 176.0, force_r
     vwap = np.nan_to_num(df["ST_vwap_1s"].values if "ST_vwap_1s" in df.columns else (bid_p[:, 0] + ask_p[:, 0]) * 0.5, nan=0.0)
     ts_arr = df["timestamp"].astype(str).values
 
+    if X_h90 is None or len(X_h90) != len(X_market) or X_h120 is None or len(X_h120) != len(X_market):
+        df_full90 = pf.read_row_groups(rg_indices).slice(first_rg_offset, len(X_market)).to_pandas()
+        if "timestamp" not in df_full90.columns:
+            df_full90["timestamp"] = df_full90.index
+        df_full90 = df_full90.reset_index(drop=True)
+        for h_macro in (90, 120):
+            r_m = SwarmRegimeRouter(coin, h_macro, 3.0, temperature=0.25, use_neural=True, neural_weight=0.15)
+            print(f"\n🔮 Досчёт макро-ансамбля H={h_macro}s (K=3.0) на {len(df_full90):,} сек...")
+            X_c_m = [df_full90[col].values.astype(np.float32) if col in df_full90.columns else np.zeros(len(df_full90), dtype=np.float32) for col in r_m.feature_names]
+            X_in_m = np.nan_to_num(np.column_stack(X_c_m), nan=0.0, posinf=0.0, neginf=0.0)
+            ens_m = r_m.predict_ensemble(X_in_m, df_full90, mode="router")
+            pr_m, ez_m = ens_m["probs"], ens_m["expected_z"]
+            pc_m = np.clip(pr_m, 1e-7, 1.0)
+            mat_m = np.column_stack([
+                ez_m, pr_m[:, 4] + pr_m[:, 5] + pr_m[:, 6], pr_m[:, 0] + pr_m[:, 1] + pr_m[:, 2],
+                pr_m[:, 5] + pr_m[:, 6], pr_m[:, 0] + pr_m[:, 1], -np.sum(pc_m * np.log(pc_m), axis=1) / np.log(7.0)
+            ]).astype(np.float32)
+            if h_macro == 90:
+                X_h90 = mat_m
+            else:
+                X_h120 = mat_m
+            del r_m, X_c_m, X_in_m, ens_m
+        del df_full90
+
     payload = {
         "X_market": X_market,
         "X_h60": X_h60 if X_h60 is not None else np.zeros((len(X_market), 6), dtype=np.float32),
+        "X_h90": X_h90 if X_h90 is not None else np.zeros((len(X_market), 6), dtype=np.float32),
+        "X_h120": X_h120 if X_h120 is not None else np.zeros((len(X_market), 6), dtype=np.float32),
         "bid_p": bid_p,
         "bid_q": bid_q,
         "ask_p": ask_p,
@@ -330,8 +387,13 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 176.0, force_r
         "tick_size": np.array(tick_size, dtype=np.float64),
     }
     payload["X_v52"] = _compute_v52_signals_matrix(payload, coin=coin)
-    np.savez_compressed(rl_cache_path, **payload)
-    print(f"✅ Кэш RL-полигона сохранён в {rl_cache_path} ({X_market.shape[0]:,} строк x {X_market.shape[1]} признаков + H=60s + X_v52)")
+    payload["X_v70_realism"] = _compute_v70_realism_matrix(payload, coin=coin)
+    try:
+        rl_cache_path.unlink(missing_ok=True)
+        np.savez_compressed(rl_cache_path, **payload)
+    except OSError:
+        np.savez_compressed(Path(f"/tmp/{rl_cache_path.name}"), **payload)
+    print(f"✅ Кэш RL-полигона сохранён в {rl_cache_path} ({X_market.shape[0]:,} строк x {X_market.shape[1]} признаков + H=60,90,120s + X_v52 + X_v70_realism)")
     return payload
 
 
@@ -349,10 +411,12 @@ class SafeTradeL2ExecutionEnv:
       6: PANIC_TAKER_EXIT (мгновенный выход по рынку через 10 уровней стакана)
     """
 
-    def __init__(self, data: dict, start_idx: int, end_idx: int, episode_len: int = 3600, order_usd: float = 95.5, legacy_v2: bool = False, enable_unfreeze: bool = True, use_v52_obs: bool = True):
+    def __init__(self, data: dict, start_idx: int, end_idx: int, episode_len: int = 3600, order_usd: float = 95.5, legacy_v2: bool = False, enable_unfreeze: bool = True, use_v52_obs: bool = True, use_v70_obs: bool = True):
         self.enable_unfreeze = bool(enable_unfreeze)
         self.X_market = data["X_market"]
         self.X_h60 = data.get("X_h60", np.zeros((len(self.X_market), 6), dtype=np.float32))
+        self.X_h90 = data.get("X_h90", self.X_h60)
+        self.X_h120 = data.get("X_h120", self.X_h60)
         self.bid_p = data["bid_p"]
         self.bid_q = data["bid_q"]
         self.ask_p = data["ask_p"]
@@ -368,6 +432,7 @@ class SafeTradeL2ExecutionEnv:
         self.order_usd = float(order_usd)
         self.legacy_v2 = bool(legacy_v2)
         self.use_v52_obs = bool(use_v52_obs) and (not self.legacy_v2)
+        self.use_v70_obs = bool(use_v70_obs) and self.use_v52_obs
         if "X_v52" in data and len(data["X_v52"]) == len(self.X_market):
             self.X_v52 = data["X_v52"].astype(np.float32)
         elif self.use_v52_obs:
@@ -375,8 +440,19 @@ class SafeTradeL2ExecutionEnv:
             data["X_v52"] = self.X_v52
         else:
             self.X_v52 = np.zeros((len(self.X_market), 4), dtype=np.float32)
-        self.obs_dim = self.X_market.shape[1] + (4 if self.use_v52_obs else 0) + 10
+        if "X_v70_realism" in data and len(data["X_v70_realism"]) == len(self.X_market):
+            self.X_v70_realism = data["X_v70_realism"].astype(np.float32)
+        elif self.use_v70_obs:
+            self.X_v70_realism = _compute_v70_realism_matrix(data)
+            data["X_v70_realism"] = self.X_v70_realism
+        else:
+            self.X_v70_realism = np.zeros((len(self.X_market), 2), dtype=np.float32)
+        self.obs_dim = self.X_market.shape[1] + (4 if self.use_v52_obs else 0) + (7 if self.use_v70_obs else 0) + 10
         self.n_actions = 7
+        self.v70_slot_fill_ratio = 0.0
+        self.v70_lowest_slot_edge_ticks = 0.0
+        self.v70_slot_dispersion_ticks = 0.0
+        self.v70_free_cash_ratio = 1.0
 
         # Предрасчет каузальных индикаторов локальных экстремумов (5м / 15м / 60м) и вектора рыночной инерции
         s_bid = pd.Series(self.bid_p[:, 0])
@@ -804,6 +880,23 @@ class SafeTradeL2ExecutionEnv:
         buf[:m_dim] = self.X_market[t]
         if getattr(self, "use_v52_obs", False):
             buf[m_dim : m_dim + 4] = self.X_v52[t]
+        if getattr(self, "use_v70_obs", False):
+            s_fill = float(self.v70_slot_fill_ratio) if self.v70_slot_fill_ratio > 0 else (0.6 if has_pos else 0.0)
+            low_edge = float(self.v70_lowest_slot_edge_ticks) if self.v70_slot_fill_ratio > 0 else (unr_ticks * 0.2)
+            disp = float(self.v70_slot_dispersion_ticks)
+            free_c = float(self.v70_free_cash_ratio) if self.v70_slot_fill_ratio > 0 else (0.4 if has_pos else 1.0)
+            ez90_t = float(self.X_h90[t, 0]) if getattr(self, "X_h90", None) is not None else float(self.X_h60[t, 0])
+            ez120_t = float(self.X_h120[t, 0]) if getattr(self, "X_h120", None) is not None else ez90_t
+            p_fr_t = float(self.X_v70_realism[t, 1]) if getattr(self, "X_v70_realism", None) is not None else 0.15
+            buf[m_dim + 4 : m_dim + 11] = (
+                s_fill,
+                min(max(low_edge, -3.0), 3.0),
+                min(max(disp, 0.0), 3.0),
+                free_c,
+                min(max(ez90_t, -3.0), 3.0),
+                min(max(ez120_t, -3.0), 3.0),
+                p_fr_t,
+            )
         buf[-10] = has_pos
         buf[-9] = min(max(unr_ticks * 0.1, -3.0), 3.0)
         buf[-8] = hold_ratio
@@ -1411,20 +1504,33 @@ class MaskableActorCritic(nn.Module):
 
 
 def load_compatible_ppo_state_dict(model: MaskableActorCritic, sd: dict) -> None:
-    """Загружает state_dict в MaskableActorCritic с хирургической адаптацией первого слоя при переходе 38D <-> 42D."""
+    """Загружает state_dict в MaskableActorCritic с хирургической адаптацией первого слоя при переходе 38D <-> 42D <-> 49D."""
     sd = dict(sd.get("model_state_dict", sd) if isinstance(sd, dict) else sd)
     target_w = model.backbone[0].weight.data
     src_w = sd["backbone.0.weight"]
     if src_w.shape != target_w.shape:
         new_w = torch.zeros_like(target_w)
-        if src_w.shape[1] == 38 and target_w.shape[1] == 42:
+        s_in, t_in = src_w.shape[1], target_w.shape[1]
+        if s_in == 38 and t_in == 42:
             new_w[:, :28] = src_w[:, :28]
             new_w[:, 32:42] = src_w[:, 28:38]
-        elif src_w.shape[1] == 42 and target_w.shape[1] == 38:
+        elif s_in == 42 and t_in == 38:
             new_w[:, :28] = src_w[:, :28]
             new_w[:, 28:38] = src_w[:, 32:42]
+        elif s_in == 42 and t_in == 49:
+            new_w[:, :32] = src_w[:, :32]
+            new_w[:, -10:] = src_w[:, -10:]
+        elif s_in == 49 and t_in == 42:
+            new_w[:, :32] = src_w[:, :32]
+            new_w[:, -10:] = src_w[:, -10:]
+        elif s_in == 38 and t_in == 49:
+            new_w[:, :28] = src_w[:, :28]
+            new_w[:, -10:] = src_w[:, -10:]
+        elif s_in == 49 and t_in == 38:
+            new_w[:, :28] = src_w[:, :28]
+            new_w[:, -10:] = src_w[:, -10:]
         else:
-            c_min = min(src_w.shape[1], target_w.shape[1])
+            c_min = min(s_in, t_in)
             new_w[:, :c_min] = src_w[:, :c_min]
         sd["backbone.0.weight"] = new_w
     model.load_state_dict(sd)
@@ -1626,6 +1732,12 @@ def load_live_telemetry_experiences(obs_dim: int = 38) -> tuple[np.ndarray, np.n
         if obs_arr.shape[1] == 38 and obs_dim == 42:
             v52_pad = np.tile(np.array([0.13, 0.02, 0.08, 0.04], dtype=np.float32), (len(obs_arr), 1))
             obs_arr = np.hstack([obs_arr[:, :28], v52_pad, obs_arr[:, 28:38]]).astype(np.float32)
+        elif obs_arr.shape[1] in (38, 42) and obs_dim == 49:
+            if obs_arr.shape[1] == 38:
+                v52_pad = np.tile(np.array([0.13, 0.02, 0.08, 0.04], dtype=np.float32), (len(obs_arr), 1))
+                obs_arr = np.hstack([obs_arr[:, :28], v52_pad, obs_arr[:, 28:38]]).astype(np.float32)
+            v70_pad = np.tile(np.array([0.30, 0.0, 0.0, 0.70, 0.0, 0.0, 0.15], dtype=np.float32), (len(obs_arr), 1))
+            obs_arr = np.hstack([obs_arr[:, :32], v70_pad, obs_arr[:, 32:42]]).astype(np.float32)
         elif obs_arr.shape[1] != obs_dim:
             return np.empty((0, obs_dim), dtype=np.float32), np.empty((0, 7), dtype=bool), np.empty((0,), dtype=np.int64)
 
@@ -1790,7 +1902,10 @@ def train_rl_agent(
     opt = torch.optim.AdamW(model.parameters(), lr=8e-5, weight_decay=1e-4)
     best_pnl = ws_res["pnl_usd"]
     best_score = ws_res["efficiency_score"]
-    torch.save(model.state_dict(), out_dir / "best_maskable_ppo.pt")
+    try:
+        torch.save(model.state_dict(), out_dir / "best_maskable_ppo.pt")
+    except OSError:
+        torch.save(model.state_dict(), Path("/tmp/best_maskable_ppo.pt"))
     history.append({"epoch": 0, **ws_res, "best_pnl_usd": round(float(best_pnl), 4), "best_score": round(float(best_score), 2)})
     print(
         f"  [Warm-Start v3] 🏆 -> PnL: ${ws_res['pnl_usd']:+.4f} | КПД: {ws_res['kpd_capture_pct']:+.1f}% "
@@ -1875,7 +1990,10 @@ def train_rl_agent(
             best_score = oos_res["efficiency_score"]
             best_pnl = max(best_pnl, oos_res["pnl_usd"])
             best_model_ref.load_state_dict(model.state_dict())
-            torch.save(model.state_dict(), out_dir / "best_maskable_ppo.pt")
+            try:
+                torch.save(model.state_dict(), out_dir / "best_maskable_ppo.pt")
+            except OSError:
+                torch.save(model.state_dict(), Path("/tmp/best_maskable_ppo.pt"))
         elif oos_res["efficiency_score"] < best_score * 0.75:
             # Мягкий возврат к лидеру при неудачной стохастической мутации
             with torch.no_grad():

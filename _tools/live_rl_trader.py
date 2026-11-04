@@ -291,9 +291,13 @@ class LiveTriadRLTrader:
             (25, 3.0, SwarmRegimeRouter(self.coin, 25, 3.0, temperature=0.25, use_neural=use_neural, neural_weight=0.15)),
         ]
         self.router_60 = SwarmRegimeRouter(self.coin, 60, 3.0, temperature=0.25, use_neural=use_neural, neural_weight=0.15)
+        self.router_90 = SwarmRegimeRouter(self.coin, 90, 3.0, temperature=0.25, use_neural=use_neural, neural_weight=0.15)
+        self.router_120 = SwarmRegimeRouter(self.coin, 120, 3.0, temperature=0.25, use_neural=use_neural, neural_weight=0.15)
         if use_neural:
             list(self._triad_pool.map(lambda r_item: r_item[2].preload_neural_models(), self.routers))
             self.router_60.preload_neural_models()
+            self.router_90.preload_neural_models()
+            self.router_120.preload_neural_models()
             torch.set_num_threads(2)
             print(f"⚡ Все активные нейросетевые модели (FastKerasModel, пул={SAFE_WORKERS} потоков) предзагружены в RAM (0 обращений к диску на тиках).")
         self.feature_names = self.routers[0][2].feature_names
@@ -310,12 +314,18 @@ class LiveTriadRLTrader:
 
         from _tools.carousel_net import CarouselPredictor
         from _tools.hazard_net import HazardPredictor
+        from _tools.execution_realism_net import ExecutionRealismPredictor
         self.carousel_net = CarouselPredictor(BASE_DIR / "models" / self.coin / "rl_execution" / "carousel_net.pt")
         self.hazard_net = HazardPredictor(BASE_DIR / "models" / self.coin / "rl_execution" / "hazard_net.pt")
+        self.realism_net = ExecutionRealismPredictor(BASE_DIR / "models" / self.coin / "rl_execution" / "execution_realism_net.pt")
         self.last_car_probs = np.full(5, 0.5, dtype=np.float32)
         self.last_car_cap_prl = 120.0
         self.last_p_adverse = 0.0
         self.last_p_exhaust = 0.0
+        self.last_p_fill_real = 0.5
+        self.last_p_frontrun = 0.2
+        self.last_ez90 = 0.0
+        self.last_ez120 = 0.0
 
         self.bid_hist_1h = deque(maxlen=14400)
         self.ez12_hist = deque(maxlen=16)
@@ -566,7 +576,10 @@ class LiveTriadRLTrader:
                                 q_merge = math.floor((net_filled - q_ind) * 10000.0) / 10000.0
                                 self.avg_entry = (self.pos_qty * self.avg_entry + q_merge * px) / max(1e-6, self.pos_qty + q_merge)
                                 self.pos_qty = math.floor((self.pos_qty + net_filled) * 10000.0) / 10000.0
-                                ind_ask_p = round(math.ceil((px + 0.75 * self.tick_size) / self.tick_size - 1e-4) * self.tick_size, 2)
+                                dyn_target_ticks = 0.75
+                                if float(getattr(self, "last_ez90", 0.0)) > 1.10 and float(getattr(self, "last_ez120", 0.0)) > 1.10 and float(getattr(self, "last_p_exhaust", 0.5)) < 0.35:
+                                    dyn_target_ticks = 2.75 if (float(getattr(self, "last_ez90", 0.0)) > 1.65 and float(getattr(self, "last_ez120", 0.0)) > 1.55) else 1.75
+                                ind_ask_p = round(math.ceil((px + dyn_target_ticks * self.tick_size) / self.tick_size - 1e-4) * self.tick_size, 2)
                                 ind_ask_p = max(b1 + self.tick_size if b1 > 0 else ind_ask_p, ind_ask_p)
                                 try:
                                     r_ind = self.client.place_limit_order(self.market, "sell", q_ind, ind_ask_p)
@@ -754,6 +767,26 @@ class LiveTriadRLTrader:
                         self.sync_account_balances(b1, from_trade_fill=True)
                         print(f"  💰 [FILL SELL SLOT-{idx_s+3}] -{s_filled:.4f} PRL @ ${s_px:.2f} (вход=${s_ent:.2f}) | PnL={s_pnl:+.4f}$ | Остаток поз={self.pos_qty:.4f} PRL | Кэш=${self.bot_cash_usd:.2f}")
                     elif s_st != "cancel":
+                        s_ent = float(s_item.get("entry_px", 0.0))
+                        s_cur_p = float(s_item.get("p", 0.0))
+                        s_rem_q = float(os_ord.get("remaining_volume", s_item.get("q", 0.0)))
+                        plus1_p = round(math.ceil((s_ent + 0.75 * self.tick_size) / self.tick_size - 1e-4) * self.tick_size, 2)
+                        if (
+                            s_ent > 0.0
+                            and s_cur_p > plus1_p + 0.25 * self.tick_size
+                            and b1 >= s_ent
+                            and (float(getattr(self, "last_p_exhaust", 0.0)) >= 0.45 or float(getattr(self, "last_p_adverse", 0.0)) >= 0.52)
+                            and s_rem_q >= 2.0
+                        ):
+                            try:
+                                self.client.cancel_order(sid)
+                                r_t = self.client.place_limit_order(self.market, "sell", s_rem_q, max(b1 + self.tick_size, plus1_p))
+                                s_item["id"] = r_t.get("id")
+                                s_item["p"] = float(r_t.get("price", max(b1 + self.tick_size, plus1_p)))
+                                s_item["q"] = float(r_t.get("origin_amount", s_rem_q))
+                                print(f"  🎯 [DYNAMIC TARGET -> +1t] Слот #{idx_s+3} подтянут к ${s_item['p']:.2f} (p_exh={self.last_p_exhaust:.0%}, p_adv={self.last_p_adverse:.0%})")
+                            except Exception:
+                                pass
                         rem_extra.append(s_item)
                 except Exception as es:
                     print(f"  ⚠️ [SYNC EXTRA SLOT WARN] id={sid}: {es}")
@@ -955,6 +988,12 @@ class LiveTriadRLTrader:
             float(p60[0] + p60[1]),
             float(res60["entropy"]),
         ]
+        if getattr(self, "router_90", None) is not None:
+            res90 = self.router_90.predict_live_tick(X_seq_2d, row_df)
+            self.last_ez90 = float(res90["expected_z"])
+        if getattr(self, "router_120", None) is not None:
+            res120 = self.router_120.predict_live_tick(X_seq_2d, row_df)
+            self.last_ez120 = float(res120["expected_z"])
 
         r = row_df.iloc[-1]
         tol = self.tick_size * 0.25
@@ -1063,9 +1102,11 @@ class LiveTriadRLTrader:
         sell_vol_10s = float(sum(x[3] for x in fh[-10:]))
         buy_vol_30s = float(sum(x[2] for x in fh[-30:]))
         sell_vol_30s = float(sum(x[3] for x in fh[-30:]))
+        ez_90 = float(getattr(self, "last_ez90", ez_60))
+        ez_120 = float(getattr(self, "last_ez120", ez_90))
         if getattr(self, "carousel_net", None) is not None and self.carousel_net.ready:
             two_sided = min(buy_vol_30s, sell_vol_30s) / (max(b1_q, a1_q) + 50.0)
-            feat44 = np.array(
+            feat47 = np.array(
                 triad_vec + lob_vec + self.last_vec60 + [
                     math.log1p(max(0.0, b1_q)),
                     math.log1p(max(0.0, a1_q)),
@@ -1077,13 +1118,39 @@ class LiveTriadRLTrader:
                     math.log1p(max(0.0, sell_vol_30s)),
                     float(np.clip(spread_ticks, 1.0, 20.0)),
                     float(np.clip(two_sided, 0.0, 10.0)),
+                    ez_90,
+                    ez_120,
+                    ez_12 - ez_120,
                 ],
                 dtype=np.float32,
             )
-            self.last_car_probs, self.last_car_cap_prl = self.carousel_net.predict_single(feat44)
+            self.last_car_probs, self.last_car_cap_prl = self.carousel_net.predict_single(feat47)
             if getattr(self, "hazard_net", None) is not None and self.hazard_net.ready:
-                pa, pe, ps = self.hazard_net.predict_batch_v2(feat44[None, :])
+                pa, pe, ps = self.hazard_net.predict_batch_v2(feat47[None, :])
                 self.last_p_adverse, self.last_p_exhaust, self.last_p_ask_sweep = float(pa[0]), float(pe[0]), float(ps[0])
+        if getattr(self, "realism_net", None) is not None and self.realism_net.ready:
+            buy_15s = float(sum(x[2] for x in fh[-15:]))
+            sell_15s = float(sum(x[3] for x in fh[-15:]))
+            est_ord_q = max(20.0, (self.order_usd * 0.25) / max(b1, self.tick_size))
+            feat16 = np.array([
+                float(np.clip(spread_ticks, 1.0, 20.0)),
+                imb_l1,
+                imb_l5,
+                float(np.log1p(b1_q) / 10.0),
+                float(np.log1p(a1_q) / 10.0),
+                float(np.log1p(b5_q) / 12.0),
+                float(np.log1p(a5_q) / 12.0),
+                float(np.log1p(max(0.0, buy_15s)) / 8.0),
+                float(np.log1p(max(0.0, sell_15s)) / 8.0),
+                float(est_ord_q / (b1_q + est_ord_q + 10.0)),
+                float(est_ord_q / (a1_q + est_ord_q + 10.0)),
+                ez_5,
+                ez_12,
+                ez_25,
+                ez_90,
+                ez_120,
+            ], dtype=np.float32)
+            self.last_p_fill_real, self.last_p_frontrun = self.realism_net.predict_single(feat16)
         self.last_ofi_5s = float(self.last_dq_bid_5s - (a1_q - a1q_5s_ago) + sum(x[2] - x[3] for x in fh[-5:]))
         self.last_ez25 = ez_25
         self.last_ez12 = ez_12
@@ -1229,15 +1296,35 @@ class LiveTriadRLTrader:
         q_ratio = q_val / (q_val + ord_q + 1e-6) if (has_bid or has_ask) else 0.0
 
         v52_vec = []
-        if getattr(self.agent.backbone[0], "in_features", 38) == 42:
+        in_feat_dim = getattr(self.agent.backbone[0], "in_features", 38)
+        if in_feat_dim >= 42:
             v52_vec = [
                 float(self.last_car_probs[1]),
                 float(math.log1p(max(0.0, self.last_car_cap_prl)) / 7.0),
                 float(self.last_p_adverse),
                 float(self.last_p_exhaust),
             ]
+        v70_vec = []
+        if in_feat_dim >= 49:
+            slot_entries = ([self.avg_entry] if (self.pos_qty >= 1.95 and self.avg_entry > 0.0) else []) + [
+                float(s.get("entry_px", self.avg_entry)) for s in getattr(self, "extra_slots", []) if float(s.get("entry_px", 0.0)) > 0
+            ]
+            n_open_slots = min(10, (1 if self.pos_qty >= 1.95 else 0) + (1 if self.slot2_ask_id is not None else 0) + len(getattr(self, "extra_slots", [])))
+            slot_fill_ratio = float(min(1.0, max(n_open_slots / 10.0, (self.pos_qty * b1) / max(1.0, tot_eq_now))))
+            lowest_slot_edge_ticks = float(np.clip(((b1 - min(slot_entries)) / self.tick_size) * 0.2, -3.0, 3.0)) if slot_entries else 0.0
+            slot_dispersion_ticks = float(np.clip(((max(slot_entries) - min(slot_entries)) / self.tick_size) * 0.2, 0.0, 3.0)) if len(slot_entries) >= 2 else 0.0
+            free_cash_ratio = float(np.clip(self.bot_cash_usd / max(1.0, tot_eq_now), 0.0, 1.0))
+            v70_vec = [
+                slot_fill_ratio,
+                lowest_slot_edge_ticks,
+                slot_dispersion_ticks,
+                free_cash_ratio,
+                float(np.clip(ez_90 * 0.5, -3.0, 3.0)),
+                float(np.clip(ez_120 * 0.5, -3.0, 3.0)),
+                float(getattr(self, "last_p_frontrun", 0.2)),
+            ]
         obs = np.array(
-            triad_vec + lob_vec + v52_vec + [
+            triad_vec + lob_vec + v52_vec + v70_vec + [
                 has_pos, float(np.clip(unr_ticks * 0.1, -3.0, 3.0)), hold_ratio,
                 has_bid, has_ask, float(np.clip(dist * 0.2, -2.0, 2.0)), q_ratio,
                 obs_err12_norm, obs_entry_edge_norm, obs_hold_edge_norm,
@@ -1686,6 +1773,9 @@ class LiveTriadRLTrader:
             else:
                 quant_step_w = float(min(1.0, max(0.001, round(eff_w * 1000.0) / 1000.0)))
                 usable_usd = max(min(avail_usd, 5.0), avail_usd * quant_step_w)
+            if float(getattr(self, "last_p_frontrun", 0.0)) > 0.60 and usable_usd >= 12.0:
+                stealth_mult = max(0.45, 1.0 - 0.65 * (float(self.last_p_frontrun) - 0.60))
+                usable_usd = max(5.0, usable_usd * stealth_mult)
             qty = math.floor((usable_usd / max(target_p, self.tick_size)) * 10000.0) / 10000.0
             if qty < 2.0:
                 return

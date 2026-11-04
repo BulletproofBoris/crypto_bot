@@ -18,9 +18,14 @@ CAROUSEL_MODEL_PATH = Path("models/prl/rl_execution/carousel_net.pt")
 
 
 def build_carousel_features(data: dict) -> np.ndarray:
-    """Формирует 44D каузальный вектор признаков для CarouselNet из кэша L2 + роя."""
+    """Формирует 47D каузальный вектор признаков для CarouselNet v3 / HazardNet v3 (включая H=90s и H=120s)."""
     X_m = np.nan_to_num(data["X_market"].astype(np.float32), nan=0.0)
     X_60 = np.nan_to_num(data["X_h60"].astype(np.float32), nan=0.0)
+    X_90 = np.nan_to_num(data.get("X_h90", X_60).astype(np.float32), nan=0.0)
+    X_120 = np.nan_to_num(data.get("X_h120", X_60).astype(np.float32), nan=0.0)
+    ez_90 = X_90[:, 0] if X_90.ndim > 1 else X_90
+    ez_120 = X_120[:, 0] if X_120.ndim > 1 else X_120
+    div_12_120 = X_m[:, 6] - ez_120
     bid_p = data["bid_p"][:, 0].astype(np.float32)
     ask_p = data["ask_p"][:, 0].astype(np.float32)
     bid_q1 = data["bid_q"][:, 0].astype(np.float32)
@@ -56,6 +61,9 @@ def build_carousel_features(data: dict) -> np.ndarray:
         np.log1p(np.maximum(0.0, sell_30s)),
         spread_ticks,
         np.clip(two_sided_flow, 0.0, 10.0),
+        ez_90,
+        ez_120,
+        div_12_120,
     ]).astype(np.float32)
     return np.hstack([X_m, X_60, extra]).astype(np.float32)
 
@@ -181,6 +189,9 @@ class CarouselPredictor:
             self.ready = True
 
     def predict_batch(self, X_feat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        in_d = len(self.mean)
+        if X_feat.shape[1] != in_d:
+            X_feat = X_feat[:, :in_d] if X_feat.shape[1] > in_d else np.pad(X_feat, ((0, 0), (0, in_d - X_feat.shape[1])))
         X_norm = np.clip((X_feat - self.mean) / self.std, -5.0, 5.0).astype(np.float32)
         with torch.no_grad():
             logits_g, log_cap_g = self.model(torch.from_numpy(X_norm))
@@ -216,6 +227,9 @@ class CarouselPredictor:
     def predict_single(self, feat_1d: np.ndarray) -> tuple[np.ndarray, float]:
         if not self.ready:
             return np.full(len(VOLUME_BUCKETS_PRL), 0.5, dtype=np.float32), 100.0
+        in_d = len(self.mean)
+        if len(feat_1d) != in_d:
+            feat_1d = feat_1d[:in_d] if len(feat_1d) > in_d else np.pad(feat_1d, (0, in_d - len(feat_1d)))
         x_norm = np.clip((feat_1d - self.mean) / self.std, -5.0, 5.0).astype(np.float32)
         with torch.no_grad():
             logits, log_cap = self.model(torch.from_numpy(x_norm[None, :]))

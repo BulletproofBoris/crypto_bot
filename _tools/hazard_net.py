@@ -126,6 +126,9 @@ class HazardPredictor:
             self.ready = True
 
     def _predict_probs(self, X_feat: np.ndarray) -> np.ndarray:
+        in_d = len(self.mean)
+        if X_feat.shape[1] != in_d:
+            X_feat = X_feat[:, :in_d] if X_feat.shape[1] > in_d else np.pad(X_feat, ((0, 0), (0, in_d - X_feat.shape[1])))
         X_norm = np.clip((X_feat - self.mean) / self.std, -5.0, 5.0).astype(np.float32)
         with torch.no_grad():
             probs = torch.sigmoid(self.model(torch.from_numpy(X_norm))).numpy()

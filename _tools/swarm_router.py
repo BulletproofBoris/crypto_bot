@@ -418,8 +418,9 @@ class SwarmRegimeRouter:
                     if X_nn is None:
                         X_nn = self._sanitize_stale_bo_features(X, current_regime_df)
                     from _tools.fast_neural_engine import FastKerasModel
+                    mw_val = float(np.mean(reg_w[s_act:e_act])) if np.ndim(reg_w) > 0 else float(reg_w)
                     print(
-                        f"  ⚡ [H={self.H}s] Инференс {exp['arch']} [{s_act}:{e_act}] ({(e_act-s_act)/3600:.1f}ч, mean_w={float(np.mean(reg_w[s_act:e_act])):.2f})...",
+                        f"  ⚡ [H={self.H}s] Инференс {exp['arch']} [{s_act}:{e_act}] ({(e_act-s_act)/3600:.1f}ч, mean_w={mw_val:.2f})...",
                         flush=True,
                     )
                     model = FastKerasModel(exp["k_file"], exp["base_arch"])
