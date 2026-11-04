@@ -283,7 +283,7 @@ class LiveTriadRLTrader:
         from _tools.swarm_router import SwarmRegimeRouter
         from _tools.train_rl_execution import MaskableActorCritic
         print(f"🧠 Инициализация боевого ядра LiveTriadRLTrader ({self.coin.upper()}, режим={self.mode.upper()}, бюджет=${self.initial_budget_usd:.2f})...")
-        self._triad_pool = ThreadPoolExecutor(max_workers=4)
+        self._triad_pool = ThreadPoolExecutor(max_workers=6)
         self._io_pool = ThreadPoolExecutor(max_workers=3)
         self.routers = [
             (5, 3.0, SwarmRegimeRouter(self.coin, 5, 3.0, temperature=0.25, use_neural=use_neural, neural_weight=0.15)),
@@ -379,8 +379,20 @@ class LiveTriadRLTrader:
             self._init_isolated_wallet()
 
     def _init_isolated_wallet(self):
+        st = {}
         if self.wallet_file.exists():
-            st = json.loads(self.wallet_file.read_text(encoding="utf-8"))
+            try:
+                st = json.loads(self.wallet_file.read_text(encoding="utf-8"))
+            except Exception as e:
+                print(f"⚠️ Ошибка чтения {self.wallet_file.name}: {e}. Пробуем .bak резервную копию...")
+                bak_file = self.wallet_file.with_suffix(".json.bak")
+                if bak_file.exists():
+                    try:
+                        st = json.loads(bak_file.read_text(encoding="utf-8"))
+                        print("✅ Успешно восстановлено состояние из резервной копии .bak")
+                    except Exception as e2:
+                        print(f"❌ Резервная копия .bak также повреждена: {e2}")
+        if st:
             self.initial_budget_usd = float(st.get("initial_budget_usd", self.initial_budget_usd))
             self.bot_cash_usd = float(st.get("bot_cash_usd", self.initial_budget_usd))
             self.pos_qty = float(st.get("pos_qty", 0.0))
@@ -418,6 +430,7 @@ class LiveTriadRLTrader:
                 self.car_state = 0
         self.bid_age_sec = 0
         self.bid_partial_filled = 0.0
+        self.adverse_streak = 0
         b1_init = 0.0
         try:
             d_init = self.client.get_depth(self.market, limit=5)
@@ -468,9 +481,19 @@ class LiveTriadRLTrader:
             "last_exit_price": round(float(getattr(self, "last_exit_price", 0.0)), 4),
         }
         try:
-            self.wallet_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+            self.wallet_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp_file = self.wallet_file.with_name(f"{self.wallet_file.name}.tmp.{os.getpid()}")
+            bak_file = self.wallet_file.with_suffix(".json.bak")
+            content = json.dumps(payload, indent=2)
+            tmp_file.write_text(content, encoding="utf-8")
+            if self.wallet_file.exists():
+                try:
+                    os.replace(self.wallet_file, bak_file)
+                except Exception:
+                    pass
+            os.replace(tmp_file, self.wallet_file)
+        except Exception as e:
+            print(f"❌ Ошибка атомарной записи кошелька {self.wallet_file.name}: {e}")
 
     def sync_live_orders(self, b1: float, count_hold: bool = False):
         if self.mode != "live":
@@ -770,21 +793,33 @@ class LiveTriadRLTrader:
                         s_ent = float(s_item.get("entry_px", 0.0))
                         s_cur_p = float(s_item.get("p", 0.0))
                         s_rem_q = float(os_ord.get("remaining_volume", s_item.get("q", 0.0)))
+                        s_age = time.time() - float(s_item.get("entry_t", time.time()))
+                        tot_slots_active = (6 if self.pos_qty >= 2.0 else 0) + len(getattr(self, "extra_slots", []))
+                        decay_l1 = 260.0 if tot_slots_active >= 7 else (360.0 if tot_slots_active >= 4 else 450.0)
+                        decay_l2 = 600.0 if tot_slots_active >= 7 else 900.0
                         plus1_p = round(math.ceil((s_ent + 0.75 * self.tick_size) / self.tick_size - 1e-4) * self.tick_size, 2)
-                        if (
+                        target_decay_p = None
+                        if s_age >= decay_l2:
+                            target_decay_p = max(b1 + self.tick_size, float(getattr(self, "last_a1", b1 + self.tick_size)))
+                        elif s_age >= decay_l1 and s_cur_p > plus1_p + 0.25 * self.tick_size:
+                            target_decay_p = plus1_p
+                        elif (
                             s_ent > 0.0
                             and s_cur_p > plus1_p + 0.25 * self.tick_size
                             and b1 >= s_ent
                             and (float(getattr(self, "last_p_exhaust", 0.0)) >= 0.45 or float(getattr(self, "last_p_adverse", 0.0)) >= 0.52)
-                            and s_rem_q >= 2.0
                         ):
+                            target_decay_p = plus1_p
+
+                        if target_decay_p is not None and abs(s_cur_p - target_decay_p) > 0.25 * self.tick_size and s_rem_q >= 2.0:
                             try:
                                 self.client.cancel_order(sid)
-                                r_t = self.client.place_limit_order(self.market, "sell", s_rem_q, max(b1 + self.tick_size, plus1_p))
+                                r_t = self.client.place_limit_order(self.market, "sell", s_rem_q, target_decay_p)
                                 s_item["id"] = r_t.get("id")
-                                s_item["p"] = float(r_t.get("price", max(b1 + self.tick_size, plus1_p)))
+                                s_item["p"] = float(r_t.get("price", target_decay_p))
                                 s_item["q"] = float(r_t.get("origin_amount", s_rem_q))
-                                print(f"  🎯 [DYNAMIC TARGET -> +1t] Слот #{idx_s+3} подтянут к ${s_item['p']:.2f} (p_exh={self.last_p_exhaust:.0%}, p_adv={self.last_p_adverse:.0%})")
+                                decay_tag = "TIME-DECAY 15m" if s_age >= 900.0 else ("TIME-DECAY 7.5m" if s_age >= 450.0 else "DYNAMIC TARGET")
+                                print(f"  🎯 [{decay_tag} -> ${s_item['p']:.2f}] Слот #{idx_s+3} (age={s_age:.0f}s, p_exh={getattr(self, 'last_p_exhaust', 0):.0%})")
                             except Exception:
                                 pass
                         rem_extra.append(s_item)
@@ -963,10 +998,20 @@ class LiveTriadRLTrader:
             print(f"  ⚠️ [BALANCE SYNC WARN] {e}")
 
     def compute_obs_and_mask(self, X_seq_2d: np.ndarray, row_df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+        # Параллельный инференс всех 6 горизонтов (H=5, 12, 25, 60, 90, 120) в пуле потоков
+        all_routers = [self.routers[0][2], self.routers[1][2], self.routers[2][2], self.router_60]
+        if getattr(self, "router_90", None) is not None:
+            all_routers.append(self.router_90)
+        if getattr(self, "router_120", None) is not None:
+            all_routers.append(self.router_120)
+
+        futs = [self._triad_pool.submit(r.predict_live_tick, X_seq_2d, row_df) for r in all_routers]
+        res_map = [f.result() for f in futs]
+
         triad_vec = []
         triad_probs = []
-        for h, name, router in self.routers:
-            res = router.predict_live_tick(X_seq_2d, row_df)
+        for i in range(3):
+            res = res_map[i]
             p = res["probs"]
             triad_probs.append(np.asarray(p, dtype=np.float32))
             ez = float(res["expected_z"])
@@ -976,7 +1021,8 @@ class LiveTriadRLTrader:
             p_tn = float(p[0] + p[1])
             triad_vec.extend([ez, p_up, p_down, p_tp, p_tn, float(res["entropy"])])
         self.last_triad_probs = triad_probs
-        res60 = self.router_60.predict_live_tick(X_seq_2d, row_df)
+
+        res60 = res_map[3]
         self.last_ez60 = float(res60["expected_z"])
         self.last_p60 = np.asarray(res60["probs"], dtype=np.float32)
         p60 = self.last_p60
@@ -988,12 +1034,12 @@ class LiveTriadRLTrader:
             float(p60[0] + p60[1]),
             float(res60["entropy"]),
         ]
+        curr_idx = 4
         if getattr(self, "router_90", None) is not None:
-            res90 = self.router_90.predict_live_tick(X_seq_2d, row_df)
-            self.last_ez90 = float(res90["expected_z"])
+            self.last_ez90 = float(res_map[curr_idx]["expected_z"])
+            curr_idx += 1
         if getattr(self, "router_120", None) is not None:
-            res120 = self.router_120.predict_live_tick(X_seq_2d, row_df)
-            self.last_ez120 = float(res120["expected_z"])
+            self.last_ez120 = float(res_map[curr_idx]["expected_z"])
 
         r = row_df.iloc[-1]
         tol = self.tick_size * 0.25
@@ -1194,16 +1240,18 @@ class LiveTriadRLTrader:
         tot_eq_now = max(1.0, self.bot_cash_usd + self.pos_qty * b1)
         underwater_now = ((self.avg_entry - b1) / self.tick_size) if (self.pos_qty >= 1.95 and self.avg_entry > 0.0) else 0.0
         min_open_px = min([self.avg_entry] + [float(s.get("entry_px", self.avg_entry)) for s in getattr(self, "extra_slots", []) if float(s.get("entry_px", 0.0)) > 0]) if (self.pos_qty >= 1.95 and self.avg_entry > 0.0) else 0.0
+        spread_t_now = (a1 - b1) / max(self.tick_size, 1e-6)
+        dyn_dip_step = max(self.tick_size, round(min(3.0, 0.5 * spread_t_now)) * self.tick_size)
         dt_since_buy = time.time() - float(getattr(self, "last_buy_fill_ts", 0.0))
         slot_spacing_ok = bool(
             self.active_bid_id is not None
             or (
                 dt_since_buy >= 25.0
-                and float(getattr(self, "last_p_adverse", 0.0)) < 0.52
+                and float(getattr(self, "last_p_adverse", 0.0)) < 0.42
                 and len(getattr(self, "extra_slots", [])) < 8
                 and (
-                    b1 <= min_open_px - self.tick_size + tol
-                    or (dt_since_buy >= 150.0 and pos_3600 <= 0.48 and b1_q >= 3500.0 and float(getattr(self, "last_p_adverse", 0.0)) < 0.40)
+                    b1 <= min_open_px - dyn_dip_step + tol
+                    or (dt_since_buy >= 150.0 and pos_3600 <= 0.48 and b1_q >= 3500.0 and float(getattr(self, "last_p_adverse", 0.0)) < 0.35)
                 )
             )
         )
@@ -1536,6 +1584,30 @@ class LiveTriadRLTrader:
 
     def execute_live_action(self, act: int, b1: float, a1: float):
         self.last_exec_act = int(act)
+
+        # Orderflow Imbalance Micro-Stop: отсечение хвостовых просадок при устойчивом прессинге
+        underwater_ticks = ((self.avg_entry - b1) / self.tick_size) if (self.pos_qty >= 2.0 and self.avg_entry > 0) else 0.0
+        if self.pos_qty >= 2.0 and underwater_ticks >= 2.5:
+            b3_vol = float(getattr(self, "last_b1_q", 0.0)) + float(getattr(self, "last_b2_q", 0.0)) + float(getattr(self, "last_b3_q", 0.0))
+            a3_vol = float(getattr(self, "last_a1_q", 0.0)) + float(getattr(self, "last_a2_q", 0.0)) + float(getattr(self, "last_a3_q", 0.0))
+            imb3 = (b3_vol - a3_vol) / max(1.0, b3_vol + a3_vol)
+            p_adv_curr = float(getattr(self, "last_p_adverse", 0.0))
+            if imb3 <= -0.45 and p_adv_curr >= 0.52:
+                self.adverse_streak = getattr(self, "adverse_streak", 0) + 1
+            else:
+                self.adverse_streak = max(0, getattr(self, "adverse_streak", 0) - 1)
+            if self.adverse_streak >= 35:
+                cut_q = math.floor((self.pos_qty * 0.40) * 10000.0) / 10000.0
+                if cut_q >= 2.0:
+                    try:
+                        print(f"  🚨 [ORDERFLOW MICRO-STOP CUT] Сброс {cut_q:.4f} PRL по ${b1:.2f} (imb3={imb3:.2f}, p_adv={p_adv_curr:.0%}, streak={self.adverse_streak}s)")
+                        self.client.place_limit_order(self.market, "sell", cut_q, b1)
+                        self.adverse_streak = 0
+                        self.sync_account_balances(b1)
+                    except Exception as e_cut:
+                        print(f"  ⚠️ [ORDERFLOW CUT ERROR]: {e_cut}")
+        else:
+            self.adverse_streak = 0
         if self.mode != "live":
             return
         tol = self.tick_size * 0.25
@@ -1653,13 +1725,14 @@ class LiveTriadRLTrader:
         if act in (1, 2) and can_buy_more:
             a1_q_cur = float(getattr(self, "last_a1_q", self.last_q_a1))
             b1_q_cur = float(getattr(self, "last_b1_q", 0.0))
+            b1_dom = b1_q_cur / max(1.0, b1_q_cur + a1_q_cur)
             ez60_cur = float(getattr(self, "last_ez60", self.last_ez25))
             was_loss_exit = float(getattr(self, "cooldown_until_ts", 0.0)) >= float(getattr(self, "last_exit_ts", 0.0)) + 25.0
             in_post_loss_window = was_loss_exit and float(getattr(self, "last_exit_ts", 0.0)) > 0.0 and (now_ts - float(self.last_exit_ts)) <= 2700.0
-            macro_step_in_ok = not in_post_loss_window and not (ez60_cur < 0.0 and self.last_dd900 >= 2.0 and b1_q_cur < 8500.0)
+            macro_step_in_ok = not in_post_loss_window and not (ez60_cur < 0.0 and self.last_dd900 >= 2.0 and b1_dom < 0.60)
             step_in_l5_ok = (
                 self.last_imb5 >= 0.0
-                or b1_q_cur >= 8500.0
+                or b1_dom >= 0.60
                 or self.last_ez12 >= 0.90
                 or (23.5 <= rng144_w <= 25.5 and self.last_dd900 == 1.0 and self.last_imb5 >= -0.10)
                 or (18.5 <= rng144_w <= 19.5 and self.last_dd900 >= 11.0 and self.last_pos3600 <= 0.05)
@@ -1668,7 +1741,7 @@ class LiveTriadRLTrader:
                 (a1 - b1) >= 1.8 * self.tick_size
                 and self.last_pos3600 > 0.62
                 and self.last_dd300 < 1.0
-                and b1_q_cur < 4500.0
+                and b1_dom < 0.42
                 and not getattr(self, "last_in_breakout", False)
             )
             step_in = (
@@ -1678,17 +1751,26 @@ class LiveTriadRLTrader:
                 and float(getattr(self, "last_p_adverse", 0.0)) < 0.45
                 and macro_step_in_ok
                 and step_in_l5_ok
-                and ((a1_q_cur <= 5000.0 and self.last_inertia >= 0.35) or wide_scalp_ok or float(getattr(self, "last_p_ask_sweep", 0.0)) >= 0.72)
+                and ((b1_dom >= 0.40 and self.last_inertia >= 0.35) or wide_scalp_ok or float(getattr(self, "last_p_ask_sweep", 0.0)) >= 0.72)
             )
             target_p = round(((b1 + self.tick_size if step_in else b1) if act == 1 else max(self.tick_size, b1 - self.tick_size)) / self.tick_size) * self.tick_size
             if self.pos_qty >= 1.95 and self.avg_entry > 0.0:
                 min_open_px = min([self.avg_entry] + [float(s.get("entry_px", self.avg_entry)) for s in getattr(self, "extra_slots", []) if float(s.get("entry_px", 0.0)) > 0])
                 if (time.time() - float(getattr(self, "last_buy_fill_ts", 0.0))) < 150.0 or self.last_pos3600 > 0.48:
                     target_p = min(target_p, round((min_open_px - self.tick_size) / self.tick_size) * self.tick_size)
-            if in_post_loss_window and self.last_exit_price > 0.0 and target_p > self.last_exit_price + tol and not (getattr(self, "last_in_breakout", False) or (b1_q_cur >= 8500.0 and ez60_cur >= 0.25 and self.last_ez25 >= 0.45)):
+            if in_post_loss_window and self.last_exit_price > 0.0 and target_p > self.last_exit_price + tol and not (getattr(self, "last_in_breakout", False) or (b1_dom >= 0.60 and ez60_cur >= 0.25 and self.last_ez25 >= 0.45)):
                 target_p = min(target_p, b1)
                 if target_p > self.last_exit_price + tol:
                     target_p = round(max(self.tick_size, b1 - self.tick_size) / self.tick_size) * self.tick_size
+            if self.active_bid_id is not None and float(getattr(self, "last_p_frontrun", 0.0)) >= 0.70 and float(getattr(self, "last_p_adverse", 0.0)) >= 0.45:
+                try:
+                    self.client.cancel_order(self.active_bid_id)
+                    print(f"  🛡️ [PREVENTIVE FRONT-RUN CANCEL] id={self.active_bid_id} (p_fr={self.last_p_frontrun:.0%}, p_adv={self.last_p_adverse:.0%})")
+                except Exception:
+                    pass
+                self.sync_live_orders(b1)
+                self.active_bid_id, self.active_bid_p, self.active_bid_q = None, 0.0, 0.0
+                return
             if self.active_bid_id is not None and abs(self.active_bid_p - target_p) <= tol:
                 self.last_exec_act = 0
                 return
@@ -2240,6 +2322,31 @@ class LiveTriadRLTrader:
                 print(f"  ⚠️ [ORDER SELL ERROR] qty={sell_qty:.4f} @ ${target_p:.2f}: {e}")
                 self.sync_account_balances(b1)
 
+        # Автономная Idle-Cash микрокарусель на свободном кэше в режиме HOLD_WAIT
+        if self.pos_qty < 1.95 and self.active_bid_id is None and self.active_ask_id is None and act in (0, 2):
+            if self.bot_cash_usd >= 15.0 and (now_ts - float(getattr(self, "_last_idle_car_ts", 0.0))) >= 45.0:
+                fh = getattr(self, "_flow_history", [])
+                vol_flow_now = float(sum((x[2] + x[3]) for x in fh[-5:])) if fh else 0.0
+                p50_c = float(self.last_car_probs[1]) if hasattr(self, "last_car_probs") else 0.5
+                p_fill_c = float(getattr(self, "last_p_fill_real", 0.5))
+                p_fr_c = float(getattr(self, "last_p_frontrun", 0.2))
+                q_cap_c = float(getattr(self, "last_car_cap_prl", 120.0))
+                dd900_c = float(getattr(self, "last_dd900", 0.0))
+                if p50_c >= 0.58 and p_fill_c >= 0.22 and p_fr_c < 0.65 and q_cap_c >= 25.0 and dd900_c <= 1.8 and vol_flow_now >= 10.0:
+                    c_usd = min(35.0, self.bot_cash_usd * 0.10)
+                    c_qty = math.floor((c_usd / b1) * 10000.0) / 10000.0
+                    if c_qty >= 2.0:
+                        try:
+                            r_c = self.client.place_limit_order(self.market, "buy", c_qty, b1)
+                            self.active_bid_id = r_c.get("id")
+                            self.active_bid_p = float(r_c.get("price", b1))
+                            self.active_bid_q = float(r_c.get("origin_amount", c_qty))
+                            self._last_idle_car_ts = now_ts
+                            self._save_wallet()
+                            print(f"  🎠 [IDLE-CASH CAROUSEL BUY] id={self.active_bid_id} | {self.active_bid_q:.4f} PRL @ ${self.active_bid_p:.2f} (flow={vol_flow_now:.0f}, p_fill={p_fill_c:.0%})")
+                        except Exception as e_car:
+                            pass
+
     def subsecond_guardian_step(self, streamer, rest_depth: dict = None):
         """
         Внутрисекундный Сторож Очереди и Контур Исполнения ~2.8 Гц (+350 мс и +680 мс между тиками):
@@ -2671,11 +2778,11 @@ def start_live_daemon(budget_usd: float = 54.0, order_usd: float = 54.0, steps: 
         env_local = BASE_DIR / ".env"
         if env_local.exists():
             sftp.put(str(env_local), "/opt/crypto_bot/.env")
-        for mod_name in ("system_resources.py", "live_rl_trader.py", "live_feature_updater.py", "microstructure_features.py", "swarm_router.py", "fast_neural_engine.py", "train_rl_execution.py", "rl_gpu_population.py", "carousel_net.py", "hazard_net.py"):
+        for mod_name in ("system_resources.py", "live_rl_trader.py", "live_feature_updater.py", "microstructure_features.py", "swarm_router.py", "fast_neural_engine.py", "train_rl_execution.py", "rl_gpu_population.py", "carousel_net.py", "hazard_net.py", "execution_realism_net.py", "multi_slot_benchmark.py"):
             loc_mod = BASE_DIR / "_tools" / mod_name
             if loc_mod.exists():
                 sftp.put(str(loc_mod), f"/opt/crypto_bot/_tools/{mod_name}")
-        for pt_name in ("best_maskable_ppo.pt", "carousel_net.pt", "hazard_net.pt"):
+        for pt_name in ("best_maskable_ppo.pt", "carousel_net.pt", "hazard_net.pt", "execution_realism_net.pt"):
             pt_local = BASE_DIR / "models" / "prl" / "rl_execution" / pt_name
             if pt_local.exists():
                 sftp.put(str(pt_local), f"/opt/crypto_bot/models/prl/rl_execution/{pt_name}")

@@ -711,20 +711,40 @@ def train_pytorch_window_fast(
     best_score = -1e9
     best_m = None
     best_sd = None
+    prev_runs = 0
+    if out_keras.exists() and out_meta.exists():
+        try:
+            old_meta = json.loads(out_meta.read_text())
+            old_m = old_meta.get("metrics_oos", {})
+            if old_m:
+                ic0 = float(old_m.get("ic_dt_ticks", 0.0))
+                auc0 = float(old_m.get("roc_auc_ovr", 0.5))
+                ll0 = float(old_m.get("log_loss", 1.95))
+                best_score = ic0 + 0.15 * (auc0 - 0.5) - 0.03 * max(0.0, ll0 - 1.35)
+                best_m = old_m
+                prev_runs = int(old_meta.get("runs", 3))
+        except Exception:
+            pass
 
-    for r_i in range(1, runs + 1):
+    start_r = (prev_runs + 1) if (0 < prev_runs < runs and best_m is not None) else 1
+    eff_bsz = 1024 if (sl >= 75 and arch in ("conv1d+gru", "attention")) else batch_size
+    eval_bsz = 2048 if (sl >= 75 and arch in ("conv1d+gru", "attention")) else 4096
+    max_chunks = 20 if (sl >= 75 and arch in ("conv1d+gru", "attention")) else 72
+    chunk_starts = list(range(0, n_tr, eff_bsz))
+
+    for r_i in range(start_r, runs + 1):
         t0 = time.perf_counter()
         torch.manual_seed(1000 * win_idx + 37 * r_i)
         net = _TrainableKerasGraph(tpl_keras, arch).to(dev)
         opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-4)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr * 0.1)
 
-        chunk_starts = list(range(0, n_tr, batch_size))
         for _ in range(epochs):
             net.train()
-            for c_idx in torch.randperm(len(chunk_starts)).tolist():
+            perm = torch.randperm(len(chunk_starts)).tolist()[:max_chunks]
+            for c_idx in perm:
                 s_i = chunk_starts[c_idx]
-                e_i = min(n_tr, s_i + batch_size)
+                e_i = min(n_tr, s_i + eff_bsz)
                 logits = net.forward_logits_chunk(x_tr_pad, s_i, e_i, sl)
                 loss = F.cross_entropy(logits, y_tr_t[s_i:e_i], weight=cw_t)
                 opt.zero_grad(); loss.backward()
@@ -735,8 +755,8 @@ def train_pytorch_window_fast(
         net.eval()
         probs_list = []
         with torch.no_grad():
-            for s_i in range(0, n_te, 4096):
-                e_i = min(n_te, s_i + 4096)
+            for s_i in range(0, n_te, eval_bsz):
+                e_i = min(n_te, s_i + eval_bsz)
                 p_b = F.softmax(net.forward_logits_chunk(x_te_pad, s_i, e_i, sl), dim=-1)
                 probs_list.append(p_b.cpu().numpy())
         probs = np.clip(np.vstack(probs_list), 1e-7, 1.0 - 1e-7)
@@ -754,21 +774,19 @@ def train_pytorch_window_fast(
         if score > best_score:
             best_score = score
             best_m = {"ic_dt_ticks": round(ic, 4), "roc_auc_ovr": round(auc, 4), "log_loss": round(ll, 4), "top2pct_mean_ticks": round(top2, 2)}
-            best_sd = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
+            net.export_to_keras(out_keras)
+        meta = {
+            "window_id": win_tag, "model_type": arch, "coin": "PRL", "H": int(horizon), "seq_len": sl,
+            "runs": int(r_i),
+            "train_ts_range": [str(ts_tr[0])[:19], str(ts_tr[-1])[:19]],
+            "test_ts_range": [str(ts_te[0])[:19], str(ts_te[-1])[:19]],
+            "metrics_oos": best_m,
+            "feature_norm": {"mean": mean.tolist(), "std": std.tolist()},
+            "weights_file": f"model_{win_tag}.keras",
+        }
+        with open(out_meta, "w") as f:
+            json.dump(meta, f, indent=2)
         print(f"  [{arch.upper()} H={horizon}s {win_tag} r{r_i:02d}/{runs}] ({time.perf_counter()-t0:.1f}s) -> IC={ic:+.4f} | AUC={auc:.4f} | Loss={ll:.4f} | Top2%={top2:+.2f}t", flush=True)
-
-    net.load_state_dict(best_sd)
-    net.export_to_keras(out_keras)
-    meta = {
-        "window_id": win_tag, "model_type": arch, "coin": "PRL", "H": int(horizon), "seq_len": sl,
-        "train_ts_range": [str(ts_tr[0])[:19], str(ts_tr[-1])[:19]],
-        "test_ts_range": [str(ts_te[0])[:19], str(ts_te[-1])[:19]],
-        "metrics_oos": best_m,
-        "feature_norm": {"mean": mean.tolist(), "std": std.tolist()},
-        "weights_file": f"model_{win_tag}.keras",
-    }
-    with open(out_meta, "w") as f:
-        json.dump(meta, f, indent=2)
     del x_tr_pad, x_te_pad, y_tr_t, net
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

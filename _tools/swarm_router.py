@@ -554,7 +554,7 @@ class SwarmRegimeRouter:
 
         all_probs = np.zeros((self.num_models, 7), dtype=np.float32)
         for i, booster in enumerate(self.models):
-            if weights[i] < 0.002 and i != self.latest_idx:
+            if weights[i] < 0.005 and i != self.latest_idx:
                 continue
             raw_p = booster.predict(x_last, num_threads=1)[0]
             all_probs[i, :min(7, len(raw_p))] = raw_p[:7]
@@ -571,13 +571,13 @@ class SwarmRegimeRouter:
             nn_probs_num = np.zeros(7, dtype=np.float32)
             nn_w_sum = 0.0
             norm_cache = {}
-            active_win_set = set(int(x) for x in np.argsort(weights)[-12:]) | {self.latest_idx}
+            active_win_set = set(int(x) for x in np.argsort(weights)[-8:]) | {self.latest_idx}
             for idx_e, exp in enumerate(self.neural_experts):
                 w_idx = min(exp.get("win_idx", 0), len(weights) - 1)
                 if w_idx not in active_win_set:
                     continue
                 reg_w = float(weights[w_idx])
-                if reg_w < 0.004:
+                if reg_w < 0.006:
                     continue
                 if exp.get("fast_model") is None:
                     exp["fast_model"] = FastKerasModel(exp["k_file"], exp["base_arch"])

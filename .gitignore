@@ -26,3 +26,4 @@ __pycache__/
 trained_models/
 prl_ensemble_pack_*/
 prl_ensemble_pack_*.zip
+scratch/
