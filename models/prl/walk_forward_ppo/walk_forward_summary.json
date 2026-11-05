@@ -1,0 +1,187 @@
+{
+  "total_time_hours": 0.49095779173904,
+  "total_oos_pnl_usd": 13.362330734729767,
+  "total_trades": 312,
+  "folds": [
+    {
+      "fold": 1,
+      "train_hours": 120.0,
+      "oos_hours": 24.0,
+      "pnl_usd": 2.7987899780273438,
+      "trades": 4,
+      "maker_bid_pct": 0.0,
+      "elapsed_sec": 107.64875030517578
+    },
+    {
+      "fold": 2,
+      "train_hours": 120.0,
+      "oos_hours": 24.0,
+      "pnl_usd": -10.5144624710083,
+      "trades": 7,
+      "maker_bid_pct": 0.3356559179610639,
+      "elapsed_sec": 92.54741477966309
+    },
+    {
+      "fold": 3,
+      "train_hours": 120.0,
+      "oos_hours": 24.0,
+      "pnl_usd": 11.429421424865723,
+      "trades": 24,
+      "maker_bid_pct": 2.7813143822773676,
+      "elapsed_sec": 92.63918209075928
+    },
+    {
+      "fold": 4,
+      "train_hours": 120.0,
+      "oos_hours": 24.0,
+      "pnl_usd": 2.0151052474975586,
+      "trades": 3,
+      "maker_bid_pct": 0.2430611819718049,
+      "elapsed_sec": 87.953617811203
+    },
+    {
+      "fold": 5,
+      "train_hours": 120.0,
+      "oos_hours": 24.0,
+      "pnl_usd": 7.73237419128418,
+      "trades": 1,
+      "maker_bid_pct": 0.0,
+      "elapsed_sec": 84.43021082878113
+    },
+    {
+      "fold": 6,
+      "train_hours": 120.0,
+      "oos_hours": 24.0,
+      "pnl_usd": 11.45140552520752,
+      "trades": 11,
+      "maker_bid_pct": 0.006944605199194426,
+      "elapsed_sec": 85.50658226013184
+    },
+    {
+      "fold": 7,
+      "train_hours": 120.0,
+      "oos_hours": 24.0,
+      "pnl_usd": 10.065638542175293,
+      "trades": 33,
+      "maker_bid_pct": 0.026620986596911964,
+      "elapsed_sec": 87.68812942504883
+    },
+    {
+      "fold": 8,
+      "train_hours": 120.0,
+      "oos_hours": 24.0,
+      "pnl_usd": -1.7657934427261353,
+      "trades": 29,
+      "maker_bid_pct": 0.10532651218778212,
+      "elapsed_sec": 87.27130651473999
+    },
+    {
+      "fold": 9,
+      "train_hours": 120.0,
+      "oos_hours": 24.0,
+      "pnl_usd": -8.058438301086426,
+      "trades": 24,
+      "maker_bid_pct": 1.5636936040186116,
+      "elapsed_sec": 86.52713060379028
+    },
+    {
+      "fold": 10,
+      "train_hours": 120.0,
+      "oos_hours": 24.0,
+      "pnl_usd": 3.9724719524383545,
+      "trades": 21,
+      "maker_bid_pct": 0.1759299983795921,
+      "elapsed_sec": 87.71051836013794
+    },
+    {
+      "fold": 11,
+      "train_hours": 120.0,
+      "oos_hours": 24.0,
+      "pnl_usd": -2.0373406410217285,
+      "trades": 15,
+      "maker_bid_pct": 0.02430611819718049,
+      "elapsed_sec": 87.62502431869507
+    },
+    {
+      "fold": 12,
+      "train_hours": 120.0,
+      "oos_hours": 24.0,
+      "pnl_usd": -4.621843338012695,
+      "trades": 13,
+      "maker_bid_pct": 0.006944605199194426,
+      "elapsed_sec": 87.15064072608948
+    },
+    {
+      "fold": 13,
+      "train_hours": 120.0,
+      "oos_hours": 24.0,
+      "pnl_usd": -3.398793935775757,
+      "trades": 13,
+      "maker_bid_pct": 0.15162388018241163,
+      "elapsed_sec": 84.70164942741394
+    },
+    {
+      "fold": 14,
+      "train_hours": 120.0,
+      "oos_hours": 24.0,
+      "pnl_usd": 0.8980051279067993,
+      "trades": 18,
+      "maker_bid_pct": 0.006944605199194426,
+      "elapsed_sec": 85.9883599281311
+    },
+    {
+      "fold": 15,
+      "train_hours": 120.0,
+      "oos_hours": 24.0,
+      "pnl_usd": -0.8262394666671753,
+      "trades": 14,
+      "maker_bid_pct": 0.17014282738026343,
+      "elapsed_sec": 86.17816400527954
+    },
+    {
+      "fold": 16,
+      "train_hours": 120.0,
+      "oos_hours": 24.0,
+      "pnl_usd": 4.269998073577881,
+      "trades": 34,
+      "maker_bid_pct": 0.028935854996643442,
+      "elapsed_sec": 85.33883428573608
+    },
+    {
+      "fold": 17,
+      "train_hours": 120.0,
+      "oos_hours": 24.0,
+      "pnl_usd": -0.8961824774742126,
+      "trades": 12,
+      "maker_bid_pct": 0.0023148683997314752,
+      "elapsed_sec": 87.92419600486755
+    },
+    {
+      "fold": 18,
+      "train_hours": 120.0,
+      "oos_hours": 24.0,
+      "pnl_usd": -6.126181602478027,
+      "trades": 20,
+      "maker_bid_pct": 0.018518947197851802,
+      "elapsed_sec": 88.36377143859863
+    },
+    {
+      "fold": 19,
+      "train_hours": 120.0,
+      "oos_hours": 24.0,
+      "pnl_usd": -0.752102255821228,
+      "trades": 5,
+      "maker_bid_pct": 0.5497812449362254,
+      "elapsed_sec": 86.63376116752625
+    },
+    {
+      "fold": 20,
+      "train_hours": 120.0,
+      "oos_hours": 24.0,
+      "pnl_usd": -2.273501396179199,
+      "trades": 11,
+      "maker_bid_pct": 0.9132155836940671,
+      "elapsed_sec": 87.51239824295044
+    }
+  ]
+}
