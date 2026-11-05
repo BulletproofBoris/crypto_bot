@@ -1,0 +1,206 @@
+{
+  "total_folds": 20,
+  "total_net_pnl": -16.43475066218525,
+  "folds": [
+    {
+      "fold": 1,
+      "train_hours": 120,
+      "test_hours": 24,
+      "net_pnl": -0.09579086303710938,
+      "cumulative_pnl": -0.09579086303710938,
+      "trades": 38,
+      "winrate_pct": 55.0,
+      "maker_bid_pct": 60.857638888888886
+    },
+    {
+      "fold": 2,
+      "train_hours": 120,
+      "test_hours": 24,
+      "net_pnl": -0.4689072072505951,
+      "cumulative_pnl": -0.5646980702877045,
+      "trades": 127,
+      "winrate_pct": 55.0,
+      "maker_bid_pct": 50.24305555555556
+    },
+    {
+      "fold": 3,
+      "train_hours": 120,
+      "test_hours": 24,
+      "net_pnl": -4.842910289764404,
+      "cumulative_pnl": -5.407608360052109,
+      "trades": 214,
+      "winrate_pct": 55.0,
+      "maker_bid_pct": 47.06597222222222
+    },
+    {
+      "fold": 4,
+      "train_hours": 120,
+      "test_hours": 24,
+      "net_pnl": -1.3836028575897217,
+      "cumulative_pnl": -6.7912112176418304,
+      "trades": 239,
+      "winrate_pct": 55.0,
+      "maker_bid_pct": 43.2349537037037
+    },
+    {
+      "fold": 5,
+      "train_hours": 120,
+      "test_hours": 24,
+      "net_pnl": -0.25069570541381836,
+      "cumulative_pnl": -7.041906923055649,
+      "trades": 158,
+      "winrate_pct": 55.0,
+      "maker_bid_pct": 48.68518518518519
+    },
+    {
+      "fold": 6,
+      "train_hours": 120,
+      "test_hours": 24,
+      "net_pnl": -0.014784097671508789,
+      "cumulative_pnl": -7.056691020727158,
+      "trades": 157,
+      "winrate_pct": 55.0,
+      "maker_bid_pct": 4.744212962962964
+    },
+    {
+      "fold": 7,
+      "train_hours": 120,
+      "test_hours": 24,
+      "net_pnl": -0.05876724049448967,
+      "cumulative_pnl": -7.115458261221647,
+      "trades": 204,
+      "winrate_pct": 55.0,
+      "maker_bid_pct": 4.859953703703704
+    },
+    {
+      "fold": 8,
+      "train_hours": 120,
+      "test_hours": 24,
+      "net_pnl": -3.242858648300171,
+      "cumulative_pnl": -10.358316909521818,
+      "trades": 405,
+      "winrate_pct": 55.0,
+      "maker_bid_pct": 32.94097222222222
+    },
+    {
+      "fold": 9,
+      "train_hours": 120,
+      "test_hours": 24,
+      "net_pnl": 0.2621881365776062,
+      "cumulative_pnl": -10.096128772944212,
+      "trades": 257,
+      "winrate_pct": 55.0,
+      "maker_bid_pct": 10.024305555555555
+    },
+    {
+      "fold": 10,
+      "train_hours": 120,
+      "test_hours": 24,
+      "net_pnl": 0.1763172149658203,
+      "cumulative_pnl": -9.919811557978392,
+      "trades": 200,
+      "winrate_pct": 55.0,
+      "maker_bid_pct": 24.381944444444446
+    },
+    {
+      "fold": 11,
+      "train_hours": 120,
+      "test_hours": 24,
+      "net_pnl": -0.8094691634178162,
+      "cumulative_pnl": -10.729280721396208,
+      "trades": 223,
+      "winrate_pct": 55.0,
+      "maker_bid_pct": 21.62847222222222
+    },
+    {
+      "fold": 12,
+      "train_hours": 120,
+      "test_hours": 24,
+      "net_pnl": 0.2305716723203659,
+      "cumulative_pnl": -10.498709049075842,
+      "trades": 180,
+      "winrate_pct": 55.0,
+      "maker_bid_pct": 10.986111111111112
+    },
+    {
+      "fold": 13,
+      "train_hours": 120,
+      "test_hours": 24,
+      "net_pnl": 0.22573821246623993,
+      "cumulative_pnl": -10.272970836609602,
+      "trades": 142,
+      "winrate_pct": 55.0,
+      "maker_bid_pct": 6.587962962962964
+    },
+    {
+      "fold": 14,
+      "train_hours": 120,
+      "test_hours": 24,
+      "net_pnl": 0.18659767508506775,
+      "cumulative_pnl": -10.086373161524534,
+      "trades": 140,
+      "winrate_pct": 55.0,
+      "maker_bid_pct": 7.885416666666667
+    },
+    {
+      "fold": 15,
+      "train_hours": 120,
+      "test_hours": 24,
+      "net_pnl": 0.5071389675140381,
+      "cumulative_pnl": -9.579234194010496,
+      "trades": 313,
+      "winrate_pct": 55.0,
+      "maker_bid_pct": 5.596064814814815
+    },
+    {
+      "fold": 16,
+      "train_hours": 120,
+      "test_hours": 24,
+      "net_pnl": 0.8622618913650513,
+      "cumulative_pnl": -8.716972302645445,
+      "trades": 454,
+      "winrate_pct": 55.0,
+      "maker_bid_pct": 3.795138888888889
+    },
+    {
+      "fold": 17,
+      "train_hours": 120,
+      "test_hours": 24,
+      "net_pnl": -8.214628219604492,
+      "cumulative_pnl": -16.931600522249937,
+      "trades": 381,
+      "winrate_pct": 55.0,
+      "maker_bid_pct": 52.00810185185185
+    },
+    {
+      "fold": 18,
+      "train_hours": 120,
+      "test_hours": 24,
+      "net_pnl": 0.3666191101074219,
+      "cumulative_pnl": -16.564981412142515,
+      "trades": 158,
+      "winrate_pct": 55.0,
+      "maker_bid_pct": 1.8854166666666667
+    },
+    {
+      "fold": 19,
+      "train_hours": 120,
+      "test_hours": 24,
+      "net_pnl": 0.010603825561702251,
+      "cumulative_pnl": -16.554377586580813,
+      "trades": 94,
+      "winrate_pct": 55.0,
+      "maker_bid_pct": 39.133101851851855
+    },
+    {
+      "fold": 20,
+      "train_hours": 120,
+      "test_hours": 24,
+      "net_pnl": 0.11962692439556122,
+      "cumulative_pnl": -16.43475066218525,
+      "trades": 107,
+      "winrate_pct": 55.0,
+      "maker_bid_pct": 9.525462962962964
+    }
+  ]
+}
