@@ -129,14 +129,17 @@ class SafeTradePrivateClient:
         row["obs_json"] = json.dumps(rec["obs"], separators=(",", ":"))
         row["mask_json"] = json.dumps([int(x) for x in rec["mask"]], separators=(",", ":"))
         if not self.use_vps_bridge:
-            tel_path = Path("/opt/crypto_bot/data/realtime/prlusdt/rl_telemetry.csv")
-            tel_path.parent.mkdir(parents=True, exist_ok=True)
-            need_hdr = not tel_path.exists() or tel_path.stat().st_size == 0
-            with open(tel_path, "a", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                if need_hdr:
-                    w.writerow(cols)
-                w.writerow([row.get(c, "") for c in cols])
+            try:
+                tel_path = Path("/opt/crypto_bot/data/realtime/prlusdt/rl_telemetry.csv")
+                tel_path.parent.mkdir(parents=True, exist_ok=True)
+                need_hdr = not tel_path.exists() or tel_path.stat().st_size == 0
+                with open(tel_path, "a", newline="", encoding="utf-8") as f:
+                    w = csv.writer(f)
+                    if need_hdr:
+                        w.writerow(cols)
+                    w.writerow([row.get(c, "") for c in cols])
+            except OSError:
+                pass
             return
         try:
             self._bridge_in.write(json.dumps({"method": "TELEMETRY", "body": row}) + "\n")
@@ -316,10 +319,13 @@ class LiveTriadRLTrader:
         from _tools.hazard_net import HazardPredictor
         from _tools.execution_realism_net import ExecutionRealismPredictor
         from _tools.microstructure_regime_gate import RegimeGatePredictor, REGIME_GATE_MODEL_PATH
+        from _tools.multi_horizon_guard_net import MultiHorizonGuardPredictor, GUARD_ENSEMBLE_DIR
         self.carousel_net = CarouselPredictor(BASE_DIR / "models" / self.coin / "rl_execution" / "carousel_net.pt")
         self.hazard_net = HazardPredictor(BASE_DIR / "models" / self.coin / "rl_execution" / "hazard_net.pt")
         self.realism_net = ExecutionRealismPredictor(BASE_DIR / "models" / self.coin / "rl_execution" / "execution_realism_net.pt")
         self.regime_gate = RegimeGatePredictor(REGIME_GATE_MODEL_PATH)
+        self.guard_predictor = MultiHorizonGuardPredictor(GUARD_ENSEMBLE_DIR)
+        self.last_guard_probs = np.array([0.05, 0.05, 0.02, 0.05], dtype=np.float32)
         self.last_regime_probs = np.array([0.9, 0.05, 0.0, 0.05], dtype=np.float32)
         self.last_car_probs = np.full(5, 0.5, dtype=np.float32)
         self.last_car_cap_prl = 120.0
@@ -1473,7 +1479,35 @@ class LiveTriadRLTrader:
         is_break_zone = (p_brk >= 0.42) and (p_tox < 0.35)
         is_toxic_block = (p_tox >= 0.50) or (self.last_p_adverse >= 0.65)
 
-        in_dip_zone = (in_dip_zone or in_breakout_zone or is_accum_zone or is_break_zone) and not is_toxic_block
+        # Вычисление роя нейро-ограничителей (Guard Ensemble: sweep12, bleed60, crash300, exit30)
+        b1_p = float(b1)
+        a1_p = float(a1)
+        sp_t = max(1.0, (a1_p - b1_p) / self.tick_size)
+        sp_pct = (a1_p - b1_p) / max(b1_p, 1e-4) * 100.0
+        v_buy = float(getattr(self, "last_buy_vol", 0.0))
+        v_sell = float(getattr(self, "last_sell_vol", 0.0))
+        f20 = np.array([
+            sp_t, sp_pct,
+            np.log1p(b1_q), np.log1p(a1_q),
+            (b1_q - a1_q) / max(1.0, b1_q + a1_q),
+            float(vel_10), float(vel_3), float(vel_180),
+            float(dd_300), float(pos_3600), float(rng_14400),
+            float(inertia),
+            np.log1p(v_buy), np.log1p(v_sell),
+            (v_buy - v_sell) / max(1.0, v_buy + v_sell),
+            ez_5, ez_12, ez_25, ez_60, ez_90,
+        ], dtype=np.float32)
+        guard_p = self.guard_predictor.predict_single(f20)
+        self.last_guard_probs = guard_p
+        p_sw12, p_bl60, p_cr300, p_ex30 = float(guard_p[0]), float(guard_p[1]), float(guard_p[2]), float(guard_p[3])
+
+        # Адаптивное снятие дискретного барьера:
+        # Если нет угрозы пролива (crash300 < 0.60) и сползания (bleed60 < 0.55),
+        # разрешаем мейкер-покупку даже при отсутствии отката dd_300!
+        danger_crash = (p_cr300 >= 0.60) or (p_bl60 >= 0.55)
+        safe_maker_flow = (not danger_crash) and (not is_toxic_block) and (self.last_p_adverse < 0.50)
+
+        in_dip_zone = (in_dip_zone or in_breakout_zone or is_accum_zone or is_break_zone or safe_maker_flow) and not is_toxic_block and not danger_crash
         self.last_can_buy_best = bool(in_dip_zone and (b1_dom >= 0.38) and (imb_l5 > -0.65))
 
         mask = np.zeros(7, dtype=bool)
@@ -1500,7 +1534,8 @@ class LiveTriadRLTrader:
             mask[0] = bool(has_ask)
             mask[3] = True
             mask[4] = True
-            if unr_ticks <= -2.0 or inertia < -0.25 or obs_err12_norm < -0.60:
+            threat_exit = (p_ex30 >= 0.65) or (p_cr300 >= 0.70)
+            if unr_ticks <= -2.0 or inertia < -0.25 or obs_err12_norm < -0.60 or threat_exit:
                 mask[6] = True
         return obs, mask
 
@@ -2582,8 +2617,10 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
         }
         last_row = streamer.step(depth, now_utc, own_orders=own_orders)
 
-        b1 = float(last_row["ST_best_bid"].iloc[0])
-        a1 = float(last_row["ST_best_ask"].iloc[0])
+        b1_col = "ST_best_bid" if "ST_best_bid" in last_row.columns else ("best_bid" if "best_bid" in last_row.columns else last_row.columns[0])
+        a1_col = "ST_best_ask" if "ST_best_ask" in last_row.columns else ("best_ask" if "best_ask" in last_row.columns else last_row.columns[1])
+        b1 = float(last_row[b1_col].iloc[0])
+        a1 = float(last_row[a1_col].iloc[0])
         if trader.pos_qty > 1e-4:
             trader.hold_sec += 1
             if b1 > 0:
@@ -2635,9 +2672,11 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
             reg_idx = int(np.argmax(getattr(trader, "last_regime_probs", [1, 0, 0, 0])))
             reg_tag = ["FLAT", "ACC", "BRK", "TOX"][reg_idx]
             reg_acc_p = float(getattr(trader, "last_regime_probs", [0, 0, 0, 0])[1])
+            gp = getattr(trader, "last_guard_probs", [0, 0, 0, 0])
+            g_tag = f"G=[Sw{gp[0]*100:.0f}%|Bl{gp[1]*100:.0f}%|Cr{gp[2]*100:.0f}%|Ex{gp[3]*100:.0f}%]"
             print(
                 f"  [{ts_msk_str} MSK | #{step_idx:04d}] Bid={b1:.2f} Ask={a1:.2f} | Act={trader.ACTION_NAMES[act]:<14} | "
-                f"V={v_pred:+.2f}t | Reg={reg_tag}({reg_acc_p:.0%}) Adv={trader.last_p_adverse:.0%} | "
+                f"V={v_pred:+.2f}t | Reg={reg_tag} {g_tag} Adv={trader.last_p_adverse:.0%} | "
                 f"Equity=${eq_usd:.2f} ({pnl_tot:+.2f}$) | {dt_ms:.1f} ms",
                 flush=True,
             )
