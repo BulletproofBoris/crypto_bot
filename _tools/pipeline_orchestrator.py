@@ -72,40 +72,51 @@ def run():
 
     # 1. Мониторинг Урока 1
     target_iterations = 250
-    log(f"Ожидание завершения {target_iterations} итераций Урока 1...")
+    it = check_l1_iterations()
+    if it < target_iterations:
+        log(f"Ожидание завершения {target_iterations} итераций Урока 1 (текущая: {it})...")
+        last_it = it
+        while True:
+            it = check_l1_iterations()
+            if it != last_it:
+                last_it = it
+                log(f"📊 Урок 1: сохранена итерация {it}/{target_iterations}")
 
-    last_it = 0
-    while True:
-        it = check_l1_iterations()
-        if it != last_it:
-            last_it = it
-            log(f"📊 Урок 1: сохранена итерация {it}/{target_iterations}")
+            if it >= target_iterations:
+                log(f"✅ Урок 1 успешно достиг {target_iterations} итераций!")
+                log("Останавливаем процесс Урока 1...")
+                kill_process_by_name("lesson_1_motorics_trainer.py")
+                time.sleep(5)
+                break
 
-        if it >= target_iterations:
-            log(f"✅ Урок 1 успешно достиг {target_iterations} итераций!")
-            log("Останавливаем процесс Урока 1...")
-            kill_process_by_name("lesson_1_motorics_trainer.py")
-            time.sleep(5)
-            break
-
-        time.sleep(20)
+            time.sleep(20)
+    else:
+        log(f"✅ Урок 1 уже завершен ({it}/{target_iterations} итераций).")
 
     # 2. Запуск Урока 2
     log("=" * 80)
-    log(f"🚀 СТАРТ УРОКА 2 (ЭКОНОМИКА СПРЕДА И КОМИССИИ): 30 ИТЕРАЦИЙ, 131,072 МОДЕЛЕЙ")
+    log(f"🚀 СТАРТ УРОКА 2 (ЭКОНОМИКА СПРЕДА И КОМИССИИ): {target_iterations} ИТЕРАЦИЙ, 8,192 МОДЕЛЕЙ")
     log("=" * 80)
 
     l2_script = PROJECT_ROOT / "_tools" / "lesson_2_spread_economics_trainer.py"
     env = os.environ.copy()
     env["PYTHONPATH"] = str(PROJECT_ROOT)
 
-    proc = subprocess.Popen(
-        [str(PYTHON_BIN), str(l2_script)],
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    log(f"Процесс Урока 2 запущен с PID {proc.pid}")
+    res = subprocess.run("pgrep -f 'lesson_2_spread_economics_trainer.py'", shell=True, capture_output=True, text=True)
+    running_pids = [p for p in res.stdout.strip().split() if p and int(p) != os.getpid()]
+
+    if running_pids:
+        log(f"Процесс Урока 2 уже запущен (PID {running_pids[0]}), переходим в режим мониторинга...")
+        proc = None
+    else:
+        l2_log = open(LOG_FILE, "a")
+        proc = subprocess.Popen(
+            [str(PYTHON_BIN), str(l2_script)],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=l2_log,
+        )
+        log(f"Процесс Урока 2 запущен с PID {proc.pid}")
 
     # 3. Мониторинг Урока 2
     last_it_l2 = 0
@@ -115,6 +126,14 @@ def run():
             last_it_l2 = it_l2
             log(f"📊 Урок 2: сохранена итерация {it_l2}/{target_iterations}")
 
+        if proc is not None and proc.poll() is not None:
+            if it_l2 >= target_iterations:
+                log(f"🎉 Урок 2 успешно завершил все {target_iterations} итераций!")
+                break
+            else:
+                log(f"⚠️ Процесс Урока 2 неожиданно завершился с кодом {proc.returncode} на итерации {it_l2}!")
+                break
+
         if it_l2 >= target_iterations:
             log(f"🎉 Урок 2 успешно достиг {target_iterations} итераций!")
             kill_process_by_name("lesson_2_spread_economics_trainer.py")
@@ -123,7 +142,7 @@ def run():
         time.sleep(20)
 
     log("=" * 80)
-    log("🏆 ВСЕ 2 УРОКА (ПО 30 ИТЕРАЦИЙ НА 131,072 МОДЕЛЯХ) ПОЛНОСТЬЮ ЗАВЕРШЕНЫ!")
+    log(f"🏆 ВСЕ 2 УРОКА (ПО {target_iterations} ИТЕРАЦИЙ НА 8,192 МОДЕЛЯХ) ПОЛНОСТЬЮ ЗАВЕРШЕНЫ!")
     log(f"Итоговый Чемпион сохранен в: {L2_DIR / 'lesson_2_champ_latest.pt'}")
     log("=" * 80)
 

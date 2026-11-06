@@ -271,22 +271,19 @@ def run_lesson_1(pop_size: int = 8192, total_iterations: int = 250, sim_steps: i
         )
 
         champ_path = OUT_DIR / f"iteration_{it:03d}_champ.pt"
-        torch.save(
-            {
-                "iteration": it,
-                "champ_id": champ_dict["ind_id"],
-                "score": champ_dict["score"],
-                "metrics": champ_dict,
-                "w1": policy.w1[champ_idx].cpu(),
-                "b1": policy.b1[champ_idx].cpu(),
-                "w2": policy.w2[champ_idx].cpu(),
-                "b2": policy.b2[champ_idx].cpu(),
-                "backbone_state": backbone_model.state_dict(),
-            },
-            champ_path,
-        )
-
-        torch.save(champ_path, OUT_DIR / "lesson_1_champ_latest.pt")
+        champ_dict_save = {
+            "iteration": it,
+            "champ_id": champ_dict["ind_id"],
+            "score": champ_dict["score"],
+            "metrics": champ_dict,
+            "w1": policy.w1[champ_idx].cpu(),
+            "b1": policy.b1[champ_idx].cpu(),
+            "w2": policy.w2[champ_idx].cpu(),
+            "b2": policy.b2[champ_idx].cpu(),
+            "backbone_state": backbone_model.state_dict(),
+        }
+        torch.save(champ_dict_save, champ_path)
+        torch.save(champ_dict_save, OUT_DIR / "lesson_1_champ_latest.pt")
 
         history_summary.append({
             "iteration": it,
