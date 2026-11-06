@@ -27,3 +27,9 @@ trained_models/
 prl_ensemble_pack_*/
 prl_ensemble_pack_*.zip
 scratch/
+models/prl/archive_run*/
+models/prl/lesson_*/
+models/prl/curriculum_v8/
+models/prl/gpu_pbt_swarm_v8/
+models/prl/walk_forward_ppo/recurrent_ppo_fold_*.pt
+

@@ -79,10 +79,9 @@ class VectorizedCudaL2Env:
     def reset_interval(self, start_idx: int, end_idx: int, episode_len: int = 4096):
         """Параллельный сброс всех сред в интервал Walk-Forward без задержек."""
         seg_len = max(1, (end_idx - start_idx - episode_len - 10) // self.num_envs)
-        for i in range(self.num_envs):
-            t_start = start_idx + i * seg_len
-            self.t[i] = t_start
-            self.max_t[i] = min(end_idx - 1, t_start + episode_len)
+        idx_seq = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        self.t.copy_(start_idx + idx_seq * seg_len)
+        self.max_t.copy_(torch.clamp(self.t + episode_len, max=end_idx - 1))
 
         self.pos_qty.zero_()
         self.avg_entry.zero_()
@@ -100,13 +99,17 @@ class VectorizedCudaL2Env:
 
         return self.get_observations()
 
-    def get_action_masks(self) -> torch.Tensor:
+    def get_action_masks(self, cur_t_scalar: int = None) -> torch.Tensor:
         """Биржевые маски для всех B сред одновременно на GPU [B, 7]."""
         masks = torch.zeros((self.num_envs, self.n_actions), dtype=torch.bool, device=self.device)
         masks[:, 0] = True  # HOLD всегда доступен
 
-        cur_t = self.t
-        b1 = torch.clamp(self.bids[cur_t, 0], min=self.tick_size)
+        if cur_t_scalar is not None:
+            b1 = torch.clamp(self.bids[cur_t_scalar, 0], min=self.tick_size)
+        else:
+            cur_t = self.t
+            b1 = torch.clamp(self.bids[cur_t, 0], min=self.tick_size)
+
         curr_pos_usd = self.pos_qty * b1
         free_cash = torch.clamp(self.initial_cash - curr_pos_usd, min=0.0)
 
@@ -124,15 +127,22 @@ class VectorizedCudaL2Env:
 
         return masks
 
-    def get_observations(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Возвращает LOB [B, 10, 4], Flow [B, 16], Targets [B, 4] прямо в VRAM."""
-        cur_t = self.t
-        lob = self.lob_tensors[cur_t]
-        flow = self.flow_market[cur_t].clone()
-        tgt = self.targets[cur_t]
-
-        b1 = torch.clamp(self.bids[cur_t, 0], min=self.tick_size)
-        a1 = torch.clamp(self.asks[cur_t, 0], min=b1 + self.tick_size)
+    def get_observations(self, cur_t_scalar: int = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Возвращает LOB [B or 1, 10, 4], Flow [B, 16], Targets [B, 4] прямо в VRAM."""
+        if cur_t_scalar is not None:
+            lob = self.lob_tensors[cur_t_scalar:cur_t_scalar+1]
+            flow = self.flow_market[cur_t_scalar:cur_t_scalar+1].expand(self.num_envs, -1).clone()
+            tgt = self.targets[cur_t_scalar:cur_t_scalar+1]
+            cur_t = cur_t_scalar
+            b1 = torch.clamp(self.bids[cur_t_scalar, 0], min=self.tick_size)
+            a1 = torch.clamp(self.asks[cur_t_scalar, 0], min=b1 + self.tick_size)
+        else:
+            cur_t = self.t
+            lob = self.lob_tensors[cur_t]
+            flow = self.flow_market[cur_t].clone()
+            tgt = self.targets[cur_t]
+            b1 = torch.clamp(self.bids[cur_t, 0], min=self.tick_size)
+            a1 = torch.clamp(self.asks[cur_t, 0], min=b1 + self.tick_size)
 
         has_pos = (self.pos_qty > 1e-6).float()
         curr_pos_usd = self.pos_qty * b1
@@ -538,6 +548,7 @@ def evaluate_population_parallel_cuda(
     end_idx: int,
     device: torch.device,
     slices_per_model: int = 8,
+    max_ticks_per_slice: int = 1200,
     tick_size: float = 0.01,
     initial_cash: float = 95.5,
     min_order_usd: float = 25.0,
@@ -546,12 +557,13 @@ def evaluate_population_parallel_cuda(
 ) -> List[Dict[str, float]]:
     """
     Одновременная параллельная аттестация ВСЕЙ популяции (например, 48 моделей)
-    в едином батче (48 * 8 = 384 среды) прямо в VRAM GPU за ~20-25 секунд!
+    в едином батче (48 * 8 = 384 среды) прямо в VRAM GPU за ~90-100 секунд!
+    8 срезов по 1200 тиков равномерно покрывают сутки (9600 тиков = ~2.7ч).
     """
     pop_size = len(models)
     total_envs = pop_size * slices_per_model
     total_ticks = min(end_idx - start_idx, len(bids) - start_idx - 1)
-    seg_len = max(100, total_ticks // slices_per_model)
+    seg_len = min(max_ticks_per_slice, max(100, total_ticks // slices_per_model))
 
     for m in models:
         m.eval()

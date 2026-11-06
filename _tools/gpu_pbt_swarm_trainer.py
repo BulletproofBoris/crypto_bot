@@ -154,6 +154,7 @@ def run_pbt_pipeline(
     test_hours: int = 24,
     embargo_sec: int = 300,
     epochs_per_fold: int = 2,
+    resume: bool = True,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log_msg("=" * 80)
@@ -186,28 +187,54 @@ def run_pbt_pipeline(
     )
 
     # Инициализация популяции из pop_size моделей
-    log_msg(f"Инициализация популяции из {pop_size} агентов на базе Shared Backbone...")
     population: List[Individual] = []
-    ckpt = torch.load(PRETRAINED_BACKBONE_PATH, map_location=device)
-    base_state = {k: v for k, v in ckpt.get("model_state_dict", ckpt).items() if not k.startswith(("actor.", "critic."))}
+    latest_ckpt_path = OUT_DIR / "pbt_champion_latest.pt"
+    start_fold = 0
+    cumulative_champ_pnl = 0.0
+    pbt_summary = []
 
-    for i in range(pop_size):
-        m = MultiTaskLOBNet(flow_dim=16, n_actions=7, latent_dim=256).to(device)
-        m.load_state_dict(base_state, strict=False)
-        # Разнообразие в начальных гиперпараметрах особей
-        ent = float(0.04 + (i / max(1, pop_size - 1)) * 0.06)  # 0.04 .. 0.10
-        risk = float(0.20 + (i / max(1, pop_size - 1)) * 0.30) # 0.20 .. 0.50
-        ind = Individual(ind_id=i + 1, model=m, entropy_coef=ent, aux_risk_coef=risk)
-        population.append(ind)
+    if resume and latest_ckpt_path.exists():
+        ckpt = torch.load(latest_ckpt_path, map_location=device)
+        start_fold = ckpt.get("fold", 0)
+        cumulative_champ_pnl = ckpt.get("cumulative_pnl", 0.0)
+        champ_state = ckpt["champ_state_dict"]
+        log_msg(f"♻️ ВОЗОБНОВЛЕНИЕ PBT с фолда {start_fold + 1}/{total_folds} (предыдущий PnL Чемпиона: ${cumulative_champ_pnl:+.2f})...")
+
+        sum_path = OUT_DIR / "pbt_summary.json"
+        if sum_path.exists():
+            try:
+                with open(sum_path, "r") as f:
+                    pbt_summary = json.load(f)
+            except Exception:
+                pass
+
+        for i in range(pop_size):
+            m = MultiTaskLOBNet(flow_dim=16, n_actions=7, latent_dim=256).to(device)
+            m.load_state_dict(champ_state)
+            ent = float(0.04 + (i / max(1, pop_size - 1)) * 0.06)
+            risk = float(0.20 + (i / max(1, pop_size - 1)) * 0.30)
+            ind = Individual(ind_id=i + 1, model=m, entropy_coef=ent, aux_risk_coef=risk)
+            if i > 0:
+                ind.mutate(mutation_rate=0.25)
+            population.append(ind)
+    else:
+        log_msg(f"Инициализация популяции из {pop_size} агентов на базе Shared Backbone...")
+        ckpt = torch.load(PRETRAINED_BACKBONE_PATH, map_location=device)
+        base_state = {k: v for k, v in ckpt.get("model_state_dict", ckpt).items() if not k.startswith(("actor.", "critic."))}
+
+        for i in range(pop_size):
+            m = MultiTaskLOBNet(flow_dim=16, n_actions=7, latent_dim=256).to(device)
+            m.load_state_dict(base_state, strict=False)
+            ent = float(0.04 + (i / max(1, pop_size - 1)) * 0.06)  # 0.04 .. 0.10
+            risk = float(0.20 + (i / max(1, pop_size - 1)) * 0.30) # 0.20 .. 0.50
+            ind = Individual(ind_id=i + 1, model=m, entropy_coef=ent, aux_risk_coef=risk)
+            population.append(ind)
 
     train_len = train_hours * 3600
     test_len = test_hours * 3600
     step_stride = (n_ticks - train_len - test_len - embargo_sec) // max(1, total_folds)
 
-    pbt_summary = []
-    cumulative_champ_pnl = 0.0
-
-    for fold in range(total_folds):
+    for fold in range(start_fold, total_folds):
         f_train_start = fold * step_stride
         f_train_end = f_train_start + train_len
         f_test_start = f_train_end + embargo_sec
@@ -287,7 +314,7 @@ def run_pbt_pipeline(
                 ind.spread_boost = champion.spread_boost
                 ind.mutate(mutation_rate=0.25)
 
-        # Сохранение текущего чемпиона
+        # Сохранение текущего чемпиона и прогресса
         torch.save(
             {
                 "fold": fold + 1,
@@ -297,6 +324,8 @@ def run_pbt_pipeline(
             },
             OUT_DIR / "pbt_champion_latest.pt"
         )
+        with open(OUT_DIR / "pbt_summary.json", "w") as f:
+            json.dump(pbt_summary, f, indent=2)
 
     # Итоговое сохранение финального чемпиона после 20 фолдов
     final_champ_path = OUT_DIR / "pbt_champion_v8_final.pt"

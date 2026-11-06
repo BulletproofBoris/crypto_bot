@@ -198,3 +198,4 @@ def compute_v8_guard_soft_mask(
     mask[0] = True
 
     return mask
+
