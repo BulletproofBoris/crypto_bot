@@ -67,14 +67,32 @@ def kill_process_by_name(pattern: str):
 
 def run():
     log("=" * 80)
-    log("🚀 ДИСПЕТЧЕР ПРОГРАММЫ ОБУЧЕНИЯ ЗАПУЩЕН (ЛИМИТ: 250 ИТЕРАЦИЙ ПО 30 СЕК)")
+    log("🚀 ДИСПЕТЧЕР ПРОГРАММЫ ОБУЧЕНИЯ ЗАПУЩЕН (ЛИМИТ: 500 ИТЕРАЦИЙ ПО 30 СЕК)")
     log("=" * 80)
 
-    # 1. Мониторинг Урока 1
-    target_iterations = 250
+    # 1. Мониторинг / Запуск Урока 1
+    target_iterations = 500
     it = check_l1_iterations()
     if it < target_iterations:
-        log(f"Ожидание завершения {target_iterations} итераций Урока 1 (текущая: {it})...")
+        log(f"Проверка процесса Урока 1 (текущая итерация: {it}/{target_iterations})...")
+        res1 = subprocess.run("pgrep -f '[l]esson_1_motorics_trainer.py'", shell=True, capture_output=True, text=True)
+        running_pids1 = [p for p in res1.stdout.strip().split() if p and int(p) != os.getpid()]
+
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(PROJECT_ROOT)
+
+        if not running_pids1:
+            log("Запуск процесса Урока 1...")
+            l1_script = PROJECT_ROOT / "_tools" / "lesson_1_motorics_trainer.py"
+            l1_log = open(PROJECT_ROOT / "data" / "logs" / "lesson_1_motorics.log", "a")
+            proc1 = subprocess.Popen(
+                [str(PYTHON_BIN), str(l1_script)],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=l1_log,
+            )
+            log(f"Процесс Урока 1 запущен с PID {proc1.pid}")
+
         last_it = it
         while True:
             it = check_l1_iterations()
@@ -102,7 +120,7 @@ def run():
     env = os.environ.copy()
     env["PYTHONPATH"] = str(PROJECT_ROOT)
 
-    res = subprocess.run("pgrep -f 'lesson_2_spread_economics_trainer.py'", shell=True, capture_output=True, text=True)
+    res = subprocess.run("pgrep -f '[l]esson_2_spread_economics_trainer.py'", shell=True, capture_output=True, text=True)
     running_pids = [p for p in res.stdout.strip().split() if p and int(p) != os.getpid()]
 
     if running_pids:

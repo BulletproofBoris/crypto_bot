@@ -1,21 +1,16 @@
 """
-SafeTrade PRL - УРОК 1: ШКОЛА МОТОРИКИ (ВЫСОКОСКОРОСТНОЙ ОПТИМУМ: 8,192 МОДЕЛИ, H=256)
-8,192 независимые модели параллельно в L2-кэше GPU RTX 5060 Ti (bfloat16, H=256).
-250 итераций полного прогона через всю 600-часовую историю (2.19M тиков).
-Морковка:
-  +2.0 за завершение полного торгового цикла (BID -> Fill -> ASK -> Fill -> Cash)
-  +0.05 за выставление котировки на лучшем биде/аске
-  -0.01 за апатию / долгий HOLD в кэше
-  -0.03 за зависание в купленной монете без попытки продажи
+SafeTrade PRL - УРОК 1 (v2): ШКОЛА МОТОРИКИ НА НЕПРЕРЫВНЫХ 1С ОКНАХ (8,192 МОДЕЛИ, H=256)
+- 10 стратифицированных непрерывных окон по 300 секунд (stride=1s, 3000 шагов/ит) для честной работы GRU.
+- Детерминированный выбор действий (argmax) без паразитного Gumbel-шума.
+- Настоящий элитарный отбор Top-64 уникальных моделей на каждой итерации.
 """
 
 import os
 import sys
 import time
 import json
-import copy
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import Dict, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -45,11 +40,6 @@ def log_msg(msg: str):
 
 
 class BatchedPopulationPolicy8K:
-    """
-    Высокоскоростная популяция из 8,192 моделей с глубокой сетью (H=256) на GPU.
-    Все 8,192 модели целиком помещаются в 32 МБ L2-кэш RTX 5060 Ti,
-    обеспечивая рекордные 25-30 секунд на полный 600-часовой прогон!
-    """
     def __init__(
         self,
         backbone: nn.Module,
@@ -67,52 +57,59 @@ class BatchedPopulationPolicy8K:
         self.device = device
         self.dtype = torch.bfloat16
 
-        # Веса голов Actor для 8,192 моделей (H=256) в bfloat16 (~1.1 ГБ)
-        self.w1 = torch.randn(pop_size, in_dim, h_dim, dtype=self.dtype, device=device) * 0.05
+        self.w1 = torch.randn(pop_size, in_dim, h_dim, dtype=self.dtype, device=device) * 0.06
         self.b1 = torch.zeros(pop_size, 1, h_dim, dtype=self.dtype, device=device)
-        self.w2 = torch.randn(pop_size, h_dim, n_actions, dtype=self.dtype, device=device) * 0.05
+        self.w2 = torch.randn(pop_size, h_dim, n_actions, dtype=self.dtype, device=device) * 0.06
         self.b2 = torch.zeros(pop_size, 1, n_actions, dtype=self.dtype, device=device)
 
+    def load_from_checkpoint(self, champ_data: dict):
+        w1_c = champ_data["w1"].to(device=self.device, dtype=self.dtype)
+        b1_c = champ_data["b1"].to(device=self.device, dtype=self.dtype)
+        w2_c = champ_data["w2"].to(device=self.device, dtype=self.dtype)
+        b2_c = champ_data["b2"].to(device=self.device, dtype=self.dtype)
+
+        self.w1.copy_(w1_c.unsqueeze(0).expand_as(self.w1))
+        self.b1.copy_(b1_c.unsqueeze(0).expand_as(self.b1))
+        self.w2.copy_(w2_c.unsqueeze(0).expand_as(self.w2))
+        self.b2.copy_(b2_c.unsqueeze(0).expand_as(self.b2))
+
+        # Разнообразие популяции
+        noise1 = (torch.randn_like(self.w1) * 0.02).to(self.dtype)
+        noise2 = (torch.randn_like(self.w2) * 0.02).to(self.dtype)
+        self.w1[1:].add_(noise1[1:])
+        self.w2[1:].add_(noise2[1:])
+
     def forward_all(self, lob_b: torch.Tensor, flow_b: torch.Tensor, hidden: torch.Tensor, masks: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # 1. Энкодинг стакана 1 раз для всего батча и расширение view
         lob_repr = self.backbone.encode_lob_batch(lob_b[:1]).expand(flow_b.size(0), -1)
         z, next_hidden = self.backbone.backbone.forward_step_fast(lob_repr, flow_b, hidden)
 
-        # 2. Выходы голов риска
         p_sweep = torch.sigmoid(self.backbone.head_sweep_12s(z))
         p_bleed = torch.sigmoid(self.backbone.head_bleed_60s(z))
         p_crash = torch.sigmoid(self.backbone.head_crash_300s(z))
         p_exit = torch.sigmoid(self.backbone.head_exit_30s(z))
         z_aug = torch.cat([z, p_sweep, p_bleed, p_crash, p_exit], dim=-1).unsqueeze(1).to(self.dtype)
 
-        # 3. Батчевый BMM инференс (H=256)
         h1 = torch.relu(torch.bmm(z_aug, self.w1) + self.b1)
         logits = (torch.bmm(h1, self.w2) + self.b2).squeeze(1).float()
-
-        # Маскирование невалидных действий
         logits = logits.masked_fill(~masks, -1e9)
 
-        # Gumbel-Max сэмплирование
-        gumbel_noise = torch.empty_like(logits).exponential_().log_().neg_()
-        actions = (logits / 0.8 + gumbel_noise).argmax(dim=-1)
+        actions = logits.argmax(dim=-1)
         return actions, next_hidden
 
-    def clone_and_mutate(self, champ_idx: int, top_k: int = 128):
-        champ_w1 = self.w1[champ_idx].clone()
-        champ_b1 = self.b1[champ_idx].clone()
-        champ_w2 = self.w2[champ_idx].clone()
-        champ_b2 = self.b2[champ_idx].clone()
+    def clone_and_mutate(self, scores: torch.Tensor, top_k: int = 64):
+        _, top_indices = torch.topk(scores, k=top_k)
 
-        # Клонируем чемпиона на всю популяцию
-        self.w1.copy_(champ_w1.unsqueeze(0).expand_as(self.w1))
-        self.b1.copy_(champ_b1.unsqueeze(0).expand_as(self.b1))
-        self.w2.copy_(champ_w2.unsqueeze(0).expand_as(self.w2))
-        self.b2.copy_(champ_b2.unsqueeze(0).expand_as(self.b2))
+        elite_w1 = self.w1[top_indices].clone()
+        elite_b1 = self.b1[top_indices].clone()
+        elite_w2 = self.w2[top_indices].clone()
+        elite_b2 = self.b2[top_indices].clone()
 
-        # Трехслойная мультимасштабная мутация:
-        # 1. 50% моделей: тонкая шлифовка (sigma=0.012)
-        # 2. 35% моделей: уверенный шаг (sigma=0.040)
-        # 3. 15% моделей: прорывной скачок (sigma=0.100)
+        repeats = self.pop_size // top_k
+        self.w1.copy_(elite_w1.repeat(repeats, 1, 1))
+        self.b1.copy_(elite_b1.repeat(repeats, 1, 1))
+        self.w2.copy_(elite_w2.repeat(repeats, 1, 1))
+        self.b2.copy_(elite_b2.repeat(repeats, 1, 1))
+
         n_fine = int(self.pop_size * 0.50)
         n_mid = int(self.pop_size * 0.35)
 
@@ -121,11 +118,10 @@ class BatchedPopulationPolicy8K:
         sigmas[n_fine:n_fine + n_mid] = 0.040
         sigmas[n_fine + n_mid:] = 0.100
 
-        noise1 = (torch.randn_like(self.w1) * sigmas).to(self.dtype)
-        noise2 = (torch.randn_like(self.w2) * sigmas).to(self.dtype)
-
-        self.w1.add_(noise1)
-        self.w2.add_(noise2)
+        self.w1.add_((torch.randn_like(self.w1) * sigmas).to(self.dtype))
+        self.b1.add_((torch.randn_like(self.b1) * (sigmas * 0.5)).to(self.dtype))
+        self.w2.add_((torch.randn_like(self.w2) * sigmas).to(self.dtype))
+        self.b2.add_((torch.randn_like(self.b2) * (sigmas * 0.5)).to(self.dtype))
 
 
 def run_motorics_simulation_8k(
@@ -133,10 +129,16 @@ def run_motorics_simulation_8k(
     vec_env: VectorizedCudaL2Env,
     total_ticks: int,
     sim_steps: int = 3000,
+    n_windows: int = 10,
     device: torch.device = torch.device("cuda"),
-) -> Tuple[Dict[str, float], int]:
+) -> Tuple[Dict[str, float], int, torch.Tensor]:
     pop_size = policy.pop_size
-    step_stride = max(1, (total_ticks - 100) // sim_steps)
+    win_len = sim_steps // n_windows
+    seg_len = (total_ticks - win_len - 200) // n_windows
+    win_starts = [
+        100 + i * seg_len + int(np.random.randint(0, max(1, seg_len - win_len)))
+        for i in range(n_windows)
+    ]
 
     vec_env.reset_interval(start_idx=0, end_idx=total_ticks, episode_len=total_ticks)
 
@@ -146,45 +148,56 @@ def run_motorics_simulation_8k(
     inventory_lock_steps = torch.zeros(pop_size, dtype=torch.float32, device=device)
 
     prev_pos = vec_env.pos_qty[:pop_size].clone()
-    h_states = policy.backbone.init_hidden(batch_size=pop_size, device=device)
-
-    t_start = time.time()
 
     with torch.no_grad():
-        for s in range(sim_steps):
-            cur_t = s * step_stride
-            if cur_t >= total_ticks - 1:
-                break
-            vec_env.t[:pop_size] = cur_t
+        for w_start in win_starts:
+            h_states = policy.backbone.init_hidden(batch_size=pop_size, device=device)
+            for step_in_win in range(win_len):
+                cur_t = int(w_start + step_in_win)
+                vec_env.t[:pop_size] = cur_t
 
-            lob, flow, _ = vec_env.get_observations(cur_t_scalar=cur_t)
-            masks = vec_env.get_action_masks(cur_t_scalar=cur_t)
-            lob_b = lob
-            flow_b = flow[:pop_size]
-            mask_b = masks[:pop_size]
+                lob, flow, _ = vec_env.get_observations(cur_t_scalar=cur_t)
+                masks = vec_env.get_action_masks(cur_t_scalar=cur_t)
 
-            actions, h_states = policy.forward_all(lob_b, flow_b, h_states, mask_b)
+                actions, h_states = policy.forward_all(lob, flow[:pop_size], h_states, masks[:pop_size])
 
-            is_quote = (actions >= 1) & (actions <= 4)
-            valid_quotes += is_quote.float()
+                is_quote = (actions >= 1) & (actions <= 4)
+                valid_quotes += is_quote.float()
 
-            in_cash = vec_env.pos_qty[:pop_size] < 1e-6
-            is_hold_in_cash = (actions == 0) & in_cash
-            idle_hold_steps += is_hold_in_cash.float()
+                in_cash = prev_pos < 1e-6
+                idle_hold_steps += ((actions == 0) & in_cash).float()
 
-            in_pos = vec_env.pos_qty[:pop_size] > 1e-6
-            is_hold_in_pos = (actions == 0) & in_pos
-            inventory_lock_steps += is_hold_in_pos.float()
+                in_pos = prev_pos > 1e-6
+                inventory_lock_steps += ((actions == 0) & in_pos).float()
 
-            vec_env.step(actions)
-            cur_pos = vec_env.pos_qty[:pop_size]
+                vec_env.step(actions)
+                cur_pos = vec_env.pos_qty[:pop_size]
 
-            just_closed = (prev_pos > 1e-6) & (cur_pos < 1e-6)
-            completed_cycles += just_closed.float()
-            prev_pos = cur_pos.clone()
+                just_closed = (prev_pos > 1e-6) & (cur_pos < 1e-6)
+                completed_cycles += just_closed.float()
+                prev_pos = cur_pos.clone()
 
-    # Векторизованный подсчет Score на GPU
-    scores = (completed_cycles * 2.0) + (valid_quotes * 0.02) - (idle_hold_steps * 0.005) - (inventory_lock_steps * 0.02)
+            # Принудительное закрытие остаточных позиций в кэш строго по бухгалтерии среды
+            last_t = int(w_start + win_len - 1)
+            b1_last = torch.clamp(vec_env.bids[last_t, 0], min=vec_env.tick_size)
+            has_rem_pos = vec_env.pos_qty[:pop_size] > 1e-6
+            if has_rem_pos.any():
+                rem_qty = vec_env.pos_qty[:pop_size][has_rem_pos]
+                fee = rem_qty * b1_last * vec_env.taker_fee
+                vec_env.cash[:pop_size][has_rem_pos] += (rem_qty * b1_last - fee)
+                vec_env.pos_qty[:pop_size][has_rem_pos] = 0.0
+                vec_env.avg_entry[:pop_size][has_rem_pos] = 0.0
+                vec_env.n_trades[:pop_size][has_rem_pos] += 1
+
+            vec_env.prev_mtm[:pop_size] = vec_env.cash[:pop_size] - vec_env.initial_cash
+            vec_env.order_side[:pop_size].fill_(-1)
+            vec_env.order_price[:pop_size].zero_()
+            vec_env.order_qty[:pop_size].zero_()
+            vec_env.q_ahead[:pop_size].zero_()
+            vec_env.active_after[:pop_size].zero_()
+            prev_pos.zero_()
+
+    scores = (completed_cycles * 4.0) + (valid_quotes * 0.02) - (idle_hold_steps * 0.005) - (inventory_lock_steps * 0.03)
     best_idx = int(scores.argmax().item())
     worst_idx = int(scores.argmin().item())
 
@@ -200,28 +213,22 @@ def run_motorics_simulation_8k(
         "worst_score": float(scores[worst_idx].item()),
     }
 
-    return champ_dict, best_idx
+    return champ_dict, best_idx, scores
 
 
-def run_lesson_1(pop_size: int = 8192, total_iterations: int = 250, sim_steps: int = 3000):
+def run_lesson_1(pop_size: int = 8192, total_iterations: int = 500, sim_steps: int = 3000, resume: bool = True):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log_msg("=" * 80)
-    log_msg(f"🚀 СТАРТ УРОКА 1: ВЫСОКОСКОРОСТНОЙ ОПТИМУМ ({pop_size:,} МОДЕЛЕЙ, H=256, {total_iterations} ИТЕРАЦИЙ)")
-    log_msg(f"Векторизованный мега-батч bfloat16 в L2-кэше {device} (охват всей 600-часовой истории)")
-    log_msg("Морковка: +2.0 за завершенный цикл (BID->ASK), штрафы за лень и зависание в позиции")
+    log_msg(f"🚀 СТАРТ УРОКА 1 (v2): ШКОЛА МОТОРИКИ НА НЕПРЕРЫВНЫХ 1С ОКНАХ ({pop_size:,} МОДЕЛЕЙ, H=256, {total_iterations} ИТ)")
     log_msg("=" * 80)
 
-    log_msg(f"Загрузка кэша L2 датасета: {CACHE_PATH}...")
     raw = np.load(CACHE_PATH)
     n_ticks = len(raw["bid_p"])
-    log_msg(f"Всего тиков в датасете: {n_ticks:,} (~{n_ticks / 3600:.1f} часов)")
-
     lob_tensors, flow_market = build_lob_10_and_flow_tensors(raw)
     targets_tensor = torch.from_numpy(
         np.stack([raw["y_sweep_12s"], raw["y_bleed_60s"], raw["y_crash_300s"], raw["y_exit_30s"]], axis=1)
     ).float()
 
-    log_msg(f"Развертывание {pop_size:,} параллельных сред в VRAM GPU...")
     vec_env = VectorizedCudaL2Env(
         bids=torch.from_numpy(raw["bid_p"]).float(),
         asks=torch.from_numpy(raw["ask_p"]).float(),
@@ -236,7 +243,6 @@ def run_lesson_1(pop_size: int = 8192, total_iterations: int = 250, sim_steps: i
         device=device,
     )
 
-    log_msg(f"Инициализация популяции {pop_size:,} моделей с глубоким скрытым слоем H=256 (bfloat16)...")
     ckpt = torch.load(BACKBONE_PATH, map_location=device)
     base_state = {k: v for k, v in ckpt.get("model_state_dict", ckpt).items() if not k.startswith(("actor.", "critic."))}
 
@@ -245,32 +251,42 @@ def run_lesson_1(pop_size: int = 8192, total_iterations: int = 250, sim_steps: i
     backbone_model.eval()
 
     policy = BatchedPopulationPolicy8K(backbone=backbone_model, pop_size=pop_size, h_dim=256, device=device)
-
-    vram_used = torch.cuda.memory_allocated() / (1024**3)
-    log_msg(f"💾 VRAM занято популяцией {pop_size:,} моделей (H=256): {vram_used:.2f} GB / 8.15 GB")
-
     history_summary = []
+    start_it = 1
 
-    for it in range(1, total_iterations + 1):
+    latest_pt = OUT_DIR / "lesson_1_champ_latest.pt"
+    summary_file = OUT_DIR / "lesson_1_summary.json"
+
+    if resume and latest_pt.exists() and summary_file.exists():
+        try:
+            with open(summary_file, "r") as f:
+                history_summary = json.load(f)
+            start_it = len(history_summary) + 1
+            if start_it <= total_iterations:
+                champ_ckpt = torch.load(latest_pt, map_location=device, weights_only=False)
+                policy.load_from_checkpoint(champ_ckpt)
+                log_msg(f"🔄 ВОЗОБНОВЛЕНИЕ ОБУЧЕНИЯ С ИТЕРАЦИИ {start_it}/{total_iterations} (загружен {latest_pt})")
+            else:
+                log_msg(f"✅ Урок 1 уже полностью завершен ({len(history_summary)}/{total_iterations} итераций)!")
+                return
+        except Exception as e:
+            log_msg(f"⚠️ Не удалось возобновить чекпоинт ({e}), старт с 1 итерации.")
+            start_it = 1
+            history_summary = []
+
+    for it in range(start_it, total_iterations + 1):
         t0 = time.time()
-
-        champ_dict, champ_idx = run_motorics_simulation_8k(
-            policy=policy,
-            vec_env=vec_env,
-            total_ticks=n_ticks,
-            sim_steps=sim_steps,
-            device=device,
+        champ_dict, champ_idx, scores = run_motorics_simulation_8k(
+            policy=policy, vec_env=vec_env, total_ticks=n_ticks, sim_steps=sim_steps, device=device
         )
-
         elapsed = time.time() - t0
         log_msg(
             f"👑 [ИТОГ ИТЕРАЦИИ {it:03d}/{total_iterations}] ЧЕМПИОН #{champ_dict['ind_id']} | "
             f"Score: {champ_dict['score']:.1f} | Циклов BID->ASK: {champ_dict['cycles']} | "
             f"Котировок: {champ_dict['quotes']} | Зависаний: {champ_dict['inv_lock_steps']} | "
-            f"Худший Score: {champ_dict['worst_score']:.1f} ({elapsed:.1f}с | {sim_steps/elapsed:.0f} ш/с)"
+            f"PnL: ${champ_dict['pnl']:+.2f} ({elapsed:.1f}с | {sim_steps/elapsed:.0f} ш/с)"
         )
 
-        champ_path = OUT_DIR / f"iteration_{it:03d}_champ.pt"
         champ_dict_save = {
             "iteration": it,
             "champ_id": champ_dict["ind_id"],
@@ -282,27 +298,14 @@ def run_lesson_1(pop_size: int = 8192, total_iterations: int = 250, sim_steps: i
             "b2": policy.b2[champ_idx].cpu(),
             "backbone_state": backbone_model.state_dict(),
         }
-        torch.save(champ_dict_save, champ_path)
+        torch.save(champ_dict_save, OUT_DIR / f"iteration_{it:03d}_champ.pt")
         torch.save(champ_dict_save, OUT_DIR / "lesson_1_champ_latest.pt")
 
-        history_summary.append({
-            "iteration": it,
-            "champion_id": champ_dict["ind_id"],
-            "score": champ_dict["score"],
-            "metrics": champ_dict,
-            "time_sec": elapsed,
-        })
+        history_summary.append({"iteration": it, "champion_id": champ_dict["ind_id"], "score": champ_dict["score"], "metrics": champ_dict, "time_sec": elapsed})
         with open(OUT_DIR / "lesson_1_summary.json", "w") as f:
             json.dump(history_summary, f, indent=2)
 
-        # Размножение Чемпиона с трехслойной мутацией
-        policy.clone_and_mutate(champ_idx=champ_idx, top_k=128)
-
-    log_msg("=" * 80)
-    log_msg(f"🎉 УРОК 1 УСПЕШНО ЗАВЕРШЕН ПО ВСЕМ {total_iterations} ИТЕРАЦИЯМ!")
-    log_msg(f"Финальный Чемпион сохранен: {OUT_DIR / 'lesson_1_champ_latest.pt'}")
-    log_msg("=" * 80)
-
+        policy.clone_and_mutate(scores=scores, top_k=64)
 
 if __name__ == "__main__":
-    run_lesson_1(pop_size=8192, total_iterations=250, sim_steps=3000)
+    run_lesson_1(pop_size=8192, total_iterations=500, sim_steps=3000)
