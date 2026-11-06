@@ -95,11 +95,12 @@ def build_600h_dataset(parquet_path: str = "data/features/prl_1s_features.parque
     print(f"  Y_crash_300s: {y_crash_300s.sum():>9,} ({y_crash_300s.mean()*100:.2f}%)")
     print(f"  Y_exit_30s  : {y_exit_30s.sum():>9,} ({y_exit_30s.mean()*100:.2f}%)")
 
-    # Сохраняем в кэш
+    # Сохраняем в кэш (атомарная запись через временный файл для защиты активных тренеров)
     OUTPUT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = OUTPUT_CACHE_PATH.with_suffix(".tmp.npz")
     print(f"💾 Сохранение тензорного кэша в {OUTPUT_CACHE_PATH}...")
     np.savez_compressed(
-        OUTPUT_CACHE_PATH,
+        tmp_path,
         bid_p=b_p,
         bid_q=b_q,
         ask_p=a_p,
@@ -113,6 +114,7 @@ def build_600h_dataset(parquet_path: str = "data/features/prl_1s_features.parque
         y_crash_300s=y_crash_300s,
         y_exit_30s=y_exit_30s,
     )
+    tmp_path.replace(OUTPUT_CACHE_PATH)
     sz_mb = OUTPUT_CACHE_PATH.stat().st_size / (1024 * 1024)
     print(f"✅ Датасет 600h успешно сохранен: {OUTPUT_CACHE_PATH.name} ({sz_mb:.1f} MB, {n:,} тиков)")
 
