@@ -34,6 +34,7 @@ class VectorizedCudaL2Env:
         initial_cash: float = 95.5,
         min_order_usd: float = 25.0,
         device: torch.device = torch.device("cuda"),
+        preserve_queue: bool = False,
     ):
         self.device = device
         self.num_envs = num_envs
@@ -42,6 +43,7 @@ class VectorizedCudaL2Env:
         self.taker_fee = taker_fee
         self.initial_cash = initial_cash
         self.min_order_usd = min_order_usd
+        self.preserve_queue = preserve_queue
         self.n_actions = 7
 
         # Данные рынка в VRAM
@@ -193,16 +195,30 @@ class VectorizedCudaL2Env:
 
         if is_buy.any():
             self.total_maker_bids[is_buy] += 1
-            self.order_side[is_buy] = 0
-            self.order_act[is_buy] = actions[is_buy]
-            # Best: b1 + 1 тик если спред >= 2 тика, иначе b1
             px_best = torch.where((a1 - b1) >= 2.0 * self.tick_size, b1 + self.tick_size, b1)
             px_pass = b1 - self.tick_size
             target_px = torch.where(is_buy_best, px_best, px_pass)
-            self.order_price[is_buy] = target_px[is_buy]
-            self.order_qty[is_buy] = self.min_order_usd / torch.clamp(target_px[is_buy], min=self.tick_size)
-            self.q_ahead[is_buy] = self.bids_q[cur_t[is_buy], 0]
-            self.active_after[is_buy] = cur_t[is_buy] + 1
+
+            if self.preserve_queue:
+                same_buy = is_buy & (self.order_side == 0) & (torch.abs(self.order_price - target_px) < 1e-5)
+                upd_buy = is_buy & (~same_buy)
+                if upd_buy.any():
+                    self.order_side[upd_buy] = 0
+                    self.order_act[upd_buy] = actions[upd_buy]
+                    self.order_price[upd_buy] = target_px[upd_buy]
+                    self.order_qty[upd_buy] = self.min_order_usd / torch.clamp(target_px[upd_buy], min=self.tick_size)
+                    # При шаге внутрь спреда (Penny Jump > b1) мы первые в очереди (q_ahead = 0.0)
+                    is_penny_jump = target_px[upd_buy] > (b1[upd_buy] + 0.5 * self.tick_size)
+                    base_q = self.bids_q[cur_t[upd_buy], 0]
+                    self.q_ahead[upd_buy] = torch.where(is_penny_jump, torch.zeros_like(base_q), base_q)
+                    self.active_after[upd_buy] = cur_t[upd_buy] + 1
+            else:
+                self.order_side[is_buy] = 0
+                self.order_act[is_buy] = actions[is_buy]
+                self.order_price[is_buy] = target_px[is_buy]
+                self.order_qty[is_buy] = self.min_order_usd / torch.clamp(target_px[is_buy], min=self.tick_size)
+                self.q_ahead[is_buy] = self.bids_q[cur_t[is_buy], 0]
+                self.active_after[is_buy] = cur_t[is_buy] + 1
 
         # Продажа / Выход (actions == 3 или 4)
         is_sell_best = (actions == 3) & (self.pos_qty > 1e-6)
@@ -210,13 +226,24 @@ class VectorizedCudaL2Env:
         is_sell = is_sell_best | is_sell_pass
 
         if is_sell.any():
-            self.order_side[is_sell] = 1
-            self.order_act[is_sell] = actions[is_sell]
             target_ask = torch.where(is_sell_best, a1, a1 + self.tick_size)
-            self.order_price[is_sell] = target_ask[is_sell]
-            self.order_qty[is_sell] = self.pos_qty[is_sell]
-            self.q_ahead[is_sell] = self.asks_q[cur_t[is_sell], 0]
-            self.active_after[is_sell] = cur_t[is_sell] + 1
+            if self.preserve_queue:
+                same_sell = is_sell & (self.order_side == 1) & (torch.abs(self.order_price - target_ask) < 1e-5)
+                upd_sell = is_sell & (~same_sell)
+                if upd_sell.any():
+                    self.order_side[upd_sell] = 1
+                    self.order_act[upd_sell] = actions[upd_sell]
+                    self.order_price[upd_sell] = target_ask[upd_sell]
+                    self.order_qty[upd_sell] = self.pos_qty[upd_sell]
+                    self.q_ahead[upd_sell] = self.asks_q[cur_t[upd_sell], 0]
+                    self.active_after[upd_sell] = cur_t[upd_sell] + 1
+            else:
+                self.order_side[is_sell] = 1
+                self.order_act[is_sell] = actions[is_sell]
+                self.order_price[is_sell] = target_ask[is_sell]
+                self.order_qty[is_sell] = self.pos_qty[is_sell]
+                self.q_ahead[is_sell] = self.asks_q[cur_t[is_sell], 0]
+                self.active_after[is_sell] = cur_t[is_sell] + 1
 
         # Отмена ордера (actions == 5)
         is_cancel = actions == 5

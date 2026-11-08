@@ -216,7 +216,7 @@ def run_motorics_simulation_8k(
     return champ_dict, best_idx, scores
 
 
-def run_lesson_1(pop_size: int = 8192, total_iterations: int = 500, sim_steps: int = 3000, resume: bool = True):
+def run_lesson_1(pop_size: int = 8192, total_iterations: int = 600, sim_steps: int = 3000, resume: bool = True):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log_msg("=" * 80)
     log_msg(f"🚀 СТАРТ УРОКА 1 (v2): ШКОЛА МОТОРИКИ НА НЕПРЕРЫВНЫХ 1С ОКНАХ ({pop_size:,} МОДЕЛЕЙ, H=256, {total_iterations} ИТ)")
@@ -308,4 +308,4 @@ def run_lesson_1(pop_size: int = 8192, total_iterations: int = 500, sim_steps: i
         policy.clone_and_mutate(scores=scores, top_k=64)
 
 if __name__ == "__main__":
-    run_lesson_1(pop_size=8192, total_iterations=500, sim_steps=3000)
+    run_lesson_1(pop_size=8192, total_iterations=600, sim_steps=3000)

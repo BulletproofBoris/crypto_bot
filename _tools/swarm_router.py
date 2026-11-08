@@ -51,11 +51,18 @@ class SwarmRegimeRouter:
         self.model_dir = BASE_DIR / "models" / self.coin / f"h{H}s_k{k_str}"
         
         manifest_path = self.model_dir / "manifest.json"
-        if not manifest_path.exists():
+        live_manifest_path = self.model_dir / "manifest_live.json"
+        meta_files = sorted(self.model_dir.glob("meta_win_*.json"))
+        if meta_files:
+            self.manifest = [json.loads(p.read_text(encoding="utf-8")) for p in meta_files]
+        elif live_manifest_path.exists():
+            with open(live_manifest_path) as f:
+                self.manifest = json.load(f)
+        elif manifest_path.exists():
+            with open(manifest_path) as f:
+                self.manifest = json.load(f)
+        else:
             raise FileNotFoundError(f"Манифест моделей не найден: {manifest_path}")
-
-        with open(manifest_path) as f:
-            self.manifest = json.load(f)
 
         # Загрузка моделей LightGBM в память
         self.models = []
@@ -91,10 +98,12 @@ class SwarmRegimeRouter:
         # Сами графы Keras подгружаются лениво (только при отсутствии готового .npy кэша предсказаний)
         self.neural_experts = []
         self.alliance_cfg = None
+        alliance_live_path = BASE_DIR / "models" / self.coin / f"ensemble_alliance_live_h{H}s.json"
         alliance_path = BASE_DIR / "models" / self.coin / f"ensemble_alliance_h{H}s.json"
-        if self.use_neural and self.neural_weight > 0.0 and alliance_path.exists():
+        active_alliance_path = alliance_live_path if alliance_live_path.exists() else alliance_path
+        if self.use_neural and self.neural_weight > 0.0 and active_alliance_path.exists():
             try:
-                with open(alliance_path) as f:
+                with open(active_alliance_path) as f:
                     self.alliance_cfg = json.load(f)
                 for arch_dir_name, arch_key in [
                     ("conv1d_gru", "conv1d+gru"),
@@ -176,34 +185,50 @@ class SwarmRegimeRouter:
         self._live_pred_ring = deque(maxlen=max(64, self.H + 5))
         self._live_win0_var = 0.25
         self._live_blend_var = 0.20
+        try:
+            from _tools.learned_regime_router import LearnedRegimeCompetenceRouter
+            self.learned_router = LearnedRegimeCompetenceRouter(device="cpu")
+            self.window_competence_8c = LearnedRegimeCompetenceRouter.build_window_competence_matrix_8c(self.manifest)
+        except Exception as e:
+            print(f"⚠️ Fallback на базовый роутер режимов: {e}")
+            self.learned_router = None
+            self.window_competence_8c = None
 
     def compute_routing_weights(self, current_regime_df: pd.DataFrame) -> np.ndarray:
         """
-        Вычисляет матрицу весов W (N x M) для каждой секунды на основе близости
-        текущего рыночного профиля к историческому профилю эксперта + логарифмического приора свежести.
+        Вычисляет матрицу весов W (N x M) для каждой секунды через Обученный 8-фазный Классификатор-Роутер
+        (LearnedRegimeCompetenceRouter) + каузальную маску открытия окон (ts_sec > train_end_sec).
         """
         n_samples = len(current_regime_df)
+        self._no_avail_mask = np.zeros(n_samples, dtype=bool)
+        self._n_avail_windows = np.full(n_samples, float(self.num_models), dtype=np.float32)
         if self.num_models == 1:
             return np.ones((n_samples, 1), dtype=np.float32)
 
-        cols = []
-        for idx, (m_k, s_k, col_name) in enumerate(self.live_feature_map):
-            if col_name in current_regime_df.columns:
-                cols.append(np.nan_to_num(current_regime_df[col_name].values, nan=float(self.regime_mean[0, idx])).astype(np.float32))
-            else:
-                cols.append(np.full(n_samples, float(self.regime_mean[0, idx]), dtype=np.float32))
+        if self.learned_router is not None and self.window_competence_8c is not None and len(self.window_competence_8c) == self.num_models:
+            reg_probs = self.learned_router.predict_regime_probs(current_regime_df)
+            comp_score = np.matmul(reg_probs, self.window_competence_8c.T) / max(0.05, self.temperature)
+        else:
+            cols = []
+            for idx, (m_k, s_k, col_name) in enumerate(self.live_feature_map):
+                if col_name in current_regime_df.columns:
+                    cols.append(np.nan_to_num(current_regime_df[col_name].values, nan=float(self.regime_mean[0, idx])).astype(np.float32))
+                else:
+                    cols.append(np.full(n_samples, float(self.regime_mean[0, idx]), dtype=np.float32))
+            cur_mat = np.column_stack(cols).astype(np.float32)
+            diff = (cur_mat[:, np.newaxis, :] - self.regime_matrix[np.newaxis, :, :]) / self.regime_stds[np.newaxis, :, :]
+            diff = np.clip(diff, -3.0, 3.0)
+            dist_sq = np.mean(diff ** 2, axis=-1)
+            comp_score = -dist_sq / max(0.05, self.temperature)
 
-        cur_mat = np.column_stack(cols).astype(np.float32)
-        diff = (cur_mat[:, np.newaxis, :] - self.regime_matrix[np.newaxis, :, :]) / self.regime_stds[np.newaxis, :, :]
-        diff = np.clip(diff, -3.0, 3.0)
-        dist_sq = np.mean(diff ** 2, axis=-1)
-
-        # Логарифмический приор свежести (-0.35*ln(1+rank)) + каузальная маскировка для вовлечения всей глубины истории
+        # Логарифмический приор свежести (-0.35*ln(1+rank)) + строгая каузальная маскировка открытия окон
         if "timestamp" in current_regime_df.columns and n_samples > 10 and len(self.train_end_sec) == self.num_models:
             ts_sec = pd.to_datetime(current_regime_df["timestamp"], utc=True).dt.as_unit("s").astype("int64").values
             avail_raw = ts_sec[:, np.newaxis] > self.train_end_sec[np.newaxis, :]
+            self._n_avail_windows = np.sum(avail_raw, axis=1).astype(np.float32)
             avail_desc = avail_raw[:, self.desc_order]
             no_avail = ~np.any(avail_desc, axis=1)
+            self._no_avail_mask = no_avail.copy()
             if np.any(no_avail):
                 avail_desc[no_avail, -1] = True
             rank_desc = (np.cumsum(avail_desc, axis=1) - 1).astype(np.float32)
@@ -215,7 +240,7 @@ class SwarmRegimeRouter:
             self._last_causal_rank = None
             recency_bonus = (-0.35 * np.log1p(self.inv_desc_order.astype(np.float32)))[np.newaxis, :]
         online_log_bonus = np.log(np.maximum(self.online_lgb_scores, 0.25))[np.newaxis, :]
-        logits = (-dist_sq / max(0.05, self.temperature)) + recency_bonus + online_log_bonus
+        logits = comp_score + recency_bonus + online_log_bonus
         logits_max = np.max(logits, axis=-1, keepdims=True)
         exp_logits = np.exp(logits - logits_max)
         weights = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
@@ -274,6 +299,17 @@ class SwarmRegimeRouter:
             weights = np.full((n_samples, self.num_models), 1.0 / self.num_models, dtype=np.float32)
         elif mode == "router":
             weights = self.compute_routing_weights(current_regime_df)
+            no_av = getattr(self, "_no_avail_mask", None)
+            if no_av is not None and np.all(no_av):
+                z_probs = np.zeros((n_samples, 7), dtype=np.float32)
+                z_probs[:, 3] = 1.0
+                return {
+                    "expected_z": np.zeros(n_samples, dtype=np.float32),
+                    "p_buy": np.zeros(n_samples, dtype=np.float32),
+                    "p_sell": np.zeros(n_samples, dtype=np.float32),
+                    "probs": z_probs,
+                    "weights": weights,
+                }
         else:
             raise ValueError(f"Неизвестный режим: {mode}")
 
@@ -281,12 +317,10 @@ class SwarmRegimeRouter:
         c_rank = getattr(self, "_last_causal_rank", None)
         min_lgb_w = 0.25 / max(1, self.num_models)
         for i in range(self.num_models):
-            if mode == "router" and n_samples > 300000 and c_rank is not None:
+            if mode == "router" and n_samples > 10000 and c_rank is not None:
                 idx_w = np.where((c_rank[:, i] < 900.0) & ((c_rank[:, i] <= 3.5) | (weights[:, i] >= min_lgb_w)))[0]
                 if len(idx_w) > 0:
                     act_slices.append((int(idx_w[0]), int(idx_w[-1]) + 1))
-                elif i == self.latest_idx:
-                    act_slices.append((max(0, n_samples - 100000), n_samples))
                 else:
                     act_slices.append((0, 0))
             else:
@@ -334,7 +368,8 @@ class SwarmRegimeRouter:
         pb_all = all_probs[:, :, 5] + all_probs[:, :, 6]
         ps_all = all_probs[:, :, 0] + all_probs[:, :, 1]
 
-        ref_i = self.latest_idx
+        active_model_indices = [i for i in range(self.num_models) if act_slices[i][1] > act_slices[i][0]]
+        ref_i = active_model_indices[-1] if active_model_indices else self.latest_idx
         s0, e0 = act_slices[ref_i] if act_slices[ref_i][1] > act_slices[ref_i][0] else (0, n_samples)
         ref_mean = float(np.mean(ez_all[ref_i, s0:e0]))
         ref_std = float(np.std(ez_all[ref_i, s0:e0])) + 1e-6
@@ -497,12 +532,24 @@ class SwarmRegimeRouter:
                 p_sell = p_sell.copy()
                 p_sell[bo_stale] = np.clip(p_sell[bo_stale] * (f_ps / s_ps), 0.0, 1.0)
 
+        no_av = getattr(self, "_no_avail_mask", None)
+        if no_av is not None and np.any(no_av) and len(no_av) == len(expected_z):
+            expected_z = expected_z.copy()
+            p_buy = p_buy.copy()
+            p_sell = p_sell.copy()
+            blend_probs = blend_probs.copy()
+            expected_z[no_av] = 0.0
+            p_buy[no_av] = 0.0
+            p_sell[no_av] = 0.0
+            blend_probs[no_av] = np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
         return {
             'probs': blend_probs,
             'expected_z': expected_z,
             'p_buy': p_buy,
             'p_sell': p_sell,
-            'weights': weights
+            'weights': weights,
+            'n_avail': getattr(self, "_n_avail_windows", np.full(len(expected_z), float(self.num_models), dtype=np.float32)),
         }
 
     def preload_neural_models(self):

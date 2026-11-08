@@ -469,6 +469,11 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
         print(f"{win_id:<6} | {ts_tr_start} -> {ts_tr_end} | {ts_te_start} -> {ts_te_end} | {ic:+6.4f}  | {auc:6.4f}   | {top2_pnl:+6.2f} тиков | {status:<10}")
 
     try:
+        with open(out_dir / "manifest_live.json", 'w') as f:
+            json.dump(manifest, f, indent=2)
+    except OSError:
+        pass
+    try:
         with open(out_dir / "manifest.json", 'w') as f:
             json.dump(manifest, f, indent=2)
     except OSError:

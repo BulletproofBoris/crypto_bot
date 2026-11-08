@@ -774,7 +774,10 @@ def train_pytorch_window_fast(
         if score > best_score:
             best_score = score
             best_m = {"ic_dt_ticks": round(ic, 4), "roc_auc_ovr": round(auc, 4), "log_loss": round(ll, 4), "top2pct_mean_ticks": round(top2, 2)}
-            net.export_to_keras(out_keras)
+            try:
+                net.export_to_keras(out_keras)
+            except OSError:
+                pass
         meta = {
             "window_id": win_tag, "model_type": arch, "coin": "PRL", "H": int(horizon), "seq_len": sl,
             "runs": int(r_i),
@@ -784,8 +787,11 @@ def train_pytorch_window_fast(
             "feature_norm": {"mean": mean.tolist(), "std": std.tolist()},
             "weights_file": f"model_{win_tag}.keras",
         }
-        with open(out_meta, "w") as f:
-            json.dump(meta, f, indent=2)
+        try:
+            with open(out_meta, "w") as f:
+                json.dump(meta, f, indent=2)
+        except OSError:
+            pass
         print(f"  [{arch.upper()} H={horizon}s {win_tag} r{r_i:02d}/{runs}] ({time.perf_counter()-t0:.1f}s) -> IC={ic:+.4f} | AUC={auc:.4f} | Loss={ll:.4f} | Top2%={top2:+.2f}t", flush=True)
     del x_tr_pad, x_te_pad, y_tr_t, net
     if torch.cuda.is_available():

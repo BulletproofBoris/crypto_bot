@@ -125,6 +125,13 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 176.0, force_r
             f"ST_bid_{lvl}_price", f"ST_bid_{lvl}_qty",
             f"ST_ask_{lvl}_price", f"ST_ask_{lvl}_qty",
         ])
+    feats_json_path = BASE_DIR / "data" / "features" / f"selected_features_{coin}_h8s.json"
+    feat_order_cols = json.loads(feats_json_path.read_text())["feature_order"] if feats_json_path.exists() else []
+    router_extra_cols = [
+        "ST_vol_15s_ticks", "ST_ofi_15s", "ST_ofi_60s", "ST_depth_ratio_5",
+        "BO_ofi_15s", "BO_ret_15s", "LL_zscore_30s",
+    ]
+    swarm_cols = [c for c in list(dict.fromkeys(lob_and_meta_cols + feat_order_cols + router_extra_cols)) if c in schema_cols]
     base_cols = [c for c in lob_and_meta_cols if c in schema_cols]
 
     rg_indices = []
@@ -197,7 +204,7 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 176.0, force_r
                                     t_off = tail_start_abs - t_cum
                                 t_rgs.append(rg_i)
                             t_cum += rg_n
-                        df_tail = pf.read_row_groups(t_rgs).slice(t_off, n_tail + pad).to_pandas()
+                        df_tail = pf.read_row_groups(t_rgs, columns=swarm_cols).slice(t_off, n_tail + pad).to_pandas()
                         if "timestamp" not in df_tail.columns:
                             df_tail["timestamp"] = df_tail.index
                         df_tail = df_tail.reset_index(drop=True)
@@ -236,7 +243,7 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 176.0, force_r
     if X_triad_Incremental is not None:
         X_triad = X_triad_Incremental
         if X_h60 is None:
-            df_full = pf.read_row_groups(rg_indices).slice(first_rg_offset, len(X_triad)).to_pandas()
+            df_full = pf.read_row_groups(rg_indices, columns=swarm_cols).slice(first_rg_offset, len(X_triad)).to_pandas()
             if "timestamp" not in df_full.columns:
                 df_full["timestamp"] = df_full.index
             df_full = df_full.reset_index(drop=True)
@@ -253,7 +260,7 @@ def build_or_load_rl_cache(coin: str = "prl", tail_hours: float = 176.0, force_r
             ]).astype(np.float32)
             del df_full, router60, X_cols60, X_in60, ens60
     else:
-        df_full = pf.read_row_groups(rg_indices).slice(first_rg_offset, n_rows).to_pandas()
+        df_full = pf.read_row_groups(rg_indices, columns=swarm_cols).slice(first_rg_offset, n_rows).to_pandas()
         if "timestamp" not in df_full.columns:
             df_full["timestamp"] = df_full.index
         df_full = df_full.reset_index(drop=True)

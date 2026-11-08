@@ -131,21 +131,34 @@ def step2_train_rolling_windows_6h(coin: str = "prl", epochs: int = 10, runs: in
     print("=" * 95)
     cache_dir = BASE_DIR / "data" / "_mmap_cache"
     for h, k in HORIZON_PAIRS:
-        print(f"\n🔹 [LightGBM H={h}s, K={k}] Проверка и дообучение скользящих окон...")
-        train_coin_horizon(coin=coin, H=h, K=k, n_estimators=450, n_jobs=SAFE_WORKERS)
-
         n_w = int(np.load(cache_dir / f"h{h}_n_windows.npy"))
+        lgb_last_mp = BASE_DIR / "models" / coin / f"h{h}s_k{k:g}" / f"meta_win_{n_w-1:02d}.json"
+        if not lgb_last_mp.exists():
+            print(f"\n🔹 [LightGBM H={h}s, K={k}] Проверка и дообучение скользящих окон...")
+            train_coin_horizon(coin=coin, H=h, K=k, n_estimators=450, n_jobs=SAFE_WORKERS)
+        else:
+            print(f"\n🔹 [LightGBM H={h}s, K={k}] Все {n_w} окон уже обучены и актуальны.")
         for arch in NEURAL_ARCHS:
             ep = (6 if h >= 90 else 8) if arch == "conv1d+gru" else (8 if h >= 90 else epochs)
             bsz = 4096 if h >= 60 else 2048
             arch_dir = BASE_DIR / "models" / coin / f"{arch.replace('+', '_')}_h{h}s"
             for w_i in range(n_w):
                 mp = arch_dir / f"meta_win_{w_i:02d}.json"
+                lgb_mp = BASE_DIR / "models" / coin / f"h{h}s_k{k:g}" / f"meta_win_{w_i:02d}.json"
                 if mp.exists():
-                    # Если окно было обучено сегодня (за последние 12 часов) или является крайним окном с меньшим числом runs (< 15), дообучаем его до runs=15
+                    try:
+                        open(mp, "r+").close()
+                    except OSError:
+                        continue
+                    meta_obj = json.loads(mp.read_text())
                     age_sec = time.time() - mp.stat().st_mtime
-                    cur_runs = int(json.loads(mp.read_text()).get("runs", 3))
-                    if not ((age_sec < 43200 or w_i == n_w - 1) and cur_runs < runs):
+                    cur_runs = int(meta_obj.get("runs", 3))
+                    ts_mismatch = False
+                    if lgb_mp.exists() and w_i >= n_w - 2:
+                        lgb_tr_range = json.loads(lgb_mp.read_text()).get("train_ts_range")
+                        if lgb_tr_range and meta_obj.get("train_ts_range") and meta_obj.get("train_ts_range") != lgb_tr_range:
+                            ts_mismatch = True
+                    if not ts_mismatch and not ((age_sec < 43200 or w_i == n_w - 1) and cur_runs < runs):
                         continue
                 print(f"  🧠 [{arch.upper()} H={h}s] Обучение окна win_{w_i:02d}/{n_w-1} (runs={runs}, epochs={ep})...", flush=True)
                 train_pytorch_window_fast(
@@ -172,6 +185,7 @@ def step2_train_rolling_windows_6h(coin: str = "prl", epochs: int = 10, runs: in
 
         # Пересборка мета-ансамбля ensemble_alliance_h{h}s.json
         al_path = BASE_DIR / "models" / coin / f"ensemble_alliance_h{h}s.json"
+        al_live_path = BASE_DIR / "models" / coin / f"ensemble_alliance_live_h{h}s.json"
         selected_models = []
         weights = {}
         for a2 in NEURAL_ARCHS:
@@ -195,6 +209,10 @@ def step2_train_rolling_windows_6h(coin: str = "prl", epochs: int = 10, runs: in
             "weights": weights,
             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        try:
+            al_live_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except OSError:
+            pass
         try:
             al_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except OSError:
