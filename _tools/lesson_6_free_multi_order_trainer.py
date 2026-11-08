@@ -423,12 +423,15 @@ def run_lesson_6(iterations: int = 1000, n_groups: int = 1365):
                 end_t = int(w_start + win_len - 1)
                 end_b1 = torch.clamp(vec_env.bids[end_t, 0], min=tick_sz)
                 rem = vec_env.pos_qty > 1e-6
-                # Если на границе окна позиция в рабочей сетке (end_b1 не провалился глубже min_buy_px - 2 тика),
-                # не штрафуем бота искусственным рыночным сбросом на таймере, а возвращаем себестоимость рабочего остатка;
-                # если же бот допустил глубокий провал > 2 тиков под нижний транш — оцениваем остаток по рынку end_b1!
-                deep_underwater = rem & (end_b1 < (vec_env.min_buy_px - 2.0 * tick_sz))
+                # ЧЕСТНАЯ РЫНОЧНАЯ ОЦЕНКА ОСТАТКА НА ГРАНИЦЕ ОКНА (без лазейки min_buy_px!):
+                # Сравниваем end_b1 строго с ИСТИННОЙ средневзвешенной ценой входа всей позиции (vec_env.avg_entry),
+                # которую невозможно обмануть мелкой докупкой на дне!
+                # - Если на 900-й секунде позиция находится в рабочем спреде (в пределах 1 тика от avg_entry),
+                #   не штрафуем незавершенный мейкер-цикл искусственным закрытием по таймеру (возвращаем pos_cost_usd).
+                # - Если же позиция просела на >= 2 тика под ИСТИННЫЙ avg_entry — оцениваем весь остаток по рынку end_b1!
+                underwater_vs_avg = rem & (end_b1 < (vec_env.avg_entry - 1.05 * tick_sz))
                 liq_val = torch.where(
-                    deep_underwater,
+                    underwater_vs_avg,
                     vec_env.pos_qty * end_b1 * (1.0 - vec_env.maker_fee),
                     vec_env.pos_cost_usd,
                 )
@@ -447,8 +450,7 @@ def run_lesson_6(iterations: int = 1000, n_groups: int = 1365):
             paper_dd_pct = 100.0 * max_paper_dd_usd / env_budgets
             loss_cycles = torch.clamp(cycles - prof_cycles, min=0).float()
 
-            # Целевая функция: максимизация реализованной прибыли при минимальной ФАКТИЧЕСКОЙ просадке (real_dd_pct)!
-            # Бумажная просадка (paper_dd_pct) внутри рабочей сетки (до 0.50%) не штрафуется вообще!
+            # Целевая функция: максимизация честной рыночной прибыли при минимальной реализованной просадке (real_dd_pct)!
             env_scores = (
                 pnl_pct * 1150.0
                 + torch.clamp(total_pnl_usd * 7.5, min=-200.0, max=380.0)
@@ -478,6 +480,11 @@ def run_lesson_6(iterations: int = 1000, n_groups: int = 1365):
 
             g_prof_buds = (g_pnl_usd_mat > 0.0).long().sum(dim=1)  # сколько из 6 бюджетов закрыты в плюс!
             group_scores = g_scores_mat.mean(dim=1) + g_prof_buds.float() * 85.0
+
+            # Слепой результат текущего Чемпиона (Группа #0 — Out-of-Sample без подглядывания мутаций!)
+            c0_pnl_pct = float(g_pnl_pct_mat[0].mean().item())
+            c0_pnl_usd = float(g_pnl_usd_mat[0].sum().item())
+            c0_dd_pct = float(g_dd_pct_mat[0].mean().item())
 
             sorted_g = torch.argsort(group_scores, descending=True)
             best_g = int(sorted_g[0].item())
@@ -521,6 +528,9 @@ def run_lesson_6(iterations: int = 1000, n_groups: int = 1365):
                 "score": round(b_score, 2),
                 "pnl_pct": round(b_pnl_pct, 4),
                 "pnl_usd": round(b_pnl_usd, 4),
+                "champ_oos_pnl_pct": round(c0_pnl_pct, 4),
+                "champ_oos_pnl_usd": round(c0_pnl_usd, 4),
+                "champ_oos_dd_pct": round(c0_dd_pct, 4),
                 "max_dd_pct": round(b_dd_pct, 4),
                 "max_dd_usd": round(b_dd_usd, 4),
                 "paper_dd_pct": round(b_pdd_pct, 4),
@@ -536,6 +546,7 @@ def run_lesson_6(iterations: int = 1000, n_groups: int = 1365):
             # Скользящее среднее за последние 20 итераций (для прозрачной оценки тренда)
             tail20 = history[-20:]
             r20_pnl = float(np.mean([x["pnl_pct"] for x in tail20]))
+            r20_oos = float(np.mean([x.get("champ_oos_pnl_pct", x["pnl_pct"]) for x in tail20]))
             r20_dd = float(np.mean([x["max_dd_pct"] for x in tail20]))
             r20_wr = 100.0 * sum(x["prof_cycles"] for x in tail20) / max(1, sum(x["cycles"] for x in tail20))
             dt = time.time() - t0
@@ -543,8 +554,9 @@ def run_lesson_6(iterations: int = 1000, n_groups: int = 1365):
 
             log_msg(
                 f"🌐 [{it}/{iterations}]{star} 6-Buds({b_prof_buds}/6+) | "
-                f"MeanPnL: {b_pnl_pct:+.2f}% (Sum ${b_pnl_usd:+.2f}) | RealDD: {b_dd_pct:.2f}% (Paper:{b_pdd_pct:.2f}%) | "
-                f"Cyc: {b_cyc}/{b_prof} (Part:{b_pf}) | 📈Roll20: {r20_pnl:+.2f}% (RealDD {r20_dd:.2f}%, WR {r20_wr:.1f}%) ({dt:.1f}с)"
+                f"BestMut: {b_pnl_pct:+.2f}% (${b_pnl_usd:+.1f}) | BlindChamp: {c0_pnl_pct:+.2f}% (${c0_pnl_usd:+.1f}) | "
+                f"RealDD: {b_dd_pct:.2f}% (Paper:{b_pdd_pct:.2f}%) | Cyc: {b_cyc}/{b_prof} (Part:{b_pf}) | "
+                f"📈Roll20: {r20_pnl:+.2f}% (OOS {r20_oos:+.2f}%, DD {r20_dd:.2f}%, WR {r20_wr:.1f}%) ({dt:.1f}с)"
             )
 
             ckpt_payload = {

@@ -360,27 +360,60 @@ class VectorizedFreeMultiOrderEnv:
         tot_active_orders = (self.bid_qty > 1e-6).long().sum(dim=1) + (self.ask_qty > 1e-6).long().sum(dim=1)
         self.multi_orders_used = self.multi_orders_used + (tot_active_orders >= 2).long()
 
-        # 4. Безветвевое каскадное исполнение на тике t + 1 одновременно по 12 Bid и 12 Ask слотам!
+        # 4. Безветвевое ЧЕСТНОЕ ПОСЛЕДОВАТЕЛЬНОЕ исполнение на тике t + 1 по 12 Bid и 12 Ask слотам!
+        # Устранены эксплойты:
+        #  - Никакой фантомной ликвидности (+l1_bid_q / +l1_ask_q) при касании спреда: исполнение идет строго
+        #    от реального ленточного потока сделок sv / bv (плюс 12% l1_q только при строгом пробое уровня на >= 1 тик).
+        #  - Честный последовательный водопад (Sequential Queue + Fill Waterfall): поток сделок расходуется
+        #    последовательно сверху вниз сначала на очередь (bid_qa), затем на сам ордер (bid_qty), и только
+        #    остаток переходит к следующему слоту!
         next_t = min(cur_t_scalar + 1, self.max_steps - 1)
         nb1 = torch.clamp(self.bids[next_t, 0], min=self.tick_size)
         na1 = torch.clamp(self.asks[next_t, 0], min=nb1 + self.tick_size)
         sv = self.sell_vol[next_t]
         bv = self.buy_vol[next_t]
 
-        # 4a. Каскадный водопад по 12 слотам Bid [B, 12]
+        # 4a. Строгий последовательный водопад по 12 слотам Bid [B, 12]
         act_b = (self.bid_qty > 1e-6) & (next_t >= self.bid_act_t)
-        crossed_b = na1 <= (self.bid_px + 1e-6)
-        hit_b = act_b & (crossed_b | ((nb1 <= self.bid_px + 1e-6) & (sv > 0.0)))
-        eff_flow_b = torch.where(crossed_b, sv + l1_bid_q, sv.expand_as(self.bid_px))
-        av_b = torch.where(hit_b, torch.clamp(eff_flow_b - self.bid_qa, min=0.0), torch.zeros_like(self.bid_qa))
-        self.bid_qa = torch.where(hit_b, torch.clamp(self.bid_qa - eff_flow_b, min=0.0), self.bid_qa)
+        strict_cross_b = na1 <= (self.bid_px - 0.5 * self.tick_size)
+        hit_b = act_b & (strict_cross_b | ((nb1 <= self.bid_px + 1e-6) & (sv > 0.0)))
 
-        want_b = torch.minimum(self.bid_qty, av_b)  # [B, 12]
+        # Общий доступный поток продавцов на тике next_t для каждого агента [B, 1]
+        any_strict_b = (act_b & strict_cross_b).any(dim=1, keepdim=True)
+        tot_flow_b = torch.where(any_strict_b, sv + 0.12 * l1_bid_q, sv)  # [B, 1]
+
+        # Для нечетных слотов (второй транш того же ценового эшелона) очередь уже учтена в четном слоте,
+        # если четный слот активен на той же цене; иначе слот проходит свою очередь сам.
+        even_act_b = act_b[:, 0::2]
+        Incremental_qa_b = self.bid_qa.clone()
+        Incremental_qa_b[:, 1::2] = torch.where(
+            even_act_b,
+            torch.clamp(self.bid_qa[:, 1::2] - self.bid_qa[:, 0::2], min=0.0),
+            self.bid_qa[:, 1::2],
+        )
+        eff_qa_b = torch.where(hit_b, Incremental_qa_b, torch.zeros_like(self.bid_qa))
+        eff_qty_b = torch.where(hit_b, self.bid_qty, torch.zeros_like(self.bid_qty))
+
+        # Кумулятивный расход потока продавцов сверху вниз: каждый слот требует сначала пробить eff_qa_b, затем eff_qty_b
+        slot_need_b = eff_qa_b + eff_qty_b  # [B, 12]
+        cum_need_b = torch.cumsum(slot_need_b, dim=1)
+        flow_before_slot_b = cum_need_b - slot_need_b
+        rem_flow_at_slot_b = torch.clamp(tot_flow_b - flow_before_slot_b, min=0.0)
+
+        qa_eaten_b = torch.minimum(eff_qa_b, rem_flow_at_slot_b)
+        self.bid_qa = torch.where(hit_b, torch.clamp(self.bid_qa - qa_eaten_b, min=0.0), self.bid_qa)
+        # Синхронизируем очередь второго транша, если первый транш стоял перед ним
+        self.bid_qa[:, 1::2] = torch.where(
+            act_b[:, 1::2] & even_act_b,
+            torch.clamp(self.bid_qa[:, 1::2] - qa_eaten_b[:, 0::2], min=0.0),
+            self.bid_qa[:, 1::2],
+        )
+
+        want_b = torch.minimum(eff_qty_b, torch.clamp(rem_flow_at_slot_b - eff_qa_b, min=0.0))  # [B, 12]
         cum_want_b = torch.cumsum(want_b, dim=1)
         prev_cum_b = cum_want_b - want_b
-        max_afford_b = torch.clamp(self.cash * 0.998 / (b1 * (1.0 + self.maker_fee)), min=0.0)
-        cap_b = torch.minimum(sv + l1_bid_q, max_afford_b).unsqueeze(1)
-        f_q = torch.minimum(want_b, torch.clamp(cap_b - prev_cum_b, min=0.0))  # [B, 12]
+        max_afford_b = torch.clamp(self.cash * 0.998 / (b1 * (1.0 + self.maker_fee)), min=0.0).unsqueeze(1)
+        f_q = torch.minimum(want_b, torch.clamp(max_afford_b - prev_cum_b, min=0.0))  # [B, 12]
 
         has_slot_b = f_q > 1e-5
         tot_fq = f_q.sum(dim=1)
@@ -393,16 +426,20 @@ class VectorizedFreeMultiOrderEnv:
         avg_fill_b_px = tot_cost_raw / torch.clamp(tot_fq, min=1e-6)
         min_fill_b_px = torch.where(has_slot_b, self.bid_px, torch.full_like(self.bid_px, 1e9)).min(dim=1).values
 
-        # Обновляем LIFO нижний транш, если докупка прошла дешевле текущей средней цены
-        is_dip_buy = has_buy & (old_q > 1e-6) & (avg_fill_b_px < self.avg_entry - 0.1 * self.tick_size)
+        # Обновляем LIFO нижний транш только если докупка существенно (минимум на 1 полный тик) дешевле средней цены
+        is_dip_buy = has_buy & (old_q > 1e-6) & (avg_fill_b_px <= self.avg_entry - 0.95 * self.tick_size)
         self.low_tranche_qty = torch.where(
             has_buy & (old_q <= 1e-6),
-            tot_fq,
+            torch.zeros_like(self.low_tranche_qty),
             torch.where(is_dip_buy, self.low_tranche_qty + tot_fq, self.low_tranche_qty),
         )
         self.min_buy_px = torch.where(
             has_buy,
-            torch.where(old_q > 1e-6, torch.minimum(self.min_buy_px, min_fill_b_px), min_fill_b_px),
+            torch.where(
+                old_q <= 1e-6,
+                avg_fill_b_px,
+                torch.where(is_dip_buy, avg_fill_b_px, self.min_buy_px),
+            ),
             self.min_buy_px,
         )
 
@@ -425,57 +462,74 @@ class VectorizedFreeMultiOrderEnv:
         )
         self.n_trades = self.n_trades + has_slot_b.long().sum(dim=1)
 
-        # 4b. Каскадный водопад по 12 слотам Ask [B, 12]
+        # 4b. Строгий последовательный водопад по 12 слотам Ask [B, 12]
         act_a = (self.ask_qty > 1e-6) & (next_t >= self.ask_act_t) & (self.pos_qty.unsqueeze(1) > 1e-6)
-        crossed_a = nb1 >= (self.ask_px - 1e-6)
-        hit_a = act_a & (crossed_a | ((na1 >= self.ask_px - 1e-6) & (bv > 0.0)))
-        eff_flow_a = torch.where(crossed_a, bv + l1_ask_q, bv.expand_as(self.ask_px))
-        av_a = torch.where(hit_a, torch.clamp(eff_flow_a - self.ask_qa, min=0.0), torch.zeros_like(self.ask_qa))
-        self.ask_qa = torch.where(hit_a, torch.clamp(self.ask_qa - eff_flow_a, min=0.0), self.ask_qa)
+        strict_cross_a = nb1 >= (self.ask_px + 0.5 * self.tick_size)
+        hit_a = act_a & (strict_cross_a | ((na1 >= self.ask_px - 1e-6) & (bv > 0.0)))
 
-        want_a = torch.minimum(self.ask_qty, av_a)  # [B, 12]
+        any_strict_a = (act_a & strict_cross_a).any(dim=1, keepdim=True)
+        tot_flow_a = torch.where(any_strict_a, bv + 0.12 * l1_ask_q, bv)  # [B, 1]
+
+        even_act_a = act_a[:, 0::2]
+        Incremental_qa_a = self.ask_qa.clone()
+        Incremental_qa_a[:, 1::2] = torch.where(
+            even_act_a,
+            torch.clamp(self.ask_qa[:, 1::2] - self.ask_qa[:, 0::2], min=0.0),
+            self.ask_qa[:, 1::2],
+        )
+        eff_qa_a = torch.where(hit_a, Incremental_qa_a, torch.zeros_like(self.ask_qa))
+        eff_qty_a = torch.where(hit_a, self.ask_qty, torch.zeros_like(self.ask_qty))
+
+        slot_need_a = eff_qa_a + eff_qty_a  # [B, 12]
+        cum_need_a = torch.cumsum(slot_need_a, dim=1)
+        flow_before_slot_a = cum_need_a - slot_need_a
+        rem_flow_at_slot_a = torch.clamp(tot_flow_a - flow_before_slot_a, min=0.0)
+
+        qa_eaten_a = torch.minimum(eff_qa_a, rem_flow_at_slot_a)
+        self.ask_qa = torch.where(hit_a, torch.clamp(self.ask_qa - qa_eaten_a, min=0.0), self.ask_qa)
+        self.ask_qa[:, 1::2] = torch.where(
+            act_a[:, 1::2] & even_act_a,
+            torch.clamp(self.ask_qa[:, 1::2] - qa_eaten_a[:, 0::2], min=0.0),
+            self.ask_qa[:, 1::2],
+        )
+
+        want_a = torch.minimum(eff_qty_a, torch.clamp(rem_flow_at_slot_a - eff_qa_a, min=0.0))  # [B, 12]
         cum_want_a = torch.cumsum(want_a, dim=1)
         prev_cum_a = cum_want_a - want_a
-        cap_a = torch.minimum(bv + l1_ask_q, self.pos_qty).unsqueeze(1)
+        cap_a = self.pos_qty.unsqueeze(1)
         f_qa = torch.minimum(want_a, torch.clamp(cap_a - prev_cum_a, min=0.0))  # [B, 12]
 
         has_slot_a = f_qa > 1e-5
-        # В LIFO-учете слот прибылен, если он продан выше своего базового уровня входа (min_buy_px для LIFO 0..5, avg_entry для 6..11)
-        slot_ref_entry = torch.cat([
-            torch.minimum(self.min_buy_px, self.avg_entry).unsqueeze(1).expand(self.num_envs, 6),
-            self.avg_entry.unsqueeze(1).expand(self.num_envs, S - 6),
-        ], dim=1)
-        is_prof_slot = (self.ask_px * (1.0 - self.maker_fee)) > (slot_ref_entry * (1.0 + self.maker_fee))
-        self.sell_cycles = self.sell_cycles + has_slot_a.long().sum(dim=1)
-        self.prof_sell_cycles = self.prof_sell_cycles + (has_slot_a & is_prof_slot).long().sum(dim=1)
-
         tot_fqa = f_qa.sum(dim=1)
         tot_rev = (f_qa * self.ask_px).sum(dim=1) * (1.0 - self.maker_fee)
         has_sell = tot_fqa > 1e-5
 
-        # Списываем проданный объем из нижнего LIFO-транша и уменьшаем себестоимость оставшейся позиции на величину выручки!
-        sold_low_q = f_qa[:, :6].sum(dim=1)
-        sold_high_q = f_qa[:, 6:].sum(dim=1)
+        # Строгий бухгалтерский учет LIFO:
+        # Сколько реально стоили проданные монеты (нижний транш по min_buy_px, верхний по avg_entry):
+        sold_low_q = torch.minimum(f_qa[:, :6].sum(dim=1), self.low_tranche_qty)
+        sold_high_q = torch.clamp(tot_fqa - sold_low_q, min=0.0)
         sold_cost_usd = torch.minimum(
             self.pos_cost_usd,
             sold_low_q * torch.minimum(self.min_buy_px, self.avg_entry) * (1.0 + self.maker_fee)
             + sold_high_q * self.avg_entry * (1.0 + self.maker_fee),
         )
-        lifo_net_gain = torch.clamp(tot_rev - sold_cost_usd, min=0.0)
+        # Цикл считается прибыльным ТОЛЬКО если фактическая чистая выручка превысила фактическую себестоимость проданных монет!
+        is_net_prof_sell = has_sell & (tot_rev > sold_cost_usd + 1e-5)
+        self.sell_cycles = self.sell_cycles + has_sell.long()
+        self.prof_sell_cycles = self.prof_sell_cycles + is_net_prof_sell.long()
 
         self.cash = torch.where(has_sell, self.cash + tot_rev, self.cash)
         rem_p = torch.clamp(self.pos_qty - tot_fqa, min=0.0)
         self.pos_qty = torch.where(has_sell, rem_p, self.pos_qty)
+        # Честный остаток себестоимости без двойного учета скидки:
         self.pos_cost_usd = torch.where(
             has_sell,
             torch.where(rem_p > 1e-6, torch.clamp(self.pos_cost_usd - sold_cost_usd, min=0.0), torch.zeros_like(self.pos_cost_usd)),
             self.pos_cost_usd,
         )
-        # Половина чистой LIFO-прибыли снижает целевой безубыток (avg_entry) оставшегося верхнего транша!
-        eff_rem_cost = torch.clamp(self.pos_cost_usd - 0.50 * lifo_net_gain, min=rem_p * self.tick_size)
         self.avg_entry = torch.where(
             has_sell,
-            torch.where(rem_p > 1e-6, eff_rem_cost / (rem_p * (1.0 + self.maker_fee)), torch.zeros_like(self.avg_entry)),
+            torch.where(rem_p > 1e-6, self.pos_cost_usd / (rem_p * (1.0 + self.maker_fee)), torch.zeros_like(self.avg_entry)),
             self.avg_entry,
         )
         self.low_tranche_qty = torch.where(
