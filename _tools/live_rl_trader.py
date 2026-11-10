@@ -1945,7 +1945,7 @@ class LiveTriadRLTrader:
                     self.last_l7_out = raw_26
                     b_w_12 = raw_26[:12] if raw_26[24] <= 0.75 else np.zeros(12, dtype=np.float32)
                     b_tot_s = float(np.sum(np.where(b_w_12 >= 0.08, b_w_12, 0.0)))
-                    self.last_l7_target_exp_frac = float(np.clip(b_tot_s * 0.25, 0.0, 1.0))
+                    self.last_l7_target_exp_frac = float(np.clip(b_tot_s * 0.85, 0.0, 1.0))
             except Exception as e_l7_step:
                 print(f"⚠️ [L7/L9 STEP WARN]: {e_l7_step}")
                 self.last_l7_out = None
@@ -2401,6 +2401,21 @@ class LiveTriadRLTrader:
             if slot_off_b or grid_shift_b:
                 to_cancel_b.append((s, slot["id"], "off" if slot_off_b else "shift"))
 
+        if not is_danger_b and not to_cancel_b:
+            tot_bud_chk = max(25.0, float(self.initial_budget_usd), float(self.bot_cash_usd + self.pos_qty * b1))
+            res_cash_chk = sum(float(s.get("qty", 0.0)) * float(s.get("px", 0.0)) * 1.002 for s in self.bid_slots if s.get("id") is not None)
+            b_tot_chk = float(np.sum(np.where(b_w >= 0.08, b_w, 0.0)))
+            targ_usd_chk = tot_bud_chk * float(np.clip(b_tot_chk * 0.85, 0.0, 1.0))
+            free_act_slots = [s for s in range(12) if self.bid_slots[s].get("id") is None and b_w[s] >= 0.12]
+            if not free_act_slots and (res_cash_chk + self.pos_qty * b1) < 0.65 * targ_usd_chk and (self.bot_cash_usd - res_cash_chk) >= 50.0:
+                occ_cands = [
+                    s for s in range(12)
+                    if self.bid_slots[s].get("id") is not None and b_w[s] >= 0.12 and (now_ts - float(self.bid_slots[s].get("act_ts", 0.0))) >= 30.0
+                ]
+                if occ_cands:
+                    smallest_s = min(occ_cands, key=lambda idx: float(self.bid_slots[idx].get("qty", 0.0)) * float(self.bid_slots[idx].get("px", 0.0)))
+                    to_cancel_b.append((smallest_s, self.bid_slots[smallest_s]["id"], "upsize"))
+
         to_cancel_a = []
         for s in range(12):
             slot = self.ask_slots[s]
@@ -2451,7 +2466,7 @@ class LiveTriadRLTrader:
             if self.ex_usdt_free > 0.0:
                 unreserved_cash = min(unreserved_cash, self.ex_usdt_free)
             b_tot_sig = float(np.sum(np.where(b_w >= 0.08, b_w, 0.0)))
-            target_exp_frac = float(np.clip(b_tot_sig * 0.25, 0.0, 1.0))
+            target_exp_frac = float(np.clip(b_tot_sig * 0.85, 0.0, 1.0))
             self.last_l7_target_exp_frac = target_exp_frac
             target_exp_usd = tot_bud * target_exp_frac
             cur_exp_usd = res_cash + self.pos_qty * b1
@@ -2459,7 +2474,7 @@ class LiveTriadRLTrader:
 
             if avail_for_new_bids >= 2.0 * b1 * 1.003:
                 b_sum = sum(b_w[s] for s in range(12) if want_b[s])
-                scale_b = (1.0 / max(b_sum, 1e-6)) if b_sum > 4.0 else 0.25
+                scale_b = 1.0 / max(b_sum, 1e-6)
                 t_bid_qty = np.zeros(12, dtype=np.float64)
                 for s in range(12):
                     if want_b[s]:

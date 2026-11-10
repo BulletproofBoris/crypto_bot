@@ -236,14 +236,14 @@ def _jit_env_step(
     place_b = empty_b & (b_w >= 0.12)
     b_w_active = torch.where(place_b, b_w, torch.zeros_like(b_w))
     b_total_sum = torch.where(b_w >= 0.08, b_w, torch.zeros_like(b_w)).sum(dim=1)
-    target_exp_frac = torch.clamp(b_total_sum * 0.25, 0.0, 1.0)
+    target_exp_frac = torch.clamp(b_total_sum * 0.85, 0.0, 1.0)
     target_exp_usd = budget * 0.996 * target_exp_frac
 
     b_sum = b_w_active.sum(dim=1, keepdim=True)
     scale_b = torch.where(
-        b_sum > 4.0,
+        b_sum > 1e-5,
         1.0 / torch.clamp(b_sum, min=1e-6),
-        torch.full_like(b_sum, 0.25),
+        torch.zeros_like(b_sum),
     )
     b_alloc = b_w_active * scale_b
 
