@@ -66,6 +66,22 @@ FILES_TO_ROTATE = [
         "path": "/opt/crypto_bot/data/realtime/prlusdt_bigone/trades_bigone.csv",
     },
     {
+        "prefix": "gate_depth",
+        "path": "/opt/crypto_bot/data/realtime/prlusdt_gate/depth_gate.csv",
+    },
+    {
+        "prefix": "gate_trades",
+        "path": "/opt/crypto_bot/data/realtime/prlusdt_gate/trades_gate.csv",
+    },
+    {
+        "prefix": "ourbit_depth",
+        "path": "/opt/crypto_bot/data/realtime/prlusdt_ourbit/depth_ourbit.csv",
+    },
+    {
+        "prefix": "ourbit_trades",
+        "path": "/opt/crypto_bot/data/realtime/prlusdt_ourbit/trades_ourbit.csv",
+    },
+    {
         "prefix": "bigone_quantus_depth",
         "path": "/opt/crypto_bot/data/realtime/quantus_bigone/depth_bigone.csv",
     },

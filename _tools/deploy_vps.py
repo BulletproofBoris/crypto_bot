@@ -37,6 +37,11 @@ CODE_FILES = (
     "_tools/learned_regime_router.py",
     "_tools/multitask_lob_net.py",
     "_tools/fast_neural_engine.py",
+    "_tools/collect_gate_realtime.py",
+    "_tools/collect_ourbit_realtime.py",
+    "_tools/watchdog_collectors.py",
+    "_tools/rotate_and_upload.py",
+    "_tools/collect_onchain_and_rules.py",
 )
 CHAMP_FILE = "models/prl/release_champion_v1.pt"
 

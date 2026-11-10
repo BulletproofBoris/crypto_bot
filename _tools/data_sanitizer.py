@@ -256,7 +256,11 @@ def clean_onchain_df(df, key):
 
 
 def sanitize_dataset(df, key, processed_dir):
-    if key in ("safetrade_depth", "safetrade_quantus_depth", "bigone_depth", "bigone_quantus_depth"):
+    if key in (
+        "safetrade_depth", "safetrade_quantus_depth",
+        "bigone_depth", "bigone_quantus_depth",
+        "gate_depth", "ourbit_depth",
+    ):
         return clean_orderbook_df(df, key)
     if key in ("safetrade_trades", "safetrade_quantus_trades"):
         return clean_trades_df(df, key, processed_dir)

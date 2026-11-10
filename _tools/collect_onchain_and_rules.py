@@ -209,6 +209,60 @@ def fetch_bigone_rules():
 
     return rules
 
+
+def fetch_gate_rules():
+    """Получает торговые правила Gate.io для PEARL_USDT."""
+    logger.info("Запрос торговых правил Gate.io (PEARL_USDT)...")
+    rules = {}
+    try:
+        r = requests.get("https://api.gateio.ws/api/v4/spot/currency_pairs/PEARL_USDT", timeout=10)
+        if r.status_code == 200:
+            d = r.json()
+            rules["PEARL_USDT"] = {
+                "coin": "PRL",
+                "min_amount": float(d.get("min_base_amount") or 0),
+                "min_quote_value": float(d.get("min_quote_amount") or 0),
+                "price_precision": int(d.get("precision") or 4),
+                "amount_precision": int(d.get("amount_precision") or 1),
+                "fee_pct": float(d.get("fee") or 0.2),
+                "trade_status": d.get("trade_status", "tradable"),
+                "deposit_enabled": True,
+                "withdrawal_enabled": True,
+                "withdrawal_fee": None,
+            }
+    except Exception as e:
+        logger.error(f"Ошибка запроса Gate.io rules: {e}")
+    return rules
+
+
+def fetch_ourbit_rules():
+    """Получает торговые правила Ourbit для PRLUSDT (отображаемого как PEARL/USDT)."""
+    logger.info("Запрос торговых правил Ourbit (PRLUSDT / PEARL)...")
+    rules = {}
+    try:
+        r = requests.get("https://api.ourbit.com/api/v3/exchangeInfo?symbol=PRLUSDT", timeout=10)
+        if r.status_code == 200:
+            syms = r.json().get("symbols") or []
+            for s in syms:
+                if s.get("symbol") == "PRLUSDT":
+                    rules["PRLUSDT"] = {
+                        "coin": "PRL",
+                        "display_alias": s.get("baseAssetDisplayAlias", "PEARL"),
+                        "min_quote_value": float(s.get("quoteAmountPrecision") or 1.0),
+                        "price_precision": int(s.get("quotePrecision") or 4),
+                        "amount_precision": int(s.get("baseAssetPrecision") or 2),
+                        "maker_commission": float(s.get("makerCommission") or 0.0),
+                        "taker_commission": float(s.get("takerCommission") or 0.0),
+                        "status": s.get("status", "ENABLED"),
+                        "deposit_enabled": True,
+                        "withdrawal_enabled": True,
+                        "withdrawal_fee": None,
+                    }
+    except Exception as e:
+        logger.error(f"Ошибка запроса Ourbit rules: {e}")
+    return rules
+
+
 def update_exchange_rules():
     """Обновляет и сохраняет актуальные правила бирж."""
     try:
@@ -222,13 +276,17 @@ def update_exchange_rules():
 
         st_rules = fetch_safetrade_rules() or prev_data.get("safetrade", {})
         bo_rules = fetch_bigone_rules() or prev_data.get("bigone", {})
+        gate_rules = fetch_gate_rules() or prev_data.get("gate", {})
+        ourbit_rules = fetch_ourbit_rules() or prev_data.get("ourbit", {})
         st_rules.pop("tscusdt", None)
 
         ts = datetime.utcnow().isoformat() + "Z"
         combined = {
             "updated_at": ts,
             "safetrade": st_rules,
-            "bigone": bo_rules
+            "bigone": bo_rules,
+            "gate": gate_rules,
+            "ourbit": ourbit_rules,
         }
 
         # Атомарная запись JSON
@@ -250,6 +308,16 @@ def update_exchange_rules():
                 writer.writerow([
                     ts, "bigone", m, "", d.get("min_quote_value"), d.get("quote_scale"),
                     d.get("base_scale"), d.get("deposit_enabled"), d.get("withdrawal_enabled"), d.get("withdrawal_fee")
+                ])
+            for m, d in gate_rules.items():
+                writer.writerow([
+                    ts, "gate", m, d.get("min_amount"), d.get("min_quote_value"), d.get("price_precision"),
+                    d.get("amount_precision"), d.get("deposit_enabled"), d.get("withdrawal_enabled"), d.get("withdrawal_fee")
+                ])
+            for m, d in ourbit_rules.items():
+                writer.writerow([
+                    ts, "ourbit", m, "", d.get("min_quote_value"), d.get("price_precision"),
+                    d.get("amount_precision"), d.get("deposit_enabled"), d.get("withdrawal_enabled"), d.get("withdrawal_fee")
                 ])
 
     except Exception as e:

@@ -54,6 +54,16 @@ TARGETS = [
         "name": "BigONE Quantus"
     },
     {
+        "service": "gate-collector",
+        "file": "/opt/crypto_bot/data/realtime/prlusdt_gate/depth_gate.csv",
+        "name": "Gate.io PEARL"
+    },
+    {
+        "service": "ourbit-collector",
+        "file": "/opt/crypto_bot/data/realtime/prlusdt_ourbit/depth_ourbit.csv",
+        "name": "Ourbit PEARL"
+    },
+    {
         "service": "rhea-collector",
         "file": "/opt/crypto_bot/data/realtime/quantus_rhea/price_rhea.csv",
         "name": "Rhea Finance Quantus"

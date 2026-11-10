@@ -29,6 +29,8 @@ DISK_WARNING_PERCENT = 90.0
 SERVICES = [
     ("safetrade-collector", "SafeTrade (PEARL/PRL, Quantus)"),
     ("bigone-collector", "BigONE (PRL, QTC)"),
+    ("gate-collector", "Gate.io (PEARL/USDT)"),
+    ("ourbit-collector", "Ourbit (PEARL/USDT [PRLUSDT])"),
     ("rhea-collector", "Rhea Finance / Near Intents"),
     ("binance-collector", "Binance Macro (BTC + NEAR)"),
     ("onchain-collector", "On-chain Metrics & Rules"),
@@ -80,6 +82,8 @@ def get_server_stats(ssh):
         "ls -lh "
         "/opt/crypto_bot/data/realtime/prlusdt/depth.csv "
         "/opt/crypto_bot/data/realtime/prlusdt_bigone/depth_bigone.csv "
+        "/opt/crypto_bot/data/realtime/prlusdt_gate/depth_gate.csv "
+        "/opt/crypto_bot/data/realtime/prlusdt_ourbit/depth_ourbit.csv "
         "/opt/crypto_bot/data/realtime/quantususdt/depth.csv "
         "/opt/crypto_bot/data/realtime/quantus_bigone/depth_bigone.csv "
         "/opt/crypto_bot/data/realtime/macro_binance/binance_macro.csv "

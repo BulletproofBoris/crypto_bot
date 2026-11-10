@@ -94,6 +94,26 @@ REMOTE_FILES = [
         "local": os.path.join(HOT_VPS_DIR, "bigone_trades_hot.csv"),
         "name": "BigONE Trades Hot (PRL)"
     },
+    {
+        "remote": "/opt/crypto_bot/data/realtime/prlusdt_gate/depth_gate.csv",
+        "local": os.path.join(HOT_VPS_DIR, "gate_depth_hot.csv"),
+        "name": "Gate.io Depth Hot (PEARL)"
+    },
+    {
+        "remote": "/opt/crypto_bot/data/realtime/prlusdt_gate/trades_gate.csv",
+        "local": os.path.join(HOT_VPS_DIR, "gate_trades_hot.csv"),
+        "name": "Gate.io Trades Hot (PEARL)"
+    },
+    {
+        "remote": "/opt/crypto_bot/data/realtime/prlusdt_ourbit/depth_ourbit.csv",
+        "local": os.path.join(HOT_VPS_DIR, "ourbit_depth_hot.csv"),
+        "name": "Ourbit Depth Hot (PEARL)"
+    },
+    {
+        "remote": "/opt/crypto_bot/data/realtime/prlusdt_ourbit/trades_ourbit.csv",
+        "local": os.path.join(HOT_VPS_DIR, "ourbit_trades_hot.csv"),
+        "name": "Ourbit Trades Hot (PEARL)"
+    },
     # QUANTUS / QTC
     {
         "remote": "/opt/crypto_bot/data/realtime/quantususdt/depth.csv",
@@ -191,6 +211,42 @@ DATASET_CONFIGS = [
         "hot_file": os.path.join(HOT_VPS_DIR, "bigone_trades_hot.csv"),
         "parquet_file": os.path.join(PROCESSED_DIR, "bigone_trades.parquet"),
         "hierarchical_file": os.path.join(PROCESSED_DIR, "prl", "bigone_trades.parquet"),
+        "dedup_key": "id",
+    },
+    {
+        "key": "gate_depth",
+        "coin": "prl",
+        "cache_pattern": "gate_depth_*.csv.gz",
+        "hot_file": os.path.join(HOT_VPS_DIR, "gate_depth_hot.csv"),
+        "parquet_file": os.path.join(PROCESSED_DIR, "gate_depth.parquet"),
+        "hierarchical_file": os.path.join(PROCESSED_DIR, "prl", "gate_depth.parquet"),
+        "dedup_key": "timestamp",
+    },
+    {
+        "key": "gate_trades",
+        "coin": "prl",
+        "cache_pattern": "gate_trades_*.csv.gz",
+        "hot_file": os.path.join(HOT_VPS_DIR, "gate_trades_hot.csv"),
+        "parquet_file": os.path.join(PROCESSED_DIR, "gate_trades.parquet"),
+        "hierarchical_file": os.path.join(PROCESSED_DIR, "prl", "gate_trades.parquet"),
+        "dedup_key": "id",
+    },
+    {
+        "key": "ourbit_depth",
+        "coin": "prl",
+        "cache_pattern": "ourbit_depth_*.csv.gz",
+        "hot_file": os.path.join(HOT_VPS_DIR, "ourbit_depth_hot.csv"),
+        "parquet_file": os.path.join(PROCESSED_DIR, "ourbit_depth.parquet"),
+        "hierarchical_file": os.path.join(PROCESSED_DIR, "prl", "ourbit_depth.parquet"),
+        "dedup_key": "timestamp",
+    },
+    {
+        "key": "ourbit_trades",
+        "coin": "prl",
+        "cache_pattern": "ourbit_trades_*.csv.gz",
+        "hot_file": os.path.join(HOT_VPS_DIR, "ourbit_trades_hot.csv"),
+        "parquet_file": os.path.join(PROCESSED_DIR, "ourbit_trades.parquet"),
+        "hierarchical_file": os.path.join(PROCESSED_DIR, "prl", "ourbit_trades.parquet"),
         "dedup_key": "id",
     },
     {

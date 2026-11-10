@@ -6,6 +6,7 @@
 - **Боевой сервер VPS:**
   - АКТИВЕН В БОЕВОМ РЕЖИМЕ (`live-rl-prl-l9.service`, `--mode live`, `Equity ~ $703.40`).
   - На лету через Hot-Reload активирован чемпион Урока 17 **`models/prl/release_champion_v1.pt` (`L17_0261`, `388D-2StageResSwiGLU(384)`, `allow_scratch_stop_asks=True`)**.
+  - Развернуты и активны 24/7 новые реалтайм-коллекторы **Gate.io (`PEARL_USDT`, `gate-collector.service`)** и **Ourbit (`PRLUSDT` / `PEARL/USDT`, `ourbit-collector.service`)** с полной интеграцией в Watchdog, суточную GDrive-ротацию и Parquet-хранилище (`sync_all_data.py`).
 - **Рефакторинг и безопасность (v18.1):**
   - Вычищены захардкоженные секреты/прокси из `_tools/vps_config.py` (перенесены в `.env` / `_tools/project_secrets.json`).
   - Устранено Sim-to-Real расхождение `flow_16[13:15]` (`has_bid` / `has_ask`) и `is_ask_penny` для `Ask[2..3]` в `_tools/live_rl_trader.py`.
