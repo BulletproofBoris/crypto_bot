@@ -94,18 +94,32 @@ def build_and_inject_v7_signals_58d(coin: str = "prl", force_recompute: bool = T
     from _tools.train_rl_execution import _compute_v52_signals_matrix, _compute_v70_realism_matrix
 
     t0 = time.time()
+    labeled_path = BASE_DIR / "data" / "labeled" / coin / f"{coin}_labeled.parquet"
     raw_600 = np.load(CACHE_600H_PATH, allow_pickle=True)
     ts_600 = raw_600["ts"].astype(np.int64)
     n_total = len(ts_600)
+    prev_v7_52d = None
+    if "v7_signals_58d" in raw_600.files and len(raw_600["v7_signals_58d"]) == n_total:
+        prev_v7_52d = raw_600["v7_signals_58d"][:, :52].copy()
     del raw_600
-    if np.max(ts_600) > 10**12:
-        ts_600 = ts_600 // 10**9
+
+    if np.max(ts_600) < 10**9 or np.min(ts_600) < 10**9:
+        ts_raw = pq.read_table(labeled_path, columns=["timestamp"]).column("timestamp").to_numpy()
+        ts_600 = pd.to_datetime(ts_raw[:n_total], utc=True).as_unit("s").astype("int64").to_numpy()
+    elif np.max(ts_600) > 10**12:
+        ts_600 = pd.to_datetime(ts_600, utc=True).as_unit("s").astype("int64").to_numpy()
 
     print(f"🔗 Потоковая сборка 58D каузальных сигналов v7 для {n_total:,} тиков ({n_total / 3600:.1f} ч)...")
     aligned_52d = np.zeros((n_total, 52), dtype=np.float32)
 
-    # 1. Загружаем готовый свежий хвост 176ч (633,600 тиков), если он есть
+    # 1. Сохраняем уже посчитанный инкрементальный хвост [2451560:n_total] и 176ч блок [1818560:2451560]
     tail_matched_start = n_total
+    if prev_v7_52d is not None and n_total > 2451560 and np.any(prev_v7_52d[2451560:] != 0):
+        aligned_52d[2451560:] = prev_v7_52d[2451560:]
+        tail_matched_start = 2451560
+        print(f"   ✅ Инкрементальный хвост ({n_total - 2451560:,} тиков: [2451560:{n_total}]) сохранен.")
+    del prev_v7_52d
+
     if CACHE_176H_PATH.exists():
         c176 = np.load(CACHE_176H_PATH, allow_pickle=True)
         xm = np.nan_to_num(c176["X_market"].astype(np.float32), nan=0.0, posinf=3.0, neginf=-3.0)
@@ -115,18 +129,22 @@ def build_and_inject_v7_signals_58d(coin: str = "prl", force_recompute: bool = T
         xv52 = np.nan_to_num(c176["X_v52"][:, :4].astype(np.float32), nan=0.0, posinf=1.0, neginf=0.0)
         xv70 = np.nan_to_num(c176["X_v70_realism"][:, :2].astype(np.float32), nan=0.0, posinf=1.0, neginf=0.0)
         tail_52d = np.column_stack([xm[:, :28], x60[:, :6], x90[:, :6], x120[:, :6], xv52, xv70]).astype(np.float32)
-        n_tail = len(tail_52d)
-        tail_matched_start = max(0, n_total - n_tail)
-        aligned_52d[tail_matched_start:] = tail_52d[: n_total - tail_matched_start]
+        if tail_matched_start == 2451560 and len(tail_52d) >= 633000:
+            aligned_52d[1818560:2451560] = tail_52d[:633000]
+            tail_matched_start = 1818560
+            print(f"   ✅ Блок 176ч (633,000 тиков: [1818560:2451560]) переиспользован из {CACHE_176H_PATH.name}.")
+        else:
+            n_tail = len(tail_52d)
+            tail_matched_start = max(0, n_total - n_tail)
+            aligned_52d[tail_matched_start:] = tail_52d[: n_total - tail_matched_start]
+            print(f"   ✅ Свежий хвост 176ч ({n_total - tail_matched_start:,} тиков: [{tail_matched_start}:{n_total}]) переиспользован из {CACHE_176H_PATH.name}.")
         del c176, xm, x60, x90, x120, xv52, xv70, tail_52d
         gc.collect()
-        print(f"   ✅ Свежий хвост 176ч ({n_total - tail_matched_start:,} тиков: [{tail_matched_start}:{n_total}]) переиспользован из {CACHE_176H_PATH.name}.")
 
     # 2. Потоковый чанковый расчёт исторического префикса [0 : tail_matched_start]
     if tail_matched_start > 0:
         mmap_dir = BASE_DIR / "data" / "_mmap_cache"
         X_all_mm = np.load(mmap_dir / "X_all.npy", mmap_mode="r")
-        labeled_path = BASE_DIR / "data" / "labeled" / coin / f"{coin}_labeled.parquet"
         pf = pq.ParquetFile(labeled_path)
         schema_cols = set(pf.schema_arrow.names)
         meta_cols = [
@@ -139,6 +157,10 @@ def build_and_inject_v7_signals_58d(coin: str = "prl", force_recompute: bool = T
             meta_cols.extend([f"ST_bid_{lvl}_price", f"ST_bid_{lvl}_qty", f"ST_ask_{lvl}_price", f"ST_ask_{lvl}_qty"])
         meta_cols = [c for c in list(dict.fromkeys(meta_cols)) if c in schema_cols]
         df_meta_all = pq.read_table(labeled_path, columns=meta_cols).slice(0, tail_matched_start).to_pandas()
+        if "timestamp" not in df_meta_all.columns:
+            df_meta_all = df_meta_all.reset_index()
+            if "timestamp" not in df_meta_all.columns and "index" in df_meta_all.columns:
+                df_meta_all = df_meta_all.rename(columns={"index": "timestamp"})
 
         horizons = [(5, 3.0), (12, 3.5), (25, 3.0), (60, 3.0), (90, 3.0), (120, 3.0)]
         routers = [SwarmRegimeRouter(coin, H, K, temperature=0.25, use_neural=False, neural_weight=0.0) for H, K in horizons]
@@ -225,6 +247,7 @@ def build_and_inject_v7_signals_58d(coin: str = "prl", force_recompute: bool = T
     raw_600 = np.load(CACHE_600H_PATH, allow_pickle=True)
     base_dict = {k: raw_600[k] for k in raw_600.files}
     del raw_600
+    base_dict["ts"] = ts_600
     base_dict["v7_signals_58d"] = v7_signals_58d
     tmp_path = CACHE_600H_PATH.with_suffix(".tmp.npz")
     np.savez_compressed(tmp_path, **base_dict)
@@ -277,7 +300,7 @@ def incremental_append_600h_cache(coin: str = "prl") -> Path:
         if "timestamp" not in df_tail.columns and "index" in df_tail.columns:
             df_tail = df_tail.rename(columns={"index": "timestamp"})
     df_tail = df_tail.reset_index(drop=True)
-    ts_tail = pd.to_datetime(df_tail["timestamp"], utc=True).astype("int64").values // 10**9
+    ts_tail = pd.to_datetime(df_tail["timestamp"], utc=True).dt.as_unit("s").astype("int64").values
 
     tick = 0.01
     bid_p = np.column_stack([np.nan_to_num(df_tail[c].values, nan=0.0) for c in b_p_cols]).astype(np.float32)

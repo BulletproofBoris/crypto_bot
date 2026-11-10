@@ -38,7 +38,7 @@ def _load_dotenv():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
-                os.environ[k.strip()] = v.strip().strip('"').strip("'")
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
 class SafeTradePrivateClient:
@@ -53,18 +53,37 @@ class SafeTradePrivateClient:
         self.api_secret = api_secret or os.environ.get("SAFETRADE_API_SECRET", "")
         self.proxies = {"http": SAFETRADE_PROXY, "https": SAFETRADE_PROXY} if (use_proxy and SAFETRADE_PROXY) else None
         from curl_cffi import requests as cffi_requests, CurlOpt
+        import queue
+        self._cffi_requests = cffi_requests
+        self._CurlOpt = CurlOpt
         self.session = cffi_requests.Session(
             impersonate="chrome120",
             curl_options={CurlOpt.IPRESOLVE: 1},
         )
         self._req_lock = threading.Lock()
         self._last_nonce = int(time.time() * 1000)
+        self._last_dispatch_ts = 0.0
         self.use_vps_bridge = use_vps_bridge
         self._ssh = None
         self._bridge_in = None
         self._bridge_out = None
+        self._sess_pool = queue.Queue()
         if self.use_vps_bridge:
             self._init_vps_bridge()
+        else:
+            def _make_warm_sess(_):
+                s = cffi_requests.Session(
+                    impersonate="chrome120",
+                    curl_options={CurlOpt.IPRESOLVE: 1},
+                )
+                try:
+                    s.get(f"{self.BASE_URL}/trade/public/markets/pearlusdt/depth?limit=1", timeout=4)
+                except Exception:
+                    pass
+                return s
+            with ThreadPoolExecutor(max_workers=6) as wp:
+                for ws in wp.map(_make_warm_sess, range(6)):
+                    self._sess_pool.put(ws)
 
     def _init_vps_bridge(self):
         from _tools.vps_config import create_ssh_client
@@ -115,6 +134,12 @@ class SafeTradePrivateClient:
             "    sys.stdout.flush()\n"
         )
         import base64
+        if self._ssh is not None:
+            try:
+                self._ssh.close()
+            except Exception:
+                pass
+            self._ssh = None
         b64_code = base64.b64encode(worker_code.encode("utf-8")).decode("ascii")
         self._ssh = create_ssh_client()
         self._bridge_in, self._bridge_out, _ = self._ssh.exec_command(
@@ -141,17 +166,18 @@ class SafeTradePrivateClient:
             except OSError:
                 pass
             return
-        try:
-            self._bridge_in.write(json.dumps({"method": "TELEMETRY", "body": row}) + "\n")
-            self._bridge_in.flush()
-            self._bridge_out.readline()
-        except Exception:
-            pass
+        with self._req_lock:
+            try:
+                self._bridge_in.write(json.dumps({"method": "TELEMETRY", "body": row}) + "\n")
+                self._bridge_in.flush()
+                self._bridge_out.readline()
+            except Exception:
+                pass
 
     def _private_req(self, method: str, path: str, body: dict = None, auth: bool = True) -> dict | list:
         url = f"{self.BASE_URL}{path}"
-        with self._req_lock:
-            if self.use_vps_bridge:
+        if self.use_vps_bridge:
+            with self._req_lock:
                 try:
                     self._bridge_in.write(json.dumps({"method": method, "url": url, "body": body, "auth": auth}) + "\n")
                     self._bridge_in.flush()
@@ -170,20 +196,31 @@ class SafeTradePrivateClient:
                         raise
                     self._init_vps_bridge()
                     raise
+        data_str = json.dumps(body) if body else None
+        sess = self._sess_pool.get()
+        try:
             for attempt in range(3):
-                hdrs = self._auth_headers() if auth else None
+                with self._req_lock:
+                    dt_disp = time.perf_counter() - self._last_dispatch_ts
+                    if dt_disp < 0.025:
+                        time.sleep(0.025 - dt_disp)
+                    hdrs = self._auth_headers() if auth else None
+                    self._last_dispatch_ts = time.perf_counter()
                 if method == "GET":
-                    r = self.session.get(url, headers=hdrs, timeout=6)
+                    r = sess.get(url, headers=hdrs, timeout=6)
                 else:
-                    r = self.session.post(url, headers=hdrs, data=json.dumps(body) if body else None, timeout=6)
+                    r = sess.post(url, headers=hdrs, data=data_str, timeout=6)
                 if r.status_code in (401, 403, 429) and attempt < 2:
-                    time.sleep(0.25 * (attempt + 1))
-                    self._last_nonce = max(int(time.time() * 1000), self._last_nonce + 5)
+                    time.sleep(0.12 * (attempt + 1))
+                    with self._req_lock:
+                        self._last_nonce = max(int(time.time() * 1000), self._last_nonce + 5)
                     continue
                 break
-            if r.status_code >= 400:
-                raise RuntimeError(f"SafeTrade HTTP {r.status_code}: {r.text}")
-            return r.json() if r.text else {}
+        finally:
+            self._sess_pool.put(sess)
+        if r.status_code >= 400:
+            raise RuntimeError(f"SafeTrade HTTP {r.status_code}: {r.text}")
+        return r.json() if r.text else {}
 
     def _auth_headers(self) -> dict:
         now_ms = int(time.time() * 1000)
@@ -341,12 +378,19 @@ class LiveTriadRLTrader:
                 self.l7_b1 = rel_ck["b1"].float()
                 self.l7_wg = rel_ck["wg"].float() if "wg" in rel_ck else None
                 self.l7_bg = rel_ck["bg"].float() if "bg" in rel_ck else None
+                self.l7_w_res1 = rel_ck["w_res1"].float() if "w_res1" in rel_ck else None
+                self.l7_b_res1 = rel_ck["b_res1"].float() if "b_res1" in rel_ck else None
+                self.l7_w_res2 = rel_ck["w_res2"].float() if "w_res2" in rel_ck else None
                 self.l7_w2 = rel_ck["w2"].float()
                 self.l7_b2 = rel_ck["b2"].float()
                 self.l7_allow_scratch = bool(rel_ck.get("allow_scratch_stop_asks", False))
                 in_d = int(self.l7_w1.shape[0])
                 h_d = int(self.l7_w1.shape[1])
-                arch_s = f"{in_d}D-SwiGLU({h_d})->256->26" if (self.l7_wg is not None or h_d == 384) else f"{in_d}D->256->26"
+                arch_s = (
+                    f"{in_d}D-2StageResSwiGLU({h_d})"
+                    if self.l7_w_res1 is not None
+                    else (f"{in_d}D-SwiGLU({h_d})->256->26" if (self.l7_wg is not None or h_d == 384) else f"{in_d}D->256->26")
+                )
                 print(f"🏆 Подключен боевой 24-слотовый Чемпион {self.rel_ckpt_path.name} ({rel_ck.get('release_name', 'L7_0150')}, {arch_s}, scratch={self.l7_allow_scratch})!")
             except Exception as e_l7:
                 print(f"⚠️ Не удалось загрузить {self.rel_ckpt_path.name}: {e_l7}")
@@ -407,6 +451,8 @@ class LiveTriadRLTrader:
         self.ask_slots = [{"slot": s, "id": None, "px": 0.0, "qty": 0.0, "act_ts": 0.0, "acc_fill": 0.0} for s in range(12)]
         self.tr_low_px = 0.0
         self.tr_low_qty = 0.0
+        self.tr_mid_px = 0.0
+        self.tr_mid_qty = 0.0
         self.tr_high_px = 0.0
         self.tr_high_qty = 0.0
         self.last_buy_fill_ts = 0.0
@@ -466,8 +512,11 @@ class LiveTriadRLTrader:
             self.extra_slots = list(st.get("extra_slots", []))
             self.tr_low_px = float(st.get("tr_low_px", 0.0))
             self.tr_low_qty = float(st.get("tr_low_qty", 0.0))
+            self.tr_mid_px = float(st.get("tr_mid_px", 0.0))
+            self.tr_mid_qty = float(st.get("tr_mid_qty", 0.0))
             self.tr_high_px = float(st.get("tr_high_px", self.avg_entry if self.pos_qty >= 1.95 else 0.0))
             self.tr_high_qty = float(st.get("tr_high_qty", self.pos_qty if self.pos_qty >= 1.95 else 0.0))
+            self._reconcile_lifo_tranches()
             raw_b_slots = st.get("bid_slots", [])
             if isinstance(raw_b_slots, list) and len(raw_b_slots) == 12:
                 for s_i in range(12):
@@ -570,6 +619,9 @@ class LiveTriadRLTrader:
                 self.l7_b1 = rel_ck["b1"].float()
                 self.l7_wg = rel_ck["wg"].float() if "wg" in rel_ck else None
                 self.l7_bg = rel_ck["bg"].float() if "bg" in rel_ck else None
+                self.l7_w_res1 = rel_ck["w_res1"].float() if "w_res1" in rel_ck else None
+                self.l7_b_res1 = rel_ck["b_res1"].float() if "b_res1" in rel_ck else None
+                self.l7_w_res2 = rel_ck["w_res2"].float() if "w_res2" in rel_ck else None
                 self.l7_w2 = rel_ck["w2"].float()
                 self.l7_b2 = rel_ck["b2"].float()
                 self.l7_allow_scratch = bool(rel_ck.get("allow_scratch_stop_asks", True))
@@ -578,7 +630,11 @@ class LiveTriadRLTrader:
                 val_ev = float(rel_ck.get("val_ev_pct", 0.0))
                 in_d = int(self.l7_w1.shape[0])
                 h_d = int(self.l7_w1.shape[1])
-                arch_s = f"{in_d}D-SwiGLU({h_d})" if (self.l7_wg is not None or h_d == 384) else f"{in_d}D"
+                arch_s = (
+                    f"{in_d}D-2StageResSwiGLU({h_d})"
+                    if self.l7_w_res1 is not None
+                    else (f"{in_d}D-SwiGLU({h_d})" if (self.l7_wg is not None or h_d == 384) else f"{in_d}D")
+                )
                 print(
                     f"  🔥 [HOT-RELOAD CHAMPION] На лету подключен новый 24-слотовый Чемпион {ckpt_p.name} "
                     f"({rel_name}, {arch_s}, ValEV={val_ev:+.3f}%, scratch={self.l7_allow_scratch}) без остановки торгов!"
@@ -617,6 +673,82 @@ class LiveTriadRLTrader:
             self.active_ask_id, self.active_ask_p, self.active_ask_q = None, 0.0, 0.0
             self.slot2_ask_id, self.slot2_ask_p, self.slot2_ask_q = None, 0.0, 0.0
 
+    def _reconcile_lifo_tranches(self):
+        """
+        Поддерживает строгий инвариант 3-уровневого LIFO-стека [tr_low, tr_mid, tr_high]:
+        1) При пустой позиции (< 1.95 PRL) все транши обнуляются.
+        2) Сумма траншей никогда не превышает pos_qty (исключает фантомный low_tr > pos_qty после внешней сверки).
+        3) При распродаже нижнего транша (< 1.95 PRL) и наличии mid_tranche >= 1.95 PRL выполняется всплытие mid -> low.
+        """
+        if self.pos_qty < 1.95:
+            self.tr_low_px, self.tr_low_qty = 0.0, 0.0
+            self.tr_mid_px, self.tr_mid_qty = 0.0, 0.0
+            self.tr_high_px, self.tr_high_qty = 0.0, 0.0
+            return
+
+        ref_px = self.avg_entry if self.avg_entry > 0.0 else max(self.tr_high_px, self.tr_mid_px, self.tr_low_px, self.tick_size)
+        self.tr_low_qty = max(0.0, float(getattr(self, "tr_low_qty", 0.0)))
+        self.tr_mid_qty = max(0.0, float(getattr(self, "tr_mid_qty", 0.0)))
+        self.tr_high_qty = max(0.0, float(getattr(self, "tr_high_qty", 0.0)))
+        if self.tr_low_qty <= 1e-4 or self.tr_low_px <= 0.0:
+            self.tr_low_qty, self.tr_low_px = 0.0, 0.0
+        if self.tr_mid_qty <= 1e-4 or self.tr_mid_px <= 0.0:
+            self.tr_mid_qty, self.tr_mid_px = 0.0, 0.0
+        if self.tr_high_qty <= 1e-4 or self.tr_high_px <= 0.0:
+            self.tr_high_qty, self.tr_high_px = 0.0, 0.0
+
+        # Сверху вниз подрезаем избыток или доливаем недостачу в core (tr_high), чтобы сумма точно равнялась pos_qty
+        rem_cap = float(self.pos_qty)
+        if self.tr_low_qty > rem_cap:
+            self.tr_low_qty = rem_cap
+        rem_cap = max(0.0, rem_cap - self.tr_low_qty)
+        if self.tr_mid_qty > rem_cap:
+            self.tr_mid_qty = rem_cap
+        rem_cap = max(0.0, rem_cap - self.tr_mid_qty)
+        if abs(self.tr_high_qty - rem_cap) > 1e-4:
+            if rem_cap > 1e-4 and self.tr_high_px <= 0.0:
+                used_cost = self.tr_low_qty * self.tr_low_px + self.tr_mid_qty * self.tr_mid_px
+                tot_cost = self.pos_qty * ref_px
+                self.tr_high_px = max(self.tick_size, (tot_cost - used_cost) / rem_cap) if tot_cost > used_cost else ref_px
+            self.tr_high_qty = rem_cap
+            if self.tr_high_qty <= 1e-4:
+                self.tr_high_px = 0.0
+
+        # Автоматическое всплытие mid_tranche -> low_tranche, когда нижний транш < 1.95 PRL
+        if self.tr_low_qty < 1.95 and self.tr_mid_qty >= 1.95:
+            prom_q = self.tr_low_qty + self.tr_mid_qty
+            self.tr_low_px = (
+                (self.tr_low_qty * self.tr_low_px + self.tr_mid_qty * self.tr_mid_px) / prom_q
+                if self.tr_low_qty > 1e-4 else self.tr_mid_px
+            )
+            self.tr_low_qty = prom_q
+            self.tr_mid_qty, self.tr_mid_px = 0.0, 0.0
+        elif 0.0 < self.tr_low_qty < 1.95:
+            # Склеиваем микро-пыль нижнего транша в верхний/средний
+            if self.tr_high_qty > 1e-4:
+                tot_h = self.tr_high_qty + self.tr_low_qty
+                self.tr_high_px = (self.tr_high_qty * self.tr_high_px + self.tr_low_qty * self.tr_low_px) / tot_h
+                self.tr_high_qty = tot_h
+            else:
+                self.tr_high_qty = self.tr_low_qty
+                self.tr_high_px = self.tr_low_px
+            self.tr_low_qty, self.tr_low_px = 0.0, 0.0
+
+        # Если tr_low_px оказался не дешевле avg_entry (размылся выше средней), переносим его в core (tr_high)
+        if self.tr_low_qty > 1e-4 and self.avg_entry > 0.0 and self.tr_low_px >= self.avg_entry - 0.05 * self.tick_size:
+            if self.tr_mid_qty >= 1.95 and self.tr_mid_px < self.avg_entry - 0.1 * self.tick_size:
+                # Меняем местами с более дешевым mid_tranche
+                self.tr_low_px, self.tr_mid_px = self.tr_mid_px, self.tr_low_px
+                self.tr_low_qty, self.tr_mid_qty = self.tr_mid_qty, self.tr_low_qty
+            else:
+                tot_h = self.tr_high_qty + self.tr_low_qty
+                self.tr_high_px = (
+                    (self.tr_high_qty * (self.tr_high_px or ref_px) + self.tr_low_qty * self.tr_low_px) / tot_h
+                    if tot_h > 1e-4 else ref_px
+                )
+                self.tr_high_qty = tot_h
+                self.tr_low_qty, self.tr_low_px = 0.0, 0.0
+
     def _save_wallet(self):
         self._refresh_legacy_slot_mirrors()
         payload = {
@@ -646,6 +778,8 @@ class LiveTriadRLTrader:
             "ask_slots": getattr(self, "ask_slots", []),
             "tr_low_px": round(float(getattr(self, "tr_low_px", 0.0)), 6),
             "tr_low_qty": round(float(getattr(self, "tr_low_qty", 0.0)), 6),
+            "tr_mid_px": round(float(getattr(self, "tr_mid_px", 0.0)), 6),
+            "tr_mid_qty": round(float(getattr(self, "tr_mid_qty", 0.0)), 6),
             "tr_high_px": round(float(getattr(self, "tr_high_px", 0.0)), 6),
             "tr_high_qty": round(float(getattr(self, "tr_high_qty", 0.0)), 6),
             "last_buy_fill_ts": round(float(getattr(self, "last_buy_fill_ts", 0.0)), 3),
@@ -672,7 +806,7 @@ class LiveTriadRLTrader:
         except Exception as e:
             print(f"❌ Ошибка атомарной записи кошелька {self.wallet_file.name}: {e}")
 
-    def _sync_24slot_orders(self, b1: float, count_hold: bool = False):
+    def _sync_24slot_orders(self, b1: float, count_hold: bool = False, pre_fetched_orders: dict = None):
         if count_hold and self.pos_qty > 1e-4:
             self.hold_sec += 1
             if b1 > 0:
@@ -686,8 +820,9 @@ class LiveTriadRLTrader:
             self._refresh_legacy_slot_mirrors()
             return
 
-        oid_map = {}
-        if len(active_oids) >= 1:
+        oid_map = dict(pre_fetched_orders) if pre_fetched_orders else {}
+        missing_for_open = [oid for oid in active_oids if oid not in oid_map]
+        if len(missing_for_open) >= 1:
             try:
                 open_list = self.client.get_open_orders(self.market)
                 for o_item in open_list:
@@ -696,6 +831,17 @@ class LiveTriadRLTrader:
                         oid_map[oid_k] = o_item
             except Exception:
                 pass
+
+        still_missing = [oid for oid in active_oids if oid not in oid_map]
+        if len(still_missing) > 1:
+            def _fetch_one(m_oid):
+                try:
+                    return (m_oid, self.client.get_order(m_oid))
+                except Exception:
+                    return (m_oid, None)
+            for m_oid, m_ord in self._io_pool.map(_fetch_one, still_missing):
+                if m_ord is not None:
+                    oid_map[m_oid] = m_ord
 
         had_any_fill = False
         had_any_change = False
@@ -721,42 +867,54 @@ class LiveTriadRLTrader:
                     cost = d_fill * px
                     net_d = math.floor(d_fill * (1.0 - fee_rate) * 10000.0) / 10000.0
                     if net_d > 0.0:
+                        self._reconcile_lifo_tranches()
                         was_flat = self.pos_qty < 1.95
-                        is_low_buy = (not was_flat) and (
-                            (px < self.avg_entry - 0.15 * self.tick_size)
-                            or (self.tr_low_qty > 1e-4 and px <= self.tr_low_px + 0.15 * self.tick_size)
-                            or (self.tr_high_qty > 1e-4 and px <= self.tr_high_px - 0.5 * self.tick_size)
-                        )
-                        is_higher_buy_from_single = (
-                            (not was_flat)
-                            and (not is_low_buy)
-                            and (self.tr_low_qty <= 1e-4)
-                            and (self.tr_high_qty >= 1.95)
-                            and (px >= self.tr_high_px + 0.35 * self.tick_size)
-                        )
+                        old_q = self.pos_qty
+                        old_avg = self.avg_entry
                         if was_flat:
                             self.tr_high_px = px
                             self.tr_high_qty = net_d
-                            self.tr_low_px = 0.0
-                            self.tr_low_qty = 0.0
+                            self.tr_mid_px, self.tr_mid_qty = 0.0, 0.0
+                            self.tr_low_px, self.tr_low_qty = 0.0, 0.0
                             self.hold_sec = 0
-                        elif is_low_buy:
-                            new_l_q = self.tr_low_qty + net_d
-                            self.tr_low_px = (self.tr_low_qty * self.tr_low_px + net_d * px) / max(1e-6, new_l_q)
-                            self.tr_low_qty = new_l_q
-                        elif is_higher_buy_from_single:
-                            self.tr_low_px = self.tr_high_px
-                            self.tr_low_qty = self.tr_high_qty
-                            self.tr_high_px = px
-                            self.tr_high_qty = net_d
+                        elif self.tr_low_qty <= 1e-4:
+                            if px <= old_avg - 0.35 * self.tick_size:
+                                self.tr_low_px = px
+                                self.tr_low_qty = net_d
+                            elif old_q >= 1.95 and px >= old_avg + 0.35 * self.tick_size:
+                                self.tr_low_px = old_avg
+                                self.tr_low_qty = old_q
+                                self.tr_high_px = px
+                                self.tr_high_qty = net_d
+                            else:
+                                new_h_q = self.tr_high_qty + net_d
+                                self.tr_high_px = (self.tr_high_qty * (self.tr_high_px or old_avg) + net_d * px) / max(1e-6, new_h_q)
+                                self.tr_high_qty = new_h_q
                         else:
-                            new_h_q = self.tr_high_qty + net_d
-                            self.tr_high_px = (self.tr_high_qty * self.tr_high_px + net_d * px) / max(1e-6, new_h_q)
-                            self.tr_high_qty = new_h_q
+                            # Уже есть нижний транш tr_low: проверяем более глубокое дно (deeper_dip), тот же уровень (same_low) или средний эшелон (mid_dip)
+                            if px < self.tr_low_px - 0.35 * self.tick_size:
+                                pushed_m_q = self.tr_mid_qty + self.tr_low_qty
+                                self.tr_mid_px = (self.tr_mid_qty * self.tr_mid_px + self.tr_low_qty * self.tr_low_px) / max(1e-6, pushed_m_q)
+                                self.tr_mid_qty = pushed_m_q
+                                self.tr_low_px = px
+                                self.tr_low_qty = net_d
+                            elif abs(px - self.tr_low_px) <= 0.35 * self.tick_size:
+                                new_l_q = self.tr_low_qty + net_d
+                                self.tr_low_px = (self.tr_low_qty * self.tr_low_px + net_d * px) / max(1e-6, new_l_q)
+                                self.tr_low_qty = new_l_q
+                            elif px <= old_avg - 0.35 * self.tick_size:
+                                new_m_q = self.tr_mid_qty + net_d
+                                self.tr_mid_px = (self.tr_mid_qty * self.tr_mid_px + net_d * px) / max(1e-6, new_m_q)
+                                self.tr_mid_qty = new_m_q
+                            else:
+                                new_h_q = self.tr_high_qty + net_d
+                                self.tr_high_px = (self.tr_high_qty * (self.tr_high_px or old_avg) + net_d * px) / max(1e-6, new_h_q)
+                                self.tr_high_qty = new_h_q
 
                         self.bot_cash_usd = max(0.0, self.bot_cash_usd - cost)
                         self.avg_entry = (self.pos_qty * self.avg_entry + net_d * px) / max(1e-6, self.pos_qty + net_d)
                         self.pos_qty = math.floor((self.pos_qty + net_d) * 10000.0) / 10000.0
+                        self._reconcile_lifo_tranches()
                         self.ex_coin_free = max(0.0, self.ex_coin_free + net_d)
                         self.peak_bid = max(self.peak_bid, px, b1 if b1 > 0 else px)
                         self.last_buy_fill_ts = time.time()
@@ -766,7 +924,7 @@ class LiveTriadRLTrader:
                         had_any_change = True
                         print(
                             f"  🟢 [24-SLOT FILL BID #{s_idx:02d}] +{net_d:.4f} PRL @ ${px:.2f} | "
-                            f"Поз={self.pos_qty:.4f} PRL (avg=${self.avg_entry:.4f}, low_tr={self.tr_low_qty:.1f}@${self.tr_low_px:.2f}) | "
+                            f"Поз={self.pos_qty:.4f} PRL (avg=${self.avg_entry:.4f}, low_tr={self.tr_low_qty:.1f}@${self.tr_low_px:.2f}, mid_tr={self.tr_mid_qty:.1f}@${self.tr_mid_px:.2f}) | "
                             f"Кэш=${self.bot_cash_usd:.2f}"
                         )
                 if st in ("done", "cancel"):
@@ -797,39 +955,49 @@ class LiveTriadRLTrader:
                 d_fill = max(0.0, filled - prev_acc)
 
                 if (st == "wait" and d_fill >= 2.0) or (st in ("done", "cancel") and d_fill > 1e-4):
+                    self._reconcile_lifo_tranches()
                     px = float(o.get("avg_price", 0.0)) or float(o.get("price", slot.get("px", b1)))
                     fee_rate = float(o.get("maker_fee", 0.001) or 0.001)
                     proceeds = d_fill * px * (1.0 - fee_rate)
-                    # Двухтраншевый LIFO/FIFO учет списания себестоимости (сначала нижний транш tr_low, затем tr_high)
-                    from_low = min(d_fill, self.tr_low_qty)
-                    from_high = max(0.0, d_fill - from_low)
-                    low_ref = self.tr_low_px if self.tr_low_px > 0.0 else (self.avg_entry if self.avg_entry > 0.0 else px)
-                    high_ref = self.tr_high_px if self.tr_high_px > 0.0 else (self.avg_entry if self.avg_entry > 0.0 else px)
-                    cost_basis = ((from_low * low_ref) + (from_high * high_ref)) / max(1e-6, 1.0 - fee_rate)
+                    # 3-уровневый LIFO учет списания себестоимости (сначала tr_low -> tr_mid для LIFO-слотов, остальное из core tr_high)
+                    is_lifo_slot = (2 <= s_idx < 6) if getattr(self, "l7_allow_scratch", False) else (s_idx < 6)
+                    from_low = min(d_fill, self.tr_low_qty) if is_lifo_slot else 0.0
+                    rem_lifo = max(0.0, d_fill - from_low) if is_lifo_slot else 0.0
+                    from_mid = min(rem_lifo, self.tr_mid_qty)
+                    from_high = max(0.0, d_fill - from_low - from_mid)
+                    if from_high > self.tr_high_qty + 1e-4:
+                        spill = from_high - self.tr_high_qty
+                        from_high = self.tr_high_qty
+                        extra_mid = min(spill, max(0.0, self.tr_mid_qty - from_mid))
+                        from_mid += extra_mid
+                        spill -= extra_mid
+                        from_low += min(spill, max(0.0, self.tr_low_qty - from_low))
+
+                    fallback_ref = self.avg_entry if self.avg_entry > 0.0 else px
+                    low_ref = self.tr_low_px if self.tr_low_px > 0.0 else fallback_ref
+                    mid_ref = self.tr_mid_px if self.tr_mid_px > 0.0 else fallback_ref
+                    high_ref = self.tr_high_px if self.tr_high_px > 0.0 else fallback_ref
+                    cost_basis = ((from_low * low_ref) + (from_mid * mid_ref) + (from_high * high_ref)) / max(1e-6, 1.0 - fee_rate)
                     pnl = proceeds - cost_basis
 
                     self.tr_low_qty = max(0.0, self.tr_low_qty - from_low)
-                    if self.tr_low_qty <= 1e-4:
-                        self.tr_low_qty, self.tr_low_px = 0.0, 0.0
+                    self.tr_mid_qty = max(0.0, self.tr_mid_qty - from_mid)
                     self.tr_high_qty = max(0.0, self.tr_high_qty - from_high)
-                    if self.tr_high_qty <= 1e-4:
-                        self.tr_high_qty, self.tr_high_px = 0.0, 0.0
-                    if 0.0 < self.tr_low_qty < 1.95:
-                        tot_q = self.tr_low_qty + self.tr_high_qty
-                        if tot_q > 1e-4:
-                            self.tr_high_px = (self.tr_low_qty * self.tr_low_px + self.tr_high_qty * self.tr_high_px) / tot_q
-                            self.tr_high_qty = tot_q
-                        self.tr_low_qty, self.tr_low_px = 0.0, 0.0
-
                     self.bot_cash_usd += proceeds
                     self.realized_pnl_usd += pnl
                     self.pos_qty = max(0.0, math.floor((self.pos_qty - d_fill) * 10000.0) / 10000.0)
-                    rem_tr_q = self.tr_low_qty + self.tr_high_qty
                     if self.pos_qty < 1.95:
                         self.pos_qty, self.avg_entry, self.hold_sec, self.peak_bid = 0.0, 0.0, 0, 0.0
-                        self.tr_low_px, self.tr_low_qty, self.tr_high_px, self.tr_high_qty = 0.0, 0.0, 0.0, 0.0
-                    elif rem_tr_q > 1e-4:
-                        self.avg_entry = (self.tr_low_qty * self.tr_low_px + self.tr_high_qty * self.tr_high_px) / rem_tr_q
+                        self._reconcile_lifo_tranches()
+                    else:
+                        rem_tr_q = self.tr_low_qty + self.tr_mid_qty + self.tr_high_qty
+                        if rem_tr_q > 1e-4:
+                            self.avg_entry = (
+                                self.tr_low_qty * low_ref
+                                + self.tr_mid_qty * mid_ref
+                                + self.tr_high_qty * high_ref
+                            ) / rem_tr_q
+                        self._reconcile_lifo_tranches()
                     self.n_trades += 1
                     self.last_exit_ts = time.time()
                     self.last_exit_price = float(px)
@@ -839,7 +1007,7 @@ class LiveTriadRLTrader:
                     had_any_change = True
                     print(
                         f"  💰 [24-SLOT FILL ASK #{s_idx:02d}] -{d_fill:.4f} PRL @ ${px:.2f} | "
-                        f"PnL={pnl:+.4f}$ | Остаток поз={self.pos_qty:.4f} PRL (avg=${self.avg_entry:.4f}) | "
+                        f"PnL={pnl:+.4f}$ | Остаток поз={self.pos_qty:.4f} PRL (avg=${self.avg_entry:.4f}, low_tr={self.tr_low_qty:.1f}@${self.tr_low_px:.2f}) | "
                         f"Кэш=${self.bot_cash_usd:.2f}"
                     )
                 if st in ("done", "cancel"):
@@ -1244,10 +1412,10 @@ class LiveTriadRLTrader:
                     tracked_bid_oids = {s["id"] for s in self.bid_slots if s.get("id") is not None}
                     tracked_bid_usd = sum(float(s.get("qty", 0.0)) * float(s.get("px", 0.0)) for s in self.bid_slots if s.get("id") is not None)
                     stale_tracked_bid = any(
-                        s.get("id") is not None and b1 > 0 and float(s.get("px", 0.0)) <= b1 - 6.0 * self.tick_size + 1e-6
+                        s.get("id") is not None and b1 > 0 and float(s.get("px", 0.0)) <= b1 - 7.0 * self.tick_size + 1e-6
                         for s in self.bid_slots
                     )
-                    max_bid_dist = 6.0 * self.tick_size
+                    max_bid_dist = 7.0 * self.tick_size
                 else:
                     tracked_bid_oids = {self.active_bid_id} if self.active_bid_id is not None else set()
                     tracked_bid_usd = (self.active_bid_q * self.active_bid_p) if self.active_bid_id is not None else 0.0
@@ -1384,12 +1552,15 @@ class LiveTriadRLTrader:
                         print(f"  🔄 [SPOT SYNC] Позиция на споте активна: {real_pos:.4f} PRL (вход=${self.avg_entry:.2f}) | Свободный USDT=${u_free:.2f}")
                 elif real_pos < 1.95 and prev_pos >= 1.95:
                     self.avg_entry, self.hold_sec, self.peak_bid = 0.0, 0, 0.0
-                    self.tr_low_px, self.tr_low_qty, self.tr_high_px, self.tr_high_qty = 0.0, 0.0, 0.0, 0.0
+                    self.tr_low_px, self.tr_low_qty = 0.0, 0.0
+                    self.tr_mid_px, self.tr_mid_qty = 0.0, 0.0
+                    self.tr_high_px, self.tr_high_qty = 0.0, 0.0
                     self.n_trades += 1
                     self.realized_pnl_usd = u_tot - self.initial_budget_usd
                     if not init_mode:
                         print(f"  🔄 [SPOT SYNC] Позиция полностью продана в USDT: баланс=${u_tot:.2f} (PnL={self.realized_pnl_usd:+.4f}$)")
                 self.pos_qty = real_pos
+                self._reconcile_lifo_tranches()
                 ind_locked_q = sum(float(s.get("q", 0.0)) for s in getattr(self, "extra_slots", []))
                 if (
                     not is_24slot
@@ -1443,15 +1614,52 @@ class LiveTriadRLTrader:
             print(f"  ⚠️ [BALANCE SYNC WARN] {e}")
 
     def compute_obs_and_mask(self, X_seq_2d: np.ndarray, row_df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-        # Параллельный инференс всех 6 горизонтов (H=5, 12, 25, 60, 90, 120) в пуле потоков
-        all_routers = [self.routers[0][2], self.routers[1][2], self.routers[2][2], self.router_60]
-        if getattr(self, "router_90", None) is not None:
-            all_routers.append(self.router_90)
-        if getattr(self, "router_120", None) is not None:
-            all_routers.append(self.router_120)
+        r_last = row_df.iloc[-1]
+        b1_chk = float(r_last.get("ST_bid_1_price", r_last.get("ST_best_bid", 0.0)))
+        a1_chk = float(r_last.get("ST_ask_1_price", r_last.get("ST_best_ask", 0.0)))
+        self._slow_router_step = getattr(self, "_slow_router_step", 0) + 1
+        prev_ba = getattr(self, "_slow_router_ba", None)
+        run_slow = (
+            (self._slow_router_step % 3 == 1)
+            or (prev_ba != (b1_chk, a1_chk))
+            or (getattr(self, "_cached_slow_res", None) is None)
+        )
 
-        futs = [self._triad_pool.submit(r.predict_live_tick, X_seq_2d, row_df) for r in all_routers]
-        res_map = [f.result() for f in futs]
+        # Быстрая триада (H=5, 12, 25) считается каждую секунду; макро-горизонты (H=60, 90, 120) — при любом сдвиге цены или раз в 3с
+        fast_routers = [self.routers[0][2], self.routers[1][2], self.routers[2][2]]
+        slow_routers = [self.router_60]
+        if getattr(self, "router_90", None) is not None:
+            slow_routers.append(self.router_90)
+        if getattr(self, "router_120", None) is not None:
+            slow_routers.append(self.router_120)
+
+        shared_reg_probs = None
+        lr_ref = getattr(fast_routers[0], "learned_router", None)
+        if lr_ref is not None and hasattr(lr_ref, "predict_live_1row"):
+            live_vels = None
+            bh_len = len(self.bid_hist_1h)
+            if bh_len >= 2 and b1_chk > 0:
+                b_10 = self.bid_hist_1h[-min(bh_len, 10)]
+                b_60 = self.bid_hist_1h[-min(bh_len, 60)]
+                b_300 = self.bid_hist_1h[-min(bh_len, 300)]
+                live_vels = (
+                    (b1_chk - b_10) / self.tick_size,
+                    (b1_chk - b_60) / self.tick_size,
+                    (b1_chk - b_300) / self.tick_size,
+                )
+            shared_reg_probs = lr_ref.predict_live_1row(row_df, live_vels=live_vels)
+
+        if run_slow:
+            all_routers = fast_routers + slow_routers
+            futs = [self._triad_pool.submit(rt.predict_live_tick, X_seq_2d, row_df, shared_reg_probs) for rt in all_routers]
+            res_all = [f.result() for f in futs]
+            res_map = res_all[:3]
+            self._cached_slow_res = res_all[3:]
+            self._slow_router_ba = (b1_chk, a1_chk)
+        else:
+            futs = [self._triad_pool.submit(rt.predict_live_tick, X_seq_2d, row_df, shared_reg_probs) for rt in fast_routers]
+            res_map = [f.result() for f in futs]
+        res_map = res_map + list(self._cached_slow_res)
 
         triad_vec = []
         triad_probs = []
@@ -1865,12 +2073,15 @@ class LiveTriadRLTrader:
                 import torch
                 with torch.no_grad():
                     mid_p = 0.5 * (b1 + a1)
-                    lob_10_4 = np.zeros((1, 10, 4), dtype=np.float32)
-                    for lvl_i in range(10):
-                        lob_10_4[0, lvl_i, 0] = np.clip((mid_p - bid_ps[lvl_i]) / self.tick_size, 0.0, 50.0) / 10.0
-                        lob_10_4[0, lvl_i, 1] = np.log1p(max(0.0, bid_qs_clean[lvl_i])) / 10.0
-                        lob_10_4[0, lvl_i, 2] = np.clip((ask_ps[lvl_i] - mid_p) / self.tick_size, 0.0, 50.0) / 10.0
-                        lob_10_4[0, lvl_i, 3] = np.log1p(max(0.0, ask_qs_clean[lvl_i])) / 10.0
+                    bp_np = np.asarray(bid_ps, dtype=np.float32)
+                    bq_np = np.maximum(0.0, np.asarray(bid_qs_clean, dtype=np.float32))
+                    ap_np = np.asarray(ask_ps, dtype=np.float32)
+                    aq_np = np.maximum(0.0, np.asarray(ask_qs_clean, dtype=np.float32))
+                    lob_10_4 = np.empty((1, 10, 4), dtype=np.float32)
+                    lob_10_4[0, :, 0] = np.clip((mid_p - bp_np) / self.tick_size, 0.0, 50.0) * 0.1
+                    lob_10_4[0, :, 1] = np.log1p(bq_np) * 0.1
+                    lob_10_4[0, :, 2] = np.clip((ap_np - mid_p) / self.tick_size, 0.0, 50.0) * 0.1
+                    lob_10_4[0, :, 3] = np.log1p(aq_np) * 0.1
 
                     vb_cur = float(r.get("ST_buy_vol", r.get("ST_buy_vol_1s", 0.0)))
                     vs_cur = float(r.get("ST_sell_vol", r.get("ST_sell_vol_1s", 0.0)))
@@ -1881,6 +2092,8 @@ class LiveTriadRLTrader:
                     free_c_rat = float(np.clip(unres_cash_now / tot_bud, 0.0, 1.0))
                     n_b_cnt = sum(1 for s in self.bid_slots if s.get("id") is not None and float(s.get("qty", 0.0)) > 1e-4)
                     n_a_cnt = sum(1 for s in self.ask_slots if s.get("id") is not None and float(s.get("qty", 0.0)) > 1e-4)
+                    has_bid_sim = 1.0 if n_b_cnt > 0 else 0.0
+                    has_ask_sim = 1.0 if n_a_cnt > 0 else 0.0
                     n_b_sl = float(n_b_cnt) / 12.0
                     n_a_sl = float(n_a_cnt) / 12.0
                     has_pos_sim = 1.0 if self.pos_qty > 1e-4 else 0.0
@@ -1902,8 +2115,8 @@ class LiveTriadRLTrader:
                         free_c_rat,
                         float(np.clip(unr_sim / 5.0, -2.0, 2.0)),
                         float(np.clip(hold_rat_sim, 0.0, 2.0)),
-                        float(n_b_sl),
-                        float(n_a_sl),
+                        has_bid_sim,
+                        has_ask_sim,
                         float(n_b_sl - n_a_sl),
                     ]], dtype=np.float32)
 
@@ -1943,7 +2156,14 @@ class LiveTriadRLTrader:
                         float(getattr(self, "last_p_fill_real", 0.5)),
                         float(getattr(self, "last_p_frontrun", 0.2)),
                     ]
-                    mat_6d = [1.0474, 0.7839, 0.6412, 0.4479, 0.3466, 0.2747]
+                    mat_6d = [
+                        float(math.log1p(getattr(self.routers[0][2], "num_models", 65)) / 4.0),
+                        float(math.log1p(getattr(self.routers[1][2], "num_models", 22)) / 4.0),
+                        float(math.log1p(getattr(self.routers[2][2], "num_models", 12)) / 4.0),
+                        float(math.log1p(getattr(self.router_60, "num_models", 5)) / 4.0),
+                        float(math.log1p(getattr(self.router_90, "num_models", 3)) / 4.0),
+                        float(math.log1p(getattr(self.router_120, "num_models", 2)) / 4.0),
+                    ]
                     v7_58_arr = np.array(
                         triad_vec + lob_vec + self.last_vec60 + self.last_vec90 + self.last_vec120 + v52_4d + real_2d + mat_6d,
                         dtype=np.float32,
@@ -1968,6 +2188,42 @@ class LiveTriadRLTrader:
                         vel_8d = [float(np.clip(v7_cur_58[vi] - v7_prev5[vi], -3.0, 3.0)) for vi in (0, 2, 4, 6, 8, 12, 34, 42)]
                         slot_32_t = torch.tensor([b_slot_12 + a_slot_12 + vel_8d], dtype=torch.float32)
                         z_aug = torch.cat([z_aug, slot_32_t], dim=-1)
+                    if int(self.l7_w1.shape[0]) >= 388:
+                        b_dist_12 = [
+                            float(np.clip((b1 - float(self.bid_slots[si].get("px", b1))) / (5.0 * self.tick_size), -0.5, 1.5))
+                            if (self.bid_slots[si].get("id") is not None and float(self.bid_slots[si].get("qty", 0.0)) > 1e-6)
+                            else 0.0
+                            for si in range(12)
+                        ]
+                        a_dist_12 = [
+                            float(np.clip((float(self.ask_slots[si].get("px", a1)) - a1) / (5.0 * self.tick_size), -0.5, 1.5))
+                            if (self.ask_slots[si].get("id") is not None and float(self.ask_slots[si].get("qty", 0.0)) > 1e-6)
+                            else 0.0
+                            for si in range(12)
+                        ]
+                        a1_5s_ago = float(getattr(self, "ask_hist_5s", [a1])[0]) if hasattr(self, "ask_hist_5s") else a1
+                        if not hasattr(self, "ask_hist_5s"):
+                            self.ask_hist_5s = deque(maxlen=6)
+                        self.ask_hist_5s.append(a1)
+                        db1_5s = float(np.clip((b1 - b1_5s_ago) / (3.0 * self.tick_size), -2.0, 2.0))
+                        da1_5s = float(np.clip((a1 - a1_5s_ago) / (3.0 * self.tick_size), -2.0, 2.0))
+                        dbq_5s = float(np.clip(math.log1p(max(0.0, b1_q)) - math.log1p(max(0.0, b1q_5s_ago)), -2.0, 2.0))
+                        daq_5s = float(np.clip(math.log1p(max(0.0, a1_q)) - math.log1p(max(0.0, a1q_5s_ago)), -2.0, 2.0))
+                        b_deep_q = max(0.0, b5_q - b1_q)
+                        a_deep_q = max(0.0, a5_q - a1_q)
+                        imb_deep = float(np.clip((b_deep_q - a_deep_q) / (b_deep_q + a_deep_q + 50.0), -1.0, 1.0))
+                        lvel_8d = [
+                            db1_5s,
+                            da1_5s,
+                            dbq_5s,
+                            daq_5s,
+                            float(np.clip((b1_q - a1_q) / (b1_q + a1_q + 10.0), -1.0, 1.0)),
+                            imb_deep,
+                            float(np.clip(math.log1p(max(0.0, vb_cur)) / 8.0, 0.0, 2.0)),
+                            float(np.clip(math.log1p(max(0.0, vs_cur)) / 8.0, 0.0, 2.0)),
+                        ]
+                        geom_32_t = torch.tensor([b_dist_12 + a_dist_12 + lvel_8d], dtype=torch.float32)
+                        z_aug = torch.cat([z_aug, geom_32_t], dim=-1)
                     pre_all = z_aug @ self.l7_w1 + self.l7_b1.squeeze(0)
                     if int(self.l7_w1.shape[1]) == 384:
                         h_base = torch.relu(pre_all[..., :256])
@@ -1978,6 +2234,10 @@ class LiveTriadRLTrader:
                         if getattr(self, "l7_wg", None) is not None and getattr(self, "l7_bg", None) is not None:
                             gate_t = 2.0 * torch.sigmoid(z_aug @ self.l7_wg + self.l7_bg.squeeze(0))
                             h1_t = h1_t * gate_t
+                    if getattr(self, "l7_w_res1", None) is not None and getattr(self, "l7_w_res2", None) is not None:
+                        res_pre = h1_t @ self.l7_w_res1 + self.l7_b_res1.squeeze(0)
+                        res_mid = torch.relu(res_pre[..., :64]) * (2.0 * torch.sigmoid(res_pre[..., 64:128]))
+                        h1_t = h1_t + (res_mid @ self.l7_w_res2)
                     raw_26 = torch.sigmoid(h1_t @ self.l7_w2 + self.l7_b2.squeeze(0)).squeeze(0).numpy()
                     self.last_l7_out = raw_26
                     b_w_12 = raw_26[:12] if raw_26[24] <= 0.75 else np.zeros(12, dtype=np.float32)
@@ -2070,8 +2330,11 @@ class LiveTriadRLTrader:
             0.0,
         ], dtype=np.float32)
 
-        reg_probs = self.regime_gate.predict_single(feat24)
-        self.last_regime_probs = reg_probs
+        if run_slow or getattr(self, "last_regime_probs", None) is None:
+            reg_probs = self.regime_gate.predict_single(feat24)
+            self.last_regime_probs = reg_probs
+        else:
+            reg_probs = self.last_regime_probs
         p_flat, p_acc, p_brk, p_tox = float(reg_probs[0]), float(reg_probs[1]), float(reg_probs[2]), float(reg_probs[3])
         is_accum_zone = (p_acc >= 0.35) and (p_tox < 0.45) and (self.last_p_adverse < 0.45)
         is_break_zone = (p_brk >= 0.42) and (p_tox < 0.35)
@@ -2080,22 +2343,30 @@ class LiveTriadRLTrader:
         # Вычисление роя нейро-ограничителей (Guard Ensemble: sweep12, bleed60, crash300, exit30)
         b1_p = float(b1)
         a1_p = float(a1)
-        sp_t = max(1.0, (a1_p - b1_p) / self.tick_size)
-        sp_pct = (a1_p - b1_p) / max(b1_p, 1e-4) * 100.0
-        v_buy = float(getattr(self, "last_buy_vol", 0.0))
-        v_sell = float(getattr(self, "last_sell_vol", 0.0))
-        f20 = np.array([
-            sp_t, sp_pct,
-            np.log1p(b1_q), np.log1p(a1_q),
-            (b1_q - a1_q) / max(1.0, b1_q + a1_q),
-            float(vel_10), float(vel_3), float(vel_180),
-            float(dd_300), float(pos_3600), float(rng_14400),
-            float(inertia),
-            np.log1p(v_buy), np.log1p(v_sell),
-            (v_buy - v_sell) / max(1.0, v_buy + v_sell),
-            ez_5, ez_12, ez_25, ez_60, ez_90,
-        ], dtype=np.float32)
-        guard_p = self.guard_predictor.predict_single(f20)
+        if self.l7_w1 is not None and getattr(self, "last_l7_out", None) is not None:
+            guard_p = np.array([
+                float(getattr(self, "last_l7_ps", 0.05)),
+                float(getattr(self, "last_l7_pb", 0.05)),
+                float(getattr(self, "last_l7_pc", 0.02)),
+                float(getattr(self, "last_l7_pe", 0.05)),
+            ], dtype=np.float32)
+        else:
+            sp_t = max(1.0, (a1_p - b1_p) / self.tick_size)
+            sp_pct = (a1_p - b1_p) / max(b1_p, 1e-4) * 100.0
+            v_buy = float(getattr(self, "last_buy_vol", 0.0))
+            v_sell = float(getattr(self, "last_sell_vol", 0.0))
+            f20 = np.array([
+                sp_t, sp_pct,
+                np.log1p(b1_q), np.log1p(a1_q),
+                (b1_q - a1_q) / max(1.0, b1_q + a1_q),
+                float(vel_10), float(vel_3), float(vel_180),
+                float(dd_300), float(pos_3600), float(rng_14400),
+                float(inertia),
+                np.log1p(v_buy), np.log1p(v_sell),
+                (v_buy - v_sell) / max(1.0, v_buy + v_sell),
+                ez_5, ez_12, ez_25, ez_60, ez_90,
+            ], dtype=np.float32)
+            guard_p = self.guard_predictor.predict_single(f20)
         self.last_guard_probs = guard_p
         p_sw12, p_bl60, p_cr300, p_ex30 = float(guard_p[0]), float(guard_p[1]), float(guard_p[2]), float(guard_p[3])
 
@@ -2259,6 +2530,25 @@ class LiveTriadRLTrader:
         return act
 
     def decide_action(self, obs: np.ndarray, mask: np.ndarray) -> tuple[int, float]:
+        l7_out = getattr(self, "last_l7_out", None)
+        if self.mode == "live" and getattr(self, "l7_w1", None) is not None and l7_out is not None and len(l7_out) == 26:
+            # В боевом режиме 24-слотовой матрицы (execute_live_24slot_grid) не тратим CPU на устаревший 1-ордерный PPO + MC-Lookahead
+            cancel_sig = float(l7_out[24]) > 0.75
+            panic_sig = float(l7_out[25]) > 0.85
+            b_w = l7_out[:12]
+            a_w = l7_out[12:24]
+            if panic_sig and self.pos_qty >= 1.95:
+                return 6, 0.0
+            if cancel_sig:
+                return 5, 0.0
+            if float(np.max(b_w[:2])) >= 0.12:
+                return 1, 0.0
+            if float(np.max(b_w[2:12])) >= 0.12:
+                return 2, 0.0
+            if self.pos_qty >= 1.95 and float(np.max(a_w)) >= 0.12:
+                return 3, 0.0
+            return 0, 0.0
+
         import torch
         with torch.no_grad():
             obs_t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
@@ -2329,10 +2619,11 @@ class LiveTriadRLTrader:
         tol = self.tick_size * 0.25
         cancel_bids = float(l7_out[24]) > 0.75
         panic_sell = (float(l7_out[25]) > 0.85) and (self.pos_qty >= 1.95)
+        panic_frac = float(np.clip((float(l7_out[25]) - 0.80) * 5.0, 0.25, 1.0)) if panic_sell else 0.0
         b_w = np.zeros(12, dtype=np.float64) if cancel_bids else np.asarray(l7_out[:12], dtype=np.float64)
         a_w = np.asarray(l7_out[12:24], dtype=np.float64)
 
-        # 0. Экстренный выход PanicSell (raw_outputs[25] > 0.85)
+        # 0. Пропорциональный экстренный выход PanicSell (raw_outputs[25] > 0.85 ➔ 25%..100% позиции)
         if panic_sell:
             ask_oids = [s["id"] for s in self.ask_slots if s.get("id") is not None]
             if ask_oids:
@@ -2341,7 +2632,10 @@ class LiveTriadRLTrader:
                     s["id"], s["px"], s["qty"], s["act_ts"], s["acc_fill"] = None, 0.0, 0.0, 0.0, 0.0
                 self._sync_24slot_orders(b1, count_hold=False)
                 self.sync_account_balances(b1)
-            sell_q = math.floor(min(self.pos_qty, max(self.ex_coin_free, self.pos_qty)) * 10000.0) / 10000.0
+            avail_pos_q = min(self.pos_qty, max(self.ex_coin_free, self.pos_qty))
+            sell_q = math.floor(avail_pos_q * panic_frac * 10000.0) / 10000.0
+            if sell_q < 2.0 and avail_pos_q >= 2.0:
+                sell_q = math.floor(avail_pos_q * 10000.0) / 10000.0
             if sell_q >= 2.0:
                 p_panic = round(max(self.tick_size, b1 - self.tick_size) / self.tick_size) * self.tick_size
                 try:
@@ -2354,7 +2648,7 @@ class LiveTriadRLTrader:
                         "act_ts": now_ts,
                         "acc_fill": 0.0,
                     }
-                    print(f"  🚨 [24-SLOT PANIC SELL] id={self.ask_slots[0]['id']} | {sell_q:.4f} PRL @ ${p_panic:.2f}")
+                    print(f"  🚨 [24-SLOT PANIC SELL ({panic_frac:.0%})] id={self.ask_slots[0]['id']} | {sell_q:.4f} PRL @ ${p_panic:.2f}")
                 except Exception as ep:
                     print(f"  ⚠️ [24-SLOT PANIC SELL WARN]: {ep}")
                 self._sync_24slot_orders(b1, count_hold=False)
@@ -2365,6 +2659,7 @@ class LiveTriadRLTrader:
         # 1. Целевая сетка цен 12 Bid-слотов и 12 Ask-слотов (1-в-1 с vectorized_free_multi_order_env.py)
         slot_offsets = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 5.0, 5.0]
         is_penny = [True, True, False, False, False, False, False, False, False, False, False, False]
+        is_ask_penny = [True, True, True, True, False, False, False, False, False, False, False, False]
         wide_sp = (a1 - b1) >= 1.9 * self.tick_size
 
         t_bid_px = np.zeros(12, dtype=np.float64)
@@ -2374,13 +2669,7 @@ class LiveTriadRLTrader:
 
         t_ask_px = np.zeros(12, dtype=np.float64)
         base_tp = np.zeros(12, dtype=np.float64)
-        if 0.0 < self.tr_low_qty < 1.95:
-            tot_q = self.tr_low_qty + self.tr_high_qty
-            if tot_q > 1e-4:
-                self.tr_high_px = (self.tr_low_qty * self.tr_low_px + self.tr_high_qty * self.tr_high_px) / tot_q
-                self.tr_high_qty = tot_q
-                self.avg_entry = self.tr_high_px
-            self.tr_low_qty, self.tr_low_px = 0.0, 0.0
+        self._reconcile_lifo_tranches()
         has_low_tr = (self.pos_qty >= 1.95) and (self.tr_low_qty >= 1.95) and (self.tr_low_px > 0.0) and (self.tr_low_px < self.avg_entry - 0.1 * self.tick_size)
         if self.pos_qty >= 1.95 and self.avg_entry > 0.0:
             base_avg_tp = math.ceil((self.avg_entry + 0.55 * self.tick_size) / self.tick_size - 1e-5) * self.tick_size
@@ -2394,13 +2683,13 @@ class LiveTriadRLTrader:
                     slot_base = base_lifo_tp if s < 6 else base_avg_tp
                     base_tp[s] = slot_base + slot_offsets[s] * self.tick_size
                 for s in range(12):
-                    mkt_ap = (a1 - self.tick_size if wide_sp else a1) if is_penny[s] else (a1 + slot_offsets[s] * self.tick_size)
+                    mkt_ap = (a1 - self.tick_size if wide_sp else a1) if is_ask_penny[s] else (a1 + slot_offsets[s] * self.tick_size)
                     t_ask_px[s] = round(max(mkt_ap, base_tp[s]) / self.tick_size) * self.tick_size
             else:
                 for s in range(12):
                     slot_base = base_lifo_tp if s < 6 else base_avg_tp
                     base_tp[s] = slot_base + slot_offsets[s] * self.tick_size
-                    mkt_ap = (a1 - self.tick_size if wide_sp else a1) if is_penny[s] else (a1 + slot_offsets[s] * self.tick_size)
+                    mkt_ap = (a1 - self.tick_size if wide_sp else a1) if is_ask_penny[s] else (a1 + slot_offsets[s] * self.tick_size)
                     t_ask_px[s] = round(max(mkt_ap, base_tp[s]) / self.tick_size) * self.tick_size
 
         # 2. Снятие слотов с защитой приоритета очереди (Queue-Priority Preservation):
@@ -2414,6 +2703,9 @@ class LiveTriadRLTrader:
         adv_now_b = float(getattr(self, "last_l7_adv", 0.0))
         pb_now_b = float(getattr(self, "last_l7_pb", 0.0))
         is_danger_b = cancel_bids or (adv_now_b >= 0.12) or (pb_now_b >= 0.45)
+        tot_bud_chk = max(25.0, float(self.initial_budget_usd), float(self.bot_cash_usd + self.pos_qty * b1))
+        res_cash_chk = sum(float(s.get("qty", 0.0)) * float(s.get("px", 0.0)) * 1.002 for s in self.bid_slots if s.get("id") is not None)
+        unres_cash_chk = max(0.0, self.bot_cash_usd - res_cash_chk)
         for s in range(12):
             slot = self.bid_slots[s]
             if slot.get("id") is None:
@@ -2423,16 +2715,16 @@ class LiveTriadRLTrader:
             off_thresh_b = 0.06 if is_danger_b else (0.06 if s < 4 else 0.04)
             slot_off_b = cancel_bids or (b_w[s] < off_thresh_b and (is_danger_b or age_s >= min_hold_b))
             grid_shift_b = (age_s >= 10.0) and (abs(t_bid_px[s] - float(slot.get("px", 0.0))) >= 1.9 * self.tick_size)
-            if slot_off_b or grid_shift_b:
-                to_cancel_b.append((s, slot["id"], "off" if slot_off_b else "shift"))
+            slot_usd = float(slot.get("qty", 0.0)) * float(slot.get("px", 0.0))
+            upsize_b = (not is_danger_b) and (age_s >= 30.0) and (b_w[s] >= 0.25) and (slot_usd < 0.25 * tot_bud_chk * b_w[s]) and (unres_cash_chk > 0.25 * tot_bud_chk)
+            if slot_off_b or grid_shift_b or upsize_b:
+                to_cancel_b.append((s, slot["id"], "off" if slot_off_b else ("shift" if grid_shift_b else "upsize")))
 
         if not is_danger_b and not to_cancel_b:
-            tot_bud_chk = max(25.0, float(self.initial_budget_usd), float(self.bot_cash_usd + self.pos_qty * b1))
-            res_cash_chk = sum(float(s.get("qty", 0.0)) * float(s.get("px", 0.0)) * 1.002 for s in self.bid_slots if s.get("id") is not None)
             b_tot_chk = float(np.sum(np.where(b_w >= 0.08, b_w, 0.0)))
             targ_usd_chk = tot_bud_chk * float(np.clip(b_tot_chk, 0.0, 1.0))
             free_act_slots = [s for s in range(12) if self.bid_slots[s].get("id") is None and b_w[s] >= 0.12]
-            if not free_act_slots and (res_cash_chk + self.pos_qty * b1) < 0.65 * targ_usd_chk and (self.bot_cash_usd - res_cash_chk) >= 50.0:
+            if not free_act_slots and (res_cash_chk + self.pos_qty * b1) < 0.65 * targ_usd_chk and unres_cash_chk >= 50.0:
                 occ_cands = [
                     s for s in range(12)
                     if self.bid_slots[s].get("id") is not None and b_w[s] >= 0.12 and (now_ts - float(self.bid_slots[s].get("act_ts", 0.0))) >= 30.0
@@ -2448,37 +2740,69 @@ class LiveTriadRLTrader:
                 continue
             age_s = now_ts - float(slot.get("act_ts", 0.0))
             cur_apx = float(slot.get("px", 0.0))
-            slot_off_a = (self.pos_qty < 1.95) or (a_w[s] < 0.04 and age_s >= 180.0)
+            slot_off_a = (self.pos_qty < 1.95) or (a_w[s] < 0.04 and age_s >= 180.0) or (a_w[s] < 0.015 and age_s >= 25.0)
             under_tp_a = (self.pos_qty >= 1.95) and (s >= 2) and (cur_apx < base_tp[s] - 0.4 * self.tick_size)
-            grid_shift_a = under_tp_a or ((self.pos_qty >= 1.95) and (age_s >= 10.0) and (abs(t_ask_px[s] - cur_apx) >= 1.9 * self.tick_size))
+            grid_shift_a = under_tp_a or ((self.pos_qty >= 1.95) and (age_s >= 15.0) and (abs(t_ask_px[s] - cur_apx) >= 1.9 * self.tick_size))
             if slot_off_a or grid_shift_a:
                 to_cancel_a.append((s, slot["id"], "off" if slot_off_a else "shift"))
 
         if to_cancel_b or to_cancel_a:
-            if cancel_bids and len(to_cancel_b) >= 3 and self.reserved_account_usdt <= 1e-4:
-                try:
-                    self.client.cancel_all_orders(self.market, side="buy")
-                except Exception:
-                    for _, oid, _ in to_cancel_b:
-                        self._safe_cancel_oid(oid)
-                for _, oid, _ in to_cancel_a:
-                    self._safe_cancel_oid(oid)
-            else:
-                for _, oid, _ in (to_cancel_b + to_cancel_a):
-                    self._safe_cancel_oid(oid)
-            self._sync_24slot_orders(b1, count_hold=False)
+            canceled_map = {}
+            need_fill_sync = False
+            all_c_oids = [x[1] for x in (to_cancel_b + to_cancel_a)]
+            for oid, res_c in zip(all_c_oids, self._io_pool.map(self._safe_cancel_oid, all_c_oids)):
+                if isinstance(res_c, dict):
+                    canceled_map[oid] = res_c
+
             for s, oid, reason in to_cancel_b:
                 if self.bid_slots[s].get("id") == oid:
-                    rel_usd = float(self.bid_slots[s].get("qty", 0.0)) * float(self.bid_slots[s].get("px", 0.0))
-                    self.ex_usdt_free += rel_usd
-                    self.bid_slots[s] = {"slot": s, "id": None, "px": 0.0, "qty": 0.0, "act_ts": 0.0, "acc_fill": 0.0}
+                    c_info = canceled_map.get(oid)
+                    prev_acc = float(self.bid_slots[s].get("acc_fill", 0.0))
+                    s_px = float(self.bid_slots[s].get("px", 0.0))
+                    no_new_fill = (
+                        (isinstance(c_info, dict) and float(c_info.get("filled_amount", 0.0)) - prev_acc <= 1e-4)
+                        or (c_info is None and s_px < b1 - tol)
+                    )
+                    if no_new_fill:
+                        rel_usd = float(self.bid_slots[s].get("qty", 0.0)) * s_px
+                        self.ex_usdt_free += rel_usd
+                        self.bid_slots[s] = {"slot": s, "id": None, "px": 0.0, "qty": 0.0, "act_ts": 0.0, "acc_fill": 0.0}
+                    else:
+                        need_fill_sync = True
                 print(f"  ✖️ [24-SLOT CANCEL BID #{s:02d} ({reason})] id={oid}")
+
             for s, oid, reason in to_cancel_a:
                 if self.ask_slots[s].get("id") == oid:
-                    rel_q = float(self.ask_slots[s].get("qty", 0.0))
-                    self.ex_coin_free += rel_q
-                    self.ask_slots[s] = {"slot": s, "id": None, "px": 0.0, "qty": 0.0, "act_ts": 0.0, "acc_fill": 0.0}
+                    c_info = canceled_map.get(oid)
+                    prev_acc = float(self.ask_slots[s].get("acc_fill", 0.0))
+                    s_px = float(self.ask_slots[s].get("px", 0.0))
+                    no_new_fill = (
+                        (isinstance(c_info, dict) and float(c_info.get("filled_amount", 0.0)) - prev_acc <= 1e-4)
+                        or (c_info is None and s_px > a1 + tol)
+                    )
+                    if no_new_fill:
+                        rel_q = float(self.ask_slots[s].get("qty", 0.0))
+                        self.ex_coin_free += rel_q
+                        self.ask_slots[s] = {"slot": s, "id": None, "px": 0.0, "qty": 0.0, "act_ts": 0.0, "acc_fill": 0.0}
+                    else:
+                        need_fill_sync = True
                 print(f"  ✖️ [24-SLOT CANCEL ASK #{s:02d} ({reason})] id={oid}")
+
+            if need_fill_sync:
+                self._sync_24slot_orders(b1, count_hold=False, pre_fetched_orders=canceled_map)
+                for s, oid, _ in to_cancel_b:
+                    if self.bid_slots[s].get("id") == oid:
+                        rel_usd = float(self.bid_slots[s].get("qty", 0.0)) * float(self.bid_slots[s].get("px", 0.0))
+                        self.ex_usdt_free += rel_usd
+                        self.bid_slots[s] = {"slot": s, "id": None, "px": 0.0, "qty": 0.0, "act_ts": 0.0, "acc_fill": 0.0}
+                for s, oid, _ in to_cancel_a:
+                    if self.ask_slots[s].get("id") == oid:
+                        rel_q = float(self.ask_slots[s].get("qty", 0.0))
+                        self.ex_coin_free += rel_q
+                        self.ask_slots[s] = {"slot": s, "id": None, "px": 0.0, "qty": 0.0, "act_ts": 0.0, "acc_fill": 0.0}
+            else:
+                # Даем движку SafeTrade (Peatio v2) ~140 мс освободить locked-баланс после отмены слотов перед перестановкой
+                time.sleep(0.14)
 
         # 3. Выставление новых Bid-слотов в свободные ячейки (b_w >= 0.12) строго по формуле VectorizedFreeMultiOrderEnv:
         #    scale_b = (1.0 / b_sum) if b_sum > 4.0 else 0.25; b_alloc = b_w * scale_b
@@ -2525,9 +2849,9 @@ class LiveTriadRLTrader:
                     [(s, float(t_bid_qty[s]), float(t_bid_px[s])) for s in range(12) if t_bid_qty[s] >= 2.0],
                     key=lambda x: b_w[x[0]],
                     reverse=True,
-                )[:3]
+                )[:8]
                 if b_tasks:
-                    b_results = [self._place_slot_order("buy", item[0], item[1], item[2]) for item in b_tasks]
+                    b_results = list(self._io_pool.map(lambda item: self._place_slot_order("buy", item[0], item[1], item[2]), b_tasks))
                     for s, res_o, q_req, p_req in b_results:
                         if res_o and res_o.get("id") is not None:
                             q_act = float(res_o.get("origin_amount", q_req))
@@ -2601,9 +2925,9 @@ class LiveTriadRLTrader:
                     [(s, float(t_ask_qty[s]), float(t_ask_px[s])) for s in range(12) if t_ask_qty[s] >= 2.0],
                     key=lambda x: a_w[x[0]],
                     reverse=True,
-                )[:3]
+                )[:8]
                 if a_tasks:
-                    a_results = [self._place_slot_order("sell", item[0], item[1], item[2]) for item in a_tasks]
+                    a_results = list(self._io_pool.map(lambda item: self._place_slot_order("sell", item[0], item[1], item[2]), a_tasks))
                     for s, res_o, q_req, p_req in a_results:
                         if res_o and res_o.get("id") is not None:
                             q_act = float(res_o.get("origin_amount", q_req))
@@ -2644,7 +2968,17 @@ class LiveTriadRLTrader:
             res = self.client.place_limit_order(self.market, side, qty, price)
             return (slot_idx, res, qty, price)
         except Exception as e:
-            print(f"  ⚠️ [24-SLOT ORDER {side.upper()} #{slot_idx:02d} WARN] qty={qty:.4f} @ ${price:.2f}: {e}")
+            err_s = str(e)
+            if "insufficient_balance" in err_s:
+                time.sleep(0.18)
+                retry_qty = math.floor((qty * 0.999) * 10000.0) / 10000.0
+                if retry_qty >= 2.0:
+                    try:
+                        res_r = self.client.place_limit_order(self.market, side, retry_qty, price)
+                        return (slot_idx, res_r, retry_qty, price)
+                    except Exception as e2:
+                        err_s = str(e2)
+            print(f"  ⚠️ [24-SLOT ORDER {side.upper()} #{slot_idx:02d} WARN] qty={qty:.4f} @ ${price:.2f}: {err_s}")
             return (slot_idx, None, qty, price)
 
     def execute_live_action(self, act: int, b1: float, a1: float):
@@ -3859,9 +4193,13 @@ def stop_live_daemon(cancel_open_orders: bool = True):
         if w_file.exists():
             try:
                 w_st = json.loads(w_file.read_text(encoding="utf-8"))
-                for k in ("active_bid_id", "active_ask_id"):
+                for k in ("active_bid_id", "active_ask_id", "slot2_ask_id"):
                     if w_st.get(k):
                         bot_oids.add(w_st[k])
+                for arr_k in ("bid_slots", "ask_slots", "extra_slots"):
+                    for item in w_st.get(arr_k, []) or []:
+                        if isinstance(item, dict) and item.get("id") is not None:
+                            bot_oids.add(item["id"])
             except Exception:
                 pass
         for oid in bot_oids:

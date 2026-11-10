@@ -185,6 +185,11 @@ class SwarmRegimeRouter:
         self._live_pred_ring = deque(maxlen=max(64, self.H + 5))
         self._live_win0_var = 0.25
         self._live_blend_var = 0.20
+        zero_prefixes = ("LL_", "BO_ofi_", "BO_cvd_", "BO_imb_", "BO_obi_", "BO_micro_", "BO_ret_", "BO_vol_intensity_")
+        self._bo_zero_cols = [idx for idx, fname in enumerate(self.feature_names) if fname.startswith(zero_prefixes)]
+        self._class_values = np.array([-3, -2, -1, 0, 1, 2, 3], dtype=np.float32)
+        cw = np.array(self.alliance_cfg.get("class_weights", [1.0] * 7), dtype=np.float32) if self.alliance_cfg else np.ones(7, dtype=np.float32)
+        self._cw_pow = np.power(np.maximum(cw, 1e-3), 0.85).astype(np.float32)
         try:
             from _tools.learned_regime_router import LearnedRegimeCompetenceRouter
             self.learned_router = LearnedRegimeCompetenceRouter(device="cpu")
@@ -194,7 +199,7 @@ class SwarmRegimeRouter:
             self.learned_router = None
             self.window_competence_8c = None
 
-    def compute_routing_weights(self, current_regime_df: pd.DataFrame) -> np.ndarray:
+    def compute_routing_weights(self, current_regime_df: pd.DataFrame, precomputed_reg_probs: np.ndarray = None) -> np.ndarray:
         """
         Вычисляет матрицу весов W (N x M) для каждой секунды через Обученный 8-фазный Классификатор-Роутер
         (LearnedRegimeCompetenceRouter) + каузальную маску открытия окон (ts_sec > train_end_sec).
@@ -206,7 +211,11 @@ class SwarmRegimeRouter:
             return np.ones((n_samples, 1), dtype=np.float32)
 
         if self.learned_router is not None and self.window_competence_8c is not None and len(self.window_competence_8c) == self.num_models:
-            reg_probs = self.learned_router.predict_regime_probs(current_regime_df)
+            reg_probs = (
+                precomputed_reg_probs
+                if (precomputed_reg_probs is not None and len(precomputed_reg_probs) == n_samples)
+                else self.learned_router.predict_regime_probs(current_regime_df)
+            )
             comp_score = np.matmul(reg_probs, self.window_competence_8c.T) / max(0.05, self.temperature)
         else:
             cols = []
@@ -222,8 +231,11 @@ class SwarmRegimeRouter:
             comp_score = -dist_sq / max(0.05, self.temperature)
 
         # Логарифмический приор свежести (-0.35*ln(1+rank)) + строгая каузальная маскировка открытия окон
-        if "timestamp" in current_regime_df.columns and n_samples > 10 and len(self.train_end_sec) == self.num_models:
-            ts_sec = pd.to_datetime(current_regime_df["timestamp"], utc=True).dt.as_unit("s").astype("int64").values
+        has_ts_col = "timestamp" in current_regime_df.columns
+        has_ts_idx = isinstance(current_regime_df.index, pd.DatetimeIndex) or getattr(current_regime_df.index, "name", None) == "timestamp"
+        if (has_ts_col or has_ts_idx) and n_samples > 10 and len(self.train_end_sec) == self.num_models:
+            ts_raw = current_regime_df["timestamp"] if has_ts_col else current_regime_df.index
+            ts_sec = np.asarray(pd.to_datetime(np.asarray(ts_raw), utc=True).as_unit("s").astype("int64"), dtype=np.int64)
             avail_raw = ts_sec[:, np.newaxis] > self.train_end_sec[np.newaxis, :]
             self._n_avail_windows = np.sum(avail_raw, axis=1).astype(np.float32)
             avail_desc = avail_raw[:, self.desc_order]
@@ -326,13 +338,30 @@ class SwarmRegimeRouter:
             else:
                 act_slices.append((0, n_samples))
 
+        matched_cache = lgb_cache_file if lgb_cache_file.exists() else None
+        if matched_cache is None:
+            cand_files = sorted(cache_dir.glob(f"lgb_probs_{self.coin}_h{self.H}s_k{self.K:g}_{n_samples}_{slice_hash}_*.npy"))
+            if cand_files:
+                matched_cache = cand_files[-1]
+
+        loaded_from_cache = False
         if getattr(self, "_lgb_cache_sig", None) == (slice_hash, manifest_mtime):
             all_probs = self._lgb_cache_probs
-        elif lgb_cache_file.exists():
-            all_probs = np.load(lgb_cache_file)
-            self._lgb_cache_sig = (slice_hash, manifest_mtime)
-            self._lgb_cache_probs = all_probs
-        else:
+            loaded_from_cache = True
+        elif matched_cache is not None and matched_cache.exists():
+            raw_cached = np.load(matched_cache)
+            m_c = raw_cached.shape[0]
+            if m_c == self.num_models:
+                all_probs = raw_cached
+                loaded_from_cache = True
+            elif m_c < self.num_models and all(act_slices[i][1] <= act_slices[i][0] for i in range(m_c, self.num_models)):
+                all_probs = np.zeros((self.num_models, n_samples, 7), dtype=np.float32)
+                all_probs[:m_c] = raw_cached
+                loaded_from_cache = True
+            if loaded_from_cache:
+                self._lgb_cache_sig = (slice_hash, manifest_mtime)
+                self._lgb_cache_probs = all_probs
+        if not loaded_from_cache:
             X_inf = self._sanitize_stale_bo_features(X, current_regime_df)
             all_probs = np.zeros((self.num_models, n_samples, 7), dtype=np.float32)
 
@@ -369,7 +398,10 @@ class SwarmRegimeRouter:
         ps_all = all_probs[:, :, 0] + all_probs[:, :, 1]
 
         active_model_indices = [i for i in range(self.num_models) if act_slices[i][1] > act_slices[i][0]]
-        ref_i = active_model_indices[-1] if active_model_indices else self.latest_idx
+        if c_rank is not None and active_model_indices:
+            ref_i = active_model_indices[0]
+        else:
+            ref_i = active_model_indices[-1] if active_model_indices else self.latest_idx
         s0, e0 = act_slices[ref_i] if act_slices[ref_i][1] > act_slices[ref_i][0] else (0, n_samples)
         ref_mean = float(np.mean(ez_all[ref_i, s0:e0]))
         ref_std = float(np.std(ez_all[ref_i, s0:e0])) + 1e-6
@@ -562,7 +594,12 @@ class SwarmRegimeRouter:
 
         list(_SWARM_POOL.map(_load_one, self.neural_experts))
 
-    def predict_live_tick(self, X_seq_2d: np.ndarray, current_regime_1row: pd.DataFrame) -> dict:
+    def predict_live_tick(
+        self,
+        X_seq_2d: np.ndarray,
+        current_regime_1row: pd.DataFrame,
+        precomputed_reg_probs: np.ndarray = None,
+    ) -> dict:
         """
         Мгновенный многопоточный инференс 1 боевого тика (1 Гц) по полному ансамблю окон без обращения к диску,
         с защитой от зависания BigONE, Online-Hedge адаптацией весов экспертов и сохранением дисперсии E[z].
@@ -572,11 +609,9 @@ class SwarmRegimeRouter:
         # 1. Защита от зависания второй биржи (BO_sec_since_tick > 60s) идентично батчевому predict_ensemble
         X_clean = X_seq_2d
         if "BO_sec_since_tick" in current_regime_1row.columns and float(current_regime_1row["BO_sec_since_tick"].iloc[-1]) > 60.0:
-            X_clean = X_seq_2d.copy()
-            zero_prefixes = ("LL_", "BO_ofi_", "BO_cvd_", "BO_imb_", "BO_obi_", "BO_micro_", "BO_ret_", "BO_vol_intensity_")
-            zero_cols = [idx for idx, fname in enumerate(self.feature_names) if fname.startswith(zero_prefixes)]
-            if zero_cols:
-                X_clean[:, zero_cols] = 0.0
+            if self._bo_zero_cols:
+                X_clean = X_seq_2d.copy()
+                X_clean[:, self._bo_zero_cols] = 0.0
 
         # 2. Online-Hedge обновление весов экспертов по фактическому движению цены за последние H секунд
         cur_mid = 0.0
@@ -595,9 +630,9 @@ class SwarmRegimeRouter:
                         nn_gain = np.exp(np.clip(0.20 * past_nn_ez * real_dt_ticks, -0.40, 0.40))
                         self.online_nn_scores = np.clip(0.985 * self.online_nn_scores + 0.015 * nn_gain, 0.35, 2.50)
 
-        x_last = X_clean[-1:, :].astype(np.float32)
-        weights = self.compute_routing_weights(current_regime_1row)[0]  # (num_models,)
-        class_values = np.array([-3, -2, -1, 0, 1, 2, 3], dtype=np.float32)
+        x_last = X_clean[-1:, :] if X_clean.dtype == np.float32 else X_clean[-1:, :].astype(np.float32)
+        weights = self.compute_routing_weights(current_regime_1row, precomputed_reg_probs=precomputed_reg_probs)[0]  # (num_models,)
+        class_values = self._class_values
 
         all_probs = np.zeros((self.num_models, 7), dtype=np.float32)
         for i, booster in enumerate(self.models):
@@ -612,8 +647,7 @@ class SwarmRegimeRouter:
 
         nn_ez_vec = np.zeros(len(self.neural_experts), dtype=np.float32)
         if self.use_neural and self.neural_weight > 0.0 and self.neural_experts:
-            cw = np.array(self.alliance_cfg.get("class_weights", [1.0] * 7), dtype=np.float32) if self.alliance_cfg else np.ones(7, dtype=np.float32)
-            cw_pow = np.power(np.maximum(cw, 1e-3), 0.85)
+            cw_pow = self._cw_pow
             nn_ez_num = 0.0
             nn_probs_num = np.zeros(7, dtype=np.float32)
             nn_w_sum = 0.0

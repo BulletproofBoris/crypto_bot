@@ -17,18 +17,18 @@
     "conv1d+gru_win_01"
   ],
   "weights": {
-    "mlp_bottleneck_win_00": 0.075403,
-    "mlp_bottleneck_win_01": 0.107307,
-    "wavenet_tcn_win_00": 0.103975,
-    "wavenet_tcn_win_01": 0.139414,
-    "cross_mixer_win_00": 0.084285,
-    "cross_mixer_win_01": 0.095696,
-    "causal_cnn_win_00": 0.056329,
-    "causal_cnn_win_01": 0.052137,
-    "attention_win_00": 0.082116,
-    "attention_win_01": 0.058679,
-    "conv1d+gru_win_00": 0.086751,
-    "conv1d+gru_win_01": 0.057908
+    "mlp_bottleneck_win_00": 0.065883,
+    "mlp_bottleneck_win_01": 0.09376,
+    "wavenet_tcn_win_00": 0.090848,
+    "wavenet_tcn_win_01": 0.131669,
+    "cross_mixer_win_00": 0.073644,
+    "cross_mixer_win_01": 0.116738,
+    "causal_cnn_win_00": 0.049218,
+    "causal_cnn_win_01": 0.128825,
+    "attention_win_00": 0.071749,
+    "attention_win_01": 0.051271,
+    "conv1d+gru_win_00": 0.075799,
+    "conv1d+gru_win_01": 0.050597
   },
-  "updated_at": "2026-11-04 18:56:53"
+  "updated_at": "2026-11-09 13:11:56"
 }

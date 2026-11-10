@@ -88,8 +88,10 @@ def load_state():
 
 def save_state(state):
     try:
-        with open(STATE_FILE, "w") as f:
+        tmp_path = f"{STATE_FILE}.tmp.{os.getpid()}"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(state, f)
+        os.replace(tmp_path, STATE_FILE)
     except Exception as e:
         logger.error(f"Не удалось сохранить состояние watchdog: {e}")
 

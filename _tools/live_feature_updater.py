@@ -65,6 +65,7 @@ class LiveFeatureStreamer:
         self.seed_template = seed_df.iloc[-1:].copy().reset_index(drop=True)
         self.buf_len = 310
         self.raw_rows = deque(maxlen=self.buf_len)
+        self.compact_rows = deque(maxlen=self.buf_len)
         self.st_delta_hist = deque([0.0] * 900, maxlen=900)
         self.st_vol_hist = deque([0.0] * 60, maxlen=60)
         self.bo_delta_hist = deque([0.0] * 900, maxlen=900)
@@ -73,7 +74,9 @@ class LiveFeatureStreamer:
         self._st_trade_pos = 0
         self._bo_trade_pos = 0
         self._seen_st_trade_ids = deque(maxlen=500)
+        self._seen_st_trade_set = set()
         self._seen_bo_trade_ids = deque(maxlen=500)
+        self._seen_bo_trade_set = set()
         self._last_block_height = -1
         self._sec_since_block = 10.0
         self._diff_1h_ago = 0.0
@@ -255,7 +258,18 @@ class LiveFeatureStreamer:
             except Exception:
                 return 0
 
-    def _poll_trades(self, path: Path, prefix: str, d: dict, pos_attr: str, seen_ids: deque, delta_hist: deque, vol_hist: deque):
+    @staticmethod
+    def _remember_seen_id(tid: str, seen_dq: deque, seen_set: set) -> bool:
+        if tid in seen_set:
+            return False
+        if len(seen_dq) == seen_dq.maxlen:
+            evicted = seen_dq.popleft()
+            seen_set.discard(evicted)
+        seen_dq.append(tid)
+        seen_set.add(tid)
+        return True
+
+    def _poll_trades(self, path: Path, prefix: str, d: dict, pos_attr: str, seen_ids: deque, seen_set: set, delta_hist: deque, vol_hist: deque):
         buy_v, sell_v, cnt = 0.0, 0.0, 0
         if path.exists():
             try:
@@ -272,9 +286,8 @@ class LiveFeatureStreamer:
                     if len(parts) < 5 or parts[0] == "id":
                         continue
                     tid = parts[0]
-                    if tid in seen_ids:
+                    if not self._remember_seen_id(tid, seen_ids, seen_set):
                         continue
-                    seen_ids.append(tid)
                     try:
                         if prefix == "ST":
                             amt = float(parts[2])
@@ -311,14 +324,14 @@ class LiveFeatureStreamer:
         d[f"{prefix}_cvd_15m"] = cvd_15m
         d[f"{prefix}_trade_imbalance_1m"] = cvd_1m / vol_1m if vol_1m > 0 else 0.0
 
-    def _bucket_trades(self, lines: list[str], prefix: str, seen_ids: deque) -> dict[int, tuple[float, float, int]]:
+    def _bucket_trades(self, lines: list[str], prefix: str, seen_ids: deque, seen_set: set) -> dict[int, tuple[float, float, int]]:
         buckets: dict[int, tuple[float, float, int]] = {}
         for ln in lines:
             parts = ln.strip().split(",")
             if len(parts) < 5 or parts[0] == "id":
                 continue
             tid = parts[0]
-            seen_ids.append(tid)
+            self._remember_seen_id(tid, seen_ids, seen_set)
             try:
                 if prefix == "ST":
                     amt = float(parts[2])
@@ -342,22 +355,27 @@ class LiveFeatureStreamer:
                 pass
         return buckets
 
+    def _append_row_buffers(self, d: dict):
+        self.raw_rows.append(d)
+        self.compact_rows.append({k: v for k, v in d.items() if k not in self._DROP_L2_11_50})
+
     def _warmup_from_seed_and_rt(self, seed_df: pd.DataFrame):
         base_dict = seed_df.iloc[-1].to_dict()
         for _, r in seed_df.tail(self.buf_len).iterrows():
             d = r.to_dict()
             d["_ts"] = pd.Timestamp.now(tz="UTC")
-            self.raw_rows.append(d)
+            self._append_row_buffers(d)
 
         st_lines = self._tail_lines(self.st_depth_path, n=800)
         bo_lines = self._tail_lines(self.bo_depth_path, n=400)
         m_lines = self._tail_lines(self.macro_path, n=400)
         on_lines = self._tail_lines(self.onchain_path, n=200)
-        st_tr_Map = self._bucket_trades(self._tail_lines(self.st_trades_path, n=1500), "ST", self._seen_st_trade_ids)
-        bo_tr_Map = self._bucket_trades(self._tail_lines(self.bo_trades_path, n=1500), "BO", self._seen_bo_trade_ids)
+        st_tr_Map = self._bucket_trades(self._tail_lines(self.st_trades_path, n=1500), "ST", self._seen_st_trade_ids, self._seen_st_trade_set)
+        bo_tr_Map = self._bucket_trades(self._tail_lines(self.bo_trades_path, n=1500), "BO", self._seen_bo_trade_ids, self._seen_bo_trade_set)
 
         if st_lines:
             self.raw_rows.clear()
+            self.compact_rows.clear()
             now_sec = self._extract_ts_sec(st_lines[-1].split(",", 1)[0]) or int(datetime.now(timezone.utc).timestamp())
             if bo_lines:
                 now_sec = max(now_sec, self._extract_ts_sec(bo_lines[-1].split(",", 1)[0]))
@@ -468,7 +486,7 @@ class LiveFeatureStreamer:
                     d["arb_bo_buy_st_sell"] = float(d["ST_bid_1_price"]) - float(d["BO_ask_1_price"])
                     d["mid_price_diff"] = float(d.get("BO_mid_price", 0.0)) - float(d.get("ST_mid_price", 0.0))
                 d["_ts"] = pd.Timestamp(s, unit="s", tz="UTC")
-                self.raw_rows.append(d)
+                self._append_row_buffers(d)
 
         for p, attr in ((self.st_trades_path, "_st_trade_pos"), (self.bo_trades_path, "_bo_trade_pos")):
             if p.exists():
@@ -568,8 +586,8 @@ class LiveFeatureStreamer:
             self._sec_since_block = min(600.0, self._sec_since_block + 1.0)
             d["onchain_seconds_since_block"] = float(self._sec_since_block)
 
-        self._poll_trades(self.st_trades_path, "ST", d, "_st_trade_pos", self._seen_st_trade_ids, self.st_delta_hist, self.st_vol_hist)
-        self._poll_trades(self.bo_trades_path, "BO", d, "_bo_trade_pos", self._seen_bo_trade_ids, self.bo_delta_hist, self.bo_vol_hist)
+        self._poll_trades(self.st_trades_path, "ST", d, "_st_trade_pos", self._seen_st_trade_ids, self._seen_st_trade_set, self.st_delta_hist, self.st_vol_hist)
+        self._poll_trades(self.bo_trades_path, "BO", d, "_bo_trade_pos", self._seen_bo_trade_ids, self._seen_bo_trade_set, self.bo_delta_hist, self.bo_vol_hist)
 
         # Кросс-биржевые мгновенные спреды
         if "BO_bid_1_price" in d and "ST_ask_1_price" in d:
@@ -585,22 +603,22 @@ class LiveFeatureStreamer:
                 q_s = 100.0 / (float(d["ST_eff_sell_vwap_100"]) * 0.999)
                 d["q_prl_accum_gain_100usd"] = q_b - q_s
 
-        self.raw_rows.append(d)
+        self._append_row_buffers(d)
 
         # 3. Векторный расчет банка фильтров W=[5, 20, 60, 300]с на окне буфера
         df_win = self._compute_window_features()
         return df_win.iloc[-1:].fillna(0.0).reset_index(drop=True)
 
-    _DROP_L2_11_50 = {
+    _DROP_L2_11_50 = frozenset(
         f"{p}_{side}_{i}_{k}"
         for p in ("ST", "BO")
         for side in ("bid", "ask")
         for i in range(11, 51)
         for k in ("price", "qty")
-    }
+    )
 
     def _compute_window_features(self) -> pd.DataFrame:
-        df_win = pd.DataFrame([{k: v for k, v in r.items() if k not in self._DROP_L2_11_50} for r in self.raw_rows])
+        df_win = pd.DataFrame(list(self.compact_rows))
         df_win = df_win.set_index("_ts")
         ssb_saved = df_win["onchain_seconds_since_block"].copy() if "onchain_seconds_since_block" in df_win.columns else None
         if "ST_mid_price" in df_win.columns:

@@ -133,6 +133,8 @@ def _jit_env_step(
     avg_entry: torch.Tensor,
     min_buy_px: torch.Tensor,
     low_tranche_qty: torch.Tensor,
+    mid_buy_px: torch.Tensor,
+    mid_tranche_qty: torch.Tensor,
     entry_t: torch.Tensor,
     bid_px: torch.Tensor,
     bid_qty: torch.Tensor,
@@ -181,6 +183,8 @@ def _jit_env_step(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
 ]:
     b1 = torch.clamp(bids_t[0], min=tick_size)
     a1 = torch.clamp(asks_t[0], min=b1 + tick_size)
@@ -189,23 +193,31 @@ def _jit_env_step(
     wide_sp = (a1 - b1) >= 2.0 * tick_size
 
     is_panic = (raw_outputs[:, 2 * S + 1] > 0.82) & (pos_qty > 1e-6)
+    panic_frac = torch.clamp((raw_outputs[:, 2 * S + 1] - 0.80) * 5.0, 0.25, 1.0)
+    raw_sell_q = pos_qty * panic_frac
+    sell_q_panic = torch.where((pos_qty - raw_sell_q) < 2.0, pos_qty, raw_sell_q)
     b_p10 = torch.clamp(bids_t[:10], min=tick_size)
     b_q10 = torch.clamp(bids_q_t[:10], min=1.0).clone()
     b_q10[9] = 1e9
     cum_q10 = torch.cumsum(b_q10, dim=0)
     prev_q10 = cum_q10 - b_q10
     take_10 = torch.clamp(
-        torch.minimum(pos_qty.unsqueeze(1) - prev_q10.unsqueeze(0), b_q10.unsqueeze(0)),
+        torch.minimum(sell_q_panic.unsqueeze(1) - prev_q10.unsqueeze(0), b_q10.unsqueeze(0)),
         min=0.0,
     )
     proceeds = (take_10 * b_p10.unsqueeze(0)).sum(dim=1) * (1.0 - taker_fee)
+    rem_pos = torch.clamp(pos_qty - sell_q_panic, min=0.0)
+    rem_frac = torch.where(pos_qty > 1e-6, rem_pos / torch.clamp(pos_qty, min=1e-6), torch.zeros_like(pos_qty))
+    full_exit = rem_pos <= 1e-5
 
     cash = torch.where(is_panic, cash + proceeds, cash)
-    pos_qty = torch.where(is_panic, torch.zeros_like(pos_qty), pos_qty)
-    pos_cost_usd = torch.where(is_panic, torch.zeros_like(pos_cost_usd), pos_cost_usd)
-    avg_entry = torch.where(is_panic, torch.zeros_like(avg_entry), avg_entry)
-    min_buy_px = torch.where(is_panic, torch.zeros_like(min_buy_px), min_buy_px)
-    low_tranche_qty = torch.where(is_panic, torch.zeros_like(low_tranche_qty), low_tranche_qty)
+    pos_qty = torch.where(is_panic, rem_pos, pos_qty)
+    pos_cost_usd = torch.where(is_panic, pos_cost_usd * rem_frac, pos_cost_usd)
+    avg_entry = torch.where(is_panic & full_exit, torch.zeros_like(avg_entry), avg_entry)
+    min_buy_px = torch.where(is_panic & full_exit, torch.zeros_like(min_buy_px), min_buy_px)
+    low_tranche_qty = torch.where(is_panic, low_tranche_qty * rem_frac, low_tranche_qty)
+    mid_buy_px = torch.where(is_panic & full_exit, torch.zeros_like(mid_buy_px), mid_buy_px)
+    mid_tranche_qty = torch.where(is_panic, mid_tranche_qty * rem_frac, mid_tranche_qty)
     ask_qty = torch.where(is_panic.unsqueeze(1), torch.zeros_like(ask_qty), ask_qty)
     n_trades = n_trades + is_panic.long()
 
@@ -227,7 +239,15 @@ def _jit_env_step(
         & ((cur_t_scalar - bid_act_t) >= 10)
         & (torch.abs(t_bid_px - bid_px) >= 1.9 * tick_size)
     )
-    clear_b = slot_off_b | grid_shift_b
+    res_cash_pre = (bid_qty * bid_px * (1.0 + maker_fee)).sum(dim=1, keepdim=True)
+    upsize_b = (
+        (bid_qty > 1e-6)
+        & ((cur_t_scalar - bid_act_t) >= 30)
+        & (b_w >= 0.25)
+        & ((bid_qty * bid_px) < 0.25 * budget.unsqueeze(1) * b_w)
+        & ((cash.unsqueeze(1) - res_cash_pre) > 0.25 * budget.unsqueeze(1))
+    )
+    clear_b = slot_off_b | grid_shift_b | upsize_b
     bid_qty = torch.where(clear_b, torch.zeros_like(bid_qty), bid_qty)
     bid_px = torch.where(clear_b, torch.zeros_like(bid_px), bid_px)
     bid_qa = torch.where(clear_b, torch.zeros_like(bid_qa), bid_qa)
@@ -303,14 +323,15 @@ def _jit_env_step(
             dim=1,
         )
 
+    is_ask_penny = is_penny_slot | (slot_lob_lvl == 0)
     raw_slot_a_px = torch.where(
-        is_penny_slot,
+        is_ask_penny,
         a1 - penny_add,
         a1 + slot_tick_offsets,
     ).unsqueeze(0).expand(num_envs, S)
     t_ask_px = torch.maximum(raw_slot_a_px, slot_base_tp + slot_tick_offsets.unsqueeze(0))
 
-    slot_off_a = (~hp_mask) | ((a_w < 0.04) & ((cur_t_scalar - ask_act_t) >= 180))
+    slot_off_a = (~hp_mask) | ((a_w < 0.04) & ((cur_t_scalar - ask_act_t) >= 180)) | ((a_w < 0.015) & ((cur_t_scalar - ask_act_t) >= 20))
     under_tp_a = (ask_qty > 1e-6) & (ask_px < slot_base_tp - 0.4 * tick_size)
     grid_shift_a = (
         (ask_qty > 1e-6)
@@ -404,7 +425,15 @@ def _jit_env_step(
     slot_need_b = eff_qa_b + eff_qty_b
     cum_need_b = torch.cumsum(slot_need_b, dim=1)
     flow_before_slot_b = cum_need_b - slot_need_b
-    rem_flow_at_slot_b = torch.clamp(tot_flow_b - flow_before_slot_b, min=0.0)
+    # Защита от эксплойта пропуска L1-стенки через 1D-таблицу [16] в регистрах (0 аллокаций 3D-тензоров!):
+    b_p10_lvl = torch.clamp(bids_t[:10], min=tick_size)
+    b_q10_lvl = torch.clamp(bids_q_t[:10], min=0.0)
+    k_ticks = torch.arange(16, device=bid_px.device, dtype=bid_px.dtype).unsqueeze(1)
+    px_grid_b = b1 - k_ticks * tick_size
+    cum_mkt_above_1d = ((b_p10_lvl.unsqueeze(0) > (px_grid_b + 0.5 * tick_size)).float() * b_q10_lvl.unsqueeze(0)).sum(dim=1)
+    depth_idx_b = torch.clamp(torch.round((b1 - bid_px) / tick_size).long(), 0, 15)
+    mkt_above_b = cum_mkt_above_1d[depth_idx_b]
+    rem_flow_at_slot_b = torch.clamp(tot_flow_b - torch.maximum(flow_before_slot_b, mkt_above_b), min=0.0)
 
     qa_eaten_b = torch.minimum(eff_qa_b, rem_flow_at_slot_b)
     bid_qa = torch.where(hit_b, torch.clamp(bid_qa - qa_eaten_b, min=0.0), bid_qa)
@@ -430,43 +459,55 @@ def _jit_env_step(
     new_q = old_q + tot_fq
     avg_fill_b_px = tot_cost_raw / torch.clamp(tot_fq, min=1e-6)
 
-    is_dip_buy = (
-        has_buy
-        & (old_q > 1e-6)
-        & (
-            (avg_fill_b_px <= avg_entry - 0.15 * tick_size)
-            | ((low_tranche_qty > 1e-6) & (avg_fill_b_px <= min_buy_px + 0.15 * tick_size))
-        )
+    # 3-уровневый честный LIFO-стек [low_tranche, mid_tranche, core_pos] без занижения себестоимости старых монет:
+    first_buy = has_buy & (old_q <= 1e-6)
+    no_low_yet = has_buy & (old_q > 1e-6) & (low_tranche_qty <= 1e-6)
+    has_low_already = has_buy & (old_q > 1e-6) & (low_tranche_qty > 1e-6)
+
+    init_dip = no_low_yet & (avg_fill_b_px <= avg_entry - 0.35 * tick_size)
+    init_higher = no_low_yet & (~init_dip) & (old_q >= 1.95) & (avg_fill_b_px >= avg_entry + 0.35 * tick_size)
+
+    deeper_dip = has_low_already & (avg_fill_b_px < min_buy_px - 0.35 * tick_size)
+    same_low = has_low_already & (~deeper_dip) & (torch.abs(avg_fill_b_px - min_buy_px) <= 0.35 * tick_size)
+    mid_dip = has_low_already & (~deeper_dip) & (~same_low) & (avg_fill_b_px <= avg_entry - 0.35 * tick_size)
+
+    # 1) Сдвиг старого low_tranche в mid_tranche при более глубокой покупке (deeper_dip) или доливка в mid_tranche (mid_dip):
+    pushed_mid_q = mid_tranche_qty + low_tranche_qty
+    pushed_mid_px = (mid_tranche_qty * mid_buy_px + low_tranche_qty * min_buy_px) / torch.clamp(pushed_mid_q, min=1e-6)
+    added_mid_q = mid_tranche_qty + tot_fq
+    added_mid_px = (mid_tranche_qty * mid_buy_px + tot_fq * avg_fill_b_px) / torch.clamp(added_mid_q, min=1e-6)
+
+    new_mid_q = torch.where(
+        first_buy,
+        torch.zeros_like(mid_tranche_qty),
+        torch.where(deeper_dip, pushed_mid_q, torch.where(mid_dip, added_mid_q, mid_tranche_qty)),
     )
-    is_higher_buy_from_single = (
-        has_buy
-        & (old_q >= 1.95)
-        & (low_tranche_qty <= 1e-6)
-        & (~is_dip_buy)
-        & (avg_fill_b_px >= avg_entry + 0.35 * tick_size)
+    new_mid_px = torch.where(
+        first_buy,
+        torch.zeros_like(mid_buy_px),
+        torch.where(deeper_dip, pushed_mid_px, torch.where(mid_dip, added_mid_px, mid_buy_px)),
     )
+
+    # 2) Обновление самого нижнего транша low_tranche (строго собственный объем и средневзвешенная цена!):
+    same_low_q = low_tranche_qty + tot_fq
+    same_low_px = (low_tranche_qty * min_buy_px + tot_fq * avg_fill_b_px) / torch.clamp(same_low_q, min=1e-6)
+
     low_tranche_qty = torch.where(
-        has_buy & (old_q <= 1e-6),
+        first_buy,
         torch.zeros_like(low_tranche_qty),
         torch.where(
-            is_dip_buy,
-            low_tranche_qty + tot_fq,
-            torch.where(is_higher_buy_from_single, old_q, low_tranche_qty),
+            init_dip | deeper_dip,
+            tot_fq,
+            torch.where(init_higher, old_q, torch.where(same_low, same_low_q, low_tranche_qty)),
         ),
     )
     min_buy_px = torch.where(
-        has_buy,
-        torch.where(
-            old_q <= 1e-6,
-            avg_fill_b_px,
-            torch.where(
-                is_dip_buy,
-                torch.where(low_tranche_qty > tot_fq + 1e-5, torch.minimum(min_buy_px, avg_fill_b_px), avg_fill_b_px),
-                torch.where(is_higher_buy_from_single, avg_entry, min_buy_px),
-            ),
-        ),
-        min_buy_px,
+        first_buy | init_dip | deeper_dip,
+        avg_fill_b_px,
+        torch.where(init_higher, avg_entry, torch.where(same_low, same_low_px, min_buy_px)),
     )
+    mid_tranche_qty = new_mid_q
+    mid_buy_px = new_mid_px
 
     avg_entry = torch.where(
         has_buy,
@@ -507,7 +548,14 @@ def _jit_env_step(
     slot_need_a = eff_qa_a + eff_qty_a
     cum_need_a = torch.cumsum(slot_need_a, dim=1)
     flow_before_slot_a = cum_need_a - slot_need_a
-    rem_flow_at_slot_a = torch.clamp(tot_flow_a - flow_before_slot_a, min=0.0)
+    # Защита от эксплойта пропуска L1-аска через 1D-таблицу [16] в регистрах (0 аллокаций 3D-тензоров!):
+    a_p10_lvl = torch.clamp(asks_t[:10], min=b1 + tick_size)
+    a_q10_lvl = torch.clamp(asks_q_t[:10], min=0.0)
+    px_grid_a = a1 + k_ticks * tick_size
+    cum_mkt_below_1d = ((a_p10_lvl.unsqueeze(0) < (px_grid_a - 0.5 * tick_size)).float() * a_q10_lvl.unsqueeze(0)).sum(dim=1)
+    depth_idx_a = torch.clamp(torch.round((ask_px - a1) / tick_size).long(), 0, 15)
+    mkt_below_a = cum_mkt_below_1d[depth_idx_a]
+    rem_flow_at_slot_a = torch.clamp(tot_flow_a - torch.maximum(flow_before_slot_a, mkt_below_a), min=0.0)
 
     qa_eaten_a = torch.minimum(eff_qa_a, rem_flow_at_slot_a)
     ask_qa = torch.where(hit_a, torch.clamp(ask_qa - qa_eaten_a, min=0.0), ask_qa)
@@ -530,11 +578,24 @@ def _jit_env_step(
 
     lifo_f_qa = f_qa[:, 2:6].sum(dim=1) if allow_scratch_stop_asks else f_qa[:, :6].sum(dim=1)
     sold_low_q = torch.minimum(lifo_f_qa, low_tranche_qty)
-    sold_high_q = torch.clamp(tot_fqa - sold_low_q, min=0.0)
+    rem_lifo_qa = torch.clamp(lifo_f_qa - sold_low_q, min=0.0)
+    sold_mid_q = torch.minimum(rem_lifo_qa, mid_tranche_qty)
+    sold_high_q = torch.clamp(tot_fqa - sold_low_q - sold_mid_q, min=0.0)
+
+    core_qty_pre = torch.clamp(pos_qty - low_tranche_qty - mid_tranche_qty, min=0.0)
+    low_mid_cost_pre = (low_tranche_qty * min_buy_px + mid_tranche_qty * mid_buy_px) * (1.0 + maker_fee)
+    core_cost_pre = torch.clamp(pos_cost_usd - low_mid_cost_pre, min=0.0)
+    core_unit_cost = torch.where(
+        core_qty_pre > 1e-5,
+        core_cost_pre / torch.clamp(core_qty_pre, min=1e-6),
+        avg_entry * (1.0 + maker_fee),
+    )
+
     sold_cost_usd = torch.minimum(
         pos_cost_usd,
-        sold_low_q * torch.minimum(min_buy_px, avg_entry) * (1.0 + maker_fee)
-        + sold_high_q * avg_entry * (1.0 + maker_fee),
+        sold_low_q * min_buy_px * (1.0 + maker_fee)
+        + sold_mid_q * mid_buy_px * (1.0 + maker_fee)
+        + sold_high_q * core_unit_cost,
     )
     is_net_prof_sell = has_sell & (tot_rev > sold_cost_usd + 1e-5)
     sell_cycles = sell_cycles + has_sell.long()
@@ -553,15 +614,32 @@ def _jit_env_step(
         torch.where(rem_p > 1e-6, pos_cost_usd / (rem_p * (1.0 + maker_fee)), torch.zeros_like(avg_entry)),
         avg_entry,
     )
-    low_tranche_qty = torch.where(
+    rem_low_q = torch.where(
         has_sell,
         torch.where(rem_p > 1e-6, torch.clamp(low_tranche_qty - sold_low_q, min=0.0), torch.zeros_like(low_tranche_qty)),
         low_tranche_qty,
     )
+    rem_mid_q = torch.where(
+        has_sell,
+        torch.where(rem_p > 1e-6, torch.clamp(mid_tranche_qty - sold_mid_q, min=0.0), torch.zeros_like(mid_tranche_qty)),
+        mid_tranche_qty,
+    )
+    # Автоматическое всплытие mid_tranche -> low_tranche, когда самый нижний транш распродан (< 1.95 PRL):
+    promote_mid = has_sell & (rem_p > 1e-6) & (rem_low_q < 1.95) & (rem_mid_q >= 1.95)
+    prom_q = rem_low_q + rem_mid_q
+    prom_px = (rem_low_q * min_buy_px + rem_mid_q * mid_buy_px) / torch.clamp(prom_q, min=1e-6)
+
+    low_tranche_qty = torch.where(promote_mid, prom_q, rem_low_q)
     min_buy_px = torch.where(
         pos_qty > 1e-6,
-        torch.where(low_tranche_qty > 1e-4, min_buy_px, avg_entry),
+        torch.where(promote_mid, prom_px, torch.where(low_tranche_qty > 1e-4, min_buy_px, avg_entry)),
         torch.zeros_like(min_buy_px),
+    )
+    mid_tranche_qty = torch.where(promote_mid | (pos_qty <= 1e-6), torch.zeros_like(rem_mid_q), rem_mid_q)
+    mid_buy_px = torch.where(
+        (pos_qty > 1e-6) & (mid_tranche_qty > 1e-4),
+        mid_buy_px,
+        torch.zeros_like(mid_buy_px),
     )
 
     rem_ord_a = torch.clamp(ask_qty - f_qa, min=0.0)
@@ -584,6 +662,8 @@ def _jit_env_step(
         avg_entry,
         min_buy_px,
         low_tranche_qty,
+        mid_buy_px,
+        mid_tranche_qty,
         entry_t,
         bid_px,
         bid_qty,
@@ -662,6 +742,8 @@ class VectorizedFreeMultiOrderEnv:
         self.avg_entry = torch.zeros(num_envs, dtype=torch.float32, device=device)
         self.min_buy_px = torch.zeros(num_envs, dtype=torch.float32, device=device)
         self.low_tranche_qty = torch.zeros(num_envs, dtype=torch.float32, device=device)
+        self.mid_buy_px = torch.zeros(num_envs, dtype=torch.float32, device=device)
+        self.mid_tranche_qty = torch.zeros(num_envs, dtype=torch.float32, device=device)
         self.entry_t = torch.zeros(num_envs, dtype=torch.long, device=device)
 
         # 12 независимых слотов Bid [B, 12] и 12 независимых слотов Ask [B, 12]
@@ -705,6 +787,8 @@ class VectorizedFreeMultiOrderEnv:
         self.avg_entry.zero_()
         self.min_buy_px.zero_()
         self.low_tranche_qty.zero_()
+        self.mid_buy_px.zero_()
+        self.mid_tranche_qty.zero_()
         self.entry_t.zero_()
         self.bid_px.zero_()
         self.bid_qty.zero_()
@@ -714,6 +798,31 @@ class VectorizedFreeMultiOrderEnv:
         self.ask_qty.zero_()
         self.ask_qa.zero_()
         self.ask_act_t.zero_()
+
+    def seed_underwater_inventory(self, start_t_scalar: int, inv_frac: float = 0.55, underwater_ticks: float = 5.0):
+        """
+        Урок 18: Инициализация 'застрявшего' инвентаря под водой (Underwater Warm-Reset),
+        чтобы обучить агента:
+          1) отторговывать спред резервом кэша через нижний LIFO-транш без слива всей котлеты;
+          2) своевременно резать убыток (Proportional De-Risking) при продолжении сползания (Slow Bleed).
+        Позиция создается с честной стартовой переоценкой бюджета по текущему Bid, чтобы PnL окна
+        измерял ровно альфу действий агента с момента start_t_scalar!
+        """
+        b1_now = float(max(self.tick_size, float(self.bids[start_t_scalar, 0].item())))
+        entry_px = round((b1_now + underwater_ticks * self.tick_size) / self.tick_size) * self.tick_size
+        pos_val_now = self.budget * float(inv_frac)
+        init_qty = torch.floor((pos_val_now / b1_now) * 100.0) / 100.0
+        valid = init_qty >= 2.0
+        rem_cash = torch.clamp(self.budget - init_qty * b1_now * (1.0 - self.maker_fee), min=0.0)
+        self.cash = torch.where(valid, rem_cash, self.budget)
+        self.pos_qty = torch.where(valid, init_qty, torch.zeros_like(init_qty))
+        self.avg_entry = torch.where(valid, torch.full_like(self.avg_entry, entry_px), torch.zeros_like(self.avg_entry))
+        self.pos_cost_usd = torch.where(valid, init_qty * entry_px * (1.0 + self.maker_fee), torch.zeros_like(self.pos_cost_usd))
+        self.min_buy_px = torch.where(valid, torch.full_like(self.min_buy_px, entry_px), torch.zeros_like(self.min_buy_px))
+        self.low_tranche_qty.zero_()
+        self.mid_buy_px.zero_()
+        self.mid_tranche_qty.zero_()
+        self.entry_t = torch.where(valid, torch.full_like(self.entry_t, max(0, start_t_scalar - 180)), torch.zeros_like(self.entry_t))
 
     def get_observations(self, cur_t_scalar: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Возвращает LOB [1, 10, 4], Flow [B, 16], Targets [1, 4], MultiSlotSignals [B, 6]."""
@@ -761,6 +870,8 @@ class VectorizedFreeMultiOrderEnv:
             self.avg_entry,
             self.min_buy_px,
             self.low_tranche_qty,
+            self.mid_buy_px,
+            self.mid_tranche_qty,
             self.entry_t,
             self.bid_px,
             self.bid_qty,
@@ -793,6 +904,8 @@ class VectorizedFreeMultiOrderEnv:
             self.avg_entry,
             self.min_buy_px,
             self.low_tranche_qty,
+            self.mid_buy_px,
+            self.mid_tranche_qty,
             self.entry_t,
             self.bid_px,
             self.bid_qty,

@@ -1,11 +1,14 @@
-# Текущий контекст проекта (SafeTrade RL Market Making v2 + Гибрид v7/v8 + Уроки 1..9 Завершены + Боевой Деплой `L9_0322` + Урок 10 в работе)
+# Текущий контекст проекта (SafeTrade RL Market Making v2 + Гибрид v7/v8 + Уроки 1..17 Завершены + Боевой Деплой `L17_0261` + Урок 18 в работе)
 
 - **Статус обучения:**
-  - **ПОЛНОСТЬЮ ЗАВЕРШЕНЫ УРОКИ 1..9:** `L1: 600/600`, `L2: 1000/1000`, `L3: 1000/1000`, `Bridge v7+v8`, `L4: 1000/1000`, `L5: 1000/1000`, `L6 v4.2: 1200/1200`, `L7 Triad Mastery: 525/525`, `L8 Continuous Marathon: 525/525`, **`L9 Convergent Mastery: 400/400`**.
-  - **В РАБОТЕ — Урок 10 (`_tools/lesson_10_asymmetric_alpha_trainer.py`, `600` итераций):** `12,288` параллельных сред (`2,048` групп × `6` бюджетов) в 32 МБ L2-кэше RTX 5060 Ti с компиляцией Triton (`@torch.compile(dynamic=True)`), антитетическими зеркальными парами мутаций ($\pm\epsilon$, `993` пары), 7-точечным параллельным Trust-Region Line Search ($\alpha \in \{0.03, 0.08, 0.18, 0.35, 0.65, 1.0\}$ + `best_elite`) и асимметричным профит-бустом (`Asymmetric Alpha & Queue Surfing`).
-- **Боевой сервер VPS (`81.19.137.18`):**
-  - АКТИВЕН В БОЕВОМ РЕЖИМЕ (`live-rl-prl-l9.service`, `--mode live`, `Equity=$625.96 (+58.56$)`).
-  - Выкачен и активирован чемпион Урока 9 **`models/prl/release_champion_v1.pt` (`L9_0322_Convergent_Mastery`, `324D -> 256 -> 26`, `allow_scratch_stop_asks=True`)**.
-- **Итоги Урока 9 (`400/400` итераций):**
-  - Полная ликвидация просадки на дампах (`Dump EV: -0.36% -> 0.00%`), сжатие `MaxDD` на 9 валидационных окнах в 15 раз (`0.63% -> 0.04%`, `ValEV = +0.0008%`) и улучшение 36-оконного Out-of-Sample счета с `-602.59 (DD 1.29%)` до **`-338.00 (DD 0.80%, D: -0.00%)`**.
+  - **ПОЛНОСТЬЮ ЗАВЕРШЕНЫ УРОКИ 1..17:** включая `L15 SwiGLU Slot-Aware`, `L16 2-Stage Residual SwiGLU Geometry (388D)` и **`L17 Dynamic Slot Co-Evolution` (чемпион `L17_0261`: `ValScore = +208.61`, `ValEV = +0.0608%`, `[N:+0.09% D:-0.03% P:+0.04% DD:0.27%]`)**.
+  - **В РАБОТЕ — Урок 18 (`_tools/lesson_18_multistack_lifo_survival_trainer.py`, `600` итераций):** честный 3-уровневый LIFO-стек (`[low_tranche, mid_tranche, core_pos]`), стресс-сценарии `Underwater Warm-Reset` (`55%` инвентаря на `-5 тиков`), 20 валидационных окон (`6 NORM + 6 DUMP + 6 PUMP + UW_NORM + UW_DUMP`) и ко-эволюция быстрых слотов `Bid[0..3]`.
+- **Боевой сервер VPS:**
+  - АКТИВЕН В БОЕВОМ РЕЖИМЕ (`live-rl-prl-l9.service`, `--mode live`, `Equity ~ $703.40`).
+  - На лету через Hot-Reload активирован чемпион Урока 17 **`models/prl/release_champion_v1.pt` (`L17_0261`, `388D-2StageResSwiGLU(384)`, `allow_scratch_stop_asks=True`)**.
+- **Рефакторинг и безопасность (v18.1):**
+  - Вычищены захардкоженные секреты/прокси из `_tools/vps_config.py` (перенесены в `.env` / `_tools/project_secrets.json`).
+  - Устранено Sim-to-Real расхождение `flow_16[13:15]` (`has_bid` / `has_ask`) и `is_ask_penny` для `Ask[2..3]` в `_tools/live_rl_trader.py`.
+  - Внедрен 3-уровневый LIFO-стек с жесткой сверкой инварианта `tr_low + tr_mid + tr_high == pos_qty` и защита от `HTTP 422 insufficient_balance` на SafeTrade.
+  - Оптимизированы потоковый буфер `_tools/live_feature_updater.py` (`compact_rows` + `O(1)` дедупликация сделок) и единый расчет `LearnedRegimeCompetenceRouter` с живыми скоростями `(vel10, vel60, vel300)` в `_tools/swarm_router.py`.
 - **Важное правило:** НЕ читай `.log` файлы целиком! Используй только `tail -n 20` или `manage_task`.

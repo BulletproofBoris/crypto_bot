@@ -15,7 +15,9 @@ _tools/deploy_vps.py
 
 import hashlib
 import json
+import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 
@@ -23,13 +25,18 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from _tools.vps_config import create_ssh_client
+from _tools.vps_config import VPS_HOST, create_ssh_client
 
 STATE_PATH = BASE_DIR / "data" / "logs" / ".vps_sync_state.json"
 CODE_FILES = (
+    "_tools/vps_config.py",
     "_tools/live_rl_trader.py",
     "_tools/live_feature_updater.py",
     "_tools/vectorized_free_multi_order_env.py",
+    "_tools/swarm_router.py",
+    "_tools/learned_regime_router.py",
+    "_tools/multitask_lob_net.py",
+    "_tools/fast_neural_engine.py",
 )
 CHAMP_FILE = "models/prl/release_champion_v1.pt"
 
@@ -40,6 +47,22 @@ def _file_sig(p: Path) -> str:
     h = hashlib.sha256()
     h.update(p.read_bytes())
     return h.hexdigest()[:16]
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def _remote_atomic_mv(ssh, tmp_rem: str, fin_rem: str) -> None:
+    cmd = f"mv -f {shlex.quote(tmp_rem)} {shlex.quote(fin_rem)}"
+    _, out_ch, err_ch = ssh.exec_command(cmd)
+    rc = out_ch.channel.recv_exit_status()
+    if rc != 0:
+        err_msg = err_ch.read().decode("utf-8", errors="ignore").strip()
+        raise RuntimeError(f"Remote mv failed (rc={rc}): {err_msg}")
 
 
 def main():
@@ -62,26 +85,29 @@ def main():
     cur_state[CHAMP_FILE] = champ_sig
     changed_champ = bool(champ_sig and prev_state.get(CHAMP_FILE) != champ_sig)
 
+    print(f"🔌 Подключение к боевому VPS ({VPS_HOST or 'configured host'})...")
     ssh = create_ssh_client(timeout=15.0)
     try:
         if changed_code or changed_champ:
             sftp = ssh.open_sftp()
-            for rel_f in changed_code:
-                loc = BASE_DIR / rel_f
-                tmp_rem = f"/opt/crypto_bot/{rel_f}.tmp"
-                fin_rem = f"/opt/crypto_bot/{rel_f}"
-                sftp.put(str(loc), tmp_rem)
-                ssh.exec_command(f"mv -f {tmp_rem} {fin_rem}")[1].read()
-                print(f"✅ [VPS SYNC CODE] {rel_f} -> {fin_rem}")
+            try:
+                for rel_f in changed_code:
+                    loc = BASE_DIR / rel_f
+                    tmp_rem = f"/opt/crypto_bot/{rel_f}.tmp"
+                    fin_rem = f"/opt/crypto_bot/{rel_f}"
+                    sftp.put(str(loc), tmp_rem)
+                    _remote_atomic_mv(ssh, tmp_rem, fin_rem)
+                    print(f"✅ [VPS SYNC CODE] {rel_f} -> {fin_rem}")
 
-            if changed_champ:
-                loc_c = BASE_DIR / CHAMP_FILE
-                tmp_c = f"/opt/crypto_bot/{CHAMP_FILE}.tmp"
-                fin_c = f"/opt/crypto_bot/{CHAMP_FILE}"
-                sftp.put(str(loc_c), tmp_c)
-                ssh.exec_command(f"mv -f {tmp_c} {fin_c}")[1].read()
-                print(f"🔥 [VPS SYNC CHAMP] {loc_c.name} (sig={champ_sig}) -> {fin_c} (Hot-Reload)")
-            sftp.close()
+                if changed_champ:
+                    loc_c = BASE_DIR / CHAMP_FILE
+                    tmp_c = f"/opt/crypto_bot/{CHAMP_FILE}.tmp"
+                    fin_c = f"/opt/crypto_bot/{CHAMP_FILE}"
+                    sftp.put(str(loc_c), tmp_c)
+                    _remote_atomic_mv(ssh, tmp_c, fin_c)
+                    print(f"🔥 [VPS SYNC CHAMP] {loc_c.name} (sig={champ_sig}) -> {fin_c} (Hot-Reload)")
+            finally:
+                sftp.close()
 
         if changed_code:
             _, out_r, _ = ssh.exec_command(
@@ -89,8 +115,7 @@ def main():
             )
             print(f"🔄 [VPS SERVICE RESTART]: {out_r.read().decode('utf-8', errors='ignore').strip()}")
 
-        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        STATE_PATH.write_text(json.dumps(cur_state, indent=2), encoding="utf-8")
+        _atomic_write_json(STATE_PATH, cur_state)
 
         cmd = (
             "echo '=== SERVICE ==='; systemctl is-active live-rl-prl-l9.service; "

@@ -217,8 +217,84 @@ class LearnedRegimeCompetenceRouter:
                 print(f"⚠️ Не удалось загрузить {ckpt_path.name}: {e}")
         self.model.eval()
 
+    def predict_live_1row(
+        self,
+        df_1row: pd.DataFrame,
+        live_vels: Optional[Tuple[float, float, float]] = None,
+    ) -> np.ndarray:
+        """
+        Сверхбыстрый инференс 1 боевого тика (n=1) без аллокации 20 промежуточных векторов
+        и с честной подстановкой скоростей (vel10, vel60, vel300), которые в df длины 1 иначе были бы 0.0.
+        """
+        if len(df_1row) == 0:
+            return np.full((1, N_REGIMES), 1.0 / N_REGIMES, dtype=np.float32)
+        r = df_1row.iloc[-1]
+        tick = 0.01
+
+        def _f(col: str, fallback: float = 0.0) -> float:
+            v = r.get(col, fallback)
+            try:
+                fv = float(v)
+                return fv if np.isfinite(fv) else fallback
+            except (TypeError, ValueError):
+                return fallback
+
+        b1 = _f("ST_bid_1_price", _f("ST_best_bid", 1.0))
+        a1 = _f("ST_ask_1_price", _f("ST_best_ask", b1 + tick))
+        sp_ticks = float(np.clip((a1 - b1) / tick, 1.0, 20.0))
+        b1_q = max(0.0, _f("ST_bid_1_qty", _f("ST_bid_qty_1", 10.0)))
+        a1_q = max(0.0, _f("ST_ask_1_qty", _f("ST_ask_qty_1", 10.0)))
+        b5_q = max(b1_q, _f("ST_bids_vol_top5", b1_q))
+        a5_q = max(a1_q, _f("ST_asks_vol_top5", a1_q))
+        imb1 = (b1_q - a1_q) / (b1_q + a1_q + 1.0)
+        imb5 = (b5_q - a5_q) / (b5_q + a5_q + 1.0)
+        vol60 = float(np.clip(_f("ST_vol_60s_ticks", 0.5), 0.0, 25.0))
+        vol300 = float(np.clip(_f("ST_vol_300s_ticks", 1.0), 0.0, 50.0))
+        ofi300 = float(np.clip(_f("ST_ofi_norm_300s", 0.0), -5.0, 5.0))
+        cvd20 = float(np.clip(_f("ST_cvd_norm_20s", 0.0), -5.0, 5.0))
+        cvd5m = float(np.clip(_f("ST_cvd_5m", 0.0) / 500.0, -5.0, 5.0))
+        buy_v = max(0.0, _f("ST_buy_vol", 0.0))
+        sell_v = max(0.0, _f("ST_sell_vol", 0.0))
+        tot_v = buy_v + sell_v
+        bo_stale = float(np.clip(_f("BO_sec_since_tick", 10.0) / 60.0, 0.0, 3.0))
+
+        if live_vels is not None:
+            v10, v60, v300 = live_vels
+        else:
+            v10 = _f("ST_ret_10s_ticks", _f("ST_mid_diff_20s", 0.0) * 0.5 / tick)
+            v60 = _f("ST_ret_60s_ticks", _f("ST_mid_diff_60s", 0.0) / tick)
+            v300 = _f("ST_ret_300s_ticks", _f("ST_mid_diff_300s", 0.0) / tick)
+        vel10 = float(np.clip(v10, -15.0, 15.0))
+        vel60 = float(np.clip(v60, -25.0, 25.0))
+        vel300 = float(np.clip(v300, -40.0, 40.0))
+
+        feats_1d = np.array([[
+            (sp_ticks - 1.5) * 0.5,
+            1.0 if sp_ticks >= 2.0 else 0.0,
+            imb1,
+            imb5,
+            imb1 - imb5,
+            np.log1p(b1_q) / 10.0 - 0.5,
+            np.log1p(a1_q) / 10.0 - 0.5,
+            np.log1p(tot_v) / 8.0,
+            (buy_v - sell_v) / (tot_v + 1.0),
+            vel10 * 0.25,
+            vel60 * 0.15,
+            vel300 * 0.08,
+            vol60 * 0.25,
+            vol300 * 0.10,
+            ofi300 * 0.4,
+            cvd20 * 0.4 + 0.1 * cvd5m - 0.05 * bo_stale,
+        ]], dtype=np.float32)
+        feats_norm = np.clip((feats_1d - self.feat_mean) / (self.feat_std + 1e-6), -5.0, 5.0).astype(np.float32)
+        with torch.no_grad():
+            logits = self.model(torch.from_numpy(feats_norm).to(self.device))
+            return F.softmax(logits, dim=-1).cpu().numpy()
+
     def predict_regime_probs(self, df: pd.DataFrame, batch_size: int = 65536) -> np.ndarray:
         """Возвращает матрицу вероятностей 8 фаз рынка P(Regime_t) размерности (N, 8)."""
+        if len(df) == 1:
+            return self.predict_live_1row(df)
         feats = extract_causal_router_features_16d(df)
         n = len(feats)
         if n == 0:

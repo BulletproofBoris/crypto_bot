@@ -6,7 +6,8 @@ venv/
 Safetrade_API.txt
 SafeTrade_API
 _tools/*.json
-
+*.pem
+*.key
 
 # Data
 data
@@ -19,8 +20,12 @@ __pycache__/
 */*/__pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
 .vscode/
 *.png
+*.bak
+*.tmp
+*.tmp.*
 
 # Temporary trainer buffers & archives (canonical models live in models/prl/)
 trained_models/
@@ -32,4 +37,5 @@ models/prl/lesson_*/
 models/prl/curriculum_v8/
 models/prl/gpu_pbt_swarm_v8/
 models/prl/walk_forward_ppo/recurrent_ppo_fold_*.pt
+models/prl/*_pre_*.pt
 

@@ -1,0 +1,34 @@
+{
+  "coin": "PRL",
+  "horizon_sec": 120,
+  "n_windows": 2,
+  "selected_models": [
+    "mlp_bottleneck_win_00",
+    "mlp_bottleneck_win_01",
+    "wavenet_tcn_win_00",
+    "wavenet_tcn_win_01",
+    "cross_mixer_win_00",
+    "cross_mixer_win_01",
+    "causal_cnn_win_00",
+    "causal_cnn_win_01",
+    "attention_win_00",
+    "attention_win_01",
+    "conv1d+gru_win_00",
+    "conv1d+gru_win_01"
+  ],
+  "weights": {
+    "mlp_bottleneck_win_00": 0.065883,
+    "mlp_bottleneck_win_01": 0.09376,
+    "wavenet_tcn_win_00": 0.090848,
+    "wavenet_tcn_win_01": 0.131669,
+    "cross_mixer_win_00": 0.073644,
+    "cross_mixer_win_01": 0.116738,
+    "causal_cnn_win_00": 0.049218,
+    "causal_cnn_win_01": 0.128825,
+    "attention_win_00": 0.071749,
+    "attention_win_01": 0.051271,
+    "conv1d+gru_win_00": 0.075799,
+    "conv1d+gru_win_01": 0.050597
+  },
+  "updated_at": "2026-11-09 13:11:56"
+}

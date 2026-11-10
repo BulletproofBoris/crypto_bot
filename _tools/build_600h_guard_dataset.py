@@ -40,11 +40,11 @@ def build_600h_dataset(parquet_path: str = "data/features/prl_1s_features.parque
     n = len(df)
     print(f"Загружено {n:,} тиков. Проверка монотонности времени...")
 
-    ts = df["timestamp"].values.astype(np.int64) // 10**9
+    ts = pd.to_datetime(df["timestamp"], utc=True).dt.as_unit("s").astype("int64").values
     if np.any(np.diff(ts) < 0):
         print("⚠️ Обнаружены немонотонные временные метки. Сортировка...")
         df = df.sort_values("timestamp").reset_index(drop=True)
-        ts = df["timestamp"].values
+        ts = pd.to_datetime(df["timestamp"], utc=True).dt.as_unit("s").astype("int64").values
 
     tick = 0.01
     b_p = df[b_p_cols].values.astype(np.float32)
