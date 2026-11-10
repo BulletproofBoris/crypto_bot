@@ -320,8 +320,11 @@ class LiveTriadRLTrader:
         self.l7_h_state = None
         self.l7_w1 = None
         self.l7_b1 = None
+        self.l7_wg = None
+        self.l7_bg = None
         self.l7_w2 = None
         self.l7_b2 = None
+        self.v7_hist_5s = deque(maxlen=6)
         self.last_l7_out = None
         self.last_l7_target_exp_frac = 1.0
         self.rel_ckpt_path = BASE_DIR / "models" / self.coin / "release_champion_v1.pt"
@@ -336,10 +339,15 @@ class LiveTriadRLTrader:
                 self.l7_h_state = self.l7_backbone.init_hidden(1, torch.device("cpu"))
                 self.l7_w1 = rel_ck["w1"].float()
                 self.l7_b1 = rel_ck["b1"].float()
+                self.l7_wg = rel_ck["wg"].float() if "wg" in rel_ck else None
+                self.l7_bg = rel_ck["bg"].float() if "bg" in rel_ck else None
                 self.l7_w2 = rel_ck["w2"].float()
                 self.l7_b2 = rel_ck["b2"].float()
                 self.l7_allow_scratch = bool(rel_ck.get("allow_scratch_stop_asks", False))
-                print(f"🏆 Подключен боевой 24-слотовый Чемпион {self.rel_ckpt_path.name} ({rel_ck.get('release_name', 'L7_0150')}, 324D->256->26, scratch={self.l7_allow_scratch})!")
+                in_d = int(self.l7_w1.shape[0])
+                h_d = int(self.l7_w1.shape[1])
+                arch_s = f"{in_d}D-SwiGLU({h_d})->256->26" if (self.l7_wg is not None or h_d == 384) else f"{in_d}D->256->26"
+                print(f"🏆 Подключен боевой 24-слотовый Чемпион {self.rel_ckpt_path.name} ({rel_ck.get('release_name', 'L7_0150')}, {arch_s}, scratch={self.l7_allow_scratch})!")
             except Exception as e_l7:
                 print(f"⚠️ Не удалось загрузить {self.rel_ckpt_path.name}: {e_l7}")
 
@@ -560,15 +568,20 @@ class LiveTriadRLTrader:
             if "w1" in rel_ck and "w2" in rel_ck:
                 self.l7_w1 = rel_ck["w1"].float()
                 self.l7_b1 = rel_ck["b1"].float()
+                self.l7_wg = rel_ck["wg"].float() if "wg" in rel_ck else None
+                self.l7_bg = rel_ck["bg"].float() if "bg" in rel_ck else None
                 self.l7_w2 = rel_ck["w2"].float()
                 self.l7_b2 = rel_ck["b2"].float()
                 self.l7_allow_scratch = bool(rel_ck.get("allow_scratch_stop_asks", True))
                 self.rel_ckpt_mtime = cur_mtime
                 rel_name = rel_ck.get("release_name", f"iter_{rel_ck.get('iteration', '?')}")
                 val_ev = float(rel_ck.get("val_ev_pct", 0.0))
+                in_d = int(self.l7_w1.shape[0])
+                h_d = int(self.l7_w1.shape[1])
+                arch_s = f"{in_d}D-SwiGLU({h_d})" if (self.l7_wg is not None or h_d == 384) else f"{in_d}D"
                 print(
                     f"  🔥 [HOT-RELOAD CHAMPION] На лету подключен новый 24-слотовый Чемпион {ckpt_p.name} "
-                    f"({rel_name}, ValEV={val_ev:+.3f}%, scratch={self.l7_allow_scratch}) без остановки торгов!"
+                    f"({rel_name}, {arch_s}, ValEV={val_ev:+.3f}%, scratch={self.l7_allow_scratch}) без остановки торгов!"
                 )
         except Exception as e_hr:
             print(f"  ⚠️ [HOT-RELOAD WARN]: {e_hr}")
@@ -1935,10 +1948,36 @@ class LiveTriadRLTrader:
                         triad_vec + lob_vec + self.last_vec60 + self.last_vec90 + self.last_vec120 + v52_4d + real_2d + mat_6d,
                         dtype=np.float32,
                     )
-                    v7_t = torch.from_numpy(v7_58_arr[:58]).unsqueeze(0)
+                    v7_cur_58 = v7_58_arr[:58]
+                    v7_prev5 = self.v7_hist_5s[0] if len(self.v7_hist_5s) > 0 else v7_cur_58
+                    self.v7_hist_5s.append(v7_cur_58.copy())
+                    v7_t = torch.from_numpy(v7_cur_58).unsqueeze(0)
                     m6_t = torch.from_numpy(multi_6d)
                     z_aug = torch.cat([z_t, ps_t, pb_t, pc_t, pe_t, v7_t, m6_t], dim=-1)
-                    h1_t = torch.relu(z_aug @ self.l7_w1 + self.l7_b1.squeeze(0))
+                    if int(self.l7_w1.shape[0]) >= 356:
+                        b_slot_12 = [
+                            float(np.clip((float(self.bid_slots[si].get("qty", 0.0)) * b1) / max(tot_bud, 25.0), 0.0, 1.0))
+                            if self.bid_slots[si].get("id") is not None else 0.0
+                            for si in range(12)
+                        ]
+                        a_slot_12 = [
+                            float(np.clip(float(self.ask_slots[si].get("qty", 0.0)) / max(self.pos_qty, 2.0), 0.0, 1.0))
+                            if self.ask_slots[si].get("id") is not None else 0.0
+                            for si in range(12)
+                        ]
+                        vel_8d = [float(np.clip(v7_cur_58[vi] - v7_prev5[vi], -3.0, 3.0)) for vi in (0, 2, 4, 6, 8, 12, 34, 42)]
+                        slot_32_t = torch.tensor([b_slot_12 + a_slot_12 + vel_8d], dtype=torch.float32)
+                        z_aug = torch.cat([z_aug, slot_32_t], dim=-1)
+                    pre_all = z_aug @ self.l7_w1 + self.l7_b1.squeeze(0)
+                    if int(self.l7_w1.shape[1]) == 384:
+                        h_base = torch.relu(pre_all[..., :256])
+                        h_gate = (2.0 * torch.sigmoid(pre_all[..., 256:384])).repeat_interleave(2, dim=-1)
+                        h1_t = h_base * h_gate
+                    else:
+                        h1_t = torch.relu(pre_all)
+                        if getattr(self, "l7_wg", None) is not None and getattr(self, "l7_bg", None) is not None:
+                            gate_t = 2.0 * torch.sigmoid(z_aug @ self.l7_wg + self.l7_bg.squeeze(0))
+                            h1_t = h1_t * gate_t
                     raw_26 = torch.sigmoid(h1_t @ self.l7_w2 + self.l7_b2.squeeze(0)).squeeze(0).numpy()
                     self.last_l7_out = raw_26
                     b_w_12 = raw_26[:12] if raw_26[24] <= 0.75 else np.zeros(12, dtype=np.float32)
