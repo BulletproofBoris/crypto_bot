@@ -2181,7 +2181,7 @@ class LiveTriadRLTrader:
                         float(math.log1p(getattr(self.router_120, "num_models", 2)) / 4.0),
                     ]
                     v7_58_arr = np.array(
-                        triad_vec + lob_vec + self.last_vec60 + self.last_vec90 + self.last_vec120 + v52_4d + real_2d + mat_6d,
+                        triad_vec + [0.0] * 10 + self.last_vec60 + self.last_vec90 + self.last_vec120 + v52_4d + real_2d + [0.0] * 6,
                         dtype=np.float32,
                     )
                     v7_cur_58 = v7_58_arr[:58]

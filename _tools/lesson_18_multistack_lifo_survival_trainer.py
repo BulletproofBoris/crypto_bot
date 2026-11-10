@@ -304,6 +304,8 @@ class AntitheticFreeGridPolicyGrouped(BatchedFreeGridPolicyGrouped):
 
             bw = buf_w1_p[:np_cur]
             bw.normal_(0.0, 1.0).mul_(sig_p)
+            bw[:, :, 278:288, :] = 0.0
+            bw[:, :, 312:318, :] = 0.0
             bw[:, :, 356:, :].mul_(3.5)
             dst_w1[:, 0].add_(bw.expand(np_cur, B_buds, self.in_dim, H1_full))
             dst_w1[:, 1].sub_(bw.expand(np_cur, B_buds, self.in_dim, H1_full))
@@ -1516,6 +1518,9 @@ def run_lesson_18(iterations: int = 600, n_groups: int = 2048):
     vel_cols = [0, 2, 4, 6, 8, 12, 34, 42]
     v7_vel8 = torch.zeros((len(v7_raw_t), 8), dtype=torch.float32, device=device)
     v7_vel8[5:] = torch.clamp(v7_raw_t[5:, vel_cols] - v7_raw_t[:-5, vel_cols], -3.0, 3.0)
+    # Навсегда вычищаем 16D мертвого балласта: дубль Instant_LOB_Snapshot (18:28) и константы Alliance_Maturity (52:58)
+    v7_raw_t[:, 18:28] = 0.0
+    v7_raw_t[:, 52:58] = 0.0
 
     # 8D микроструктурный импульс стакана и ленты сделок за 5с:
     bp_t = torch.from_numpy(sub["bid_p"][:, :5].astype(np.float32)).to(device)
