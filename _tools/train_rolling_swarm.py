@@ -240,7 +240,12 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
     else:
         base_cols += [target_c7_col, target_dt_col]
 
-    cols_to_load = list(dict.fromkeys([c for c in feature_cols + base_cols if c in schema_cols]))
+    mmap_x_path = BASE_DIR / "data" / "_mmap_cache" / "X_all.npy"
+    use_mmap_x = mmap_x_path.exists()
+    if use_mmap_x:
+        cols_to_load = list(dict.fromkeys([c for c in base_cols if c in schema_cols]))
+    else:
+        cols_to_load = list(dict.fromkeys([c for c in feature_cols + base_cols if c in schema_cols]))
 
     L = int(round(H * K))
     print(f"\n{'='*95}")
@@ -251,7 +256,8 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
     t0 = time.time()
     tbl = pq.read_table(labeled_path, columns=cols_to_load)
     df = tbl.to_pandas()
-    print(f"⏱️ Данные загружены за {time.time()-t0:.2f}с ({len(df):,} строк)")
+    del tbl
+    print(f"⏱️ Данные загружены за {time.time()-t0:.2f}с ({len(df):,} строк, mmap_X={use_mmap_x})")
 
     if need_labeling:
         print(f"⚙️ Динамический расчет микроструктурных меток для H = {H}с, K = {k_str}...")
@@ -328,14 +334,17 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
     print(f"\n{'Win':<6} | {'Train TS':<33} | {'Test TS':<33} | {'OOS IC':<8} | {'AUC OVR':<8} | {'Top-2% PnL':<11} | {'Статус':<10}")
     print("-" * 125)
 
-    X_all = df[feature_cols].values.copy()
-    if 'BO_sec_since_tick' in df.columns:
-        bo_stale = (df['BO_sec_since_tick'].fillna(0).values > 60.0)
-        if np.any(bo_stale):
-            zero_prefixes = ('LL_', 'BO_ofi_', 'BO_cvd_', 'BO_imb_', 'BO_obi_', 'BO_micro_', 'BO_ret_', 'BO_vol_intensity_')
-            zero_cols = [i_c for i_c, fn in enumerate(feature_cols) if fn.startswith(zero_prefixes)]
-            if zero_cols:
-                X_all[np.ix_(bo_stale, zero_cols)] = 0.0
+    if use_mmap_x:
+        X_all = np.load(mmap_x_path, mmap_mode="r")
+    else:
+        X_all = df[feature_cols].values.copy()
+        if 'BO_sec_since_tick' in df.columns:
+            bo_stale = (df['BO_sec_since_tick'].fillna(0).values > 60.0)
+            if np.any(bo_stale):
+                zero_prefixes = ('LL_', 'BO_ofi_', 'BO_cvd_', 'BO_imb_', 'BO_obi_', 'BO_micro_', 'BO_ret_', 'BO_vol_intensity_')
+                zero_cols = [i_c for i_c, fn in enumerate(feature_cols) if fn.startswith(zero_prefixes)]
+                if zero_cols:
+                    X_all[np.ix_(bo_stale, zero_cols)] = 0.0
 
     for idx, w in enumerate(windows):
         win_id = f"win_{idx:02d}"
@@ -360,19 +369,22 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
                     ic, auc, top2_pnl = mo.get("ic_dt_ticks", 0.0), mo.get("roc_auc_ovr", 0.5), mo.get("top2pct_mean_ticks", 0.0)
                     print(f"{win_id:<6} | {ts_tr_start} -> {ts_tr_end} | {ts_te_start} -> {ts_te_end} | {ic:+6.4f}  | {auc:6.4f}   | {top2_pnl:+6.2f} тиков | ⏩ КЭШ     ")
                     continue
+                else:
+                    # Сдвинувшееся хвостовое окно: сбрасываем старые веса нейросетей для этого win_id
+                    na_dir = out_dir / "neural_alliance"
+                    if na_dir.exists():
+                        for pt_file in na_dir.glob(f"*/{win_id}.pt"):
+                            pt_file.unlink(missing_ok=True)
             except Exception:
                 pass
 
-        X_train = X_all[tr_idx]
-        y_train = df['target_class'].iloc[tr_idx].values + 3  # Сдвиг [-3..3] -> [0..6]
+        tr_idx_fit = tr_idx[::3] if len(tr_idx) > 900_000 else (tr_idx[::2] if len(tr_idx) > 450_000 else tr_idx)
+        X_train = np.asarray(X_all[tr_idx_fit], dtype=np.float32)
+        y_train = df['target_class'].iloc[tr_idx_fit].values + 3  # Сдвиг [-3..3] -> [0..6]
 
-        X_test = X_all[te_idx]
+        X_test = np.asarray(X_all[te_idx], dtype=np.float32)
         y_test = df['target_class'].iloc[te_idx].values + 3
         dt_test = df['target_dt'].iloc[te_idx].values
-
-        # Обучение LightGBM
-        df_train = pd.DataFrame(X_train, columns=feature_cols)
-        df_test = pd.DataFrame(X_test, columns=feature_cols)
 
         # Асимметричные веса классов для защиты от False Positive Buy на проливах
         from sklearn.utils.class_weight import compute_class_weight
@@ -398,11 +410,11 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
             n_jobs=n_jobs,
             verbose=-1
         )
-        clf.fit(df_train, y_train)
+        clf.fit(X_train, y_train, feature_name=feature_cols)
 
         # Оценка на чистом Out-of-Sample
-        probs_test = clf.predict_proba(df_test)
-        full_probs = np.zeros((len(df_test), 7), dtype=np.float32)
+        probs_test = clf.predict_proba(X_test)
+        full_probs = np.zeros((len(X_test), 7), dtype=np.float32)
         for col_i, cls_val in enumerate(clf.classes_):
             if 0 <= cls_val < 7:
                 full_probs[:, cls_val] = probs_test[:, col_i]

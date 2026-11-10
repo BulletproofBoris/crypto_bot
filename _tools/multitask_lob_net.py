@@ -136,9 +136,16 @@ class MultiTaskSpatialTemporalBackbone(nn.Module):
         z_last = out.squeeze(1)  # (batch, latent_dim)
         return z_last, next_hidden
 
-    def encode_lob_batch(self, lob_batch: torch.Tensor) -> torch.Tensor:
-        """Батчевый предрасчет LOB-эмбеддингов на GPU (N, 10, 4) -> (N, 64)"""
-        return self.lob_encoder(lob_batch)
+    def encode_lob_batch(self, lob_batch: torch.Tensor, chunk_size: int = 32768) -> torch.Tensor:
+        """Батчевый предрасчет LOB-эмбеддингов на GPU чанками под L2-кэш (N, 10, 4) -> (N, 64)"""
+        n = lob_batch.size(0)
+        if n <= chunk_size:
+            return self.lob_encoder(lob_batch)
+        out = torch.empty((n, 64), dtype=torch.float32, device=lob_batch.device)
+        for i in range(0, n, chunk_size):
+            j = min(n, i + chunk_size)
+            out[i:j] = self.lob_encoder(lob_batch[i:j])
+        return out
 
     def forward_step_fast(
         self,

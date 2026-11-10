@@ -728,9 +728,10 @@ def train_pytorch_window_fast(
 
     start_r = (prev_runs + 1) if (0 < prev_runs < runs and best_m is not None) else 1
     eff_bsz = 1024 if (sl >= 75 and arch in ("conv1d+gru", "attention")) else batch_size
-    eval_bsz = 2048 if (sl >= 75 and arch in ("conv1d+gru", "attention")) else 4096
+    eval_bsz = 4096 if (sl >= 75 and arch in ("conv1d+gru", "attention")) else 8192
     max_chunks = 20 if (sl >= 75 and arch in ("conv1d+gru", "attention")) else 72
     chunk_starts = list(range(0, n_tr, eff_bsz))
+    eval_stride = 4 if (n_te > 250_000 and sl >= 75 and arch in ("conv1d+gru", "attention")) else 1
 
     for r_i in range(start_r, runs + 1):
         t0 = time.perf_counter()
@@ -754,22 +755,27 @@ def train_pytorch_window_fast(
 
         net.eval()
         probs_list = []
+        eval_idx_list = []
         with torch.no_grad():
-            for s_i in range(0, n_te, eval_bsz):
+            for s_i in range(0, n_te, eval_bsz * eval_stride):
                 e_i = min(n_te, s_i + eval_bsz)
                 p_b = F.softmax(net.forward_logits_chunk(x_te_pad, s_i, e_i, sl), dim=-1)
                 probs_list.append(p_b.cpu().numpy())
+                eval_idx_list.append(np.arange(s_i, e_i))
         probs = np.clip(np.vstack(probs_list), 1e-7, 1.0 - 1e-7)
-        ll = float(-np.mean(np.sum(y_te_oh * np.log(probs), axis=1)))
+        ev_idx = np.concatenate(eval_idx_list)
+        y_te_oh_sub = y_te_oh[ev_idx]
+        dt_te_sub = dt_te[ev_idx]
+        ll = float(-np.mean(np.sum(y_te_oh_sub * np.log(probs), axis=1)))
         ez = np.dot(probs, classes_vec)
-        ic = float(np.corrcoef(ez, dt_te)[0, 1]) if np.std(ez) > 1e-7 and np.std(dt_te) > 1e-7 else 0.0
+        ic = float(np.corrcoef(ez, dt_te_sub)[0, 1]) if np.std(ez) > 1e-7 and np.std(dt_te_sub) > 1e-7 else 0.0
         try:
-            auc = float(roc_auc_score(y_te_oh, probs, multi_class="ovr"))
+            auc = float(roc_auc_score(y_te_oh_sub, probs, multi_class="ovr"))
         except Exception:
             auc = 0.5
-        k2 = max(1, int(len(dt_te) * 0.02))
+        k2 = max(1, int(len(dt_te_sub) * 0.02))
         top_idx = np.argsort(np.abs(ez))[-k2:]
-        top2 = float(np.mean(np.sign(ez[top_idx]) * dt_te[top_idx]))
+        top2 = float(np.mean(np.sign(ez[top_idx]) * dt_te_sub[top_idx]))
         score = ic + 0.15 * (auc - 0.5) - 0.03 * max(0.0, ll - 1.35)
         if score > best_score:
             best_score = score

@@ -481,8 +481,9 @@ class LiveFeatureStreamer:
         tol = float(own_orders.get("tick_size", 0.01)) * 0.25
         bid_p = float(own_orders.get("bid_p", 0.0) or 0.0)
         bid_q = float(own_orders.get("bid_q", 0.0) or 0.0)
+        bids_own = own_orders.get("bids", [(bid_p, bid_q)] if bid_q > 0 else [])
         asks_own = own_orders.get("asks", [])
-        if bid_q <= 0.0 and not any(q > 0.0 for _, q in asks_own):
+        if not any(q > 0.0 for _, q in bids_own) and not any(q > 0.0 for _, q in asks_own):
             return
         bp = [float(d.get(f"ST_bid_{i}_price", 0.0)) for i in range(1, 51)]
         bq = [float(d.get(f"ST_bid_{i}_qty", 0.0)) for i in range(1, 51)]
@@ -492,8 +493,9 @@ class LiveFeatureStreamer:
         for p, q in zip(bp, bq):
             if p <= 0:
                 continue
-            if bid_q > 0 and abs(p - bid_p) <= tol:
-                q = max(0.0, q - bid_q)
+            for op, oq in bids_own:
+                if oq > 0 and abs(p - op) <= tol:
+                    q = max(0.0, q - oq)
             if q > 1e-4:
                 b_clean.append((p, q))
         a_clean = []

@@ -233,5 +233,147 @@ def build_and_inject_v7_signals_58d(coin: str = "prl", force_recompute: bool = T
     return CACHE_600H_PATH
 
 
+def incremental_append_600h_cache(coin: str = "prl") -> Path:
+    """
+    Быстрое инкрементальное достраивание rl_guard_lob_cache_600h.npz для новых тиков в хвосте
+    prl_labeled.parquet без полного пересчёта 2.45M исторических строк.
+    """
+    from _tools.swarm_router import SwarmRegimeRouter
+    from _tools.train_rl_execution import _compute_v52_signals_matrix, _compute_v70_realism_matrix
+
+    t0 = time.time()
+    labeled_path = BASE_DIR / "data" / "labeled" / coin / f"{coin}_labeled.parquet"
+    pf = pq.ParquetFile(labeled_path)
+    n_new = pf.metadata.num_rows
+
+    old_npz = np.load(CACHE_600H_PATH, allow_pickle=True)
+    n_old = len(old_npz["bid_p"])
+    if n_new <= n_old and "v7_signals_58d" in old_npz.files and len(old_npz["v7_signals_58d"]) == n_new:
+        print(f"✅ Кэш {CACHE_600H_PATH.name} уже актуален ({n_new:,} тиков).")
+        return CACHE_600H_PATH
+
+    overlap = 600
+    s_idx = max(0, n_old - overlap)
+    n_tail = n_new - s_idx
+    print(f"⚡ Инкрементальное обновление {CACHE_600H_PATH.name}: {n_old:,} ➔ {n_new:,} тиков (хвост {n_tail:,} строк)...", flush=True)
+
+    b_p_cols = [f"ST_bid_{i}_price" for i in range(1, 11)]
+    b_q_cols = [f"ST_bid_{i}_qty" for i in range(1, 11)]
+    a_p_cols = [f"ST_ask_{i}_price" for i in range(1, 11)]
+    a_q_cols = [f"ST_ask_{i}_qty" for i in range(1, 11)]
+    meta_cols = [
+        "timestamp", "ST_spread", "ST_vol_60s_ticks", "ST_ofi_norm_300s",
+        "ST_vol_15s_ticks", "ST_ofi_15s", "ST_ofi_60s", "ST_depth_ratio_5",
+        "BO_ofi_15s", "BO_ret_15s", "LL_zscore_30s", "BO_sec_since_tick",
+        "ST_vol_300s_ticks", "ST_trade_vol", "ST_buy_vol", "ST_sell_vol", "ST_vwap_1s",
+        "ST_cvd_1m", "ST_cvd_5m",
+    ] + b_p_cols + b_q_cols + a_p_cols + a_q_cols
+    schema_cols = set(pf.schema_arrow.names)
+    avail_cols = [c for c in list(dict.fromkeys(meta_cols)) if c in schema_cols]
+
+    df_tail = pq.read_table(labeled_path, columns=avail_cols).slice(s_idx, n_tail).to_pandas().reset_index(drop=True)
+    ts_tail = pd.to_datetime(df_tail["timestamp"], utc=True).astype("int64").values // 10**9
+
+    tick = 0.01
+    bid_p = np.column_stack([np.nan_to_num(df_tail[c].values, nan=0.0) for c in b_p_cols]).astype(np.float32)
+    bid_q = np.column_stack([np.nan_to_num(df_tail[c].values, nan=0.0) for c in b_q_cols]).astype(np.float32)
+    ask_p = np.column_stack([np.nan_to_num(df_tail[c].values, nan=0.0) for c in a_p_cols]).astype(np.float32)
+    ask_q = np.column_stack([np.nan_to_num(df_tail[c].values, nan=0.0) for c in a_q_cols]).astype(np.float32)
+    buy_v = np.nan_to_num(df_tail["ST_buy_vol"].values, nan=0.0).astype(np.float32)
+    sell_v = np.nan_to_num(df_tail["ST_sell_vol"].values, nan=0.0).astype(np.float32)
+
+    b1 = bid_p[:, 0]
+    y_sweep_12s = np.zeros(n_tail, dtype=np.float32)
+    for k in range(1, 13):
+        b1_fwd = np.pad(b1[k:], (0, k), mode="edge")
+        y_sweep_12s = np.maximum(y_sweep_12s, ((b1 - b1_fwd) >= (tick * 0.95)).astype(np.float32))
+
+    min_drop_60s = np.zeros(n_tail, dtype=np.float32)
+    max_rise_60s = np.zeros(n_tail, dtype=np.float32)
+    for k in range(1, 61):
+        b1_fwd = np.pad(b1[k:], (0, k), mode="edge")
+        min_drop_60s = np.maximum(min_drop_60s, (b1 - b1_fwd) / tick)
+        max_rise_60s = np.maximum(max_rise_60s, (b1_fwd - b1) / tick)
+    y_bleed_60s = ((min_drop_60s >= 1.95) & (max_rise_60s < 0.95)).astype(np.float32)
+
+    min_drop_300s = np.zeros(n_tail, dtype=np.float32)
+    for k in range(5, 301, 5):
+        b1_fwd = np.pad(b1[k:], (0, k), mode="edge")
+        min_drop_300s = np.maximum(min_drop_300s, (b1 - b1_fwd) / tick)
+    y_crash_300s = (min_drop_300s >= 4.95).astype(np.float32)
+
+    min_drop_30s = np.zeros(n_tail, dtype=np.float32)
+    for k in range(1, 31):
+        b1_fwd = np.pad(b1[k:], (0, k), mode="edge")
+        min_drop_30s = np.maximum(min_drop_30s, (b1 - b1_fwd) / tick)
+    y_exit_30s = (min_drop_30s >= 1.95).astype(np.float32)
+
+    X_all_mm = np.load(BASE_DIR / "data" / "_mmap_cache" / "X_all.npy", mmap_mode="r")
+    x_tail = np.array(X_all_mm[s_idx:n_new], dtype=np.float32)
+
+    horizons = [(5, 3.0), (12, 3.5), (25, 3.0), (60, 3.0), (90, 3.0), (120, 3.0)]
+    routers = [SwarmRegimeRouter(coin, H, K, temperature=0.25, use_neural=True, neural_weight=0.15) for H, K in horizons]
+    h_mats = []
+    for r in routers:
+        ens = r.predict_ensemble(x_tail, df_tail, mode="router")
+        r._lgb_cache_probs = None
+        h_mats.append(_extract_6d_from_ens(ens))
+
+    spread_ticks = np.clip((ask_p[:, 0] - bid_p[:, 0]) / 0.01, 0.0, 50.0)
+    b1_q, a1_q = np.maximum(bid_q[:, 0], 0.0), np.maximum(ask_q[:, 0], 0.0)
+    b5_q, a5_q = np.sum(np.maximum(bid_q[:, :5], 0.0), axis=1), np.sum(np.maximum(ask_q[:, :5], 0.0), axis=1)
+    b10_q, a10_q = np.sum(np.maximum(bid_q, 0.0), axis=1), np.sum(np.maximum(ask_q, 0.0), axis=1)
+    vol_300 = np.nan_to_num(df_tail["ST_vol_300s_ticks"].values, nan=1.0)
+    ofi_300 = np.nan_to_num(df_tail["ST_ofi_norm_300s"].values, nan=0.0)
+    x_lob = np.column_stack([
+        spread_ticks / 10.0,
+        (b1_q - a1_q) / (b1_q + a1_q + 1e-6),
+        (b5_q - a5_q) / (b5_q + a5_q + 1e-6),
+        (b10_q - a10_q) / (b10_q + a10_q + 1e-6),
+        np.log1p(b1_q) / 10.0, np.log1p(a1_q) / 10.0,
+        np.log1p(b5_q) / 12.0, np.log1p(a5_q) / 12.0,
+        np.clip(vol_300 / 5.0, 0.0, 5.0), np.clip(ofi_300, -3.0, 3.0),
+    ]).astype(np.float32)
+
+    xm_c = np.hstack([h_mats[0], h_mats[1], h_mats[2], x_lob]).astype(np.float32)
+    vwap_arr = np.nan_to_num(df_tail["ST_vwap_1s"].values, nan=0.0) if "ST_vwap_1s" in df_tail.columns else (bid_p[:, 0] + ask_p[:, 0]) * 0.5
+    chunk_dict = {
+        "X_market": xm_c, "X_h60": h_mats[3], "X_h90": h_mats[4], "X_h120": h_mats[5],
+        "bid_p": bid_p, "bid_q": bid_q, "ask_p": ask_p, "ask_q": ask_q,
+        "buy_vol": buy_v, "sell_vol": sell_v, "vwap": vwap_arr, "tick_size": 0.01,
+    }
+    xv52_c = _compute_v52_signals_matrix(chunk_dict, coin=coin)[:, :4].astype(np.float32)
+    xv70_c = _compute_v70_realism_matrix(chunk_dict, coin=coin)[:, :2].astype(np.float32)
+    tail_52d = np.column_stack([xm_c, h_mats[3], h_mats[4], h_mats[5], xv52_c, xv70_c]).astype(np.float32)
+    mat_tail = compute_horizon_maturity_6d(ts_tail, coin=coin)
+    v7_tail_58d = np.clip(np.column_stack([tail_52d, mat_tail]), -5.0, 5.0).astype(np.float32)
+
+    def _cat(key_name, new_tail_arr):
+        return np.concatenate([old_npz[key_name][:s_idx], new_tail_arr], axis=0)
+
+    out_dict = {
+        "ts": _cat("ts", ts_tail),
+        "bid_p": _cat("bid_p", bid_p),
+        "bid_q": _cat("bid_q", bid_q),
+        "ask_p": _cat("ask_p", ask_p),
+        "ask_q": _cat("ask_q", ask_q),
+        "buy_vol": _cat("buy_vol", buy_v),
+        "sell_vol": _cat("sell_vol", sell_v),
+        "y_sweep_12s": _cat("y_sweep_12s", y_sweep_12s),
+        "y_bleed_60s": _cat("y_bleed_60s", y_bleed_60s),
+        "y_crash_300s": _cat("y_crash_300s", y_crash_300s),
+        "y_exit_30s": _cat("y_exit_30s", y_exit_30s),
+        "v7_signals_58d": _cat("v7_signals_58d", v7_tail_58d),
+        "tick_size": np.float32(0.01),
+    }
+    del old_npz
+    gc.collect()
+    tmp_path = CACHE_600H_PATH.with_suffix(".tmp.npz")
+    np.savez_compressed(tmp_path, **out_dict)
+    tmp_path.replace(CACHE_600H_PATH)
+    print(f"🎉 Инкрементальный кэш {CACHE_600H_PATH.name} ({n_new:,} тиков) сохранен за {time.time() - t0:.1f}с!", flush=True)
+    return CACHE_600H_PATH
+
+
 if __name__ == "__main__":
-    build_and_inject_v7_signals_58d(coin="prl", force_recompute=True)
+    incremental_append_600h_cache(coin="prl")

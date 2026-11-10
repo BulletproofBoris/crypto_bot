@@ -249,7 +249,7 @@ class BatchedFreeGridPolicyGrouped(nn.Module):
         return best_g
 
 
-def run_lesson_6(iterations: int = 1000, n_groups: int = 1365):
+def run_lesson_6(iterations: int = 1200, n_groups: int = 1365):
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     n_budgets = 6
@@ -348,7 +348,26 @@ def run_lesson_6(iterations: int = 1000, n_groups: int = 1365):
     env_budgets = budget_tiers.unsqueeze(0).expand(n_groups, n_budgets).reshape(pop_size)
 
     rng = np.random.default_rng(202606)
-    win_len = 900  # 2 окна по 900с = 1,800 секунд (30 минут реального рынка)
+    win_len = 900  # 2 окна по 900с = 1,800 секунд (1 Нормальное + 1 Стресс/Проливное окно!)
+
+    # Предварительная классификация всех 900-секундных окон на Normal (торговый коридор/рост) и Stress/Dump (пролив >= 2 тиков):
+    b1_all_np = vec_env.bids[:, 0].detach().cpu().numpy()
+    cand_starts = np.arange(100, slice_len - win_len - 100, 90)
+    normal_starts = []
+    stress_starts = []
+    for w0 in cand_starts:
+        seg = b1_all_np[w0 : w0 + win_len]
+        end_drop = (seg[0] - seg[-1]) / tick_sz
+        max_drop = (np.max(seg[:300]) - np.min(seg[150:])) / tick_sz
+        rng_ticks = (np.max(seg) - np.min(seg)) / tick_sz
+        if end_drop >= 1.8 or max_drop >= 2.8:
+            stress_starts.append(int(w0))
+        elif rng_ticks >= 1.0 and end_drop <= 1.0:
+            normal_starts.append(int(w0))
+    normal_starts = np.array(normal_starts if normal_starts else cand_starts, dtype=np.int64)
+    stress_starts = np.array(stress_starts if stress_starts else cand_starts, dtype=np.int64)
+    log_msg(f"⚖️ СПАРЕННЫЙ ЭКЗАМЕН v4.2: найдено {len(normal_starts)} Normal-окон и {len(stress_starts)} Stress/Dump-окон (до {iterations} ит.)")
+
     for _skip in range(1, start_iter):
         _ = rng.integers(100, slice_len - win_len - 100, size=2)
 
@@ -370,7 +389,8 @@ def run_lesson_6(iterations: int = 1000, n_groups: int = 1365):
         vec_env.sell_cycles.zero_()
         vec_env.prof_sell_cycles.zero_()
 
-        w_starts = rng.integers(100, slice_len - win_len - 100, size=2)
+        # Спаренный экзамен: 1 окно из Normal + 1 окно из Stress/Dump на КАЖДОЙ итерации!
+        w_starts = [int(rng.choice(normal_starts)), int(rng.choice(stress_starts))]
         with torch.no_grad():
             for w_start in w_starts:
                 vec_env.reset_with_budgets(env_budgets)
@@ -502,10 +522,20 @@ def run_lesson_6(iterations: int = 1000, n_groups: int = 1365):
             b_mo = int(g_mo_mat[best_g].float().mean().item())
             b_hold = float(g_hold_mat[best_g].mean().item())
 
-            # Обновляем Hall-of-Fame только если лучшая группа показала чистый плюс минимум на 4 из 6 бюджетов
-            # и превзошла действующего чемпиона (Группу #0) на этом же окне
+            # Обновляем Hall-of-Fame на спаренном экзамене (Normal + Dump):
+            # 1) Если кандидат вышел в чистый плюс по сумме Normal+Dump минимум на 4 из 6 бюджетов и превзошел Чемпиона #0;
+            # 2) ЛИБО если на тяжелом обвале кандидат активно торговал (b_cyc >= 2) и существенно сократил потери/просадку
+            #    относительно слепого Чемпиона #0 (чтобы защитные мутации против обвалов закреплялись в Зале Славы!).
+            c0_score = float(group_scores[0].item())
             hof_updated = False
-            if b_pnl_pct > 0.0 and b_prof_buds >= 4 and b_score >= float(group_scores[0].item()):
+            is_strict_win = (b_pnl_pct > 0.0) and (b_prof_buds >= 4) and (b_score >= c0_score)
+            is_crash_defense_win = (
+                (b_cyc >= 2)
+                and (b_score > c0_score + 20.0)
+                and (b_pnl_pct > c0_pnl_pct + 0.05)
+                and (b_dd_pct <= c0_dd_pct)
+            )
+            if is_strict_win or is_crash_defense_win:
                 best_env0 = best_g * n_budgets
                 w1_n, b1_n, w2_n, b2_n = policy._normalize_single_weights(
                     policy.w1[best_env0], policy.b1[best_env0], policy.w2[best_env0], policy.b2[best_env0]
@@ -579,4 +609,4 @@ def run_lesson_6(iterations: int = 1000, n_groups: int = 1365):
 
 
 if __name__ == "__main__":
-    run_lesson_6(iterations=1000, n_groups=1365)
+    run_lesson_6(iterations=1200, n_groups=1365)
