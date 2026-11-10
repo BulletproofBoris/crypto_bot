@@ -84,6 +84,10 @@ def rebuild_mmap_cache_low_ram(coin: str = "prl"):
     ]
     load_meta = [c for c in meta_cols if c in schema_cols]
     df = pq.read_table(labeled_path, columns=load_meta).to_pandas()
+    if "timestamp" not in df.columns:
+        df = df.reset_index()
+        if "timestamp" not in df.columns and "index" in df.columns:
+            df = df.rename(columns={"index": "timestamp"})
 
     segs = find_clean_segments(df)
     wins_map = {}

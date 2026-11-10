@@ -236,7 +236,7 @@ def _jit_env_step(
     place_b = empty_b & (b_w >= 0.12)
     b_w_active = torch.where(place_b, b_w, torch.zeros_like(b_w))
     b_total_sum = torch.where(b_w >= 0.08, b_w, torch.zeros_like(b_w)).sum(dim=1)
-    target_exp_frac = torch.clamp(b_total_sum * 0.85, 0.0, 1.0)
+    target_exp_frac = torch.clamp(b_total_sum, 0.0, 1.0)
     target_exp_usd = budget * 0.996 * target_exp_frac
 
     b_sum = b_w_active.sum(dim=1, keepdim=True)
@@ -279,15 +279,12 @@ def _jit_env_step(
     avg_tp_tick = torch.ceil((avg_entry + 0.55 * tick_size) / tick_size - 1e-5) * tick_size
     lifo_tp_tick = torch.ceil((min_buy_px + 0.55 * tick_size) / tick_size - 1e-5) * tick_size
     base_avg_tp = torch.where(pos_qty > 1e-6, avg_tp_tick, a1)
-    base_lifo_tp = torch.where(has_low_tr, torch.maximum(lifo_tp_tick, base_avg_tp - 3.0 * tick_size), base_avg_tp)
+    base_lifo_tp = torch.where(has_low_tr, lifo_tp_tick, base_avg_tp)
 
     if allow_scratch_stop_asks:
-        hold_now = torch.where(pos_qty > 1e-6, float(cur_t_scalar) - entry_t.float(), torch.zeros_like(pos_qty))
-        can_stop_1 = (pos_qty > 1e-6) & (b1 <= avg_entry - 0.9 * tick_size) & (hold_now >= 25.0)
-        can_scratch_0 = (pos_qty > 1e-6) & ((hold_now >= 60.0) | (b1 <= avg_entry - 0.5 * tick_size))
         avg_round_tick = torch.clamp(torch.round(avg_entry / tick_size) * tick_size, min=tick_size)
-        stop_1_px = torch.where(can_stop_1, torch.clamp(avg_round_tick - tick_size, min=tick_size), base_avg_tp).unsqueeze(1)
-        scratch_0_px = torch.where(can_scratch_0, avg_round_tick, base_avg_tp).unsqueeze(1)
+        stop_1_px = torch.where(pos_qty > 1e-6, torch.clamp(avg_round_tick - tick_size, min=tick_size), base_avg_tp).unsqueeze(1)
+        scratch_0_px = torch.where(pos_qty > 1e-6, avg_round_tick, base_avg_tp).unsqueeze(1)
         slot_base_tp = torch.cat(
             [
                 stop_1_px,

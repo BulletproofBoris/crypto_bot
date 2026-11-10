@@ -1940,12 +1940,10 @@ class LiveTriadRLTrader:
                     z_aug = torch.cat([z_t, ps_t, pb_t, pc_t, pe_t, v7_t, m6_t], dim=-1)
                     h1_t = torch.relu(z_aug @ self.l7_w1 + self.l7_b1.squeeze(0))
                     raw_26 = torch.sigmoid(h1_t @ self.l7_w2 + self.l7_b2.squeeze(0)).squeeze(0).numpy()
-                    if not (self.last_l7_ps >= 0.45 or self.last_l7_pb >= 0.50 or self.last_l7_pc >= 0.50):
-                        raw_26[24] = 0.0
                     self.last_l7_out = raw_26
                     b_w_12 = raw_26[:12] if raw_26[24] <= 0.75 else np.zeros(12, dtype=np.float32)
                     b_tot_s = float(np.sum(np.where(b_w_12 >= 0.08, b_w_12, 0.0)))
-                    self.last_l7_target_exp_frac = float(np.clip(b_tot_s * 0.85, 0.0, 1.0))
+                    self.last_l7_target_exp_frac = float(np.clip(b_tot_s, 0.0, 1.0))
             except Exception as e_l7_step:
                 print(f"⚠️ [L7/L9 STEP WARN]: {e_l7_step}")
                 self.last_l7_out = None
@@ -2348,23 +2346,11 @@ class LiveTriadRLTrader:
         if self.pos_qty >= 1.95 and self.avg_entry > 0.0:
             base_avg_tp = math.ceil((self.avg_entry + 0.55 * self.tick_size) / self.tick_size - 1e-5) * self.tick_size
             lifo_tp = math.ceil((self.tr_low_px + 0.55 * self.tick_size) / self.tick_size - 1e-5) * self.tick_size if has_low_tr else base_avg_tp
-            base_lifo_tp = max(lifo_tp, base_avg_tp - 3.0 * self.tick_size) if has_low_tr else base_avg_tp
+            base_lifo_tp = lifo_tp if has_low_tr else base_avg_tp
             if getattr(self, "l7_allow_scratch", False):
-                ps_now = float(getattr(self, "last_l7_ps", 0.0))
-                pb_now = float(getattr(self, "last_l7_pb", 0.0))
-                pc_now = float(getattr(self, "last_l7_pc", 0.0))
-                pe_now = float(getattr(self, "last_l7_pe", 0.0))
-                adv_now = float(getattr(self, "last_l7_adv", 0.0))
                 avg_round_tick = round(self.avg_entry / self.tick_size) * self.tick_size
-                is_underwater = b1 <= self.avg_entry - 0.5 * self.tick_size
-                allow_s1 = (self.hold_sec >= 60.0) or is_underwater
-                allow_s0 = (
-                    (b1 <= self.avg_entry - 0.9 * self.tick_size)
-                    and (self.hold_sec >= 25.0)
-                    and (adv_now >= 0.12 or pb_now >= 0.48 or cancel_bids or self.hold_sec >= 180.0)
-                )
-                base_tp[0] = max(self.tick_size, avg_round_tick - 1.0 * self.tick_size) if allow_s0 else (avg_round_tick if allow_s1 else base_lifo_tp)
-                base_tp[1] = avg_round_tick if allow_s1 else base_lifo_tp
+                base_tp[0] = max(self.tick_size, avg_round_tick - 1.0 * self.tick_size)
+                base_tp[1] = avg_round_tick
                 for s in range(2, 12):
                     slot_base = base_lifo_tp if s < 6 else base_avg_tp
                     base_tp[s] = slot_base + slot_offsets[s] * self.tick_size
@@ -2405,7 +2391,7 @@ class LiveTriadRLTrader:
             tot_bud_chk = max(25.0, float(self.initial_budget_usd), float(self.bot_cash_usd + self.pos_qty * b1))
             res_cash_chk = sum(float(s.get("qty", 0.0)) * float(s.get("px", 0.0)) * 1.002 for s in self.bid_slots if s.get("id") is not None)
             b_tot_chk = float(np.sum(np.where(b_w >= 0.08, b_w, 0.0)))
-            targ_usd_chk = tot_bud_chk * float(np.clip(b_tot_chk * 0.85, 0.0, 1.0))
+            targ_usd_chk = tot_bud_chk * float(np.clip(b_tot_chk, 0.0, 1.0))
             free_act_slots = [s for s in range(12) if self.bid_slots[s].get("id") is None and b_w[s] >= 0.12]
             if not free_act_slots and (res_cash_chk + self.pos_qty * b1) < 0.65 * targ_usd_chk and (self.bot_cash_usd - res_cash_chk) >= 50.0:
                 occ_cands = [
@@ -2466,7 +2452,7 @@ class LiveTriadRLTrader:
             if self.ex_usdt_free > 0.0:
                 unreserved_cash = min(unreserved_cash, self.ex_usdt_free)
             b_tot_sig = float(np.sum(np.where(b_w >= 0.08, b_w, 0.0)))
-            target_exp_frac = float(np.clip(b_tot_sig * 0.85, 0.0, 1.0))
+            target_exp_frac = float(np.clip(b_tot_sig, 0.0, 1.0))
             self.last_l7_target_exp_frac = target_exp_frac
             target_exp_usd = tot_bud * target_exp_frac
             cur_exp_usd = res_cash + self.pos_qty * b1

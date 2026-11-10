@@ -271,7 +271,12 @@ def incremental_append_600h_cache(coin: str = "prl") -> Path:
     schema_cols = set(pf.schema_arrow.names)
     avail_cols = [c for c in list(dict.fromkeys(meta_cols)) if c in schema_cols]
 
-    df_tail = pq.read_table(labeled_path, columns=avail_cols).slice(s_idx, n_tail).to_pandas().reset_index(drop=True)
+    df_tail = pq.read_table(labeled_path, columns=avail_cols).slice(s_idx, n_tail).to_pandas()
+    if "timestamp" not in df_tail.columns:
+        df_tail = df_tail.reset_index()
+        if "timestamp" not in df_tail.columns and "index" in df_tail.columns:
+            df_tail = df_tail.rename(columns={"index": "timestamp"})
+    df_tail = df_tail.reset_index(drop=True)
     ts_tail = pd.to_datetime(df_tail["timestamp"], utc=True).astype("int64").values // 10**9
 
     tick = 0.01

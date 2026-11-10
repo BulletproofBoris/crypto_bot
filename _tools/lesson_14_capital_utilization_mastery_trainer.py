@@ -227,8 +227,6 @@ def _jit_policy_forward(
     z_aug_g = torch.cat([z, p4, v7_exp, multi_6d.to(z.dtype)], dim=-1).view(n_groups, n_budgets, 324)
     h1_g = torch.relu(torch.bmm(z_aug_g, w1_g) + b1_g)
     raw_out = torch.sigmoid((torch.bmm(h1_g, w2_g) + b2_g).reshape(pop_size, 26).float())
-    danger_mask = (p4[:, 0] >= 0.45) | (p4[:, 1] >= 0.50) | (p4[:, 2] >= 0.50)
-    raw_out[:, 24] = torch.where(danger_mask, raw_out[:, 24], raw_out[:, 24] * 0.35)
     return h1_g, raw_out
 
 
@@ -569,8 +567,7 @@ def _multi_win_val_tick(
     low_tranche_qty = torch.where(is_panic, torch.zeros_like(low_tranche_qty), low_tranche_qty)
     ask_qty = torch.where(is_panic.unsqueeze(1), torch.zeros_like(ask_qty), ask_qty)
 
-    danger_mask = (p4[:, 0] >= 0.45) | (p4[:, 1] >= 0.50) | (p4[:, 2] >= 0.50)
-    cancel_bids = (raw_outputs[:, 2 * S] > 0.75) & danger_mask
+    cancel_bids = raw_outputs[:, 2 * S] > 0.75
     cb_mask = cancel_bids.unsqueeze(1)
     b_w = torch.where(cb_mask, torch.zeros_like(raw_outputs[:, :S]), raw_outputs[:, :S])
 
@@ -595,7 +592,7 @@ def _multi_win_val_tick(
     place_b = empty_b & (b_w >= 0.12)
     b_w_active = torch.where(place_b, b_w, torch.zeros_like(b_w))
     b_total_sum = torch.where(b_w >= 0.08, b_w, torch.zeros_like(b_w)).sum(dim=1)
-    target_exp_frac = torch.clamp(b_total_sum * 0.85, 0.0, 1.0)
+    target_exp_frac = torch.clamp(b_total_sum, 0.0, 1.0)
     target_exp_usd = budget * 0.996 * target_exp_frac
 
     b_sum = b_w_active.sum(dim=1, keepdim=True)
@@ -630,17 +627,12 @@ def _multi_win_val_tick(
     avg_tp_tick = torch.ceil((avg_entry + 0.55 * tick_size) / tick_size - 1e-5) * tick_size
     lifo_tp_tick = torch.ceil((min_buy_px + 0.55 * tick_size) / tick_size - 1e-5) * tick_size
     base_avg_tp = torch.where(pos_qty > 1e-6, avg_tp_tick, a1)
-    base_lifo_tp = torch.where(
-        has_low_tr, torch.maximum(lifo_tp_tick, base_avg_tp - 3.0 * tick_size), base_avg_tp
-    )
+    base_lifo_tp = torch.where(has_low_tr, lifo_tp_tick, base_avg_tp)
 
     if allow_scratch:
-        hold_s = torch.where(pos_qty > 1e-6, torch.clamp((t_vec - entry_t).float(), min=0.0), torch.zeros_like(pos_qty))
-        can_stop_1 = (pos_qty > 1e-6) & (b1 <= avg_entry - 0.9 * tick_size) & (hold_s >= 25.0)
-        can_scratch_0 = (pos_qty > 1e-6) & ((hold_s >= 60.0) | (b1 <= avg_entry - 0.5 * tick_size))
         avg_round_tick = torch.clamp(torch.round(avg_entry / tick_size) * tick_size, min=tick_size)
-        stop_1_px = torch.where(can_stop_1, torch.clamp(avg_round_tick - tick_size, min=tick_size), base_avg_tp).unsqueeze(1)
-        scratch_0_px = torch.where(can_scratch_0, avg_round_tick, base_avg_tp).unsqueeze(1)
+        stop_1_px = torch.where(pos_qty > 1e-6, torch.clamp(avg_round_tick - tick_size, min=tick_size), base_avg_tp).unsqueeze(1)
+        scratch_0_px = torch.where(pos_qty > 1e-6, avg_round_tick, base_avg_tp).unsqueeze(1)
         slot_base_tp = torch.cat(
             [stop_1_px, scratch_0_px, base_lifo_tp.unsqueeze(1).expand(N, 4), base_avg_tp.unsqueeze(1).expand(N, S - 6)],
             dim=1,
@@ -1248,6 +1240,7 @@ def run_lesson_14(iterations: int = 600, n_groups: int = 2048):
         norm_s, dump_s, pump_s = [], [], []
         for w0 in starts_arr:
             seg = b1_all_np[w0 : w0 + win_len]
+            entry_fillable = True
             if require_tradable:
                 s_sv = float(sv_all_np[w0 : w0 + win_len].sum())
                 s_bv = float(bv_all_np[w0 : w0 + win_len].sum())
@@ -1255,15 +1248,18 @@ def run_lesson_14(iterations: int = 600, n_groups: int = 2048):
                 q_a25 = float(np.percentile(aq_all_np[w0 : w0 + win_len], 25))
                 if s_sv < q_b25 * 1.5 or s_bv < q_a25 * 1.2:
                     continue
+                sv_300 = float(sv_all_np[w0 : w0 + 300].sum())
+                bv_420 = float(bv_all_np[w0 + 180 : w0 + win_len].sum())
+                entry_fillable = (sv_300 >= max(float(bq_all_np[w0]), q_b25) * 1.35) and (bv_420 >= q_a25 * 1.35)
             end_diff = (seg[-1] - seg[0]) / tick_sz
             max_drop = (np.max(seg[:240]) - np.min(seg[120:])) / tick_sz
             max_rally = (np.max(seg[120:]) - np.min(seg[:240])) / tick_sz
             rng_ticks = (np.max(seg) - np.min(seg)) / tick_sz
             if end_diff <= -1.5 or max_drop >= 2.2:
                 dump_s.append(int(w0))
-            elif end_diff >= 1.0 or max_rally >= 2.0:
+            elif (end_diff >= 1.0 or max_rally >= 2.0) and entry_fillable:
                 pump_s.append(int(w0))
-            elif rng_ticks >= 1.0 and abs(end_diff) < 0.5:
+            elif rng_ticks >= 1.0 and abs(end_diff) < 0.5 and entry_fillable:
                 norm_s.append(int(w0))
         return (
             np.array(norm_s if norm_s else starts_arr, dtype=np.int64),

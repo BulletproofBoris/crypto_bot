@@ -320,11 +320,10 @@ def process_coin_labeling(
     tick_size = cfg['tick_size']
     min_vol = cfg['min_vol']
     
-    tbl = pq.read_table(in_file)
-    df = tbl.to_pandas()
-    if isinstance(df.index, pd.DatetimeIndex) or df.index.name == 'timestamp':
-        df = df.reset_index()
-    total_rows = len(df)
+    import gc
+    pf = pq.ParquetFile(in_file)
+    total_rows = pf.metadata.num_rows
+    schema_names = set(pf.schema_arrow.names)
     train_80 = int(total_rows * split_ratio)
     L_max = max(10, train_80 // n_target)
     
@@ -364,6 +363,14 @@ def process_coin_labeling(
     print(f"   Защита от утечки: Purge={purge_steps}с, Embargo={embargo_steps}с (Буфер={gap_steps}с)")
     print("=" * 80)
     
+    req_cols = [
+        'ST_mid_price', 'ST_spread', 'ST_bid_1_price', 'ST_ask_1_price',
+        'ST_bid_1_qty', 'ST_ask_1_qty', 'ST_bid_2_qty', 'ST_ask_2_qty',
+        'ST_bids_vol_top5', 'ST_asks_vol_top5', 'ST_trade_vol',
+        'is_data_gap', 'arb_spread_zscore_20s'
+    ]
+    df_mini = pq.read_table(in_file, columns=[c for c in req_cols if c in schema_names]).to_pandas()
+    
     sample_split = np.full(total_rows, 'unknown', dtype=object)
     sample_split[:max_L] = 'warmup'
     sample_split[max_L:train_end] = 'train'
@@ -371,8 +378,8 @@ def process_coin_labeling(
     sample_split[val_start:total_rows - max_H] = 'val'
     sample_split[total_rows - max_H:] = 'tail'
 
-    if 'is_data_gap' in df.columns:
-        raw_gap = (df['is_data_gap'].values > 0)
+    if 'is_data_gap' in df_mini.columns:
+        raw_gap = (df_mini['is_data_gap'].values > 0)
         if np.any(raw_gap):
             post_gap_warmup = min(int(max_L), 300)
             pre_gap_purge = min(int(max_H), 60)
@@ -386,35 +393,23 @@ def process_coin_labeling(
                 sample_split[full_gap_mask] = 'purged_gap'
                 print(f"   🧹 Исключено технических разрывов связи (is_data_gap + буфер): {n_gap_purged:,} строк")
     
-    out_df = df.copy()
-    out_df['coin'] = coin.upper()
-    out_df['sample_split'] = sample_split
-    out_df['is_valid_sample'] = (sample_split == 'train') | (sample_split == 'val')
-    
     primary_pair = (5, 4) if (5, 4) in pairs else pairs[0]
     grid_records = []
     
     tr_mask = (sample_split == 'train')
     va_mask = (sample_split == 'val')
     extra_cols = {}
-    req_cols = [
-        'ST_mid_price', 'ST_spread', 'ST_bid_1_price', 'ST_ask_1_price',
-        'ST_bid_1_qty', 'ST_ask_1_qty', 'ST_bid_2_qty', 'ST_ask_2_qty',
-        'ST_bids_vol_top5', 'ST_asks_vol_top5', 'ST_trade_vol'
-    ]
-    df_mini = df[[c for c in req_cols if c in df.columns]].copy()
+    extra_cols['coin'] = np.full(total_rows, coin.upper(), dtype=object)
+    extra_cols['sample_split'] = sample_split
+    extra_cols['is_valid_sample'] = (sample_split == 'train') | (sample_split == 'val')
 
-    workers = min(len(pairs), SAFE_WORKERS)
-    if workers > 1:
-        tasks = [(df_mini, coin, H, K, min_vol, tick_size) for H, K in pairs]
-        print(f"  ⚡ Параллельный расчет {len(pairs)} комбинаций (H, K) на {workers} процессах CPU (лимит 80%)...")
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            pair_results = list(executor.map(_worker_label_pair, tasks))
-    else:
-        pair_results = [
-            (H, K, compute_single_horizon_labels(df_mini, coin, H, K, min_vol, tick_size))
-            for H, K in pairs
-        ]
+    print(f"  ⚡ Низкоуровневый расчет {len(pairs)} комбинаций (H, K) без дублирования RAM...")
+    pair_results = [
+        (H, K, compute_single_horizon_labels(df_mini, coin, H, K, min_vol, tick_size))
+        for H, K in pairs
+    ]
+    del df_mini
+    gc.collect()
 
     for H, K, res in pair_results:
         L = int(round(H * K))
@@ -477,8 +472,6 @@ def process_coin_labeling(
             'pct_flat': (c7_col[tr_mask] == 0).mean() * 100.0
         })
 
-    out_df = pd.concat([out_df, pd.DataFrame(extra_cols, index=out_df.index)], axis=1)
-
     # Вывод результатов
     print(f"\n📊 СХОДИМОСТЬ СЕТКИ ДЛЯ {coin.upper()}:")
     print(f"{'K':<3} | {'H':<4} | {'L':<4} | {'E[z] Class +2':<15} | {'Err(+2)':<8} | {'E[z] Class -2':<15} | {'Err(-2)':<8} | {'Статус'}")
@@ -489,43 +482,30 @@ def process_coin_labeling(
         print(f"{r['K']:<3} | {r['H']:<4} | {r['L']:<4} | {r['z_tr_p2']:+.4f} -> {r['z_va_p2']:+.4f} | {r['err_z_p2']:5.1f}%  | {r['z_tr_m2']:+.4f} -> {r['z_va_m2']:+.4f} | {r['err_z_m2']:5.1f}%  | {st}")
     print("-" * 85)
 
-    # Сохраняем единый датасет для монеты
+    # Сохраняем единый датасет для монеты напрямую через PyArrow без создания 4 ГБ Pandas DataFrame
+    import pyarrow as pa
     os.makedirs(base_outdir, exist_ok=True)
     coin_outdir = os.path.join(base_outdir, coin)
     os.makedirs(coin_outdir, exist_ok=True)
     
     unified_coin_path = os.path.join(coin_outdir, f"{coin}_labeled.parquet")
-    out_df.to_parquet(unified_coin_path, index=False, compression="zstd")
-    print(f"💾 Единый размеченный датасет {coin.upper()}: {unified_coin_path} ({len(out_df):,} строк, {len(out_df.columns)} колонок)")
-    
-    # Обратная совместимость для сплитов базового горизонта
-    if save_legacy_splits:
-        pH, pK = primary_pair
-        tr_df = out_df[out_df['sample_split'] == 'train'].reset_index(drop=True)
-        va_df = out_df[out_df['sample_split'] == 'val'].reset_index(drop=True)
-        
-        tr_path = os.path.join(coin_outdir, f"train_labeled_h{pH}s.parquet")
-        va_path = os.path.join(coin_outdir, f"val_labeled_h{pH}s.parquet")
-        full_path = os.path.join(coin_outdir, f"full_labeled_h{pH}s.parquet")
-        
-        tr_df.to_parquet(tr_path, index=False, compression="zstd")
-        va_df.to_parquet(va_path, index=False, compression="zstd")
-        out_df[out_df['is_valid_sample']].to_parquet(full_path, index=False, compression="zstd")
-        
-        if coin == "prl":
-            legacy_tr = os.path.join(base_outdir, f"train_labeled_h{pH}s.parquet")
-            legacy_va = os.path.join(base_outdir, f"val_labeled_h{pH}s.parquet")
-            legacy_full = os.path.join(base_outdir, f"full_labeled_h{pH}s.parquet")
-            for src_p, leg_p in [(tr_path, legacy_tr), (va_path, legacy_va), (full_path, legacy_full)]:
-                try:
-                    if os.path.islink(leg_p) or os.path.exists(leg_p):
-                        os.remove(leg_p)
-                    os.symlink(os.path.relpath(src_p, os.path.dirname(leg_p)), leg_p)
-                except Exception:
-                    pass
-            
-    import gc
-    del out_df
+    base_tbl = pq.read_table(in_file)
+    existing_col_names = set(base_tbl.schema.names)
+    for col_name, col_arr in extra_cols.items():
+        pa_arr = pa.array(col_arr)
+        if col_name in existing_col_names:
+            idx_c = base_tbl.schema.get_field_index(col_name)
+            base_tbl = base_tbl.set_column(idx_c, col_name, pa_arr)
+        else:
+            base_tbl = base_tbl.append_column(col_name, pa_arr)
+            existing_col_names.add(col_name)
+    del extra_cols
+    gc.collect()
+    tmp_unified = unified_coin_path + ".tmp"
+    pq.write_table(base_tbl, tmp_unified, compression="zstd")
+    os.replace(tmp_unified, unified_coin_path)
+    print(f"💾 Единый размеченный датасет {coin.upper()}: {unified_coin_path} ({base_tbl.num_rows:,} строк, {base_tbl.num_columns} колонок)")
+    del base_tbl
     gc.collect()
     return None, grid_records
 
