@@ -34,11 +34,14 @@ from _tools.vps_config import SAFETRADE_PROXY
 def _load_dotenv():
     env_path = BASE_DIR / ".env"
     if env_path.exists():
+        parsed = {}
         for line in env_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+                parsed[k.strip()] = v.strip().strip('"').strip("'")
+        for k, v in parsed.items():
+            os.environ.setdefault(k, v)
 
 
 class SafeTradePrivateClient:
@@ -584,6 +587,18 @@ class LiveTriadRLTrader:
                 self.car_state = 0
             elif self.car_state == 2 and self.active_bid_id is None and self.bot_cash_usd < 3.5:
                 self.car_state = 0
+        cur_key_fp = (
+            hashlib.sha256(self.client.api_key.encode("utf-8")).hexdigest()[:12]
+            if (self.client is not None and getattr(self.client, "api_key", ""))
+            else ""
+        )
+        saved_key_fp = str(st.get("api_key_fp", "")).strip() if st else ""
+        if saved_key_fp and cur_key_fp and saved_key_fp != cur_key_fp:
+            raise RuntimeError(
+                f"🚨 ACCOUNT MISMATCH GUARD: Текущий SAFETRADE_API_KEY (fp={cur_key_fp}) "
+                f"не совпадает с привязанным к кошельку бота (fp={saved_key_fp})! Старт заблокирован."
+            )
+        self.api_key_fp = cur_key_fp or saved_key_fp
         self.bid_age_sec = 0
         self.bid_partial_filled = 0.0
         self.adverse_streak = 0
@@ -753,6 +768,7 @@ class LiveTriadRLTrader:
         self._refresh_legacy_slot_mirrors()
         payload = {
             "updated_at": datetime.now(timezone.utc).isoformat(),
+            "api_key_fp": str(getattr(self, "api_key_fp", "")),
             "initial_budget_usd": round(self.initial_budget_usd, 6),
             "bot_cash_usd": round(self.bot_cash_usd, 6),
             "pos_qty": round(self.pos_qty, 6),
