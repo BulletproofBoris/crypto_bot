@@ -67,10 +67,11 @@ def _jit_compute_obs_flow_and_multi(
     unreserved_cash_now = torch.clamp(cash - reserved_cash_now, min=0.0)
     free_cash_ratio = torch.clamp(unreserved_cash_now / torch.clamp(budget, min=25.0), 0.0, 1.0)
 
-    unr_ticks = torch.where(has_pos > 0.5, (b1_c - avg_entry) / tick_size, torch.zeros_like(has_pos))
+    eff_pos_scale = torch.clamp(pos_ratio / 0.25, 0.15, 1.0)
+    unr_ticks = torch.where(has_pos > 0.5, ((b1_c - avg_entry) / tick_size) * eff_pos_scale, torch.zeros_like(has_pos))
     hold_ratio = torch.where(
         has_pos > 0.5,
-        torch.clamp((float(cur_t_scalar) - entry_t.float()) / 300.0, 0.0, 2.0),
+        torch.clamp((float(cur_t_scalar) - entry_t.float()) / 300.0, 0.0, 2.0) * eff_pos_scale,
         torch.zeros_like(has_pos),
     )
 
@@ -440,10 +441,21 @@ def _jit_env_step(
             | ((low_tranche_qty > 1e-6) & (avg_fill_b_px <= min_buy_px + 0.15 * tick_size))
         )
     )
+    is_higher_buy_from_single = (
+        has_buy
+        & (old_q >= 1.95)
+        & (low_tranche_qty <= 1e-6)
+        & (~is_dip_buy)
+        & (avg_fill_b_px >= avg_entry + 0.35 * tick_size)
+    )
     low_tranche_qty = torch.where(
         has_buy & (old_q <= 1e-6),
         torch.zeros_like(low_tranche_qty),
-        torch.where(is_dip_buy, low_tranche_qty + tot_fq, low_tranche_qty),
+        torch.where(
+            is_dip_buy,
+            low_tranche_qty + tot_fq,
+            torch.where(is_higher_buy_from_single, old_q, low_tranche_qty),
+        ),
     )
     min_buy_px = torch.where(
         has_buy,
@@ -453,7 +465,7 @@ def _jit_env_step(
             torch.where(
                 is_dip_buy,
                 torch.where(low_tranche_qty > tot_fq + 1e-5, torch.minimum(min_buy_px, avg_fill_b_px), avg_fill_b_px),
-                min_buy_px,
+                torch.where(is_higher_buy_from_single, avg_entry, min_buy_px),
             ),
         ),
         min_buy_px,

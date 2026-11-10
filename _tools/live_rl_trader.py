@@ -714,6 +714,13 @@ class LiveTriadRLTrader:
                             or (self.tr_low_qty > 1e-4 and px <= self.tr_low_px + 0.15 * self.tick_size)
                             or (self.tr_high_qty > 1e-4 and px <= self.tr_high_px - 0.5 * self.tick_size)
                         )
+                        is_higher_buy_from_single = (
+                            (not was_flat)
+                            and (not is_low_buy)
+                            and (self.tr_low_qty <= 1e-4)
+                            and (self.tr_high_qty >= 1.95)
+                            and (px >= self.tr_high_px + 0.35 * self.tick_size)
+                        )
                         if was_flat:
                             self.tr_high_px = px
                             self.tr_high_qty = net_d
@@ -724,6 +731,11 @@ class LiveTriadRLTrader:
                             new_l_q = self.tr_low_qty + net_d
                             self.tr_low_px = (self.tr_low_qty * self.tr_low_px + net_d * px) / max(1e-6, new_l_q)
                             self.tr_low_qty = new_l_q
+                        elif is_higher_buy_from_single:
+                            self.tr_low_px = self.tr_high_px
+                            self.tr_low_qty = self.tr_high_qty
+                            self.tr_high_px = px
+                            self.tr_high_qty = net_d
                         else:
                             new_h_q = self.tr_high_qty + net_d
                             self.tr_high_px = (self.tr_high_qty * self.tr_high_px + net_d * px) / max(1e-6, new_h_q)
@@ -1859,8 +1871,9 @@ class LiveTriadRLTrader:
                     n_b_sl = float(n_b_cnt) / 12.0
                     n_a_sl = float(n_a_cnt) / 12.0
                     has_pos_sim = 1.0 if self.pos_qty > 1e-4 else 0.0
-                    unr_sim = ((b1 - self.avg_entry) / self.tick_size) if (has_pos_sim > 0.5 and self.avg_entry > 0.0) else 0.0
-                    hold_rat_sim = min(self.hold_sec / 45.0, 2.0) if has_pos_sim > 0.5 else 0.0
+                    eff_pos_scale = float(np.clip(pos_rat / 0.25, 0.15, 1.0))
+                    unr_sim = (((b1 - self.avg_entry) / self.tick_size) * eff_pos_scale) if (has_pos_sim > 0.5 and self.avg_entry > 0.0) else 0.0
+                    hold_rat_sim = (min(self.hold_sec / 300.0, 2.0) * eff_pos_scale) if has_pos_sim > 0.5 else 0.0
 
                     flow_16 = np.array([[
                         float(np.clip(spread_ticks, 1.0, 10.0) / 5.0),
@@ -2342,20 +2355,16 @@ class LiveTriadRLTrader:
                 pc_now = float(getattr(self, "last_l7_pc", 0.0))
                 pe_now = float(getattr(self, "last_l7_pe", 0.0))
                 adv_now = float(getattr(self, "last_l7_adv", 0.0))
-                # Scratch (0t) и Stop (-1t) разрешаются ТОЛЬКО при реальной опасности дампа/срыва (cancel_bids или высокий adv_now при просадке b1 < avg_entry),
-                # чтобы в спокойном флэте (Adv=0%) слоты #00 и #01 стояли в профит (+1t = base_lifo_tp) и не отдавали комиссию за 60с до профитного выкупа!
+                avg_round_tick = round(self.avg_entry / self.tick_size) * self.tick_size
                 is_underwater = b1 <= self.avg_entry - 0.5 * self.tick_size
-                allow_s1 = (
-                    (is_underwater and self.hold_sec >= 240.0 and (adv_now >= 0.20 or pb_now >= 0.52 or cancel_bids))
-                    or (adv_now >= 0.45)
-                    or (cancel_bids and self.hold_sec >= 90.0)
-                )
+                allow_s1 = (self.hold_sec >= 60.0) or is_underwater
                 allow_s0 = (
-                    (b1 <= self.avg_entry - 1.1 * self.tick_size)
-                    and ((adv_now >= 0.55) or (cancel_bids and pb_now >= 0.58 and pc_now >= 0.55))
+                    (b1 <= self.avg_entry - 0.9 * self.tick_size)
+                    and (self.hold_sec >= 25.0)
+                    and (adv_now >= 0.12 or pb_now >= 0.48 or cancel_bids or self.hold_sec >= 180.0)
                 )
-                base_tp[0] = (self.avg_entry - 1.0 * self.tick_size) if allow_s0 else (self.avg_entry if allow_s1 else base_lifo_tp)
-                base_tp[1] = self.avg_entry if allow_s1 else base_lifo_tp
+                base_tp[0] = max(self.tick_size, avg_round_tick - 1.0 * self.tick_size) if allow_s0 else (avg_round_tick if allow_s1 else base_lifo_tp)
+                base_tp[1] = avg_round_tick if allow_s1 else base_lifo_tp
                 for s in range(2, 12):
                     slot_base = base_lifo_tp if s < 6 else base_avg_tp
                     base_tp[s] = slot_base + slot_offsets[s] * self.tick_size
@@ -2385,7 +2394,9 @@ class LiveTriadRLTrader:
             if slot.get("id") is None:
                 continue
             age_s = now_ts - float(slot.get("act_ts", 0.0))
-            slot_off_b = cancel_bids or (b_w[s] < 0.06 and (is_danger_b or age_s >= 20.0))
+            min_hold_b = 30.0 if s < 4 else 120.0
+            off_thresh_b = 0.06 if is_danger_b else (0.06 if s < 4 else 0.04)
+            slot_off_b = cancel_bids or (b_w[s] < off_thresh_b and (is_danger_b or age_s >= min_hold_b))
             grid_shift_b = (age_s >= 10.0) and (abs(t_bid_px[s] - float(slot.get("px", 0.0))) >= 1.9 * self.tick_size)
             if slot_off_b or grid_shift_b:
                 to_cancel_b.append((s, slot["id"], "off" if slot_off_b else "shift"))
