@@ -412,6 +412,7 @@ class LiveTriadRLTrader:
                 self.l7_allow_scratch = bool(rel_ck.get("allow_scratch_stop_asks", False))
                 self.l7_use_cross_venue = bool(rel_ck.get("use_cross_venue_v1", False))
                 self.l7_decoupled_backbone = bool(rel_ck.get("decoupled_market_backbone", int(self.l7_w1.shape[0]) >= 420))
+                self.l7_selective_front_cancel = bool(rel_ck.get("selective_front_cancel", int(rel_ck.get("lesson", 0)) >= 22))
                 in_d = int(self.l7_w1.shape[0])
                 h_d = int(self.l7_w1.shape[1])
                 arch_s = (
@@ -673,6 +674,7 @@ class LiveTriadRLTrader:
                 self.l7_allow_scratch = bool(rel_ck.get("allow_scratch_stop_asks", True))
                 self.l7_use_cross_venue = bool(rel_ck.get("use_cross_venue_v1", False))
                 self.l7_decoupled_backbone = bool(rel_ck.get("decoupled_market_backbone", int(self.l7_w1.shape[0]) >= 420))
+                self.l7_selective_front_cancel = bool(rel_ck.get("selective_front_cancel", int(rel_ck.get("lesson", 0)) >= 22))
                 if self.l7_use_cross_venue and getattr(self, "cv_first_order_net", None) is None:
                     cv_fo_path = BASE_DIR / "models" / self.coin / "cross_venue_first_order" / "cross_venue_first_order_v1.pt"
                     if cv_fo_path.exists():
@@ -2814,9 +2816,15 @@ class LiveTriadRLTrader:
         now_ts = time.time()
         tol = self.tick_size * 0.25
         cancel_bids = float(l7_out[24]) > 0.75
+        sel_front = bool(getattr(self, "l7_selective_front_cancel", False))
         panic_sell = (float(l7_out[25]) > 0.85) and (self.pos_qty >= 1.95)
         panic_frac = float(np.clip((float(l7_out[25]) - 0.80) * 5.0, 0.25, 1.0)) if panic_sell else 0.0
-        b_w = np.zeros(12, dtype=np.float64) if cancel_bids else np.asarray(l7_out[:12], dtype=np.float64)
+        b_w = np.asarray(l7_out[:12], dtype=np.float64).copy()
+        if cancel_bids:
+            if sel_front:
+                b_w[:6] = 0.0
+            else:
+                b_w[:] = 0.0
         a_w = np.asarray(l7_out[12:24], dtype=np.float64)
 
         # 0. Пропорциональный экстренный выход PanicSell (raw_outputs[25] > 0.85 ➔ 25%..100% позиции)
@@ -2898,7 +2906,7 @@ class LiveTriadRLTrader:
         to_cancel_b = []
         adv_now_b = float(getattr(self, "last_l7_adv", 0.0))
         pb_now_b = float(getattr(self, "last_l7_pb", 0.0))
-        is_danger_b = cancel_bids or (adv_now_b >= 0.12) or (pb_now_b >= 0.45)
+        is_danger_b = cancel_bids if sel_front else (cancel_bids or (adv_now_b >= 0.12) or (pb_now_b >= 0.45))
         tot_bud_chk = max(25.0, float(self.initial_budget_usd), float(self.bot_cash_usd + self.pos_qty * b1))
         res_cash_chk = sum(float(s.get("qty", 0.0)) * float(s.get("px", 0.0)) * 1.002 for s in self.bid_slots if s.get("id") is not None)
         unres_cash_chk = max(0.0, self.bot_cash_usd - res_cash_chk)
@@ -2907,9 +2915,12 @@ class LiveTriadRLTrader:
             if slot.get("id") is None:
                 continue
             age_s = now_ts - float(slot.get("act_ts", 0.0))
-            min_hold_b = 30.0 if s < 4 else 120.0
-            off_thresh_b = 0.06 if is_danger_b else (0.06 if s < 4 else 0.04)
-            slot_off_b = cancel_bids or (b_w[s] < off_thresh_b and (is_danger_b or age_s >= min_hold_b))
+            if sel_front:
+                slot_off_b = (cancel_bids and s < 6) or (b_w[s] < 0.06)
+            else:
+                min_hold_b = 30.0 if s < 4 else 120.0
+                off_thresh_b = 0.06 if is_danger_b else (0.06 if s < 4 else 0.04)
+                slot_off_b = cancel_bids or (b_w[s] < off_thresh_b and (is_danger_b or age_s >= min_hold_b))
             grid_shift_b = (age_s >= 10.0) and (abs(t_bid_px[s] - float(slot.get("px", 0.0))) >= 1.9 * self.tick_size)
             slot_usd = float(slot.get("qty", 0.0)) * float(slot.get("px", 0.0))
             upsize_b = (not is_danger_b) and (age_s >= 30.0) and (b_w[s] >= 0.25) and (slot_usd < 0.25 * tot_bud_chk * b_w[s]) and (unres_cash_chk > 0.25 * tot_bud_chk)
@@ -2936,7 +2947,10 @@ class LiveTriadRLTrader:
                 continue
             age_s = now_ts - float(slot.get("act_ts", 0.0))
             cur_apx = float(slot.get("px", 0.0))
-            slot_off_a = (self.pos_qty < 1.95) or (a_w[s] < 0.04 and age_s >= 180.0) or (a_w[s] < 0.015 and age_s >= 25.0)
+            if sel_front:
+                slot_off_a = (self.pos_qty < 1.95) or (a_w[s] < 0.04)
+            else:
+                slot_off_a = (self.pos_qty < 1.95) or (a_w[s] < 0.04 and age_s >= 180.0) or (a_w[s] < 0.015 and age_s >= 25.0)
             under_tp_a = (self.pos_qty >= 1.95) and (cur_apx < base_tp[s] - 0.4 * self.tick_size)
             grid_shift_a = under_tp_a or ((self.pos_qty >= 1.95) and (age_s >= 15.0) and (abs(t_ask_px[s] - cur_apx) >= 1.9 * self.tick_size))
             if slot_off_a or grid_shift_a:
