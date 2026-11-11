@@ -3043,7 +3043,7 @@ class LiveTriadRLTrader:
                     [(s, float(t_bid_qty[s]), float(t_bid_px[s])) for s in range(12) if t_bid_qty[s] >= 2.0],
                     key=lambda x: b_w[x[0]],
                     reverse=True,
-                )[:8]
+                )[:3]
                 if b_tasks:
                     b_results = list(self._io_pool.map(lambda item: self._place_slot_order("buy", item[0], item[1], item[2]), b_tasks))
                     for s, res_o, q_req, p_req in b_results:
@@ -3120,7 +3120,7 @@ class LiveTriadRLTrader:
                     [(s, float(t_ask_qty[s]), float(t_ask_px[s])) for s in range(12) if t_ask_qty[s] >= 2.0],
                     key=lambda x: a_w[x[0]],
                     reverse=True,
-                )[:8]
+                )[:4]
                 if a_tasks:
                     a_results = list(self._io_pool.map(lambda item: self._place_slot_order("sell", item[0], item[1], item[2]), a_tasks))
                     for s, res_o, q_req, p_req in a_results:
@@ -3166,7 +3166,7 @@ class LiveTriadRLTrader:
         return None
 
     def _place_slot_order(self, side: str, slot_idx: int, qty: float, price: float):
-        time.sleep(0.045)
+        time.sleep(0.11)
         try:
             res = self.client.place_limit_order(self.market, side, qty, price)
             return (slot_idx, res, qty, price)
