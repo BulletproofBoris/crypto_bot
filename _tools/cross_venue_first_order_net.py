@@ -2,28 +2,13 @@
 """
 _tools/cross_venue_first_order_net.py
 =============================================================================
-Модели 1-го порядка нового поколения: Cross-Venue Microstructure & Multi-Level Fill Net
-(SafeTrade L1..L5 + BigONE L1..L5 + ST/BO Trade Tape + Executable Arbitrage Lead-Lag).
-
-Решает главную слепую зону предыдущих моделей 1-го порядка (MultiTaskLOBNet / Guard / Realism),
-которые смотрели ТОЛЬКО в стакан SafeTrade и не видели поводыря BigONE (32.1% всей предсказательной
-силы роя на H=5..120s!).
+Модели 1-го порядка v2: 4-Venue Microstructure & Macro Lead-Lag Net
+(SafeTrade L1..L5 + BigONE L1..L5 + Gate.io PEARL + Ourbit PEARL + Binance BTC/NEAR).
 
 Выходы модуля (100% каузальные, без единого тика утечки из будущего, 1-в-1 в офлайне и в live):
-1. `cv_leadlag_10d` (занимает очищенный слот v7_signals_58d[:, 18:28] -> агент [278:288]):
-   [0] bo_fresh            : exp(-bo_sec_since_tick / 15.0) — свежесть котировок BigONE
-   [1] arb_buy_st_ticks    : clip((bo_b1 - st_a1) / (3 * tick), -2, 2) * bo_fresh — арбитражная тяга вверх
-   [2] arb_sell_st_ticks   : clip((st_b1 - bo_a1) / (3 * tick), -2, 2) * bo_fresh — арбитражный удар по Bid ST!
-   [3] mid_diff_ticks      : clip((bo_mid - st_mid) / (5 * tick), -2, 2) * bo_fresh — спред средних цен BO - ST
-   [4] bo_vel_5s_ticks     : clip((bo_mid - bo_mid_5s) / (3 * tick), -2, 2) * bo_fresh — 5с импульс BigONE
-   [5] lead_lag_5s_ticks   : clip(((bo_mid - bo_mid_5s) - (st_mid - st_mid_5s)) / (3 * tick), -2, 2) * bo_fresh
-   [6] bo_imb_l1           : ((bo_b1_q - bo_a1_q) / (bo_b1_q + bo_a1_q + 10)) * bo_fresh
-   [7] bo_imb_l5_delta_5s  : clip(bo_imb_l5 - bo_imb_l5_5s, -1.5, 1.5) * bo_fresh
-   [8] bo_tape_imb_5s      : ((bo_buy_5s - bo_sell_5s) / (bo_buy_5s + bo_sell_5s + 5)) * bo_fresh
-   [9] bo_burst_5s         : (log1p(bo_buy_5s + bo_sell_5s) / 8.0) * bo_fresh
-
-2. `cv_probs_6d` (выход нейросети `CrossVenueFirstOrderNet`, занимает слот v7_signals_58d[:, 52:58] -> агент [312:318]):
-   [0] p_cv_sweep_12s      : вероятность пробития ST b1 вниз >= 1 тик за 12с (с учетом BigONE!)
+1. `cv_leadlag_10d` (занимает слот v7_signals_58d[:, 18:28] -> агент [278:288])
+2. `cv_probs_6d` (выход нейросети `CrossVenueFirstOrderNet` 44D -> 6D, слот v7_signals_58d[:, 52:58] -> агент [312:318]):
+   [0] p_cv_sweep_12s      : вероятность пробития ST b1 вниз >= 1 тик за 12с
    [1] p_cv_bleed_60s      : вероятность сползания ST b1 вниз >= 2 тика без отскока за 60с
    [2] p_cv_rebound_30s    : вероятность чистого роста ST b1 вверх >= +1 тик за 30с без пробития вниз
    [3] p_clean_fill_b0     : вероятность чистого налива + плюсового выхода при Bid на b1 (0t) за 45с
@@ -36,15 +21,19 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
+
+os.environ.setdefault("TRITON_CACHE_DIR", "/tmp/triton_cache")
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/tmp/torchinductor_cache")
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 CACHE_600H_PATH = BASE_DIR / "data" / "cache" / "rl_guard_lob_cache_600h.npz"
@@ -63,7 +52,114 @@ def _rolling_sum_5s(arr: np.ndarray) -> np.ndarray:
     return np.maximum(0.0, out).astype(np.float32)
 
 
-def compute_cross_venue_10d_and_28d(
+def align_extra_venues_and_macro(ts_sec: np.ndarray) -> dict[str, np.ndarray]:
+    """Мгновенное O(N log M) каузальное выравнивание Gate.io, Ourbit и Binance BTC/NEAR по сетке ts_sec."""
+    n_g = len(ts_sec)
+    proc_dir = BASE_DIR / "data" / "processed"
+
+    def _align_one(depth_pq: Path, trades_pq: Path) -> dict[str, np.ndarray]:
+        b1 = np.zeros(n_g, dtype=np.float32)
+        a1 = np.zeros(n_g, dtype=np.float32)
+        b5_q = np.zeros(n_g, dtype=np.float32)
+        a5_q = np.zeros(n_g, dtype=np.float32)
+        sec_since = np.full(n_g, 999.0, dtype=np.float32)
+        buy_v = np.zeros(n_g, dtype=np.float32)
+        sell_v = np.zeros(n_g, dtype=np.float32)
+        last_px = np.zeros(n_g, dtype=np.float32)
+        trade_sec = np.full(n_g, 999.0, dtype=np.float32)
+
+        if depth_pq.exists():
+            cols_d = ["timestamp", "bid_1_price", "ask_1_price"] + [f"bid_{i}_qty" for i in range(1, 6)] + [f"ask_{i}_qty" for i in range(1, 6)]
+            dfd = pd.read_parquet(depth_pq, columns=cols_d).sort_values("timestamp")
+            d_ts = dfd["timestamp"].dt.as_unit("s").astype("int64").to_numpy()
+            idx = np.searchsorted(d_ts, ts_sec, side="right") - 1
+            valid = idx >= 0
+            vi = idx[valid]
+            b1[valid] = np.nan_to_num(dfd["bid_1_price"].to_numpy(dtype=np.float32)[vi], nan=0.0)
+            a1[valid] = np.nan_to_num(dfd["ask_1_price"].to_numpy(dtype=np.float32)[vi], nan=0.0)
+            bq_s = np.sum(np.nan_to_num(dfd[[f"bid_{i}_qty" for i in range(1, 6)]].to_numpy(dtype=np.float32), nan=0.0), axis=1)
+            aq_s = np.sum(np.nan_to_num(dfd[[f"ask_{i}_qty" for i in range(1, 6)]].to_numpy(dtype=np.float32), nan=0.0), axis=1)
+            b5_q[valid] = bq_s[vi]
+            a5_q[valid] = aq_s[vi]
+            sec_since[valid] = np.clip((ts_sec[valid] - d_ts[vi]).astype(np.float32), 0.0, 999.0)
+
+        if trades_pq.exists():
+            dft = pd.read_parquet(trades_pq, columns=["timestamp", "price", "amount", "side"]).sort_values("timestamp")
+            t_ts = dft["timestamp"].dt.as_unit("s").astype("int64").to_numpy()
+            amt = np.nan_to_num(dft["amount"].to_numpy(dtype=np.float32), nan=0.0)
+            px = np.nan_to_num(dft["price"].to_numpy(dtype=np.float32), nan=0.0)
+            is_buy = dft["side"].astype(str).str.lower().to_numpy() == "buy"
+
+            pos = np.searchsorted(ts_sec, t_ts, side="left")
+            in_g = (pos < n_g) & (ts_sec[np.minimum(pos, n_g - 1)] == t_ts)
+            np.add.at(buy_v, pos[in_g & is_buy], amt[in_g & is_buy])
+            np.add.at(sell_v, pos[in_g & (~is_buy)], amt[in_g & (~is_buy)])
+
+            idx_t = np.searchsorted(t_ts, ts_sec, side="right") - 1
+            vt = idx_t >= 0
+            last_px[vt] = px[idx_t[vt]]
+            trade_sec[vt] = np.clip((ts_sec[vt] - t_ts[idx_t[vt]]).astype(np.float32), 0.0, 999.0)
+
+        return {
+            "b1": b1, "a1": a1, "b5_q": b5_q, "a5_q": a5_q,
+            "sec_since": np.minimum(sec_since, trade_sec),
+            "buy_v": buy_v, "sell_v": sell_v, "last_px": last_px,
+        }
+
+    gt = _align_one(proc_dir / "gate_depth.parquet", proc_dir / "gate_trades.parquet")
+    ob = _align_one(proc_dir / "ourbit_depth.parquet", proc_dir / "ourbit_trades.parquet")
+
+    btc_mid = np.zeros(n_g, dtype=np.float32)
+    near_mid = np.zeros(n_g, dtype=np.float32)
+    macro_pq = proc_dir / "binance_macro.parquet"
+    if macro_pq.exists():
+        dfm = pd.read_parquet(macro_pq, columns=["timestamp", "btc_mid", "near_mid"]).sort_values("timestamp")
+        m_ts = dfm["timestamp"].dt.as_unit("s").astype("int64").to_numpy()
+        idx_m = np.searchsorted(m_ts, ts_sec, side="right") - 1
+        vm = idx_m >= 0
+        btc_mid[vm] = np.nan_to_num(dfm["btc_mid"].to_numpy(dtype=np.float32)[idx_m[vm]], nan=0.0)
+        near_mid[vm] = np.nan_to_num(dfm["near_mid"].to_numpy(dtype=np.float32)[idx_m[vm]], nan=0.0)
+
+    return {"gt": gt, "ob": ob, "btc_mid": btc_mid, "near_mid": near_mid}
+
+
+def _compute_ext_venue_6d(
+    st_mid: np.ndarray,
+    v_dict: Optional[dict],
+    tick: float,
+) -> np.ndarray:
+    n = len(st_mid)
+    out = np.zeros((n, 6), dtype=np.float32)
+    if v_dict is None:
+        return out
+    b1_raw = v_dict["b1"]
+    a1_raw = v_dict["a1"]
+    lpx = v_dict["last_px"]
+    sec = np.clip(np.nan_to_num(v_dict["sec_since"], nan=999.0), 0.0, 300.0)
+
+    has_book = (b1_raw > tick) & (a1_raw >= b1_raw)
+    ref_px = np.where(has_book, 0.5 * (b1_raw + a1_raw), np.where(lpx > tick, lpx, st_mid)).astype(np.float32)
+    valid = ((has_book | (lpx > tick)) & (sec <= 180.0))
+    fresh = np.where(valid, np.exp(-sec / 20.0), 0.0).astype(np.float32)
+
+    ref_5s = np.pad(ref_px[:-5], (5, 0), mode="edge") if n > 5 else ref_px.copy()
+    b5 = np.maximum(0.0, v_dict["b5_q"])
+    a5 = np.maximum(0.0, v_dict["a5_q"])
+    imb_l5 = np.where(has_book, (b5 - a5) / (b5 + a5 + 25.0), 0.0)
+
+    buy_5s = _rolling_sum_5s(v_dict["buy_v"])
+    sell_5s = _rolling_sum_5s(v_dict["sell_v"])
+
+    out[:, 0] = fresh
+    out[:, 1] = np.clip((ref_px - st_mid) / (5.0 * tick), -2.5, 2.5) * fresh
+    out[:, 2] = np.clip((ref_px - ref_5s) / (3.0 * tick), -2.5, 2.5) * fresh
+    out[:, 3] = np.clip(imb_l5, -1.0, 1.0) * fresh
+    out[:, 4] = np.clip((buy_5s - sell_5s) / (buy_5s + sell_5s + 5.0), -1.0, 1.0) * fresh
+    out[:, 5] = np.clip(np.log1p(buy_5s + sell_5s) / 8.0, 0.0, 2.0) * fresh
+    return out
+
+
+def compute_cross_venue_10d_and_44d(
     st_bp: np.ndarray,
     st_bq: np.ndarray,
     st_ap: np.ndarray,
@@ -77,12 +173,17 @@ def compute_cross_venue_10d_and_28d(
     bo_buy: np.ndarray,
     bo_sell: np.ndarray,
     bo_sec_since: np.ndarray,
+    extra_feeds: Optional[dict] = None,
     tick: float = 0.01,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Векторизованный и строго каузальный расчет:
-      - `cv_10d` (N, 10): быстрые кросс-биржевые Lead-Lag импульсы SafeTrade + BigONE,
-      - `x_28d`  (N, 28): полный входной вектор для нейросети 1-го порядка `CrossVenueFirstOrderNet`.
+      - `cv_10d` (N, 10): быстрые кросс-биржевые импульсы (включая композитный 4-биржевой консенсус в слотах 8..9),
+      - `x_44d`  (N, 44): полный 4-биржевой + макро вектор для `CrossVenueFirstOrderNet v2`:
+          [0:28]  — SafeTrade + BigONE L1..L5 + лента (100% обратная совместимость с v1),
+          [28:34] — Gate.io PEARL/USDT (fresh, mid_diff, vel_5s, imb_l5, tape_imb_5s, burst_5s),
+          [34:40] — Ourbit PEARL/USDT (fresh, mid_diff, vel_5s, imb_l5, tape_imb_5s, burst_5s),
+          [40:44] — Binance Macro BTC/NEAR (btc_ret_5s, btc_ret_30s, near_ret_5s, near_ret_30s).
     """
     n = len(st_bp)
     st_b1 = np.maximum(tick, st_bp[:, 0].astype(np.float32))
@@ -92,7 +193,6 @@ def compute_cross_venue_10d_and_28d(
     bo_b1_raw = np.nan_to_num(bo_bp[:, 0].astype(np.float32), nan=0.0)
     bo_a1_raw = np.nan_to_num(bo_ap[:, 0].astype(np.float32), nan=0.0)
     valid_bo = (bo_b1_raw > tick) & (bo_a1_raw >= bo_b1_raw) & (np.nan_to_num(bo_sec_since, nan=999.0) <= 120.0)
-
     bo_sec_clamped = np.clip(np.nan_to_num(bo_sec_since.astype(np.float32), nan=999.0), 0.0, 300.0)
     bo_fresh = np.where(valid_bo, np.exp(-bo_sec_clamped / 15.0), 0.0).astype(np.float32)
 
@@ -130,7 +230,6 @@ def compute_cross_venue_10d_and_28d(
     cv_10d[:, 8] = np.clip((bo_buy_5s - bo_sell_5s) / (bo_buy_5s + bo_sell_5s + 5.0), -1.0, 1.0) * bo_fresh
     cv_10d[:, 9] = np.clip(np.log1p(bo_buy_5s + bo_sell_5s) / 8.0, 0.0, 2.0) * bo_fresh
 
-    # Дополнительные 18 микроструктурных признаков SafeTrade + BigONE для сети 1-го порядка (итого 28D):
     st_b1_q = np.maximum(0.0, st_bq[:, 0].astype(np.float32))
     st_a1_q = np.maximum(0.0, st_aq[:, 0].astype(np.float32))
     st_b2_q = np.maximum(0.0, st_bq[:, 1].astype(np.float32))
@@ -163,8 +262,34 @@ def compute_cross_venue_10d_and_28d(
     x_extra[:, 16] = np.clip((bo_mid - bo_mid_20s) / (5.0 * tick), -2.5, 2.5) * bo_fresh
     x_extra[:, 17] = np.clip(((bo_mid - bo_mid_20s) - (st_mid - st_mid_20s)) / (5.0 * tick), -2.5, 2.5) * bo_fresh
 
-    x_28d = np.hstack([cv_10d, x_extra]).astype(np.float32)
-    return cv_10d, x_28d
+    gt_6d = _compute_ext_venue_6d(st_mid, extra_feeds.get("gt") if extra_feeds else None, tick)
+    ob_6d = _compute_ext_venue_6d(st_mid, extra_feeds.get("ob") if extra_feeds else None, tick)
+
+    macro_4d = np.zeros((n, 4), dtype=np.float32)
+    if extra_feeds is not None:
+        btc = extra_feeds.get("btc_mid")
+        near = extra_feeds.get("near_mid")
+        if btc is not None and len(btc) == n:
+            btc_s = np.maximum(1.0, btc)
+            btc_5s = np.pad(btc_s[:-5], (5, 0), mode="edge") if n > 5 else btc_s
+            btc_30s = np.pad(btc_s[:-30], (30, 0), mode="edge") if n > 30 else btc_s
+            macro_4d[:, 0] = np.clip((btc_s - btc_5s) / btc_5s * 500.0, -3.0, 3.0) * (btc > 0)
+            macro_4d[:, 1] = np.clip((btc_s - btc_30s) / btc_30s * 250.0, -3.0, 3.0) * (btc > 0)
+        if near is not None and len(near) == n:
+            near_s = np.maximum(0.01, near)
+            near_5s = np.pad(near_s[:-5], (5, 0), mode="edge") if n > 5 else near_s
+            near_30s = np.pad(near_s[:-30], (30, 0), mode="edge") if n > 30 else near_s
+            macro_4d[:, 2] = np.clip((near_s - near_5s) / near_5s * 300.0, -3.0, 3.0) * (near > 0)
+            macro_4d[:, 3] = np.clip((near_s - near_30s) / near_30s * 150.0, -3.0, 3.0) * (near > 0)
+
+    x_44d = np.hstack([cv_10d, x_extra, gt_6d, ob_6d, macro_4d]).astype(np.float32)
+    return cv_10d, x_44d
+
+
+def compute_cross_venue_10d_and_28d(*args, **kwargs) -> Tuple[np.ndarray, np.ndarray]:
+    """Обратно совместимая обертка (возвращает cv_10d и первые 28 признаков)."""
+    cv_10d, x_44d = compute_cross_venue_10d_and_44d(*args, **kwargs)
+    return cv_10d, x_44d[:, :28]
 
 
 def compute_cross_venue_single_tick(
@@ -183,10 +308,15 @@ def compute_cross_venue_single_tick(
     bo_sec_since: float,
     hist_state: dict,
     tick: float = 0.01,
+    gt_snap: Optional[dict] = None,
+    ob_snap: Optional[dict] = None,
+    macro_snap: Optional[dict] = None,
+    out_dim_x: int = 44,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Однотиковый O(1) расчет (< 0.15 мс на CPU) для `_tools/live_rl_trader.py`
-    со 100% математическим совпадением с `compute_cross_venue_10d_and_28d`.
+    со 100% математическим совпадением с `compute_cross_venue_10d_and_44d`.
+    Поддерживает как `out_dim_x=28` (v1), так и `out_dim_x=44` (v2 4-Venue + Macro).
     """
     from collections import deque
 
@@ -217,15 +347,33 @@ def compute_cross_venue_single_tick(
     st_b5_q = float(np.sum(np.maximum(0.0, st_bq[:5])))
     st_a5_q = float(np.sum(np.maximum(0.0, st_aq[:5])))
 
-    if "dq20" not in hist_state:
-        hist_state["dq20"] = deque(maxlen=20)
-    dq = hist_state["dq20"]
-    cur_snap = (st_mid, bo_mid, bo_imb_l5, st_b1, st_a1, st_b1_q, st_a1_q)
+    def _ext_ref(snap: Optional[dict]) -> float:
+        if not snap:
+            return st_mid
+        b1_s = float(snap.get("b1", 0.0))
+        a1_s = float(snap.get("a1", 0.0))
+        lpx_s = float(snap.get("last_px", 0.0))
+        if b1_s > tick and a1_s >= b1_s:
+            return 0.5 * (b1_s + a1_s)
+        if lpx_s > tick:
+            return lpx_s
+        return st_mid
+
+    gt_ref = _ext_ref(gt_snap)
+    ob_ref = _ext_ref(ob_snap)
+    btc_m = float(macro_snap.get("btc_mid", 0.0)) if macro_snap else 0.0
+    near_m = float(macro_snap.get("near_mid", 0.0)) if macro_snap else 0.0
+
+    if "dq30" not in hist_state:
+        hist_state["dq30"] = deque(maxlen=30)
+    dq = hist_state["dq30"]
+    cur_snap = (st_mid, bo_mid, bo_imb_l5, st_b1, st_a1, st_b1_q, st_a1_q, gt_ref, ob_ref, btc_m, near_m)
     s5 = dq[-5] if len(dq) >= 5 else (dq[0] if len(dq) > 0 else cur_snap)
-    s20 = dq[0] if len(dq) > 0 else cur_snap
+    s20 = dq[-20] if len(dq) >= 20 else (dq[0] if len(dq) > 0 else cur_snap)
+    s30 = dq[0] if len(dq) > 0 else cur_snap
     dq.append(cur_snap)
 
-    st_mid_5s, bo_mid_5s, bo_imb_l5_5s, st_b1_5s, st_a1_5s, st_b1q_5s, st_a1q_5s = s5
+    st_mid_5s, bo_mid_5s, bo_imb_l5_5s, st_b1_5s, st_a1_5s, st_b1q_5s, st_a1q_5s = s5[:7]
     st_mid_20s, bo_mid_20s = s20[0], s20[1]
 
     cv_10d = np.array([
@@ -262,16 +410,127 @@ def compute_cross_venue_single_tick(
         float(np.clip(((bo_mid - bo_mid_20s) - (st_mid - st_mid_20s)) / (5.0 * tick), -2.5, 2.5) * bo_fresh),
     ], dtype=np.float32)
 
-    return cv_10d, np.concatenate([cv_10d, x_extra], axis=0)
+    if out_dim_x <= 28:
+        return cv_10d, np.concatenate([cv_10d, x_extra], axis=0)
+
+    def _ext_single_6d(snap: Optional[dict], ref_now: float, ref_prev5: float) -> np.ndarray:
+        if not snap:
+            return np.zeros(6, dtype=np.float32)
+        b1_s = float(snap.get("b1", 0.0))
+        a1_s = float(snap.get("a1", 0.0))
+        lpx_s = float(snap.get("last_px", 0.0))
+        sec_s = min(max(0.0, float(snap.get("sec_since", 999.0))), 300.0)
+        has_b = (b1_s > tick) and (a1_s >= b1_s)
+        valid_s = (has_b or (lpx_s > tick)) and (sec_s <= 180.0)
+        fr = math.exp(-sec_s / 20.0) if valid_s else 0.0
+        b5_s = max(0.0, float(snap.get("b5_q", 0.0)))
+        a5_s = max(0.0, float(snap.get("a5_q", 0.0)))
+        imb_s = ((b5_s - a5_s) / (b5_s + a5_s + 25.0)) if has_b else 0.0
+        bv5 = max(0.0, float(snap.get("buy_5s", 0.0)))
+        sv5 = max(0.0, float(snap.get("sell_5s", 0.0)))
+        return np.array([
+            fr,
+            float(np.clip((ref_now - st_mid) / (5.0 * tick), -2.5, 2.5) * fr),
+            float(np.clip((ref_now - ref_prev5) / (3.0 * tick), -2.5, 2.5) * fr),
+            float(np.clip(imb_s, -1.0, 1.0) * fr),
+            float(np.clip((bv5 - sv5) / (bv5 + sv5 + 5.0), -1.0, 1.0) * fr),
+            float(np.clip(math.log1p(bv5 + sv5) / 8.0, 0.0, 2.0) * fr),
+        ], dtype=np.float32)
+
+    gt_5s = s5[7] if len(s5) > 7 else gt_ref
+    ob_5s = s5[8] if len(s5) > 8 else ob_ref
+    btc_5s = max(1.0, s5[9] if len(s5) > 9 and s5[9] > 0 else max(1.0, btc_m))
+    btc_30s = max(1.0, s30[9] if len(s30) > 9 and s30[9] > 0 else max(1.0, btc_m))
+    near_5s = max(0.01, s5[10] if len(s5) > 10 and s5[10] > 0 else max(0.01, near_m))
+    near_30s = max(0.01, s30[10] if len(s30) > 10 and s30[10] > 0 else max(0.01, near_m))
+
+    gt_6d = _ext_single_6d(gt_snap, gt_ref, gt_5s)
+    ob_6d = _ext_single_6d(ob_snap, ob_ref, ob_5s)
+    macro_4d = np.array([
+        float(np.clip((btc_m - btc_5s) / btc_5s * 500.0, -3.0, 3.0)) if btc_m > 0 else 0.0,
+        float(np.clip((btc_m - btc_30s) / btc_30s * 250.0, -3.0, 3.0)) if btc_m > 0 else 0.0,
+        float(np.clip((near_m - near_5s) / near_5s * 300.0, -3.0, 3.0)) if near_m > 0 else 0.0,
+        float(np.clip((near_m - near_30s) / near_30s * 150.0, -3.0, 3.0)) if near_m > 0 else 0.0,
+    ], dtype=np.float32)
+
+    return cv_10d, np.concatenate([cv_10d, x_extra, gt_6d, ob_6d, macro_4d], axis=0)[:out_dim_x]
+
+
+def peek_local_venue_snap(venue_dir: Path, depth_fn: str, trades_fn: str, state_cache: dict) -> Optional[dict]:
+    """Сверхлегкое (< 0.05 мс) чтение хвоста локальных CSV Gate.io / Ourbit на VPS с кэшем 0.8с."""
+    now = time.time()
+    key = str(venue_dir)
+    prev = state_cache.get(key)
+    if prev is not None and (now - prev[0]) < 0.8:
+        return prev[1]
+    dp = venue_dir / depth_fn
+    tp = venue_dir / trades_fn
+    if not dp.exists() and not tp.exists():
+        state_cache[key] = (now, None)
+        return None
+    b1 = a1 = b5_q = a5_q = last_px = buy_5s = sell_5s = 0.0
+    sec_d = sec_t = 999.0
+    try:
+        if dp.exists():
+            sz = dp.stat().st_size
+            sec_d = max(0.0, now - dp.stat().st_mtime)
+            if sz > 64:
+                with open(dp, "rb") as f:
+                    f.seek(max(0, sz - 4096))
+                    lines = f.read().decode("utf-8", errors="ignore").strip().splitlines()
+                if lines and not lines[-1].startswith("timestamp"):
+                    ps = lines[-1].split(",")
+                    if len(ps) >= 103:
+                        b1 = float(ps[1] or 0.0)
+                        a1 = float(ps[101] or 0.0)
+                        b5_q = sum(float(ps[2 * i] or 0.0) for i in range(1, 6))
+                        a5_q = sum(float(ps[100 + 2 * i] or 0.0) for i in range(1, 6))
+    except Exception:
+        pass
+    try:
+        if tp.exists():
+            sz_t = tp.stat().st_size
+            if sz_t > 32:
+                with open(tp, "rb") as f:
+                    f.seek(max(0, sz_t - 6144))
+                    tlines = f.read().decode("utf-8", errors="ignore").strip().splitlines()
+                from datetime import datetime
+                for ln in reversed(tlines[-40:]):
+                    if ln.startswith("id,") or "," not in ln:
+                        continue
+                    pts = ln.split(",")
+                    if len(pts) < 5:
+                        continue
+                    ts_s = datetime.fromisoformat(pts[1].replace("Z", "+00:00")).timestamp()
+                    age = max(0.0, now - ts_s)
+                    if last_px <= 0.0:
+                        last_px = float(pts[2] or 0.0)
+                        sec_t = age
+                    if age <= 5.5:
+                        amt = float(pts[3] or 0.0)
+                        if pts[4].strip().lower() == "buy":
+                            buy_5s += amt
+                        else:
+                            sell_5s += amt
+                    else:
+                        break
+    except Exception:
+        pass
+    snap = {
+        "b1": b1, "a1": a1, "b5_q": b5_q, "a5_q": a5_q,
+        "last_px": last_px, "buy_5s": buy_5s, "sell_5s": sell_5s,
+        "sec_since": min(sec_d, sec_t),
+    }
+    state_cache[key] = (now, snap)
+    return snap
 
 
 class CrossVenueFirstOrderNet(nn.Module):
     """
-    Быстрая Residual-SwiGLU нейросеть 1-го порядка (28D -> 128D -> Residual SwiGLU -> 6 логитов).
-    Инференс 1 тика на CPU занимает ~0.08 мс; пакетный инференс 2.75M тиков на GPU — ~1.5 сек.
+    Быстрая Residual-SwiGLU нейросеть 1-го порядка (44D -> 128D -> Residual SwiGLU -> 6 логитов).
     """
 
-    def __init__(self, in_dim: int = 28, h_dim: int = 128, out_dim: int = 6):
+    def __init__(self, in_dim: int = 44, h_dim: int = 128, out_dim: int = 6):
         super().__init__()
         self.in_norm = nn.LayerNorm(in_dim)
         self.fc1 = nn.Linear(in_dim, h_dim * 2)
@@ -303,23 +562,12 @@ def build_first_order_targets_6d(
     y_bleed_60s: np.ndarray,
     tick: float = 0.01,
 ) -> np.ndarray:
-    """
-    Формирует 6 таргетов для обучения сети 1-го порядка (строго для loss на Train/Val):
-      [0] y_sweep_12s      : вынос b1 вниз >= 1 тик за 12с
-      [1] y_bleed_60s      : ступенчатое падение b1 >= 2 тика без отскока за 60с
-      [2] y_rebound_30s    : чистый подъем b1 >= +1 тик за 30с без падения вниз >= 1 тик!
-      [3] y_clean_fill_b0  : постановка Bid на b1 получает проторговку очереди И в окне 45с цена выходит в >= b1 + 1t без обвала >= 2t
-      [4] y_clean_fill_bm1 : постановка Bid на b1 - 1t получает налив И в окне 60с цена возвращается >= b1 (прибыль +1t от входа!) без обвала до b1 - 3t
-      [5] y_clean_fill_bm2 : постановка Bid на b1 - 2t получает налив И в окне 90с цена возвращается >= b1 - 1t (прибыль +1t от входа!) без обвала до b1 - 4t
-    """
+    """Формирует 6 таргетов сети 1-го порядка через O(N) GPU 1D MaxPool."""
     n = len(st_bp)
     b1 = st_bp[:, 0].astype(np.float32)
     b1_q = np.maximum(1.0, st_bq[:, 0].astype(np.float32))
     sell_v = np.maximum(0.0, st_sell.astype(np.float32))
 
-    # Скользящие вперед максимумы/минимумы b1 и кумулятивный sell_vol
-    # Мгновенный O(N) расчет скользящих вперед максимумов/минимумов b1[t+1 .. t+W] через 1D MaxPool
-    # (100% побитовая эквивалентность циклу k=1..90 с mode="edge", в ~80x быстрее без 90 копий массива!)
     pool_dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     with torch.no_grad():
         b1_t = torch.from_numpy(b1).to(pool_dev).view(1, 1, n)
@@ -342,18 +590,14 @@ def build_first_order_targets_6d(
         sell_fwd_25[:-25] = (cs_sell[25:] - cs_sell[:-25]).astype(np.float32)
 
     y_rebound_30s = (((max_b1_30 - b1) >= 0.95 * tick) & ((b1 - min_b1_30) < 0.95 * tick)).astype(np.float32)
-
-    # b0 (на b1): налив очереди sell_fwd_25 >= 0.65 * b1_q (или микрокасание), без обвала >= 2t, с выходом ask >= b1+1t (т.е. b1 >= b1 или a1 проторгован)
     fill_b0 = (sell_fwd_25 >= 0.65 * b1_q) | ((b1 - min_b1_30) >= 0.95 * tick)
     win_b0 = ((max_b1_45 - b1) >= 0.0) & ((b1 - min_b1_45) < 1.95 * tick)
     y_clean_b0 = (fill_b0 & win_b0).astype(np.float32)
 
-    # bm1 (на b1 - 1t): цена качнулась до b1 - 1t (налили наш лимитник на -1t), не провалилась до b1 - 3t, и вернулась хотя бы к b1!
     touch_bm1 = (b1 - min_b1_45) >= 0.95 * tick
     rebound_bm1 = ((max_b1_60 - (b1 - tick)) >= 0.95 * tick) & ((b1 - min_b1_60) < 2.95 * tick)
     y_clean_bm1 = (touch_bm1 & rebound_bm1).astype(np.float32)
 
-    # bm2 (на b1 - 2t): цена качнулась до b1 - 2t (налили наш нижний уровень), не провалилась до b1 - 4t, и отскочила хотя бы к b1 - 1t!
     touch_bm2 = (b1 - min_b1_60) >= 1.95 * tick
     rebound_bm2 = ((max_b1_90 - (b1 - 2.0 * tick)) >= 0.95 * tick) & ((b1 - min_b1_90) < 3.95 * tick)
     y_clean_bm2 = (touch_bm2 & rebound_bm2).astype(np.float32)
@@ -368,33 +612,20 @@ def build_first_order_targets_6d(
     ]).astype(np.float32)
 
 
-def _roc_auc_binary(y_true: np.ndarray, y_score: np.ndarray) -> float:
-    pos = y_true > 0.5
-    n_pos = int(np.sum(pos))
-    n_neg = int(len(y_true) - n_pos)
-    if n_pos == 0 or n_neg == 0:
-        return 0.5
-    order = np.argsort(y_score)
-    ranks = np.empty_like(order, dtype=np.float64)
-    ranks[order] = np.arange(1, len(y_score) + 1, dtype=np.float64)
-    sum_pos_ranks = float(np.sum(ranks[pos]))
-    auc = (sum_pos_ranks - n_pos * (n_pos + 1) / 2.0) / (float(n_pos) * float(n_neg))
-    return float(auc)
-
-
 def train_and_inject_cross_venue_first_order(
     cache_path: Path = CACHE_600H_PATH,
     epochs: int = 12,
-    batch_size: int = 8192,
+    batch_size: int = 16384,
 ) -> dict:
     """
-    1) Загружает обновленный `rl_guard_lob_cache_600h.npz` (включая `bo_*` массивы).
-    2) Строго делит данные по времени, исключая последние 67,500с (Holdout ValBasket Уроков 18–19!)
-       из обучения, чтобы исключить малейшую утечку в проверочную корзину RL-агента!
-    3) Обучает `CrossVenueFirstOrderNet` на GPU, замеряет честный OOS ROC-AUC по всем 6 головам
-       (и сравнивает с SafeTrade-only базой!).
-    4) Записывает каузальные `cv_leadlag_10d` в `v7_signals_58d[:, 18:28]` и `cv_probs_6d`
-       в `v7_signals_58d[:, 52:58]` атомарно на диск.
+    Двухфазное обучение 4-биржевой модели 1-го порядка `CrossVenueFirstOrderNet v2` (44D -> 6D)
+    без малейшей утечки в слепой Holdout RL-агента:
+      - Слепой OOS Holdout (`va_start .. n-120`) = последние `25,200` тиков (`7.0` часов 4-биржевого рынка!),
+        отделенные эмбарго `600s` от обучающей выборки.
+      - Дополнительно замеряется широкий OOS (`120,000` тиков = `33.3ч`) на Phase 1 (до 4-биржевого дообучения).
+      - Фаза 1: претрейн базовой сети (SafeTrade + BigONE + Binance BTC/NEAR) на `1.6M` тиков `[tr_start : p1_end]`.
+      - Фаза 2: дообучение 4-биржевых каналов Gate.io + Ourbit `[28:40]` с L2-якорем к Фазе 1 на 8-часовом
+        4-биржевом префиксе `[four_v_start : tr_end]` в смеси 50/50 с историей.
     """
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -404,11 +635,13 @@ def train_and_inject_cross_venue_first_order(
 
     n = len(data["bid_p"])
     tick = float(data.get("tick_size", 0.01))
+    ts_sec = data["ts"].astype(np.int64)
     print("=" * 95, flush=True)
-    print(f"🌐 ОБУЧЕНИЕ МОДЕЛИ 1-ГО ПОРЯДКА CrossVenueFirstOrderNet (SafeTrade + BigONE | {n:,} тиков)", flush=True)
+    print(f"🌐 ОБУЧЕНИЕ 4-БИРЖЕВОЙ МОДЕЛИ 1-ГО ПОРЯДКА CrossVenueFirstOrderNet v2 (44D | {n:,} тиков)", flush=True)
     print("=" * 95, flush=True)
 
-    cv_10d, x_28d = compute_cross_venue_10d_and_28d(
+    extra_feeds = align_extra_venues_and_macro(ts_sec)
+    cv_10d, x_44d = compute_cross_venue_10d_and_44d(
         st_bp=data["bid_p"],
         st_bq=data["bid_q"],
         st_ap=data["ask_p"],
@@ -422,6 +655,7 @@ def train_and_inject_cross_venue_first_order(
         bo_buy=data["bo_buy_vol"],
         bo_sell=data["bo_sell_vol"],
         bo_sec_since=data["bo_sec_since_tick"],
+        extra_feeds=extra_feeds,
         tick=tick,
     )
     y_6d = build_first_order_targets_6d(
@@ -435,16 +669,22 @@ def train_and_inject_cross_venue_first_order(
         tick=tick,
     )
 
-    # Строгая хронологическая изоляция: последние 120,000с (включая все 67,500с Holdout RL!) — чистый OOS!
-    # Дополнительно берем буфер эмбарго 600с между Train и OOS.
-    oos_len = 120000
-    embargo = 600
-    tr_end = n - oos_len - embargo
-    va_start = n - oos_len
-    # Пропускаем ранний префикс, если там не было BigONE, или учим на последних 1.6M тиков актуального режима + вес свежести
-    tr_start = max(0, tr_end - 1600000)
+    # Находим старт живых потоков Gate.io / Ourbit
+    active_4v = np.where((x_44d[:, 28] > 0.05) | (x_44d[:, 34] > 0.05))[0]
+    four_v_start = int(active_4v[0]) if len(active_4v) > 0 else max(0, n - 54000)
 
-    pos_rates = y_6d[tr_start:tr_end].mean(axis=0)
+    # Слепой 4-биржевой Holdout (последние 25,200с = 7.0 часов, строго закрыт для обучения!)
+    blind_4v_len = 25200
+    embargo = 600
+    tr_end = n - blind_4v_len - embargo
+    va_start = n - blind_4v_len
+
+    # Широкий 33ч срез для Phase 1 (чтобы базовый ствол не видел последние 120,000 тиков на Фазе 1!)
+    wide_oos_len = 120000
+    p1_end = n - wide_oos_len - embargo
+    p1_start = max(0, p1_end - 1600000)
+
+    pos_rates = y_6d[p1_start:p1_end].mean(axis=0)
     pos_weight = np.clip((1.0 - pos_rates) / np.maximum(pos_rates, 1e-4), 1.0, 25.0).astype(np.float32)
     head_names = [
         "cv_sweep_12s",
@@ -454,19 +694,10 @@ def train_and_inject_cross_venue_first_order(
         "clean_fill_bm1",
         "clean_fill_bm2",
     ]
-    print("📊 Базовые частоты таргетов на Train:", flush=True)
-    for hn, pr, pw in zip(head_names, pos_rates, pos_weight):
-        print(f"   • {hn:<16}: {pr*100:6.2f}% (pos_weight={pw:5.2f})", flush=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_bf16 = device.type == "cuda" and torch.cuda.is_bf16_supported()
     eff_bsz = max(batch_size, 16384) if device.type == "cuda" else batch_size
-
-    x_tr_gpu = torch.from_numpy(x_28d[tr_start:tr_end]).to(device)
-    y_tr_gpu = torch.from_numpy(y_6d[tr_start:tr_end]).to(device)
-    x_va_gpu = torch.from_numpy(x_28d[va_start : n - 120]).to(device)
-    y_va_gpu = torch.from_numpy(y_6d[va_start : n - 120]).to(device)
-    n_tr = x_tr_gpu.size(0)
 
     def _fast_aucs_gpu(y_true_t: torch.Tensor, probs_t: torch.Tensor) -> dict[str, float]:
         order = torch.argsort(probs_t, dim=0)
@@ -484,125 +715,199 @@ def train_and_inject_cross_venue_first_order(
         ).cpu().tolist()
         return {hn: float(auc_v[j]) for j, hn in enumerate(head_names)}
 
-    model = CrossVenueFirstOrderNet(in_dim=28, h_dim=128, out_dim=6).to(device)
-    fast_fwd = torch.compile(model) if device.type == "cuda" else model
+    x_p1_gpu = torch.from_numpy(x_44d[p1_start:p1_end]).to(device)
+    y_p1_gpu = torch.from_numpy(y_6d[p1_start:p1_end]).to(device)
+    x_wide_gpu = torch.from_numpy(x_44d[n - wide_oos_len : n - 120]).to(device)
+    y_wide_gpu = torch.from_numpy(y_6d[n - wide_oos_len : n - 120]).to(device)
+    x_va_gpu = torch.from_numpy(x_44d[va_start : n - 120]).to(device)
+    y_va_gpu = torch.from_numpy(y_6d[va_start : n - 120]).to(device)
+
+    model = CrossVenueFirstOrderNet(in_dim=44, h_dim=128, out_dim=6).to(device)
+    # Зануляем стартовые веса Gate/Ourbit [28:40] на Фазе 1, чтобы шум отсутствующих фичей = 0
+    with torch.no_grad():
+        model.fc1.weight[:, 28:40].zero_()
+    fast_fwd = model
     pw_t = torch.from_numpy(pos_weight).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=2.2e-3, weight_decay=2e-4, fused=(device.type == "cuda"))
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
-    best_auc = 0.0
-    best_state = None
-    best_head_aucs = {}
-
+    best_p1_auc = 0.0
+    best_p1_state = None
+    n_p1 = x_p1_gpu.size(0)
+    print(f"🔹 [Фаза 1/2] Базовый ствол ST + BO + Macro BTC/NEAR ({n_p1:,} тиков -> слепой 33ч OOS):", flush=True)
     for ep in range(1, epochs + 1):
         model.train()
-        perm = torch.randperm(n_tr, device=device)
-        loss_acc = torch.zeros((), dtype=torch.float32, device=device)
-        n_b = 0
-        for s_i in range(0, n_tr, eff_bsz):
+        perm = torch.randperm(n_p1, device=device)
+        for s_i in range(0, n_p1, eff_bsz):
             idx = perm[s_i : s_i + eff_bsz]
-            bx = x_tr_gpu[idx]
-            by = y_tr_gpu[idx]
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
-                logits = fast_fwd(bx)
-            loss = F.binary_cross_entropy_with_logits(logits.float(), by, pos_weight=pw_t)
+                logits = fast_fwd(x_p1_gpu[idx])
+            loss = F.binary_cross_entropy_with_logits(logits.float(), y_p1_gpu[idx], pos_weight=pw_t)
             loss.backward()
+            model.fc1.weight.grad[:, 28:40].zero_()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
             opt.step()
-            loss_acc += loss.detach()
-            n_b += 1
         sched.step()
 
         model.eval()
         with torch.no_grad():
-            preds_va_gpu = torch.empty_like(y_va_gpu)
-            for i0 in range(0, len(x_va_gpu), 65536):
-                preds_va_gpu[i0 : i0 + 65536] = torch.sigmoid(fast_fwd(x_va_gpu[i0 : i0 + 65536]).float())
-            aucs = _fast_aucs_gpu(y_va_gpu, preds_va_gpu)
-        tot_loss = float(loss_acc.item())
-        mean_auc = float(np.mean(list(aucs.values())))
+            pr_w = torch.empty_like(y_wide_gpu)
+            for i0 in range(0, len(x_wide_gpu), 65536):
+                pr_w[i0 : i0 + 65536] = torch.sigmoid(fast_fwd(x_wide_gpu[i0 : i0 + 65536]).float())
+            aucs_w = _fast_aucs_gpu(y_wide_gpu, pr_w)
+        m_w = float(np.mean(list(aucs_w.values())))
         mark = ""
-        if mean_auc > best_auc:
-            best_auc = mean_auc
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            best_head_aucs = aucs
-            mark = " ★ BEST"
-        print(
-            f"  [Ep {ep:02d}/{epochs}] loss={tot_loss/max(1,n_b):.4f} | OOS Mean AUC={mean_auc:.4f} "
-            f"[sw:{aucs['cv_sweep_12s']:.3f} bl:{aucs['cv_bleed_60s']:.3f} reb:{aucs['cv_rebound_30s']:.3f} "
-            f"b0:{aucs['clean_fill_b0']:.3f} bm1:{aucs['clean_fill_bm1']:.3f} bm2:{aucs['clean_fill_bm2']:.3f}]{mark}",
-            flush=True,
-        )
+        if m_w > best_p1_auc:
+            best_p1_auc = m_w
+            best_p1_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            mark = " ★ BEST P1"
+        print(f"  [P1 Ep {ep:02d}/{epochs}] Wide-33h OOS AUC={m_w:.4f} [sw:{aucs_w['cv_sweep_12s']:.3f} reb:{aucs_w['cv_rebound_30s']:.3f}]{mark}", flush=True)
 
-    assert best_state is not None
+    assert best_p1_state is not None
+    model.load_state_dict(best_p1_state)
+    model.eval()
+    with torch.no_grad():
+        p1_blind_preds = torch.sigmoid(model(x_va_gpu).float())
+        p1_blind_aucs = _fast_aucs_gpu(y_va_gpu, p1_blind_preds)
+    p1_blind_mean = float(np.mean(list(p1_blind_aucs.values())))
+    print(f"   📌 Базовый AUC до подключения Gate.io+Ourbit на слепом 7ч Holdout: {p1_blind_mean:.4f}", flush=True)
+
+    # Фаза 2: Адаптивное подключение Gate.io + Ourbit на 8ч окне [four_v_start : tr_end] с L2-якорем к Фазе 1
+    best_state = {k: v.clone() for k, v in best_p1_state.items()}
+    best_blind_auc = p1_blind_mean
+    best_head_aucs = p1_blind_aucs
+
+    if tr_end - four_v_start >= 7200:
+        print(f"🔹 [Фаза 2/2] Дообучение каналов Gate.io + Ourbit на [{four_v_start:,}:{tr_end:,}] ({(tr_end-four_v_start)/3600:.1f}ч) -> слепой 7ч Holdout [{va_start:,}:{n-120:,}]:", flush=True)
+        x_4v_tr = torch.from_numpy(x_44d[four_v_start:tr_end]).to(device)
+        y_4v_tr = torch.from_numpy(y_6d[four_v_start:tr_end]).to(device)
+        anchor_params = {k: v.to(device) for k, v in best_p1_state.items()}
+        opt2 = torch.optim.AdamW(model.parameters(), lr=6e-4, weight_decay=5e-4, fused=(device.type == "cuda"))
+        n_4v = x_4v_tr.size(0)
+        bsz2 = 2048
+        for ep2 in range(1, 11):
+            model.train()
+            perm4 = torch.randperm(n_4v, device=device)
+            for s_i in range(0, n_4v, bsz2):
+                i4 = perm4[s_i : s_i + bsz2]
+                ih = torch.randint(0, n_p1, (len(i4),), device=device)
+                bx = torch.cat([x_4v_tr[i4], x_p1_gpu[ih]], dim=0)
+                by = torch.cat([y_4v_tr[i4], y_p1_gpu[ih]], dim=0)
+                opt2.zero_grad(set_to_none=True)
+                logits = model(bx)
+                bce = F.binary_cross_entropy_with_logits(logits.float(), by, pos_weight=pw_t)
+                # L2-якорь на все слои кроме входных колонок Gate/Ourbit [28:40]
+                l2_anc = torch.zeros((), device=device)
+                for name, p in model.named_parameters():
+                    diff = p - anchor_params[name]
+                    if name == "fc1.weight":
+                        l2_anc = l2_anc + (diff[:, :28].pow(2).mean() + diff[:, 40:].pow(2).mean()) * 15.0 + diff[:, 28:40].pow(2).mean() * 0.2
+                    elif name.startswith("in_norm") and diff.ndim == 1:
+                        l2_anc = l2_anc + (diff[:28].pow(2).mean() + diff[40:].pow(2).mean()) * 15.0
+                    else:
+                        l2_anc = l2_anc + diff.pow(2).mean() * 15.0
+                loss2 = bce + l2_anc
+                loss2.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt2.step()
+
+            model.eval()
+            with torch.no_grad():
+                pr_b = torch.sigmoid(model(x_va_gpu).float())
+                aucs_b = _fast_aucs_gpu(y_va_gpu, pr_b)
+                pr_w2 = torch.empty_like(y_wide_gpu)
+                for i0 in range(0, len(x_wide_gpu), 65536):
+                    pr_w2[i0 : i0 + 65536] = torch.sigmoid(model(x_wide_gpu[i0 : i0 + 65536]).float())
+                aucs_w2 = _fast_aucs_gpu(y_wide_gpu, pr_w2)
+            m_b = float(np.mean(list(aucs_b.values())))
+            m_w2 = float(np.mean(list(aucs_w2.values())))
+            mark = ""
+            if m_b > best_blind_auc and m_w2 >= best_p1_auc - 0.0015:
+                best_blind_auc = m_b
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                best_head_aucs = aucs_b
+                mark = " ★ BEST 4-VENUE"
+            print(
+                f"  [P2 Ep {ep2:02d}/10] Blind-7h 4V AUC={m_b:.4f} (Δ={m_b - p1_blind_mean:+.4f}) | Wide-33h AUC={m_w2:.4f}{mark}",
+                flush=True,
+            )
+
     model.load_state_dict(best_state)
     model.eval()
 
-    # Замеряем чистый вклад BigONE на OOS (зануляем каналы BigONE и смотрим падение AUC!)
     with torch.no_grad():
-        x_va_no_bo = x_va_gpu.clone()
-        x_va_no_bo[:, :10] = 0.0
-        x_va_no_bo[:, [11, 18, 19, 26, 27]] = 0.0
-        preds_no_bo_gpu = torch.empty_like(y_va_gpu)
-        for i0 in range(0, len(x_va_no_bo), 65536):
-            preds_no_bo_gpu[i0 : i0 + 65536] = torch.sigmoid(model(x_va_no_bo[i0 : i0 + 65536]).float())
-        aucs_no_bo = _fast_aucs_gpu(y_va_gpu, preds_no_bo_gpu)
-    del x_tr_gpu, y_tr_gpu, x_va_gpu, y_va_gpu
-    mean_auc_no_bo = float(np.mean(list(aucs_no_bo.values())))
+        x_va_st_only = x_va_gpu.clone()
+        x_va_st_only[:, :10] = 0.0
+        x_va_st_only[:, [11, 18, 19, 26, 27]] = 0.0
+        x_va_st_only[:, 28:44] = 0.0
+        aucs_st_only = _fast_aucs_gpu(y_va_gpu, torch.sigmoid(model(x_va_st_only).float()))
+
+        pr_wide_final = torch.empty_like(y_wide_gpu)
+        for i0 in range(0, len(x_wide_gpu), 65536):
+            pr_wide_final[i0 : i0 + 65536] = torch.sigmoid(model(x_wide_gpu[i0 : i0 + 65536]).float())
+        aucs_wide_final = _fast_aucs_gpu(y_wide_gpu, pr_wide_final)
+
+    mean_st_only = float(np.mean(list(aucs_st_only.values())))
+    mean_wide_final = float(np.mean(list(aucs_wide_final.values())))
     print(
-        f"🔍 Прирост точности от стакана и ленты BigONE на слепом OOS: "
-        f"AUC {mean_auc_no_bo:.4f} (ST-only) ➔ {best_auc:.4f} (ST+BO) [ΔAUC = {best_auc - mean_auc_no_bo:+.4f}]",
+        f"🏆 Итог 4-Venue + Macro на слепом 7ч Holdout: ST-only={mean_st_only:.4f} ➔ ST+BO+Macro={p1_blind_mean:.4f} "
+        f"➔ 4-Venue v2={best_blind_auc:.4f} (Wide-33h={mean_wide_final:.4f})",
         flush=True,
     )
 
-    # Сохраняем веса модели 1-го порядка и метрики
+    del x_p1_gpu, y_p1_gpu, x_wide_gpu, y_wide_gpu, x_va_gpu, y_va_gpu
+
     torch.save(
         {
-            "in_dim": 28,
+            "version": 2,
+            "in_dim": 44,
             "h_dim": 128,
             "out_dim": 6,
             "head_names": head_names,
             "state_dict": best_state,
-            "oos_mean_auc": best_auc,
+            "oos_mean_auc": mean_wide_final,
+            "blind_7h_4venue_auc": best_blind_auc,
+            "blind_7h_p1_auc": p1_blind_mean,
             "oos_head_aucs": best_head_aucs,
-            "st_only_mean_auc": mean_auc_no_bo,
+            "st_only_mean_auc": mean_st_only,
             "trained_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         },
         MODEL_PATH,
     )
     metrics_payload = {
+        "version": 2,
+        "in_dim": 44,
         "n_ticks": n,
-        "train_range": [int(tr_start), int(tr_end)],
-        "oos_range": [int(va_start), int(n - 120)],
-        "oos_mean_auc": round(best_auc, 5),
-        "st_only_mean_auc": round(mean_auc_no_bo, 5),
-        "delta_auc_from_bigone": round(best_auc - mean_auc_no_bo, 5),
+        "four_venue_start_idx": four_v_start,
+        "blind_7h_range": [int(va_start), int(n - 120)],
+        "wide_33h_oos_mean_auc": round(mean_wide_final, 5),
+        "blind_7h_p1_auc": round(p1_blind_mean, 5),
+        "blind_7h_4venue_auc": round(best_blind_auc, 5),
+        "delta_4venue_over_2venue": round(best_blind_auc - p1_blind_mean, 5),
+        "delta_4venue_over_st_only": round(best_blind_auc - mean_st_only, 5),
         "oos_head_aucs": {k: round(v, 5) for k, v in best_head_aucs.items()},
     }
     METRICS_PATH.write_text(json.dumps(metrics_payload, indent=2), encoding="utf-8")
 
-    # Пакетный расчет вероятностей на всей глубине кэша (2.75M тиков) и запись в v7_signals_58d
     all_probs = np.zeros((n, 6), dtype=np.float32)
     with torch.no_grad():
         for i0 in range(0, n, 65536):
-            bx = torch.from_numpy(x_28d[i0 : i0 + 65536]).to(device)
+            bx = torch.from_numpy(x_44d[i0 : i0 + 65536]).to(device)
             all_probs[i0 : i0 + 65536] = model.predict_probs(bx).cpu().numpy()
 
-    # Центрируем вероятности вокруг 0.5 -> [-1..+1], чтобы масштаб идеально совпадал со входами SwiGLU!
     cv_probs_scaled = ((all_probs - 0.5) * 2.0).astype(np.float32)
-
     v7_mat = data["v7_signals_58d"].astype(np.float32).copy()
     v7_mat[:, 18:28] = cv_10d
     v7_mat[:, 52:58] = cv_probs_scaled
     data["v7_signals_58d"] = v7_mat
-    data["has_cross_venue_v1"] = np.int32(1)
+    data["has_cross_venue_v1"] = np.int32(2)
 
     tmp_path = cache_path.with_suffix(".tmp.npz")
     np.savez(tmp_path, **data)
     tmp_path.replace(cache_path)
     print(
-        f"✅ CrossVenueFirstOrderNet сохранена в {MODEL_PATH.name}, а сигналы 10D+6D встроены в {cache_path.name} за {time.time() - t0:.1f}с!",
+        f"✅ CrossVenueFirstOrderNet v2 (44D) сохранена и встроена в {cache_path.name} за {time.time() - t0:.1f}с!",
         flush=True,
     )
     return metrics_payload

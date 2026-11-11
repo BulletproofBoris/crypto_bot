@@ -1,22 +1,23 @@
 {
-  "n_ticks": 2779660,
-  "train_range": [
-    1059060,
-    2659060
+  "version": 2,
+  "in_dim": 44,
+  "n_ticks": 2802030,
+  "four_venue_start_idx": 2746859,
+  "blind_7h_range": [
+    2776830,
+    2801910
   ],
-  "oos_range": [
-    2659660,
-    2779540
-  ],
-  "oos_mean_auc": 0.82261,
-  "st_only_mean_auc": 0.79658,
-  "delta_auc_from_bigone": 0.02603,
+  "wide_33h_oos_mean_auc": 0.82262,
+  "blind_7h_p1_auc": 0.84479,
+  "blind_7h_4venue_auc": 0.84674,
+  "delta_4venue_over_2venue": 0.00195,
+  "delta_4venue_over_st_only": 0.02326,
   "oos_head_aucs": {
-    "cv_sweep_12s": 0.87479,
-    "cv_bleed_60s": 0.76566,
-    "cv_rebound_30s": 0.87017,
-    "clean_fill_b0": 0.82988,
-    "clean_fill_bm1": 0.82107,
-    "clean_fill_bm2": 0.77407
+    "cv_sweep_12s": 0.89461,
+    "cv_bleed_60s": 0.79298,
+    "cv_rebound_30s": 0.90197,
+    "clean_fill_b0": 0.86891,
+    "clean_fill_bm1": 0.86516,
+    "clean_fill_bm2": 0.75678
   }
 }

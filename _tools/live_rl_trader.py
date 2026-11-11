@@ -385,7 +385,8 @@ class LiveTriadRLTrader:
                     out_dim=int(cv_ck.get("out_dim", 6)),
                 ).eval()
                 self.cv_first_order_net.load_state_dict(cv_ck["state_dict"], strict=True)
-                print(f"🌐 Подключена кросс-биржевая модель 1-го порядка {cv_fo_path.name} (AUC={cv_ck.get('oos_mean_auc', 0.0):.4f})!")
+                cv_auc = float(cv_ck.get("blind_7h_4venue_auc", cv_ck.get("oos_mean_auc", 0.0)))
+                print(f"🌐 Подключена кросс-биржевая модель 1-го порядка {cv_fo_path.name} (in_dim={cv_ck.get('in_dim', 28)}, AUC={cv_auc:.4f})!")
             except Exception as e_cv:
                 print(f"⚠️ Не удалось загрузить {cv_fo_path.name}: {e_cv}")
         if self.rel_ckpt_path.exists():
@@ -403,10 +404,14 @@ class LiveTriadRLTrader:
                 self.l7_w_res1 = rel_ck["w_res1"].float() if "w_res1" in rel_ck else None
                 self.l7_b_res1 = rel_ck["b_res1"].float() if "b_res1" in rel_ck else None
                 self.l7_w_res2 = rel_ck["w_res2"].float() if "w_res2" in rel_ck else None
+                self.l7_w_rec = rel_ck["w_rec"].float() if "w_rec" in rel_ck and rel_ck["w_rec"] is not None else None
+                self.l7_b_rec = rel_ck["b_rec"].float() if "b_rec" in rel_ck and rel_ck["b_rec"] is not None else None
+                self.l7_mem_h = torch.zeros((1, 16), dtype=torch.float32)
                 self.l7_w2 = rel_ck["w2"].float()
                 self.l7_b2 = rel_ck["b2"].float()
                 self.l7_allow_scratch = bool(rel_ck.get("allow_scratch_stop_asks", False))
                 self.l7_use_cross_venue = bool(rel_ck.get("use_cross_venue_v1", False))
+                self.l7_decoupled_backbone = bool(rel_ck.get("decoupled_market_backbone", int(self.l7_w1.shape[0]) >= 420))
                 in_d = int(self.l7_w1.shape[0])
                 h_d = int(self.l7_w1.shape[1])
                 arch_s = (
@@ -657,10 +662,17 @@ class LiveTriadRLTrader:
                 self.l7_w_res1 = rel_ck["w_res1"].float() if "w_res1" in rel_ck else None
                 self.l7_b_res1 = rel_ck["b_res1"].float() if "b_res1" in rel_ck else None
                 self.l7_w_res2 = rel_ck["w_res2"].float() if "w_res2" in rel_ck else None
+                self.l7_w_rec = rel_ck["w_rec"].float() if "w_rec" in rel_ck and rel_ck["w_rec"] is not None else None
+                self.l7_b_rec = rel_ck["b_rec"].float() if "b_rec" in rel_ck and rel_ck["b_rec"] is not None else None
+                if not hasattr(self, "l7_mem_h") or self.l7_mem_h is None:
+                    self.l7_mem_h = torch.zeros((1, 16), dtype=torch.float32)
+                else:
+                    self.l7_mem_h.zero_()
                 self.l7_w2 = rel_ck["w2"].float()
                 self.l7_b2 = rel_ck["b2"].float()
                 self.l7_allow_scratch = bool(rel_ck.get("allow_scratch_stop_asks", True))
                 self.l7_use_cross_venue = bool(rel_ck.get("use_cross_venue_v1", False))
+                self.l7_decoupled_backbone = bool(rel_ck.get("decoupled_market_backbone", int(self.l7_w1.shape[0]) >= 420))
                 if self.l7_use_cross_venue and getattr(self, "cv_first_order_net", None) is None:
                     cv_fo_path = BASE_DIR / "models" / self.coin / "cross_venue_first_order" / "cross_venue_first_order_v1.pt"
                     if cv_fo_path.exists():
@@ -2149,6 +2161,17 @@ class LiveTriadRLTrader:
                     unr_sim = (((b1 - self.avg_entry) / self.tick_size) * eff_pos_scale) if (has_pos_sim > 0.5 and self.avg_entry > 0.0) else 0.0
                     hold_rat_sim = (min(self.hold_sec / 300.0, 2.0) * eff_pos_scale) if has_pos_sim > 0.5 else 0.0
 
+                    acct_8d_list = [
+                        float(has_pos_sim),
+                        pos_rat,
+                        free_c_rat,
+                        float(np.clip(unr_sim / 5.0, -2.0, 2.0)),
+                        float(np.clip(hold_rat_sim, 0.0, 2.0)),
+                        has_bid_sim,
+                        has_ask_sim,
+                        float(n_b_sl - n_a_sl),
+                    ]
+                    dec_bb = bool(getattr(self, "l7_decoupled_backbone", False))
                     flow_16 = np.array([[
                         float(np.clip(spread_ticks, 1.0, 10.0) / 5.0),
                         float(imb_l1),
@@ -2158,14 +2181,7 @@ class LiveTriadRLTrader:
                         float(np.clip(dd_300, 0.0, 20.0) / 10.0),
                         float(np.log1p(max(0.0, b10_q)) / 12.0),
                         float(np.log1p(max(0.0, a10_q)) / 12.0),
-                        float(has_pos_sim),
-                        pos_rat,
-                        free_c_rat,
-                        float(np.clip(unr_sim / 5.0, -2.0, 2.0)),
-                        float(np.clip(hold_rat_sim, 0.0, 2.0)),
-                        has_bid_sim,
-                        has_ask_sim,
-                        float(n_b_sl - n_a_sl),
+                        *( [0.0] * 8 if dec_bb else acct_8d_list ),
                     ]], dtype=np.float32)
 
                     l1_b_usd = max(100.0, b1 * b1_q)
@@ -2225,8 +2241,19 @@ class LiveTriadRLTrader:
                     bo_ap_5 = np.array([float(r.get(f"BO_ask_{i}_price", 0.0) or 0.0) for i in range(1, 6)], dtype=np.float32)
                     bo_aq_5 = np.array([float(r.get(f"BO_ask_{i}_qty", 0.0) or 0.0) for i in range(1, 6)], dtype=np.float32)
                     bo_sec_age = float(r.get("BO_sec_since_tick", 0.0) or 0.0)
-                    from _tools.cross_venue_first_order_net import compute_cross_venue_single_tick
-                    cv_10_np, cv_28_np = compute_cross_venue_single_tick(
+                    from _tools.cross_venue_first_order_net import compute_cross_venue_single_tick, peek_local_venue_snap
+                    cv_net_obj = getattr(self, "cv_first_order_net", None)
+                    cv_in_dim = int(cv_net_obj.in_norm.normalized_shape[0]) if cv_net_obj is not None else 28
+                    gt_sn = ob_sn = mac_sn = None
+                    if cv_in_dim > 28:
+                        rt_root = BASE_DIR / "data" / "realtime"
+                        gt_sn = peek_local_venue_snap(rt_root / "prlusdt_gate", "depth_gate.csv", "trades_gate.csv", self.cv_hist_state)
+                        ob_sn = peek_local_venue_snap(rt_root / "prlusdt_ourbit", "depth_ourbit.csv", "trades_ourbit.csv", self.cv_hist_state)
+                        mac_sn = {
+                            "btc_mid": float(r.get("macro_btc_mid", 0.0) or 0.0),
+                            "near_mid": float(r.get("macro_near_mid", 0.0) or 0.0),
+                        }
+                    cv_10_np, cv_vec_np = compute_cross_venue_single_tick(
                         st_bp=bp_np,
                         st_bq=bq_np,
                         st_ap=ap_np,
@@ -2242,9 +2269,13 @@ class LiveTriadRLTrader:
                         bo_sec_since=bo_sec_age,
                         hist_state=self.cv_hist_state,
                         tick=self.tick_size,
+                        gt_snap=gt_sn,
+                        ob_snap=ob_sn,
+                        macro_snap=mac_sn,
+                        out_dim_x=cv_in_dim,
                     )
-                    if getattr(self, "l7_use_cross_venue", False) and getattr(self, "cv_first_order_net", None) is not None:
-                        cv_probs_6 = self.cv_first_order_net.predict_probs(torch.from_numpy(cv_28_np).unsqueeze(0)).squeeze(0).numpy()
+                    if getattr(self, "l7_use_cross_venue", False) and cv_net_obj is not None:
+                        cv_probs_6 = cv_net_obj.predict_probs(torch.from_numpy(cv_vec_np).unsqueeze(0)).squeeze(0).numpy()
                         slot_18_28 = cv_10_np.tolist()
                         slot_52_58 = ((cv_probs_6 - 0.5) * 2.0).astype(np.float32).tolist()
                     else:
@@ -2310,6 +2341,80 @@ class LiveTriadRLTrader:
                         ]
                         geom_32_t = torch.tensor([b_dist_12 + a_dist_12 + lvel_8d], dtype=torch.float32)
                         z_aug = torch.cat([z_aug, geom_32_t], dim=-1)
+                    if int(self.l7_w1.shape[0]) >= 420:
+                        now_q_ts = time.time()
+                        roll_s30 = max(10.0, sum(x[3] for x in list(self.flow_hist_10s)) * 3.0)
+                        for si, sl_b in enumerate(self.bid_slots):
+                            oid_b = sl_b.get("id")
+                            sq_b = float(sl_b.get("qty", 0.0))
+                            spx_b = float(sl_b.get("px", 0.0))
+                            if oid_b is not None and sq_b > 1e-6:
+                                lvl_i = int(np.clip(round((b1 - spx_b) / self.tick_size), 0, 9))
+                                vis_q = max(0.0, float(bq_np[lvl_i]) - sq_b) if spx_b <= b1 + 0.1 * self.tick_size else 0.0
+                                if sl_b.get("qa_oid") != oid_b:
+                                    sl_b["qa_oid"] = oid_b
+                                    sl_b["qa0"] = vis_q
+                                    sl_b["qa"] = vis_q
+                                else:
+                                    cur_qa = float(sl_b.get("qa", vis_q))
+                                    if b1 <= spx_b + 1e-6 and vs_cur > 0.0:
+                                        cur_qa = max(0.0, cur_qa - max(0.0, vs_cur))
+                                    if spx_b <= b1 + 0.1 * self.tick_size:
+                                        cur_qa = min(cur_qa, vis_q)
+                                    sl_b["qa"] = cur_qa
+                        for si, sl_a in enumerate(self.ask_slots):
+                            oid_a = sl_a.get("id")
+                            sq_a = float(sl_a.get("qty", 0.0))
+                            spx_a = float(sl_a.get("px", 0.0))
+                            if oid_a is not None and sq_a > 1e-6:
+                                lvl_i = int(np.clip(round((spx_a - a1) / self.tick_size), 0, 9))
+                                vis_q = max(0.0, float(aq_np[lvl_i]) - sq_a) if spx_a >= a1 - 0.1 * self.tick_size else 0.0
+                                if sl_a.get("qa_oid") != oid_a:
+                                    sl_a["qa_oid"] = oid_a
+                                    sl_a["qa0"] = vis_q
+                                    sl_a["qa"] = vis_q
+                                else:
+                                    cur_qa = float(sl_a.get("qa", vis_q))
+                                    if a1 >= spx_a - 1e-6 and vb_cur > 0.0:
+                                        cur_qa = max(0.0, cur_qa - max(0.0, vb_cur))
+                                    if spx_a >= a1 - 0.1 * self.tick_size:
+                                        cur_qa = min(cur_qa, vis_q)
+                                    sl_a["qa"] = cur_qa
+
+                        act_bs = [s for s in self.bid_slots if s.get("id") is not None and float(s.get("qty", 0.0)) > 1e-6]
+                        if act_bs:
+                            best_bs = min(act_bs, key=lambda x: (b1 - float(x.get("px", b1)), int(x.get("slot", 0))))
+                            bb_qa = float(best_bs.get("qa", 0.0))
+                            bb_qa0 = float(best_bs.get("qa0", bb_qa))
+                            best_b_rat = float(np.clip(bb_qa / (bb_qa0 + 10.0), 0.0, 1.5))
+                            best_b_tape = float(np.clip(math.log1p(bb_qa / roll_s30) / 3.0, 0.0, 2.0))
+                            best_b_age = float(np.clip((now_q_ts - float(best_bs.get("act_ts", now_q_ts))) / 120.0, 0.0, 2.0))
+                        else:
+                            best_b_rat, best_b_tape, best_b_age = 1.0, 0.0, 0.0
+
+                        deep_bs = [s for s in self.bid_slots[4:] if s.get("id") is not None and float(s.get("qty", 0.0)) > 1e-6]
+                        if deep_bs:
+                            deep_b_rat = float(np.mean([np.clip(float(s.get("qa", 0.0)) / (float(s.get("qa0", 0.0)) + 10.0), 0.0, 1.5) for s in deep_bs]))
+                        else:
+                            deep_b_rat = 1.0
+
+                        act_as = [s for s in self.ask_slots if s.get("id") is not None and float(s.get("qty", 0.0)) > 1e-6]
+                        if act_as:
+                            best_as = min(act_as, key=lambda x: (float(x.get("px", a1)) - a1, int(x.get("slot", 0))))
+                            ba_qa = float(best_as.get("qa", 0.0))
+                            ba_qa0 = float(best_as.get("qa0", ba_qa))
+                            best_a_rat = float(np.clip(ba_qa / (ba_qa0 + 10.0), 0.0, 1.5))
+                            best_a_tape = float(np.clip(math.log1p(ba_qa / roll_b30) / 3.0, 0.0, 2.0))
+                            best_a_age = float(np.clip((now_q_ts - float(best_as.get("act_ts", now_q_ts))) / 120.0, 0.0, 2.0))
+                        else:
+                            best_a_rat, best_a_tape, best_a_age = 1.0, 0.0, 0.0
+
+                        q_imb_adv = (1.0 - min(1.0, max(0.0, best_a_rat))) * has_ask_sim - (1.0 - min(1.0, max(0.0, best_b_rat))) * has_bid_sim
+                        queue_8d_list = [best_b_rat, best_b_tape, best_b_age, deep_b_rat, best_a_rat, best_a_tape, best_a_age, q_imb_adv]
+                        if not hasattr(self, "l7_mem_h") or self.l7_mem_h is None:
+                            self.l7_mem_h = torch.zeros((1, 16), dtype=torch.float32)
+                        ext_32_t = torch.cat([torch.tensor([acct_8d_list + queue_8d_list], dtype=torch.float32), self.l7_mem_h.float()], dim=-1)
+                        z_aug = torch.cat([z_aug, ext_32_t], dim=-1)
                     pre_all = z_aug @ self.l7_w1 + self.l7_b1.squeeze(0)
                     if int(self.l7_w1.shape[1]) == 384:
                         h_base = torch.relu(pre_all[..., :256])
@@ -2324,6 +2429,11 @@ class LiveTriadRLTrader:
                         res_pre = h1_t @ self.l7_w_res1 + self.l7_b_res1.squeeze(0)
                         res_mid = torch.relu(res_pre[..., :64]) * (2.0 * torch.sigmoid(res_pre[..., 64:128]))
                         h1_t = h1_t + (res_mid @ self.l7_w_res2)
+                    if getattr(self, "l7_w_rec", None) is not None and getattr(self, "l7_b_rec", None) is not None:
+                        rec_raw = h1_t @ self.l7_w_rec + self.l7_b_rec.squeeze(0)
+                        rec_u = torch.tanh(rec_raw[..., :16])
+                        rec_gate = torch.sigmoid(rec_raw[..., 16:32] + 1.5)
+                        self.l7_mem_h = (rec_gate * self.l7_mem_h + (1.0 - rec_gate) * rec_u).detach()
                     raw_26 = torch.sigmoid(h1_t @ self.l7_w2 + self.l7_b2.squeeze(0)).squeeze(0).numpy()
                     self.last_l7_out = raw_26
                     b_w_12 = raw_26[:12] if raw_26[24] <= 0.75 else np.zeros(12, dtype=np.float32)
