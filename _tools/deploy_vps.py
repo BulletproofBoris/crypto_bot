@@ -36,12 +36,16 @@ CODE_FILES = (
     "_tools/swarm_router.py",
     "_tools/learned_regime_router.py",
     "_tools/multitask_lob_net.py",
+    "_tools/cross_venue_first_order_net.py",
     "_tools/fast_neural_engine.py",
     "_tools/collect_gate_realtime.py",
     "_tools/collect_ourbit_realtime.py",
     "_tools/watchdog_collectors.py",
     "_tools/rotate_and_upload.py",
     "_tools/collect_onchain_and_rules.py",
+)
+AUX_MODEL_FILES = (
+    "models/prl/cross_venue_first_order/cross_venue_first_order_v1.pt",
 )
 CHAMP_FILE = "models/prl/release_champion_v1.pt"
 
@@ -86,6 +90,14 @@ def main():
         if sig and prev_state.get(rel_f) != sig:
             changed_code.append(rel_f)
 
+    changed_aux = []
+    for rel_m in AUX_MODEL_FILES:
+        msig = _file_sig(BASE_DIR / rel_m)
+        if msig:
+            cur_state[rel_m] = msig
+            if prev_state.get(rel_m) != msig:
+                changed_aux.append(rel_m)
+
     champ_sig = _file_sig(BASE_DIR / CHAMP_FILE)
     cur_state[CHAMP_FILE] = champ_sig
     changed_champ = bool(champ_sig and prev_state.get(CHAMP_FILE) != champ_sig)
@@ -93,16 +105,19 @@ def main():
     print(f"🔌 Подключение к боевому VPS ({VPS_HOST or 'configured host'})...")
     ssh = create_ssh_client(timeout=15.0)
     try:
-        if changed_code or changed_champ:
+        if changed_code or changed_aux or changed_champ:
+            if changed_aux:
+                _, out_mk, _ = ssh.exec_command("mkdir -p /opt/crypto_bot/models/prl/cross_venue_first_order")
+                out_mk.channel.recv_exit_status()
             sftp = ssh.open_sftp()
             try:
-                for rel_f in changed_code:
+                for rel_f in changed_code + changed_aux:
                     loc = BASE_DIR / rel_f
                     tmp_rem = f"/opt/crypto_bot/{rel_f}.tmp"
                     fin_rem = f"/opt/crypto_bot/{rel_f}"
                     sftp.put(str(loc), tmp_rem)
                     _remote_atomic_mv(ssh, tmp_rem, fin_rem)
-                    print(f"✅ [VPS SYNC CODE] {rel_f} -> {fin_rem}")
+                    print(f"✅ [VPS SYNC] {rel_f} -> {fin_rem}")
 
                 if changed_champ:
                     loc_c = BASE_DIR / CHAMP_FILE
@@ -135,7 +150,7 @@ def main():
     # Автоматическая фиксация и отправка (git commit & push) кода и актуального Чемпиона в Git
     try:
         subprocess.run(
-            ["git", "add", "STATUS_CONTEXT.md", "models/prl/release_champion_v1.pt", "_tools"],
+            ["git", "add", "STATUS_CONTEXT.md", "models/prl/release_champion_v1.pt", "models/prl/cross_venue_first_order", "_tools"],
             cwd=str(BASE_DIR),
             check=False,
             capture_output=True,

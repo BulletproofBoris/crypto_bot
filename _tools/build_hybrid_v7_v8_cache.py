@@ -271,8 +271,9 @@ def incremental_append_600h_cache(coin: str = "prl") -> Path:
 
     old_npz = np.load(CACHE_600H_PATH, allow_pickle=True)
     n_old = len(old_npz["bid_p"])
-    if n_new <= n_old and "v7_signals_58d" in old_npz.files and len(old_npz["v7_signals_58d"]) == n_new:
-        print(f"✅ Кэш {CACHE_600H_PATH.name} уже актуален ({n_new:,} тиков).")
+    has_bo = "bo_bid_p" in old_npz.files and len(old_npz["bo_bid_p"]) == n_old
+    if n_new <= n_old and "v7_signals_58d" in old_npz.files and len(old_npz["v7_signals_58d"]) == n_new and has_bo:
+        print(f"✅ Кэш {CACHE_600H_PATH.name} уже актуален ({n_new:,} тиков, включая BigONE L2).")
         return CACHE_600H_PATH
 
     overlap = 600
@@ -284,13 +285,18 @@ def incremental_append_600h_cache(coin: str = "prl") -> Path:
     b_q_cols = [f"ST_bid_{i}_qty" for i in range(1, 11)]
     a_p_cols = [f"ST_ask_{i}_price" for i in range(1, 11)]
     a_q_cols = [f"ST_ask_{i}_qty" for i in range(1, 11)]
+    bo_bp_cols = [f"BO_bid_{i}_price" for i in range(1, 6)]
+    bo_bq_cols = [f"BO_bid_{i}_qty" for i in range(1, 6)]
+    bo_ap_cols = [f"BO_ask_{i}_price" for i in range(1, 6)]
+    bo_aq_cols = [f"BO_ask_{i}_qty" for i in range(1, 6)]
+    bo_extra_cols = ["BO_buy_vol", "BO_sell_vol", "BO_sec_since_tick"]
     meta_cols = [
         "timestamp", "ST_spread", "ST_vol_60s_ticks", "ST_ofi_norm_300s",
         "ST_vol_15s_ticks", "ST_ofi_15s", "ST_ofi_60s", "ST_depth_ratio_5",
         "BO_ofi_15s", "BO_ret_15s", "LL_zscore_30s", "BO_sec_since_tick",
         "ST_vol_300s_ticks", "ST_trade_vol", "ST_buy_vol", "ST_sell_vol", "ST_vwap_1s",
         "ST_cvd_1m", "ST_cvd_5m",
-    ] + b_p_cols + b_q_cols + a_p_cols + a_q_cols
+    ] + b_p_cols + b_q_cols + a_p_cols + a_q_cols + bo_bp_cols + bo_bq_cols + bo_ap_cols + bo_aq_cols + bo_extra_cols
     schema_cols = set(pf.schema_arrow.names)
     avail_cols = [c for c in list(dict.fromkeys(meta_cols)) if c in schema_cols]
 
@@ -379,6 +385,35 @@ def incremental_append_600h_cache(coin: str = "prl") -> Path:
     def _cat(key_name, new_tail_arr):
         return np.concatenate([old_npz[key_name][:s_idx], new_tail_arr], axis=0)
 
+    bo_bp_tail = np.column_stack([np.nan_to_num(df_tail[c].values, nan=0.0) if c in df_tail.columns else np.zeros(n_tail) for c in bo_bp_cols]).astype(np.float32)
+    bo_bq_tail = np.column_stack([np.nan_to_num(df_tail[c].values, nan=0.0) if c in df_tail.columns else np.zeros(n_tail) for c in bo_bq_cols]).astype(np.float32)
+    bo_ap_tail = np.column_stack([np.nan_to_num(df_tail[c].values, nan=0.0) if c in df_tail.columns else np.zeros(n_tail) for c in bo_ap_cols]).astype(np.float32)
+    bo_aq_tail = np.column_stack([np.nan_to_num(df_tail[c].values, nan=0.0) if c in df_tail.columns else np.zeros(n_tail) for c in bo_aq_cols]).astype(np.float32)
+    bo_bv_tail = (np.nan_to_num(df_tail["BO_buy_vol"].values, nan=0.0) if "BO_buy_vol" in df_tail.columns else np.zeros(n_tail)).astype(np.float32)
+    bo_sv_tail = (np.nan_to_num(df_tail["BO_sell_vol"].values, nan=0.0) if "BO_sell_vol" in df_tail.columns else np.zeros(n_tail)).astype(np.float32)
+    bo_sec_tail = (np.nan_to_num(df_tail["BO_sec_since_tick"].values, nan=999.0) if "BO_sec_since_tick" in df_tail.columns else np.full(n_tail, 999.0)).astype(np.float32)
+
+    if has_bo:
+        bo_bp_full = _cat("bo_bid_p", bo_bp_tail)
+        bo_bq_full = _cat("bo_bid_q", bo_bq_tail)
+        bo_ap_full = _cat("bo_ask_p", bo_ap_tail)
+        bo_aq_full = _cat("bo_ask_q", bo_aq_tail)
+        bo_bv_full = _cat("bo_buy_vol", bo_bv_tail)
+        bo_sv_full = _cat("bo_sell_vol", bo_sv_tail)
+        bo_sec_full = _cat("bo_sec_since_tick", bo_sec_tail)
+    else:
+        print("   🌐 Разовая догрузка исторических колонок BigONE L1..L5 + Trades для всего 600h+ массива...", flush=True)
+        bo_need = [c for c in (bo_bp_cols + bo_bq_cols + bo_ap_cols + bo_aq_cols + bo_extra_cols) if c in schema_cols]
+        tbl_bo = pq.read_table(labeled_path, columns=bo_need)
+        bo_bp_full = np.column_stack([np.nan_to_num(tbl_bo.column(c).to_numpy(zero_copy_only=False), nan=0.0) for c in bo_bp_cols]).astype(np.float32)
+        bo_bq_full = np.column_stack([np.nan_to_num(tbl_bo.column(c).to_numpy(zero_copy_only=False), nan=0.0) for c in bo_bq_cols]).astype(np.float32)
+        bo_ap_full = np.column_stack([np.nan_to_num(tbl_bo.column(c).to_numpy(zero_copy_only=False), nan=0.0) for c in bo_ap_cols]).astype(np.float32)
+        bo_aq_full = np.column_stack([np.nan_to_num(tbl_bo.column(c).to_numpy(zero_copy_only=False), nan=0.0) for c in bo_aq_cols]).astype(np.float32)
+        bo_bv_full = np.nan_to_num(tbl_bo.column("BO_buy_vol").to_numpy(zero_copy_only=False), nan=0.0).astype(np.float32)
+        bo_sv_full = np.nan_to_num(tbl_bo.column("BO_sell_vol").to_numpy(zero_copy_only=False), nan=0.0).astype(np.float32)
+        bo_sec_full = np.nan_to_num(tbl_bo.column("BO_sec_since_tick").to_numpy(zero_copy_only=False), nan=999.0).astype(np.float32)
+        del tbl_bo
+
     out_dict = {
         "ts": _cat("ts", ts_tail),
         "bid_p": _cat("bid_p", bid_p),
@@ -387,6 +422,13 @@ def incremental_append_600h_cache(coin: str = "prl") -> Path:
         "ask_q": _cat("ask_q", ask_q),
         "buy_vol": _cat("buy_vol", buy_v),
         "sell_vol": _cat("sell_vol", sell_v),
+        "bo_bid_p": bo_bp_full,
+        "bo_bid_q": bo_bq_full,
+        "bo_ask_p": bo_ap_full,
+        "bo_ask_q": bo_aq_full,
+        "bo_buy_vol": bo_bv_full,
+        "bo_sell_vol": bo_sv_full,
+        "bo_sec_since_tick": bo_sec_full,
         "y_sweep_12s": _cat("y_sweep_12s", y_sweep_12s),
         "y_bleed_60s": _cat("y_bleed_60s", y_bleed_60s),
         "y_crash_300s": _cat("y_crash_300s", y_crash_300s),

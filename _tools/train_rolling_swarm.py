@@ -257,6 +257,10 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
     tbl = pq.read_table(labeled_path, columns=cols_to_load)
     df = tbl.to_pandas()
     del tbl
+    if "timestamp" not in df.columns:
+        df = df.reset_index()
+        if "timestamp" not in df.columns and "index" in df.columns:
+            df = df.rename(columns={"index": "timestamp"})
     print(f"⏱️ Данные загружены за {time.time()-t0:.2f}с ({len(df):,} строк, mmap_X={use_mmap_x})")
 
     if need_labeling:

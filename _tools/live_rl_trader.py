@@ -365,10 +365,29 @@ class LiveTriadRLTrader:
         self.l7_w2 = None
         self.l7_b2 = None
         self.v7_hist_5s = deque(maxlen=6)
+        self.st_trade_5s = deque(maxlen=5)
+        self.bo_trade_5s = deque(maxlen=5)
+        self.cv_hist_state = {}
+        self.cv_first_order_net = None
+        self.l7_use_cross_venue = False
         self.last_l7_out = None
         self.last_l7_target_exp_frac = 1.0
         self.rel_ckpt_path = BASE_DIR / "models" / self.coin / "release_champion_v1.pt"
         self.rel_ckpt_mtime = 0.0
+        cv_fo_path = BASE_DIR / "models" / self.coin / "cross_venue_first_order" / "cross_venue_first_order_v1.pt"
+        if cv_fo_path.exists():
+            try:
+                from _tools.cross_venue_first_order_net import CrossVenueFirstOrderNet
+                cv_ck = torch.load(cv_fo_path, map_location="cpu", weights_only=False)
+                self.cv_first_order_net = CrossVenueFirstOrderNet(
+                    in_dim=int(cv_ck.get("in_dim", 28)),
+                    h_dim=int(cv_ck.get("h_dim", 128)),
+                    out_dim=int(cv_ck.get("out_dim", 6)),
+                ).eval()
+                self.cv_first_order_net.load_state_dict(cv_ck["state_dict"], strict=True)
+                print(f"🌐 Подключена кросс-биржевая модель 1-го порядка {cv_fo_path.name} (AUC={cv_ck.get('oos_mean_auc', 0.0):.4f})!")
+            except Exception as e_cv:
+                print(f"⚠️ Не удалось загрузить {cv_fo_path.name}: {e_cv}")
         if self.rel_ckpt_path.exists():
             try:
                 from _tools.multitask_lob_net import MultiTaskLOBNet
@@ -387,6 +406,7 @@ class LiveTriadRLTrader:
                 self.l7_w2 = rel_ck["w2"].float()
                 self.l7_b2 = rel_ck["b2"].float()
                 self.l7_allow_scratch = bool(rel_ck.get("allow_scratch_stop_asks", False))
+                self.l7_use_cross_venue = bool(rel_ck.get("use_cross_venue_v1", False))
                 in_d = int(self.l7_w1.shape[0])
                 h_d = int(self.l7_w1.shape[1])
                 arch_s = (
@@ -640,6 +660,18 @@ class LiveTriadRLTrader:
                 self.l7_w2 = rel_ck["w2"].float()
                 self.l7_b2 = rel_ck["b2"].float()
                 self.l7_allow_scratch = bool(rel_ck.get("allow_scratch_stop_asks", True))
+                self.l7_use_cross_venue = bool(rel_ck.get("use_cross_venue_v1", False))
+                if self.l7_use_cross_venue and getattr(self, "cv_first_order_net", None) is None:
+                    cv_fo_path = BASE_DIR / "models" / self.coin / "cross_venue_first_order" / "cross_venue_first_order_v1.pt"
+                    if cv_fo_path.exists():
+                        from _tools.cross_venue_first_order_net import CrossVenueFirstOrderNet
+                        cv_ck = torch.load(cv_fo_path, map_location="cpu", weights_only=False)
+                        self.cv_first_order_net = CrossVenueFirstOrderNet(
+                            in_dim=int(cv_ck.get("in_dim", 28)),
+                            h_dim=int(cv_ck.get("h_dim", 128)),
+                            out_dim=int(cv_ck.get("out_dim", 6)),
+                        ).eval()
+                        self.cv_first_order_net.load_state_dict(cv_ck["state_dict"], strict=True)
                 self.rel_ckpt_mtime = cur_mtime
                 rel_name = rel_ck.get("release_name", f"iter_{rel_ck.get('iteration', '?')}")
                 val_ev = float(rel_ck.get("val_ev_pct", 0.0))
@@ -2180,8 +2212,46 @@ class LiveTriadRLTrader:
                         float(math.log1p(getattr(self.router_90, "num_models", 3)) / 4.0),
                         float(math.log1p(getattr(self.router_120, "num_models", 2)) / 4.0),
                     ]
+                    bo_vb_cur = float(r.get("BO_buy_vol", 0.0) or 0.0)
+                    bo_vs_cur = float(r.get("BO_sell_vol", 0.0) or 0.0)
+                    self.st_trade_5s.append((max(0.0, vb_cur), max(0.0, vs_cur)))
+                    self.bo_trade_5s.append((max(0.0, bo_vb_cur), max(0.0, bo_vs_cur)))
+                    st_b5s = sum(x[0] for x in self.st_trade_5s)
+                    st_s5s = sum(x[1] for x in self.st_trade_5s)
+                    bo_b5s = sum(x[0] for x in self.bo_trade_5s)
+                    bo_s5s = sum(x[1] for x in self.bo_trade_5s)
+                    bo_bp_5 = np.array([float(r.get(f"BO_bid_{i}_price", 0.0) or 0.0) for i in range(1, 6)], dtype=np.float32)
+                    bo_bq_5 = np.array([float(r.get(f"BO_bid_{i}_qty", 0.0) or 0.0) for i in range(1, 6)], dtype=np.float32)
+                    bo_ap_5 = np.array([float(r.get(f"BO_ask_{i}_price", 0.0) or 0.0) for i in range(1, 6)], dtype=np.float32)
+                    bo_aq_5 = np.array([float(r.get(f"BO_ask_{i}_qty", 0.0) or 0.0) for i in range(1, 6)], dtype=np.float32)
+                    bo_sec_age = float(r.get("BO_sec_since_tick", 0.0) or 0.0)
+                    from _tools.cross_venue_first_order_net import compute_cross_venue_single_tick
+                    cv_10_np, cv_28_np = compute_cross_venue_single_tick(
+                        st_bp=bp_np,
+                        st_bq=bq_np,
+                        st_ap=ap_np,
+                        st_aq=aq_np,
+                        st_buy_5s=st_b5s,
+                        st_sell_5s=st_s5s,
+                        bo_bp=bo_bp_5,
+                        bo_bq=bo_bq_5,
+                        bo_ap=bo_ap_5,
+                        bo_aq=bo_aq_5,
+                        bo_buy_5s=bo_b5s,
+                        bo_sell_5s=bo_s5s,
+                        bo_sec_since=bo_sec_age,
+                        hist_state=self.cv_hist_state,
+                        tick=self.tick_size,
+                    )
+                    if getattr(self, "l7_use_cross_venue", False) and getattr(self, "cv_first_order_net", None) is not None:
+                        cv_probs_6 = self.cv_first_order_net.predict_probs(torch.from_numpy(cv_28_np).unsqueeze(0)).squeeze(0).numpy()
+                        slot_18_28 = cv_10_np.tolist()
+                        slot_52_58 = ((cv_probs_6 - 0.5) * 2.0).astype(np.float32).tolist()
+                    else:
+                        slot_18_28 = [0.0] * 10
+                        slot_52_58 = [0.0] * 6
                     v7_58_arr = np.array(
-                        triad_vec + [0.0] * 10 + self.last_vec60 + self.last_vec90 + self.last_vec120 + v52_4d + real_2d + [0.0] * 6,
+                        triad_vec + slot_18_28 + self.last_vec60 + self.last_vec90 + self.last_vec120 + v52_4d + real_2d + slot_52_58,
                         dtype=np.float32,
                     )
                     v7_cur_58 = v7_58_arr[:58]
