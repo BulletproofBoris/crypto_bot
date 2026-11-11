@@ -144,6 +144,8 @@ def main():
         )
         _, out_t, _ = ssh.exec_command(cmd)
         print(out_t.read().decode("utf-8", errors="ignore").strip())
+        from _tools.vps_kpd_audit import print_vps_kpd_summary
+        print_vps_kpd_summary(ssh)
     finally:
         ssh.close()
 
