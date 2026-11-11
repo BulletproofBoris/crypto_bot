@@ -327,7 +327,7 @@ class LiveTriadRLTrader:
         from _tools.train_rl_execution import MaskableActorCritic
         print(f"🧠 Инициализация боевого ядра LiveTriadRLTrader ({self.coin.upper()}, режим={self.mode.upper()}, бюджет=${self.initial_budget_usd:.2f})...")
         self._triad_pool = ThreadPoolExecutor(max_workers=6)
-        self._io_pool = ThreadPoolExecutor(max_workers=8)
+        self._io_pool = ThreadPoolExecutor(max_workers=2)
         self.routers = [
             (5, 3.0, SwarmRegimeRouter(self.coin, 5, 3.0, temperature=0.25, use_neural=use_neural, neural_weight=0.15)),
             (12, 3.5, SwarmRegimeRouter(self.coin, 12, 3.5, temperature=0.25, use_neural=use_neural, neural_weight=0.15)),
@@ -2827,7 +2827,7 @@ class LiveTriadRLTrader:
             age_s = now_ts - float(slot.get("act_ts", 0.0))
             cur_apx = float(slot.get("px", 0.0))
             slot_off_a = (self.pos_qty < 1.95) or (a_w[s] < 0.04 and age_s >= 180.0) or (a_w[s] < 0.015 and age_s >= 25.0)
-            under_tp_a = (self.pos_qty >= 1.95) and (s >= 2) and (cur_apx < base_tp[s] - 0.4 * self.tick_size)
+            under_tp_a = (self.pos_qty >= 1.95) and (cur_apx < base_tp[s] - 0.4 * self.tick_size)
             grid_shift_a = under_tp_a or ((self.pos_qty >= 1.95) and (age_s >= 15.0) and (abs(t_ask_px[s] - cur_apx) >= 1.9 * self.tick_size))
             if slot_off_a or grid_shift_a:
                 to_cancel_a.append((s, slot["id"], "off" if slot_off_a else "shift"))
@@ -2846,8 +2846,7 @@ class LiveTriadRLTrader:
                     prev_acc = float(self.bid_slots[s].get("acc_fill", 0.0))
                     s_px = float(self.bid_slots[s].get("px", 0.0))
                     no_new_fill = (
-                        (isinstance(c_info, dict) and float(c_info.get("filled_amount", 0.0)) - prev_acc <= 1e-4)
-                        or (c_info is None and s_px < b1 - tol)
+                        isinstance(c_info, dict) and float(c_info.get("filled_amount", 0.0)) - prev_acc <= 1e-4
                     )
                     if no_new_fill:
                         rel_usd = float(self.bid_slots[s].get("qty", 0.0)) * s_px
@@ -2863,8 +2862,7 @@ class LiveTriadRLTrader:
                     prev_acc = float(self.ask_slots[s].get("acc_fill", 0.0))
                     s_px = float(self.ask_slots[s].get("px", 0.0))
                     no_new_fill = (
-                        (isinstance(c_info, dict) and float(c_info.get("filled_amount", 0.0)) - prev_acc <= 1e-4)
-                        or (c_info is None and s_px > a1 + tol)
+                        isinstance(c_info, dict) and float(c_info.get("filled_amount", 0.0)) - prev_acc <= 1e-4
                     )
                     if no_new_fill:
                         rel_q = float(self.ask_slots[s].get("qty", 0.0))
@@ -2979,16 +2977,17 @@ class LiveTriadRLTrader:
                         t_ask_qty[s] = math.floor((unreserved_pos * a_w[s] * scale_a) * 10000.0) / 10000.0
 
                 if has_low_tr and self.pos_qty >= 1.95 and self.avg_entry > 0.0 and base_lifo_tp < base_avg_tp - 0.1 * self.tick_size:
+                    lifo_s0 = 2 if getattr(self, "l7_allow_scratch", False) else 0
                     lifo_placed = sum(
                         float(self.ask_slots[s].get("qty", 0.0))
-                        for s in range(2, 6)
+                        for s in range(lifo_s0, 6)
                         if self.ask_slots[s].get("id") is not None
                     )
                     rem_low_tr = max(0.0, self.tr_low_qty - lifo_placed)
-                    want_low_sum = float(np.sum(t_ask_qty[2:6]))
+                    want_low_sum = float(np.sum(t_ask_qty[lifo_s0:6]))
                     if want_low_sum > rem_low_tr and want_low_sum > 1e-6:
                         low_cap_scale = rem_low_tr / want_low_sum
-                        for s in range(2, 6):
+                        for s in range(lifo_s0, 6):
                             t_ask_qty[s] = math.floor((t_ask_qty[s] * low_cap_scale) * 10000.0) / 10000.0
 
                 # Укрупнение микро-остатков < 2.0 PRL (биржевой минимум SafeTrade) в пользу самых приоритетных Ask-слотов
@@ -3044,17 +3043,35 @@ class LiveTriadRLTrader:
             self._save_wallet()
 
     def _safe_cancel_oid(self, oid):
-        try:
-            return self.client.cancel_order(oid)
-        except Exception:
-            return None
+        for attempt in range(3):
+            try:
+                if attempt > 0:
+                    time.sleep(0.16 * attempt)
+                return self.client.cancel_order(oid)
+            except Exception as e_c:
+                if "429" in str(e_c) or "limit_exceeded" in str(e_c):
+                    time.sleep(0.22 * (attempt + 1))
+                    continue
+                return None
+        return None
 
     def _place_slot_order(self, side: str, slot_idx: int, qty: float, price: float):
+        time.sleep(0.045)
         try:
             res = self.client.place_limit_order(self.market, side, qty, price)
             return (slot_idx, res, qty, price)
         except Exception as e:
             err_s = str(e)
+            if "429" in err_s or "limit_exceeded" in err_s:
+                for attempt in range(1, 3):
+                    time.sleep(0.25 * attempt)
+                    try:
+                        res_r429 = self.client.place_limit_order(self.market, side, qty, price)
+                        return (slot_idx, res_r429, qty, price)
+                    except Exception as e429:
+                        err_s = str(e429)
+                        if "429" not in err_s and "limit_exceeded" not in err_s:
+                            break
             if "insufficient_balance" in err_s:
                 time.sleep(0.18)
                 retry_qty = math.floor((qty * 0.999) * 10000.0) / 10000.0

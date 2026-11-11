@@ -250,7 +250,7 @@ def build_and_inject_v7_signals_58d(coin: str = "prl", force_recompute: bool = T
     base_dict["ts"] = ts_600
     base_dict["v7_signals_58d"] = v7_signals_58d
     tmp_path = CACHE_600H_PATH.with_suffix(".tmp.npz")
-    np.savez_compressed(tmp_path, **base_dict)
+    np.savez(tmp_path, **base_dict)
     tmp_path.replace(CACHE_600H_PATH)
     print(f"✅ Гибридный кэш v7+v8 (v7_signals_58d: {v7_signals_58d.shape}) сохранен за {time.time() - t0:.1f}с!")
     return CACHE_600H_PATH
@@ -439,7 +439,7 @@ def incremental_append_600h_cache(coin: str = "prl") -> Path:
     del old_npz
     gc.collect()
     tmp_path = CACHE_600H_PATH.with_suffix(".tmp.npz")
-    np.savez_compressed(tmp_path, **out_dict)
+    np.savez(tmp_path, **out_dict)
     tmp_path.replace(CACHE_600H_PATH)
     print(f"🎉 Инкрементальный кэш {CACHE_600H_PATH.name} ({n_new:,} тиков) сохранен за {time.time() - t0:.1f}с!", flush=True)
     return CACHE_600H_PATH

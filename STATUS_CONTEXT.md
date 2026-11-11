@@ -1,16 +1,27 @@
-# Текущий контекст проекта (SafeTrade RL Market Making v2 + Гибрид v7/v8 + Уроки 1..18 Завершены + Боевой Деплой `v18.1 + L18_0065`)
+# Текущий контекст проекта (SafeTrade RL Market Making v2 + Гибрид v7/v8 + Уроки 1..20 Завершены + Боевой Деплой `v20.1 + L20_0025_soup22_pure_econ_reward`)
 
-- **Статус обучения:**
-  - **ПОЛНОСТЬЮ ЗАВЕРШЕНЫ УРОКИ 1..18:**
-    - `L17 Dynamic Slot Co-Evolution`: чемпион `L17_0261` (`ValScore = +208.61` на 18 чистых окнах, `ValEV = +0.0608%`).
-    - **`L18 3-Tier LIFO Stack & Underwater Survival` (`_tools/lesson_18_multistack_lifo_survival_trainer.py`, завершен на `it=225`, пик `L18_0065`):** на жесткой 20-оконной корзине с подводными краш-тестами (`UW_NORM` + `UW_DUMP`, 55% инвентаря на `-5 тиков` и честный 3-уровневый LIFO-стек) чемпион **`L18_0065`** поднял `ValScore` с **`-166.01` (база L17)** до **`+28.66`** (`+194.67 п.`), а в прямом очном бенчмарке против `L17_0261` выиграл `FULL_20` (`Score -144.59` vs `-364.36`, `EV +0.0161%` vs `+0.0153%`, `DD 0.315%` vs `0.687%`) и сократил просадку на подводных краш-тестах **в 4.6 раза** (`-0.150%` vs `-0.687%`).
-- **Боевой сервер VPS:**
-  - АКТИВЕН В БОЕВОМ РЕЖИМЕ (`live-rl-prl-l9.service`, `--mode live`, ядро **`v18.2`** с криптографическим замком `ACCOUNT MISMATCH GUARD` и вычищенным 16D балластом `Instant_LOB_Snapshot + Alliance_Maturity_Const`).
-  - Развернут очищенный релизный чемпион **`models/prl/release_champion_v1.pt` (`L18_0065_pruned16`, `FULL_20 Score = +115.90`, `ValEV = +0.0299%`, `MaxDD = 0.251%`)**.
-  - Развернуты и активны 24/7 новые реалтайм-коллекторы **Gate.io (`PEARL_USDT`, `gate-collector.service`)** и **Ourbit (`PRLUSDT` / `PEARL/USDT`, `ourbit-collector.service`)** с полной интеграцией в Watchdog, суточную GDrive-ротацию и Parquet-хранилище (`sync_all_data.py`).
-- **Рефакторинг и безопасность (v18.1):**
-  - Вычищены захардкоженные секреты/прокси из `_tools/vps_config.py` (перенесены в `.env` / `_tools/project_secrets.json`).
-  - Устранено Sim-to-Real расхождение `flow_16[13:15]` (`has_bid` / `has_ask`) и `is_ask_penny` для `Ask[2..3]` в `_tools/live_rl_trader.py`.
-  - Внедрен 3-уровневый LIFO-стек с жесткой сверкой инварианта `tr_low + tr_mid + tr_high == pos_qty` и защита от `HTTP 422 insufficient_balance` на SafeTrade.
-  - Оптимизированы потоковый буфер `_tools/live_feature_updater.py` (`compact_rows` + `O(1)` дедупликация сделок) и единый расчет `LearnedRegimeCompetenceRouter` с живыми скоростями `(vel10, vel60, vel300)` в `_tools/swarm_router.py`.
+- **Актуальная база данных и рой экспертов 1-го порядка (обновлено 2026-11-11):**
+  - Синхронизировано **`2,779,660` секундных тиков (`772.1ч`)** до `2026-11-11 07:12:48 MSK` (`safetrade_depth`: `2,429,378`, `bigone_depth`: `2,610,329`, `gate_trades`: `43,515`, `ourbit_trades`: `10,569`, `prl_rl_telemetry`: `1,344,690`).
+  - Пересобраны и дообучены все свежие плавающие окна роя LightGBM + 6 нейросетевых архитектур: `H=5s` (`win_68`, 69 окон), `H=12s` (`win_23`, 24 окна, `AUC=0.7651`), `H=25s` (`win_12`, 13 окон, 78 экспертов) + обновлены альянсы `H=60/90/120s`.
+  - Дообучена кросс-биржевая модель 1-го порядка **`CrossVenueFirstOrderNet` (`SafeTrade + BigONE`, `_tools/cross_venue_first_order_net.py`)**: слепой OOS Mean AUC вырос с `0.7966` (`ST-only`) до **`0.8226` (`ΔAUC = +0.0260`)** (`sweep_12s = 0.875`, `rebound_30s = 0.870`).
+  - **Внедрены 4 lossless-оптимизации обучения сетей 1-го порядка:**
+    1. `_tools/pretrain_lob_backbone.py`: векторизация 10-уровневого стакана + предзагрузка в VRAM (`BF16`, `batch_size=1024`, `@torch.compile`, `AdamW(fused=True)`, `FocalLoss` в `FP32`).
+    2. `_tools/cross_venue_first_order_net.py` + `_tools/build_hybrid_v7_v8_cache.py`: побитово эквивалентный GPU `F.max_pool1d` вместо 90-шагового `np.pad` цикла, полный VRAM-тренинг (`batch_size=16384`), GPU `ROC-AUC` (`torch.argsort`) и быстрый `np.savez`.
+    3. `_tools/fast_neural_engine.py`: отказ от грубого `FP8` на узких слоях в пользу `BF16` Tensor Cores + `FP32` loss, замена `@torch.jit.script` цикла GRU на нативный C++/cuDNN `torch._VF.gru` (`max_diff = 2.08e-07`), `F.layer_norm` и параллелизм `runs` через `CUDA Streams`.
+    4. `_tools/train_rolling_swarm.py`: единый `shared_cache` DataFrame между горизонтами `H` и параллельное обучение окон LightGBM через `ThreadPoolExecutor(max_workers=3)`.
+
+- **Статус обучения RL-агента (ПОЛНОСТЬЮ ЗАВЕРШЕНЫ УРОКИ 1..20, `400 / 400` эпох):**
+  - **`L20 Pure Economic Utility & 9-Window Parallel Triton GPU` (`_tools/lesson_20_sim2real_noscratch_champion_trainer.py` + `_tools/fused_l20_train_tick.py`):**
+    - Полный отказ от искусственных таймеров, запретов и суррогатных бонусов суеты в пользу 100% чистой экономической полезности счёта (`NetReturn_% - UlcerIndex_% - 0.35 * TailDD_%^2 - 0.04 * MeanAPILoad`).
+    - **Базовая скорость RL-обучения зафиксирована на `5.7–7.2 с/эпоху`** (`16.5x` быстрее исходных `115 с/эпоху`): 9-оконный параллельный Triton-проход (`599` шагов × `110,592` сред вместо `5,391` шагов) + `O(1)` префиксный стакан (`100% GPU-Util`, `4,973 MiB / 8,151 MiB` VRAM, 0% PCIe swap). Резерв дальнейшего ускорения (`~2.2–2.5 с/эпоху`) сохранён в бэклоге Урока 21.
+    - Абсолютный активный маркет-мейкер чемпион **`L20_0025_soup22_pure_econ_reward` (`models/prl/release_champion_v1.pt`, Model Soup итераций `22 + 25`)** уверенно победил `L18_0065_pruned16` и `L19_0055_cv_gated` на всех слепых OOS-корзинах:
+      - `CLEAN_18`: **`EconUtil = +2.94bp`, `EV = +0.0224%`** (`NORM:+0.019%`, `DUMP:+0.013%`, `PUMP:+0.041%`, `MaxDD = 0.290%`) против `L19` (`+1.01bp`, `EV = +0.0123%`, `DUMP:-0.027%`, `MaxDD = 0.345%`) и `L18` (`-1.35bp`, `EV = +0.0063%`, `MaxDD = 0.705%`).
+      - `FULL_20`: **`EconUtil = +1.76bp`, `EV = +0.0141%`** (в **`2.82x`** выше `L19` `+0.0050%` и в **`10.1x`** выше `L18` `+0.0014%`, все 3 режима строго в плюсе).
+      - `RECENT_HOLDOUT_ALL` (`35` свежих OOS-окон = `18.7ч`): **`EV = +0.0243%`** (`NORM:+0.011%`, `DUMP:+0.080%`, `PUMP:+0.027%`) против отрицательного `EV = -0.0013%` (`DUMP:-0.052%`) у `L19`.
+      - `BLIND_55H_PRE_TRAIN` (`29` слепых исторических окон за `55ч` до трейна): `EV = -0.0200%` (`DUMP:-0.105%`) лучше `L19` (`EV = -0.0232%`, `DUMP:-0.168%`).
+
+- **Аудит боевого сервера VPS и Sim-to-Real укрепление (`v20.1`):**
+  - Работа ведётся **строго на изолированном субаккаунте `...6C9` (`fp=220a65fa6912`)**; основной счёт `...6A4` криптографически заблокирован.
+  - В `_tools/live_rl_trader.py` активны все 4 Sim-to-Real защиты: фикс гонки отмены прострельных исполнений (`_sync_24slot_orders`), `Cold-Start Warmup Shield` (`15` тиков прогрева GRU), лимитированный пул ордеров (`max_workers=2` + пейсинг `45 мс` + backoff на `HTTP 429`) и бесшовный Hot-Reload чемпиона.
+
 - **Важное правило:** НЕ читай `.log` файлы целиком! Используй только `tail -n 20` или `manage_task`.

@@ -205,8 +205,10 @@ def compute_regime_fingerprint(df_slice: pd.DataFrame):
     return fp
 
 
-def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: int, align_horizon: int = None):
-    """Обучает полный пул Rolling-моделей для монеты и горизонта H."""
+def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: int, align_horizon: int = None, shared_cache: dict = None):
+    """Обучает полный пул Rolling-моделей для монеты и горизонта H (с переиспользованием RAM и параллельным пулом окон)."""
+    from concurrent.futures import ThreadPoolExecutor
+
     coin = coin.lower()
     labeled_path = BASE_DIR / "data" / "labeled" / coin / f"{coin}_labeled.parquet"
     feats_json = BASE_DIR / "data" / "features" / f"selected_features_{coin}_h8s.json"
@@ -228,24 +230,12 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
     base_cols = [
         'timestamp', 'sample_split', 'is_data_gap', 'ST_mid_price', 'ST_trade_vol', 'BO_sec_since_tick',
         'ST_vol_300s_ticks', 'ST_vol_60s_ticks', 'ST_spread', 'ST_spread_pct',
-        'ST_ofi_norm_300s', 'ST_cvd_5m', 'ST_cvd_norm_20s'
+        'ST_ofi_norm_300s', 'ST_cvd_5m', 'ST_cvd_norm_20s',
+        'ST_bid_1_price', 'ST_ask_1_price', 'ST_bid_1_qty', 'ST_ask_1_qty',
+        'ST_bids_vol_top5', 'ST_asks_vol_top5',
     ]
-    if need_labeling:
-        orderbook_cols = [
-            'ST_mid_price', 'ST_spread', 'ST_bid_1_price', 'ST_ask_1_price',
-            'ST_bid_1_qty', 'ST_ask_1_qty', 'ST_bids_vol_top5', 'ST_asks_vol_top5',
-            'ST_trade_vol'
-        ]
-        base_cols += orderbook_cols
-    else:
-        base_cols += [target_c7_col, target_dt_col]
-
     mmap_x_path = BASE_DIR / "data" / "_mmap_cache" / "X_all.npy"
     use_mmap_x = mmap_x_path.exists()
-    if use_mmap_x:
-        cols_to_load = list(dict.fromkeys([c for c in base_cols if c in schema_cols]))
-    else:
-        cols_to_load = list(dict.fromkeys([c for c in feature_cols + base_cols if c in schema_cols]))
 
     L = int(round(H * K))
     print(f"\n{'='*95}")
@@ -254,14 +244,30 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
     print(f"{'='*95}")
 
     t0 = time.time()
-    tbl = pq.read_table(labeled_path, columns=cols_to_load)
-    df = tbl.to_pandas()
-    del tbl
-    if "timestamp" not in df.columns:
-        df = df.reset_index()
-        if "timestamp" not in df.columns and "index" in df.columns:
-            df = df.rename(columns={"index": "timestamp"})
-    print(f"⏱️ Данные загружены за {time.time()-t0:.2f}с ({len(df):,} строк, mmap_X={use_mmap_x})")
+    if shared_cache is not None and coin in shared_cache:
+        df = shared_cache[coin].copy(deep=False)
+        if not need_labeling and target_c7_col not in df.columns:
+            t_tbl = pq.read_table(labeled_path, columns=[target_c7_col, target_dt_col])
+            df[target_c7_col] = t_tbl.column(target_c7_col).to_numpy(zero_copy_only=False)
+            df[target_dt_col] = t_tbl.column(target_dt_col).to_numpy(zero_copy_only=False)
+            del t_tbl
+    else:
+        if use_mmap_x:
+            cols_to_load = list(dict.fromkeys([c for c in base_cols if c in schema_cols]))
+        else:
+            cols_to_load = list(dict.fromkeys([c for c in feature_cols + base_cols if c in schema_cols]))
+        if not need_labeling:
+            cols_to_load = list(dict.fromkeys(cols_to_load + [target_c7_col, target_dt_col]))
+        tbl = pq.read_table(labeled_path, columns=cols_to_load)
+        df = tbl.to_pandas()
+        del tbl
+        if "timestamp" not in df.columns:
+            df = df.reset_index()
+            if "timestamp" not in df.columns and "index" in df.columns:
+                df = df.rename(columns={"index": "timestamp"})
+        if shared_cache is not None:
+            shared_cache[coin] = df.copy(deep=False)
+    print(f"⏱️ Данные готовы за {time.time()-t0:.2f}с ({len(df):,} строк, mmap_X={use_mmap_x})")
 
     if need_labeling:
         print(f"⚙️ Динамический расчет микроструктурных меток для H = {H}с, K = {k_str}...")
@@ -350,12 +356,13 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
                 if zero_cols:
                     X_all[np.ix_(bo_stale, zero_cols)] = 0.0
 
+    manifest_slots = [None] * len(windows)
+    pending_tasks = []
+
     for idx, w in enumerate(windows):
         win_id = f"win_{idx:02d}"
         tr_s, tr_e = w['tr_start'], w['tr_end']
         te_s, te_e = w['te_start'], w['te_end']
-        tr_idx = w.get('tr_idx', np.arange(tr_s, tr_e))
-        te_idx = w.get('te_idx', np.arange(te_s, te_e))
 
         ts_tr_start = str(df['timestamp'].iloc[min(tr_s, len(df)-1)])[:19]
         ts_tr_end = str(df['timestamp'].iloc[min(tr_e - 1, len(df)-1)])[:19]
@@ -368,121 +375,137 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
             try:
                 old_meta = json.loads(meta_path.read_text())
                 if old_meta.get("train_ts_range") == [ts_tr_start, ts_tr_end] or idx < len(windows) - 2:
-                    manifest.append(old_meta)
+                    manifest_slots[idx] = old_meta
                     mo = old_meta.get("metrics_oos", {})
                     ic, auc, top2_pnl = mo.get("ic_dt_ticks", 0.0), mo.get("roc_auc_ovr", 0.5), mo.get("top2pct_mean_ticks", 0.0)
                     print(f"{win_id:<6} | {ts_tr_start} -> {ts_tr_end} | {ts_te_start} -> {ts_te_end} | {ic:+6.4f}  | {auc:6.4f}   | {top2_pnl:+6.2f} тиков | ⏩ КЭШ     ")
                     continue
                 else:
-                    # Сдвинувшееся хвостовое окно: сбрасываем старые веса нейросетей для этого win_id
                     na_dir = out_dir / "neural_alliance"
                     if na_dir.exists():
                         for pt_file in na_dir.glob(f"*/{win_id}.pt"):
                             pt_file.unlink(missing_ok=True)
             except Exception:
                 pass
+        pending_tasks.append((idx, w, win_id, ts_tr_start, ts_tr_end, ts_te_start, ts_te_end))
 
-        tr_idx_fit = tr_idx[::3] if len(tr_idx) > 900_000 else (tr_idx[::2] if len(tr_idx) > 450_000 else tr_idx)
-        X_train = np.asarray(X_all[tr_idx_fit], dtype=np.float32)
-        y_train = df['target_class'].iloc[tr_idx_fit].values + 3  # Сдвиг [-3..3] -> [0..6]
-
-        X_test = np.asarray(X_all[te_idx], dtype=np.float32)
-        y_test = df['target_class'].iloc[te_idx].values + 3
-        dt_test = df['target_dt'].iloc[te_idx].values
-
-        # Асимметричные веса классов для защиты от False Positive Buy на проливах
+    if pending_tasks:
         from sklearn.utils.class_weight import compute_class_weight
-        base_weights = compute_class_weight('balanced', classes=np.arange(7), y=y_train)
-        custom_weights = dict(enumerate(base_weights))
-        custom_weights[0] *= 1.35  # Class -3 (защита от ножей)
-        custom_weights[1] *= 1.25  # Class -2
-        custom_weights[2] *= 1.10  # Class -1
 
-        clf = lgb.LGBMClassifier(
-            objective="multiclass",
-            num_class=7,
-            class_weight=custom_weights,
-            n_estimators=n_estimators,
-            learning_rate=0.08,
-            num_leaves=31,
-            max_depth=6,
-            min_child_samples=50,
-            subsample=0.8,
-            subsample_freq=1,
-            colsample_bytree=0.8,
-            random_state=42 + idx,
-            n_jobs=n_jobs,
-            verbose=-1
-        )
-        clf.fit(X_train, y_train, feature_name=feature_cols)
-
-        # Оценка на чистом Out-of-Sample
-        probs_test = clf.predict_proba(X_test)
-        full_probs = np.zeros((len(X_test), 7), dtype=np.float32)
-        for col_i, cls_val in enumerate(clf.classes_):
-            if 0 <= cls_val < 7:
-                full_probs[:, cls_val] = probs_test[:, col_i]
-        
-        # Ожидаемый импульс E[z] = sum P(c) * c
+        n_win_workers = min(3, len(pending_tasks), max(1, n_jobs // 4))
+        lgb_threads = max(2, n_jobs // n_win_workers)
+        y_all_arr = df['target_class'].values
+        dt_all_arr = df['target_dt'].values
         classes_values = np.array([-3, -2, -1, 0, 1, 2, 3], dtype=np.float32)
-        expected_z = np.dot(full_probs, classes_values)
 
-        # Метрики OOS
-        ic = float(np.corrcoef(expected_z, dt_test)[0, 1]) if np.std(expected_z) > 1e-6 else 0.0
-        
-        try:
-            present_classes = [c for c in range(7) if np.sum(y_test == c) > 0]
-            if len(present_classes) > 1:
-                # Нормализация вероятностей для присутствующих классов
-                p_sub = full_probs[:, present_classes]
-                p_sub = p_sub / np.maximum(p_sub.sum(axis=1, keepdims=True), 1e-7)
-                auc = float(roc_auc_score(y_test, p_sub, multi_class='ovr', labels=present_classes))
-            else:
+        def _fit_single_window(task_tuple):
+            idx, w, win_id, ts_tr_start, ts_tr_end, ts_te_start, ts_te_end = task_tuple
+            tr_s, tr_e = w['tr_start'], w['tr_end']
+            te_s, te_e = w['te_start'], w['te_end']
+            tr_idx = w.get('tr_idx', np.arange(tr_s, tr_e))
+            te_idx = w.get('te_idx', np.arange(te_s, te_e))
+
+            tr_idx_fit = tr_idx[::3] if len(tr_idx) > 900_000 else (tr_idx[::2] if len(tr_idx) > 450_000 else tr_idx)
+            X_train = np.asarray(X_all[tr_idx_fit], dtype=np.float32)
+            y_train = y_all_arr[tr_idx_fit] + 3
+
+            X_test = np.asarray(X_all[te_idx], dtype=np.float32)
+            y_test = y_all_arr[te_idx] + 3
+            dt_test = dt_all_arr[te_idx]
+
+            base_weights = compute_class_weight('balanced', classes=np.arange(7), y=y_train)
+            custom_weights = dict(enumerate(base_weights))
+            custom_weights[0] *= 1.35
+            custom_weights[1] *= 1.25
+            custom_weights[2] *= 1.10
+
+            clf = lgb.LGBMClassifier(
+                objective="multiclass",
+                num_class=7,
+                class_weight=custom_weights,
+                n_estimators=n_estimators,
+                learning_rate=0.08,
+                num_leaves=31,
+                max_depth=6,
+                min_child_samples=50,
+                subsample=0.8,
+                subsample_freq=1,
+                colsample_bytree=0.8,
+                random_state=42 + idx,
+                n_jobs=lgb_threads,
+                verbose=-1,
+            )
+            clf.fit(X_train, y_train, feature_name=feature_cols)
+
+            probs_test = clf.predict_proba(X_test)
+            full_probs = np.zeros((len(X_test), 7), dtype=np.float32)
+            for col_i, cls_val in enumerate(clf.classes_):
+                if 0 <= cls_val < 7:
+                    full_probs[:, cls_val] = probs_test[:, col_i]
+
+            expected_z = np.dot(full_probs, classes_values)
+            ic = float(np.corrcoef(expected_z, dt_test)[0, 1]) if np.std(expected_z) > 1e-6 else 0.0
+
+            try:
+                present_classes = [c for c in range(7) if np.sum(y_test == c) > 0]
+                if len(present_classes) > 1:
+                    p_sub = full_probs[:, present_classes]
+                    p_sub = p_sub / np.maximum(p_sub.sum(axis=1, keepdims=True), 1e-7)
+                    auc = float(roc_auc_score(y_test, p_sub, multi_class='ovr', labels=present_classes))
+                else:
+                    auc = 0.5
+            except Exception:
                 auc = 0.5
-        except Exception:
-            auc = 0.5
 
-        # Доходность Top-2% сигналов (покупка по экстремальному ожидаемому z)
-        top2_threshold = np.quantile(expected_z, 0.98)
-        top2_mask = expected_z >= top2_threshold
-        top2_pnl = float(np.mean(dt_test[top2_mask])) if np.sum(top2_mask) > 0 else 0.0
+            top2_threshold = np.quantile(expected_z, 0.98)
+            top2_mask = expected_z >= top2_threshold
+            top2_pnl = float(np.mean(dt_test[top2_mask])) if np.sum(top2_mask) > 0 else 0.0
 
-        # Сохранение модели
-        model_path = out_dir / f"model_{win_id}.txt"
-        clf.booster_.save_model(str(model_path))
+            model_path = out_dir / f"model_{win_id}.txt"
+            clf.booster_.save_model(str(model_path))
 
-        # Паспорт режима (Regime Fingerprint)
-        fp_train = compute_regime_fingerprint(df.iloc[tr_idx])
-        fp_test = compute_regime_fingerprint(df.iloc[te_idx])
+            fp_train = compute_regime_fingerprint(df.iloc[tr_idx])
+            fp_test = compute_regime_fingerprint(df.iloc[te_idx])
 
-        meta = {
-            'window_id': win_id,
-            'coin': coin.upper(),
-            'H': H,
-            'K': K,
-            'L': H * K,
-            'train_ts_range': [ts_tr_start, ts_tr_end],
-            'test_ts_range': [ts_te_start, ts_te_end],
-            'n_train': int(len(X_train)),
-            'n_test': int(len(X_test)),
-            'metrics_oos': {
-                'ic_dt_ticks': round(ic, 4),
-                'roc_auc_ovr': round(auc, 4),
-                'top2pct_mean_ticks': round(top2_pnl, 2),
-            },
-            'regime_fingerprint_train': fp_train,
-            'regime_fingerprint_test': fp_test,
-            'model_file': model_path.name
-        }
+            meta = {
+                'window_id': win_id,
+                'coin': coin.upper(),
+                'H': H,
+                'K': K,
+                'L': H * K,
+                'train_ts_range': [ts_tr_start, ts_tr_end],
+                'test_ts_range': [ts_te_start, ts_te_end],
+                'n_train': int(len(X_train)),
+                'n_test': int(len(X_test)),
+                'metrics_oos': {
+                    'ic_dt_ticks': round(ic, 4),
+                    'roc_auc_ovr': round(auc, 4),
+                    'top2pct_mean_ticks': round(top2_pnl, 2),
+                },
+                'regime_fingerprint_train': fp_train,
+                'regime_fingerprint_test': fp_test,
+                'model_file': model_path.name,
+            }
+            meta_path = out_dir / f"meta_{win_id}.json"
+            with open(meta_path, 'w') as f:
+                json.dump(meta, f, indent=2)
 
-        meta_path = out_dir / f"meta_{win_id}.json"
-        with open(meta_path, 'w') as f:
-            json.dump(meta, f, indent=2)
+            status = "🎯 ОТЛИЧНО" if ic > 0.15 and top2_pnl > 0.5 else ("✅ ХОРОШО" if ic > 0.05 else "⚠️ СЛАБО")
+            log_line = f"{win_id:<6} | {ts_tr_start} -> {ts_tr_end} | {ts_te_start} -> {ts_te_end} | {ic:+6.4f}  | {auc:6.4f}   | {top2_pnl:+6.2f} тиков | {status:<10}"
+            return idx, meta, log_line
 
-        manifest.append(meta)
+        if n_win_workers > 1:
+            with ThreadPoolExecutor(max_workers=n_win_workers) as pool:
+                for idx, meta, log_line in pool.map(_fit_single_window, pending_tasks):
+                    manifest_slots[idx] = meta
+                    print(log_line, flush=True)
+        else:
+            for task_tuple in pending_tasks:
+                idx, meta, log_line = _fit_single_window(task_tuple)
+                manifest_slots[idx] = meta
+                print(log_line, flush=True)
 
-        status = "🎯 ОТЛИЧНО" if ic > 0.15 and top2_pnl > 0.5 else ("✅ ХОРОШО" if ic > 0.05 else "⚠️ СЛАБО")
-        print(f"{win_id:<6} | {ts_tr_start} -> {ts_tr_end} | {ts_te_start} -> {ts_te_end} | {ic:+6.4f}  | {auc:6.4f}   | {top2_pnl:+6.2f} тиков | {status:<10}")
+    manifest = [m for m in manifest_slots if m is not None]
 
     try:
         with open(out_dir / "manifest_live.json", 'w') as f:
@@ -512,13 +535,14 @@ def main():
         print(f"   Пользовательские K: {k_vals}")
     print(f"{'='*80}")
 
+    shared_df_cache = {}
     for coin in coins:
         for idx, H in enumerate(horizons):
             if k_vals and idx < len(k_vals):
                 K = k_vals[idx]
             else:
                 K = get_default_k(coin, H)
-            train_coin_horizon(coin, H, K, args.n_estimators, args.n_jobs, align_horizon=args.align_horizon)
+            train_coin_horizon(coin, H, K, args.n_estimators, args.n_jobs, align_horizon=args.align_horizon, shared_cache=shared_df_cache)
 
 
 if __name__ == '__main__':

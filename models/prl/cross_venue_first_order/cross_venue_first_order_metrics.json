@@ -1,22 +1,22 @@
 {
-  "n_ticks": 2753777,
+  "n_ticks": 2779660,
   "train_range": [
-    1033177,
-    2633177
+    1059060,
+    2659060
   ],
   "oos_range": [
-    2633777,
-    2753657
+    2659660,
+    2779540
   ],
-  "oos_mean_auc": 0.82403,
-  "st_only_mean_auc": 0.80619,
-  "delta_auc_from_bigone": 0.01784,
+  "oos_mean_auc": 0.82261,
+  "st_only_mean_auc": 0.79658,
+  "delta_auc_from_bigone": 0.02603,
   "oos_head_aucs": {
-    "cv_sweep_12s": 0.88844,
-    "cv_bleed_60s": 0.75614,
-    "cv_rebound_30s": 0.88035,
-    "clean_fill_b0": 0.83628,
-    "clean_fill_bm1": 0.83074,
-    "clean_fill_bm2": 0.75227
+    "cv_sweep_12s": 0.87479,
+    "cv_bleed_60s": 0.76566,
+    "cv_rebound_30s": 0.87017,
+    "clean_fill_b0": 0.82988,
+    "clean_fill_bm1": 0.82107,
+    "clean_fill_bm2": 0.77407
   }
 }
