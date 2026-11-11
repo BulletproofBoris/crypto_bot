@@ -439,7 +439,7 @@ def _build_roll_sell_30s(sell_vol_t: torch.Tensor) -> torch.Tensor:
     return torch.clamp(cs[idx_hi] - cs[idx_lo], min=10.0)
 
 
-def run_lesson_21(iterations: int = 400, n_groups: int = 2048):
+def run_lesson_21(iterations: int = 400, n_groups: int = 2048, early_stop: bool = True, rng_seed: int = 2026211):
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     n_budgets = 6
@@ -579,7 +579,7 @@ def run_lesson_21(iterations: int = 400, n_groups: int = 2048):
 
     budget_tiers = torch.tensor([100.0, 300.0, 625.0, 1000.0, 1500.0, 2500.0], device=device)
     env_budgets = budget_tiers.unsqueeze(0).expand(n_groups, n_budgets).reshape(pop_size)
-    rng = np.random.default_rng(2026211)
+    rng = np.random.default_rng(rng_seed)
     win_len = 600
 
     b1_all_np = vec_env.bids[:, 0].detach().cpu().numpy()
@@ -1178,7 +1178,7 @@ def run_lesson_21(iterations: int = 400, n_groups: int = 2048):
                 torch.save(ckpt_payload, latest_ckpt)
                 torch.save(ckpt_payload, SAVE_DIR / f"lesson_21_champ_iter_{it:04d}.pt")
 
-            if (it - last_val_champ_it) >= 140 and it >= 180:
+            if early_stop and (it - last_val_champ_it) >= 140 and it >= 180:
                 log_msg(f"🛑 [EARLY STOP L21] {it - last_val_champ_it} эпох без Парето-улучшения (лучший на it={last_val_champ_it}).")
                 break
 
@@ -1192,5 +1192,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--iters", type=int, default=400)
     ap.add_argument("--groups", type=int, default=2048)
+    ap.add_argument("--seed", type=int, default=2026211)
+    ap.add_argument("--no-early-stop", action="store_true")
     args = ap.parse_args()
-    run_lesson_21(iterations=args.iters, n_groups=args.groups)
+    run_lesson_21(iterations=args.iters, n_groups=args.groups, early_stop=not args.no_early_stop, rng_seed=args.seed)
