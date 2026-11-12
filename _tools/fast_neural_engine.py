@@ -509,7 +509,10 @@ class _TrainableKerasGraph(torch.nn.Module):
         return y
 
     def forward_logits_chunk(self, x_pad: torch.Tensor, s_i: int, e_i: int, sl: int) -> torch.Tensor:
-        x_sub = self._ln(x_pad[s_i : e_i + sl - 1], "layer_normalization").unsqueeze(0)
+        x_slice = x_pad[s_i : e_i + sl - 1]
+        if x_slice.dtype != torch.float32:
+            x_slice = x_slice.float()
+        x_sub = self._ln(x_slice, "layer_normalization").unsqueeze(0)
         if self.base_arch == "conv1d+gru":
             x = self._conv(x_sub, "conv1d", dilation=1, causal=False, act="gelu")
             x = self._ln(self._conv(x, "conv1d_1", dilation=1, causal=True, act="gelu"), "layer_normalization_1").squeeze(0)
@@ -673,30 +676,59 @@ def train_pytorch_window_fast(
     y_all = np.load(cdir / f"y_all_{h_key}.npy", mmap_mode="r")
     dt_all = np.load(cdir / f"dt_all_{h_key}.npy", mmap_mode="r")
 
+    import gc
     X_tr = np.array(X_all[tr_idx], dtype=np.float32)
-    X_te = np.array(X_all[te_idx], dtype=np.float32)
     y_tr = np.array(y_all[tr_idx], dtype=np.int64)
-    y_te = np.array(y_all[te_idx], dtype=np.int64)
-    dt_te = np.array(dt_all[te_idx], dtype=np.float32)
-    ts_tr, ts_te = ts_all[tr_idx], ts_all[te_idx]
+    ts_tr_range = [str(ts_all[tr_idx[0]])[:19], str(ts_all[tr_idx[-1]])[:19]]
+    ts_te_range = [str(ts_all[te_idx[0]])[:19], str(ts_all[te_idx[-1]])[:19]]
+    del ts_all
 
     mean = np.nanmean(X_tr, axis=0).astype(np.float32)
     std = (np.nanstd(X_tr, axis=0) + 1e-6).astype(np.float32)
-    X_tr_n = np.nan_to_num(np.clip((X_tr - mean) / std, -5.0, 5.0), nan=0.0)
-    X_te_n = np.nan_to_num(np.clip((X_te - mean) / std, -5.0, 5.0), nan=0.0)
+    X_tr -= mean
+    X_tr /= std
+    np.clip(X_tr, -5.0, 5.0, out=X_tr)
+    np.nan_to_num(X_tr, copy=False, nan=0.0, posinf=5.0, neginf=-5.0)
 
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pad_dtype = torch.float16 if dev.type == "cuda" else torch.float32
+    n_tr = len(y_tr)
+    x_tr_pad = torch.empty((n_tr + sl - 1, X_tr.shape[1]), dtype=pad_dtype, device=dev)
+    first_tr = torch.as_tensor(X_tr[:1], dtype=pad_dtype, device=dev)
+    if sl > 1:
+        x_tr_pad[: sl - 1].copy_(first_tr.expand(sl - 1, -1))
+    for i0 in range(0, n_tr, 250_000):
+        i1 = min(n_tr, i0 + 250_000)
+        x_tr_pad[sl - 1 + i0 : sl - 1 + i1].copy_(torch.as_tensor(X_tr[i0:i1], dtype=pad_dtype))
+    del X_tr, tr_idx
+
+    X_te = np.array(X_all[te_idx], dtype=np.float32)
+    y_te = np.array(y_all[te_idx], dtype=np.int64)
+    dt_te = np.array(dt_all[te_idx], dtype=np.float32)
+    X_te -= mean
+    X_te /= std
+    np.clip(X_te, -5.0, 5.0, out=X_te)
+    np.nan_to_num(X_te, copy=False, nan=0.0, posinf=5.0, neginf=-5.0)
+    n_te = len(y_te)
+    x_te_pad = torch.empty((n_te + sl - 1, X_te.shape[1]), dtype=pad_dtype, device=dev)
+    first_te = torch.as_tensor(X_te[:1], dtype=pad_dtype, device=dev)
+    if sl > 1:
+        x_te_pad[: sl - 1].copy_(first_te.expand(sl - 1, -1))
+    for i0 in range(0, n_te, 250_000):
+        i1 = min(n_te, i0 + 250_000)
+        x_te_pad[sl - 1 + i0 : sl - 1 + i1].copy_(torch.as_tensor(X_te[i0:i1], dtype=pad_dtype))
+    del X_te, te_idx, X_all, y_all, dt_all
+    gc.collect()
+
     base_w = compute_class_weight("balanced", classes=np.arange(7), y=y_tr[sl - 1:])
     base_w[0] *= 1.35; base_w[1] *= 1.25; base_w[2] *= 1.10
     base_w[4] *= 1.10; base_w[5] *= 1.25; base_w[6] *= 1.35
     cw_t = torch.as_tensor(base_w, dtype=torch.float32, device=dev)
-
-    x_tr_pad = torch.as_tensor(np.vstack([np.repeat(X_tr_n[:1], sl - 1, axis=0), X_tr_n]), dtype=torch.float32, device=dev)
-    x_te_pad = torch.as_tensor(np.vstack([np.repeat(X_te_n[:1], sl - 1, axis=0), X_te_n]), dtype=torch.float32, device=dev)
     y_tr_t = torch.as_tensor(y_tr, dtype=torch.long, device=dev)
-    n_tr, n_te = len(y_tr), len(y_te)
+    del y_tr
     classes_vec = np.array([-3, -2, -1, 0, 1, 2, 3], dtype=np.float32)
     y_te_oh = np.eye(7, dtype=np.float32)[y_te]
+    del y_te
 
     best_score = -1e9
     best_m = None
@@ -719,8 +751,8 @@ def train_pytorch_window_fast(
     start_r = (prev_runs + 1) if (0 < prev_runs < runs and best_m is not None) else 1
     heavy_arch = arch in ("wavenet_tcn", "causal_cnn", "conv1d+gru", "attention")
     if sl >= 150:
-        eff_bsz = 1024 if heavy_arch else min(batch_size, 1536)
-        max_par_runs = 2 if heavy_arch else 4
+        eff_bsz = 512 if arch in ("conv1d+gru", "attention") else (1024 if heavy_arch else min(batch_size, 1536))
+        max_par_runs = 1 if arch in ("conv1d+gru", "attention") else (2 if heavy_arch else 4)
     elif sl >= 75:
         eff_bsz = 1024 if arch in ("conv1d+gru", "attention") else min(batch_size, 1536 if heavy_arch else 2048)
         max_par_runs = 3 if heavy_arch else 5
@@ -728,7 +760,7 @@ def train_pytorch_window_fast(
         eff_bsz = batch_size
         max_par_runs = 5 if heavy_arch else 8
 
-    eval_bsz = 2048 if (sl >= 75 and heavy_arch) else 4096
+    eval_bsz = 512 if (sl >= 150 and heavy_arch) else (1024 if (sl >= 75 and heavy_arch) else 4096)
     max_chunks = 20 if (sl >= 75 and arch in ("conv1d+gru", "attention")) else 72
     chunk_starts = list(range(0, n_tr, eff_bsz))
     eval_stride = 4 if (n_te > 250_000 and sl >= 75 and arch in ("conv1d+gru", "attention")) else 1
@@ -790,14 +822,14 @@ def train_pytorch_window_fast(
         for idx_r, r_i in enumerate(wave_rids):
             net = nets[idx_r]
             net.eval()
-            probs_gpu_chunks = []
+            probs_cpu_chunks = []
             with torch.no_grad():
                 for s_i in eval_starts:
                     e_i = min(n_te, s_i + eval_bsz)
                     with torch.amp.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_bf16):
                         logits_te = net.forward_logits_chunk(x_te_pad, s_i, e_i, sl)
-                    probs_gpu_chunks.append(F.softmax(logits_te.float(), dim=-1))
-                probs = np.clip(torch.cat(probs_gpu_chunks, dim=0).cpu().numpy(), 1e-7, 1.0 - 1e-7)
+                    probs_cpu_chunks.append(F.softmax(logits_te.float(), dim=-1).cpu().numpy())
+                probs = np.clip(np.concatenate(probs_cpu_chunks, axis=0), 1e-7, 1.0 - 1e-7)
             ll = float(-np.mean(np.sum(y_te_oh_sub * np.log(probs), axis=1)))
             ez = np.dot(probs, classes_vec)
             ic = float(np.corrcoef(ez, dt_te_sub)[0, 1]) if np.std(ez) > 1e-7 and np.std(dt_te_sub) > 1e-7 else 0.0
@@ -819,8 +851,8 @@ def train_pytorch_window_fast(
             meta = {
                 "window_id": win_tag, "model_type": arch, "coin": coin.upper(), "H": int(horizon), "seq_len": sl,
                 "runs": int(r_i),
-                "train_ts_range": [str(ts_tr[0])[:19], str(ts_tr[-1])[:19]],
-                "test_ts_range": [str(ts_te[0])[:19], str(ts_te[-1])[:19]],
+                "train_ts_range": ts_tr_range,
+                "test_ts_range": ts_te_range,
                 "metrics_oos": best_m,
                 "feature_norm": {"mean": mean.tolist(), "std": std.tolist()},
                 "weights_file": f"model_{win_tag}.keras",
@@ -835,7 +867,8 @@ def train_pytorch_window_fast(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    del x_tr_pad, x_te_pad, y_tr_t
+    del x_tr_pad, x_te_pad, y_tr_t, y_te_oh, dt_te
+    gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return {"window": win_tag, "arch": arch, "cached": False, **(best_m or {})}

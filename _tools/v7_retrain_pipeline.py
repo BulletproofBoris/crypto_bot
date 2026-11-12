@@ -120,42 +120,71 @@ def step1_sync_and_rebuild_dataset(coin: str = "prl"):
     print(f"🎉 Бинарный кэш data/_mmap_cache обновлён за {time.time() - t0:.1f}с!", flush=True)
 
 
-def step2_train_rolling_windows_6h(coin: str = "prl", epochs: int = 10, runs: int = 15, cache_subdir: str | None = None):
+def step2_train_rolling_windows_6h(
+    coin: str = "prl",
+    epochs: int = 10,
+    runs: int = 15,
+    cache_subdir: str | None = None,
+    phase: str = "all",
+    lgb_workers: int | None = None,
+):
     """Шаг 2: Инкрементальное дообучение скользящих окон LightGBM + 6 нейросетей (H=5..120s, runs=15) и обновление альянсов."""
-    from _tools.train_rolling_swarm import train_coin_horizon
-    from _tools.fast_neural_engine import train_pytorch_window_fast
+    import subprocess
     from _tools.system_resources import SAFE_WORKERS
 
     coin_l = coin.lower()
+    eff_workers = int(lgb_workers) if lgb_workers is not None else int(SAFE_WORKERS)
     if cache_subdir is None:
         cache_subdir = "_mmap_cache_bo" if coin_l.endswith("_bo") else "_mmap_cache"
 
-    print("=" * 95)
-    print(f"🧬 [ШАГ 2/6] ДООБУЧЕНИЕ СКОЛЬЗЯЩИХ ОКОН РОЯ {coin_l.upper()} (LIGHTGBM + 6 НЕЙРОСЕТЕЙ, H=5..120s, runs={runs})")
-    print("=" * 95)
+    print("=" * 95, flush=True)
+    print(f"🧬 [ШАГ 2/6] ДООБУЧЕНИЕ СКОЛЬЗЯЩИХ ОКОН РОЯ {coin_l.upper()} (phase={phase.upper()}, H=5..120s, runs={runs})", flush=True)
+    print("=" * 95, flush=True)
     cache_dir = BASE_DIR / "data" / cache_subdir
     ts_all_arr = np.load(cache_dir / "ts_all.npy", allow_pickle=True)
 
-    for h, k in HORIZON_PAIRS:
-        n_w = int(np.load(cache_dir / f"h{h}_n_windows.npy"))
-        lgb_dir = BASE_DIR / "models" / coin_l / f"h{h}s_k{k:g}"
-        need_lgb = False
-        for w_chk in range(n_w):
-            mp_chk = lgb_dir / f"meta_win_{w_chk:02d}.json"
-            if not mp_chk.exists():
-                need_lgb = True
-                break
-            if w_chk >= max(0, n_w - 2):
-                tr_idx_chk = np.load(cache_dir / f"h{h}_tr_idx_{w_chk:02d}.npy")
-                exp_tr_range = [str(ts_all_arr[tr_idx_chk[0]])[:19], str(ts_all_arr[tr_idx_chk[-1]])[:19]]
-                if json.loads(mp_chk.read_text()).get("train_ts_range") != exp_tr_range:
+    # Фаза 2А: Все пулы LightGBM обучаются в отдельных чистых CPU-процессах ДО инициализации PyTorch CUDA (исключает OpenMP libgomp deadlock!)
+    if phase in ("all", "lgb"):
+        for h, k in HORIZON_PAIRS:
+            n_w = int(np.load(cache_dir / f"h{h}_n_windows.npy"))
+            lgb_dir = BASE_DIR / "models" / coin_l / f"h{h}s_k{k:g}"
+            need_lgb = False
+            for w_chk in range(n_w):
+                mp_chk = lgb_dir / f"meta_win_{w_chk:02d}.json"
+                if not mp_chk.exists():
                     need_lgb = True
                     break
-        if need_lgb:
-            print(f"\n🔹 [LightGBM {coin_l.upper()} H={h}s, K={k}] Проверка и дообучение скользящих окон...")
-            train_coin_horizon(coin=coin_l, H=h, K=k, n_estimators=450, n_jobs=SAFE_WORKERS)
-        else:
-            print(f"\n🔹 [LightGBM {coin_l.upper()} H={h}s, K={k}] Все {n_w} окон актуальны по временным меткам.")
+                if w_chk >= max(0, n_w - 2):
+                    tr_idx_chk = np.load(cache_dir / f"h{h}_tr_idx_{w_chk:02d}.npy")
+                    exp_tr_range = [str(ts_all_arr[tr_idx_chk[0]])[:19], str(ts_all_arr[tr_idx_chk[-1]])[:19]]
+                    if json.loads(mp_chk.read_text()).get("train_ts_range") != exp_tr_range:
+                        need_lgb = True
+                        break
+            if need_lgb:
+                print(f"\n🔹 [LightGBM {coin_l.upper()} H={h}s, K={k}] Обучение скользящих окон в чистом CPU-подпроцессе (workers={eff_workers})...", flush=True)
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-u",
+                        "-c",
+                        f"import sys; sys.path.insert(0, {str(BASE_DIR)!r}); "
+                        f"from _tools.train_rolling_swarm import train_coin_horizon; "
+                        f"train_coin_horizon(coin={coin_l!r}, H={h}, K={k}, n_estimators=450, n_jobs={eff_workers})",
+                    ],
+                    check=True,
+                )
+            else:
+                print(f"\n🔹 [LightGBM {coin_l.upper()} H={h}s, K={k}] Все {n_w} окон актуальны по временным меткам.", flush=True)
+
+    if phase == "lgb":
+        print(f"✅ CPU-фаза LightGBM для {coin_l.upper()} завершена (GPU не задействовался).", flush=True)
+        return
+
+    from _tools.fast_neural_engine import train_pytorch_window_fast
+
+    # Фаза 2Б: Непрерывное GPU-обучение всех 6 нейросетевых архитектур по всем горизонтам без пауз на CPU LightGBM!
+    for h, k in HORIZON_PAIRS:
+        n_w = int(np.load(cache_dir / f"h{h}_n_windows.npy"))
         for arch in NEURAL_ARCHS:
             ep = (6 if h >= 90 else 8) if arch == "conv1d+gru" else (8 if h >= 90 else epochs)
             bsz = 4096 if h >= 60 else 2048

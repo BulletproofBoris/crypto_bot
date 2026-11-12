@@ -77,15 +77,21 @@ def main():
     ap.add_argument("--st-runs", type=int, default=15)
     ap.add_argument("--bo-runs", type=int, default=8, help="Число мультистартов на окно для полного пула BigONE (120+ окон x 6 NN)")
     ap.add_argument("--only", choices=["all", "st", "bo"], default="all")
+    ap.add_argument("--phase", choices=["all", "lgb", "nn"], default="all")
+    ap.add_argument("--lgb-workers", type=int, default=None)
     args = ap.parse_args()
 
     t0 = time.time()
     if args.only in ("all", "st"):
-        step2_train_rolling_windows_6h(coin="prl", epochs=args.epochs, runs=args.st_runs, cache_subdir="_mmap_cache")
+        step2_train_rolling_windows_6h(
+            coin="prl", epochs=args.epochs, runs=args.st_runs, cache_subdir="_mmap_cache", phase=args.phase, lgb_workers=args.lgb_workers
+        )
         print_swarm_summary("prl", "_mmap_cache")
 
     if args.only in ("all", "bo"):
-        step2_train_rolling_windows_6h(coin="prl_bo", epochs=args.epochs, runs=args.bo_runs, cache_subdir="_mmap_cache_bo")
+        step2_train_rolling_windows_6h(
+            coin="prl_bo", epochs=args.epochs, runs=args.bo_runs, cache_subdir="_mmap_cache_bo", phase=args.phase, lgb_workers=args.lgb_workers
+        )
         print_swarm_summary("prl_bo", "_mmap_cache_bo")
 
     print(f"\n🎉 Полный цикл обучения моделей 1-го порядка завершен за {(time.time() - t0) / 60.0:.1f} мин!", flush=True)
