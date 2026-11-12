@@ -48,9 +48,9 @@ from _tools.fused_l22_train_tick import (
 
 CACHE_PATH = BASE_DIR / "data" / "cache" / "rl_guard_lob_cache_600h.npz"
 RELEASE_CHAMP_PATH = BASE_DIR / "models" / "prl" / "release_champion_v1.pt"
-SAVE_DIR = BASE_DIR / "models" / "prl" / "lesson_22_p2_slot_queue_444d"
-RESUME_CHAMP_PATH = SAVE_DIR / "lesson_22_p2_champ_resume.pt"
-LOG_FILE = BASE_DIR / "data" / "logs" / "lesson_22_p2_slot_queue_444d.log"
+SAVE_DIR = BASE_DIR / "models" / "prl" / "lesson_22_p3_slot_queue_2000"
+RESUME_CHAMP_PATH = SAVE_DIR / "lesson_22_p3_champ_resume.pt"
+LOG_FILE = BASE_DIR / "data" / "logs" / "lesson_22_p3_slot_queue_2000.log"
 
 # 16 семантических входных блоков головы политики (444D = 334D Market + 110D Agent):
 SEMANTIC_BLOCKS_L21 = [
@@ -517,19 +517,19 @@ def run_lesson_22(iterations: int = 1000, n_groups: int = 2048, early_stop: bool
     policy = CompactDecoupledParetoPolicy(backbone=backbone, n_groups=n_groups, n_budgets=n_budgets, device=device)
     v7_all = v7_all.to(dtype=policy.dtype)
 
-    summary_path = SAVE_DIR / "lesson_22_p2_summary.json"
-    latest_ckpt = SAVE_DIR / "lesson_22_p2_champ_latest.pt"
+    summary_path = SAVE_DIR / "lesson_22_p3_summary.json"
+    latest_ckpt = SAVE_DIR / "lesson_22_p3_champ_latest.pt"
     history = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else []
 
     seed_path = RESUME_CHAMP_PATH if RESUME_CHAMP_PATH.exists() else (latest_ckpt if latest_ckpt.exists() else RELEASE_CHAMP_PATH)
     ck = torch.load(seed_path, map_location=device, weights_only=False)
     policy.load_champion(ck)
-    start_iter = (int(ck.get("iteration", 0)) + 1) if (int(ck.get("lesson", 21)) == 22 and int(ck.get("phase", 1)) == 2) else 1
+    start_iter = (int(ck.get("iteration", 0)) + 1) if (int(ck.get("lesson", 21)) == 22 and int(ck.get("phase", 1)) == 3) else 1
     if start_iter > 1 and history:
         history = [r for r in history if int(r.get("iteration", 0)) < start_iter]
     log_msg(
-        f"🧬 Урок 22.2 (444D Per-Slot FIFO Queue Progress + Burst Physics + Cosine Restarts): старт с it={start_iter} из {seed_path.name} "
-        f"({ck.get('release_name', 'L22_0969_queue_kpd_4venue_decoupled')}) на {n_total:,} тиках!"
+        f"🧬 Урок 22.3 (444D Per-Slot FIFO Queue Progress + Unshackled Polyak Horizon, 2000 iters): старт с it={start_iter} из {seed_path.name} "
+        f"({ck.get('release_name', 'L22P2_SOUP_TOP2')}) на {n_total:,} тиках!"
     )
 
     hof_state = {
@@ -1045,8 +1045,8 @@ def run_lesson_22(iterations: int = 1000, n_groups: int = 2048, early_stop: bool
                 hof_g_logit = cand_polyak_gl
 
             hof_updated = False
-            if it % 3 == 0 or it == iterations or (b_fit > c0_fit + 0.35 and b_prof_buds >= 4):
-                ls_alphas = [0.05, 0.12, 0.25, 0.45, 0.70, 1.00]
+            if it % 3 == 0 or it == iterations or (b_fit > c0_fit + 0.30 and b_prof_buds >= 4):
+                ls_alphas = [0.03, 0.08, 0.18, 0.35, 0.60, 1.00]
                 ls_raw_states = []
                 ls_gls = []
                 ls_folded_candidates = []
@@ -1055,13 +1055,15 @@ def run_lesson_22(iterations: int = 1000, n_groups: int = 2048, early_stop: bool
                     "w1": cand_w1.detach().cpu().float(),
                     "b1": cand_b1.detach().cpu().float(),
                     "w_res1": cand_wr1.detach().cpu().float(),
-                    "b_res1": cand_br1.detach().cpu().float(),
+                    "b1_dummy": None,
                     "w_res2": cand_wr2.detach().cpu().float(),
                     "w2": cand_w2.detach().cpu().float(),
                     "b2": cand_b2.detach().cpu().float(),
                     "w_rec": cand_wrec.detach().cpu().float(),
                     "b_rec": cand_brec.detach().cpu().float(),
                 }
+                del c_cpu["b1_dummy"]
+                c_cpu["b_res1"] = cand_br1.detach().cpu().float()
                 c_gl_cpu = cand_gl.detach().cpu().float()
                 for a_ls in ls_alphas:
                     st_a = {k: (1.0 - a_ls) * best_val_state[k].float() + a_ls * c_cpu[k] for k in c_cpu}
@@ -1074,21 +1076,23 @@ def run_lesson_22(iterations: int = 1000, n_groups: int = 2048, early_stop: bool
                 ls_gls.append(cand_polyak_gl.float())
                 ls_folded_candidates.append(policy.fold_gate_into_state(cand_polyak_state, cand_polyak_gl))
 
-                raw_best = {
-                    "w1": policy.w1[best_g].detach().cpu().float(),
-                    "b1": policy.b1[best_g].detach().cpu().float(),
-                    "w_res1": policy.w_res1[best_g].detach().cpu().float(),
-                    "b_res1": policy.b_res1[best_g].detach().cpu().float(),
-                    "w_res2": policy.w_res2[best_g].detach().cpu().float(),
-                    "w2": policy.w2[best_g].detach().cpu().float(),
-                    "b2": policy.b2[best_g].detach().cpu().float(),
-                    "w_rec": policy.w_rec[best_g].detach().cpu().float(),
-                    "b_rec": policy.b_rec[best_g].detach().cpu().float(),
-                }
-                gl_best = policy.g_logits[best_g].detach().cpu().float()
-                ls_raw_states.append(raw_best)
-                ls_gls.append(gl_best)
-                ls_folded_candidates.append(policy.fold_gate_into_state(raw_best, gl_best))
+                for el_rank in (0, 1):
+                    el_g = int(sorted_g[el_rank].item())
+                    raw_el = {
+                        "w1": policy.w1[el_g].detach().cpu().float(),
+                        "b1": policy.b1[el_g].detach().cpu().float(),
+                        "w_res1": policy.w_res1[el_g].detach().cpu().float(),
+                        "b_res1": policy.b_res1[el_g].detach().cpu().float(),
+                        "w_res2": policy.w_res2[el_g].detach().cpu().float(),
+                        "w2": policy.w2[el_g].detach().cpu().float(),
+                        "b2": policy.b2[el_g].detach().cpu().float(),
+                        "w_rec": policy.w_rec[el_g].detach().cpu().float(),
+                        "b_rec": policy.b_rec[el_g].detach().cpu().float(),
+                    }
+                    gl_el_c = policy.g_logits[el_g].detach().cpu().float()
+                    ls_raw_states.append(raw_el)
+                    ls_gls.append(gl_el_c)
+                    ls_folded_candidates.append(policy.fold_gate_into_state(raw_el, gl_el_c))
 
                 val_res_list = evaluate_l22_dual_basket(
                     vec_env, bf16_runner, lob_fu_all, v7_all, roll_sell_30s_all, ls_folded_candidates, val_basket, win_len, tick_sz, device, True, True
@@ -1102,11 +1106,19 @@ def run_lesson_22(iterations: int = 1000, n_groups: int = 2048, early_stop: bool
                     c_act_fr = float(v_res["clean_act_frac"])
                     c_eta_q = float(v_res["clean_eta_queue_pct"])
                     c_cpf = float(v_res["clean_cnl_per_fill"])
-                    # Строгий двухконтурный лексикографический Парето-критерий обновления чемпиона:
-                    valid_active_mm = (c_cev > 0.003) and (c_fills >= 4.0)
-                    strictly_dominates = (c_cu >= best_clean_util) and (c_uu >= best_uw_util) and ((c_cu > best_clean_util + 0.02) or (c_uu > best_uw_util + 0.05))
-                    clean_axis_breakthrough = (c_pu > best_pareto_util + 0.03) and (c_cu > best_clean_util + 0.08) and (c_cev >= best_clean_ev - 0.0015) and (c_uu >= best_uw_util - 3.5)
-                    if valid_active_mm and (strictly_dominates or clean_axis_breakthrough):
+                    valid_active_mm = (c_cev > 0.005) and (c_fills >= 5.0)
+                    strictly_dominates = (
+                        (c_cu >= best_clean_util - 0.005)
+                        and (c_uu >= best_uw_util - 0.015)
+                        and (c_pu > best_pareto_util + 0.012)
+                    )
+                    pareto_gain_guarded = (
+                        (c_pu > best_pareto_util + 0.022)
+                        and (c_cu >= best_clean_util - 0.06)
+                        and (c_uu >= best_uw_util - 1.25)
+                        and (c_cev >= best_clean_ev - 0.0012)
+                    )
+                    if valid_active_mm and (strictly_dominates or pareto_gain_guarded):
                         best_pareto_util = c_pu
                         best_clean_util = c_cu
                         best_uw_util = c_uu
@@ -1116,25 +1128,28 @@ def run_lesson_22(iterations: int = 1000, n_groups: int = 2048, early_stop: bool
                         best_cnl_per_fill = c_cpf
                         g_vals = (2.0 * torch.sigmoid(ls_gls[c_idx])).tolist()
                         best_val_folded = {k: v.clone() for k, v in ls_folded_candidates[c_idx].items()}
-                        # Zero Gate-Folding Drift: ребейз folded-весов в эталон с обнулением g_logit
                         best_val_state = {k: v.to(hof_state[k].dtype).clone() for k, v in best_val_folded.items()}
                         best_val_g_logit = torch.zeros(N_BLOCKS_L21, dtype=torch.float32)
                         hof_state = {k: v.clone() for k, v in best_val_state.items()}
                         hof_g_logit = torch.zeros(N_BLOCKS_L21, dtype=torch.float32)
                         hof_updated = True
                         last_val_champ_it = it
-                        ls_tag = f"alpha={ls_alphas[c_idx]:.2f}" if c_idx < len(ls_alphas) else ("polyak_hof" if c_idx == 6 else "best_elite")
+                        ls_tag = f"alpha={ls_alphas[c_idx]:.2f}" if c_idx < len(ls_alphas) else ("polyak_hof" if c_idx == 6 else f"best_elite_{c_idx - 6}")
                         log_msg(
-                            f"  💎 [NEW L22.2 444D CHAMPION it={it} ({ls_tag})] ParetoUtil={c_pu:+.2f}bp "
+                            f"  💎 [NEW L22.3 444D CHAMPION it={it} ({ls_tag})] ParetoUtil={c_pu:+.2f}bp "
                             f"[Clean18={c_cu:+.2f}bp (EV={c_cev:+.4f}%, Fills={c_fills:.1f}, Cnl/Fill={c_cpf:.1f}, η_queue={c_eta_q:.1f}%, Act={c_act_fr:.0%}) | "
                             f"UW4={c_uu:+.2f}bp (ΔMTM={v_res['uw_delta_ev']:+.4f}%)] | "
                             f"Clean[N:{v_res['clean_norm_pct']:+.3f}% D:{v_res['clean_dump_pct']:+.3f}% P:{v_res['clean_pump_pct']:+.3f}% DD:{v_res['clean_dd_pct']:.2f}%] | "
                             f"Gates(CV4={g_vals[6]:.2f}, Acct={g_vals[12]:.2f}, Queue={g_vals[13]:.2f}, SlotProg={g_vals[15]:.2f})"
                         )
 
-            if it % 20 == 0 and not hof_updated:
-                hof_state = {k: v.clone() for k, v in best_val_state.items()}
-                hof_g_logit = best_val_g_logit.clone()
+            # Мягкий возврат Polyak-центра только при длительной стагнации (120 эпох без рекорда), сохраняя 35% накопленного импульса [420:444]:
+            if (it - last_val_champ_it) > 0 and (it - last_val_champ_it) % 120 == 0 and not hof_updated:
+                hof_state = {
+                    k: (0.65 * best_val_state[k].float() + 0.35 * hof_state[k].float()).to(best_val_state[k].dtype)
+                    for k in best_val_state
+                }
+                hof_g_logit = 0.65 * best_val_g_logit + 0.35 * hof_g_logit
 
             policy.evolve_gated_groups(
                 pareto_fitness,
@@ -1172,7 +1187,7 @@ def run_lesson_22(iterations: int = 1000, n_groups: int = 2048, early_stop: bool
             dt_ep = time.time() - t0
             star = "★" if hof_updated else "·"
             log_msg(
-                f"🎯 L22.2 [{it}/{iterations}]{star} ({b_prof_buds}/6+) | Flat: {b_flat_ret:+.3f}% ({b_flat_u:+.1f}bp, Fills={b_fills:.1f}, Cnl={b_cancels:.1f}, η_q={b_eta_queue:.0f}%) "
+                f"🎯 L22.3 [{it}/{iterations}]{star} ({b_prof_buds}/6+) | Flat: {b_flat_ret:+.3f}% ({b_flat_u:+.1f}bp, Fills={b_fills:.1f}, Cnl={b_cancels:.1f}, η_q={b_eta_queue:.0f}%) "
                 f"[N:{b_norm_pct:+.2f}% D:{b_dump_pct:+.2f}% P:{b_pump_pct:+.2f}%] | UW: {b_uw_ret:+.3f}% ({b_uw_u:+.1f}bp) | "
                 f"DD: {b_dd_pct:.2f}% | Champ EV={best_clean_ev:+.4f}% η_q={best_eta_queue:.1f}% ({dt_ep:.2f}с)"
             )
@@ -1180,9 +1195,9 @@ def run_lesson_22(iterations: int = 1000, n_groups: int = 2048, early_stop: bool
             if hof_updated or it == iterations or it == start_iter:
                 ckpt_payload = {
                     "lesson": 22,
-                    "phase": 2,
+                    "phase": 3,
                     "iteration": it,
-                    "release_name": f"L22P2_{it:04d}_slot_queue_444d",
+                    "release_name": f"L22P3_{it:04d}_slot_queue_444d",
                     "n_slots": 24,
                     "allow_scratch_stop_asks": True,
                     "use_cross_venue_v1": True,
@@ -1208,7 +1223,7 @@ def run_lesson_22(iterations: int = 1000, n_groups: int = 2048, early_stop: bool
                     "b_rec": best_val_folded["b_rec"],
                 }
                 torch.save(ckpt_payload, latest_ckpt)
-                torch.save(ckpt_payload, SAVE_DIR / f"lesson_22_p2_champ_iter_{it:04d}.pt")
+                torch.save(ckpt_payload, SAVE_DIR / f"lesson_22_p3_champ_iter_{it:04d}.pt")
 
             if early_stop and (it - last_val_champ_it) >= 350 and it >= 600:
                 log_msg(f"🛑 [EARLY STOP L22.2] {it - last_val_champ_it} эпох без Парето-улучшения (лучший на it={last_val_champ_it}).")

@@ -717,8 +717,18 @@ def train_pytorch_window_fast(
             pass
 
     start_r = (prev_runs + 1) if (0 < prev_runs < runs and best_m is not None) else 1
-    eff_bsz = 1024 if (sl >= 75 and arch in ("conv1d+gru", "attention")) else batch_size
-    eval_bsz = 4096 if (sl >= 75 and arch in ("conv1d+gru", "attention")) else 8192
+    heavy_arch = arch in ("wavenet_tcn", "causal_cnn", "conv1d+gru", "attention")
+    if sl >= 150:
+        eff_bsz = 1024 if heavy_arch else min(batch_size, 1536)
+        max_par_runs = 2 if heavy_arch else 4
+    elif sl >= 75:
+        eff_bsz = 1024 if arch in ("conv1d+gru", "attention") else min(batch_size, 1536 if heavy_arch else 2048)
+        max_par_runs = 3 if heavy_arch else 5
+    else:
+        eff_bsz = batch_size
+        max_par_runs = 5 if heavy_arch else 8
+
+    eval_bsz = 2048 if (sl >= 75 and heavy_arch) else 4096
     max_chunks = 20 if (sl >= 75 and arch in ("conv1d+gru", "attention")) else 72
     chunk_starts = list(range(0, n_tr, eff_bsz))
     eval_stride = 4 if (n_te > 250_000 and sl >= 75 and arch in ("conv1d+gru", "attention")) else 1
@@ -726,99 +736,106 @@ def train_pytorch_window_fast(
     use_fused = dev.type == "cuda"
 
     run_ids = list(range(start_r, runs + 1))
-    t_par0 = time.perf_counter()
-    nets = []
-    opts = []
-    scheds = []
-    streams = []
-    perms_per_run = []
-    for r_i in run_ids:
-        torch.manual_seed(1000 * win_idx + 37 * r_i)
-        net_i = _TrainableKerasGraph(tpl_keras, arch).to(dev)
-        opt_i = torch.optim.AdamW(net_i.parameters(), lr=lr, weight_decay=1e-4, fused=use_fused)
-        sched_i = torch.optim.lr_scheduler.CosineAnnealingLR(opt_i, T_max=epochs, eta_min=lr * 0.1)
-        ep_perms = [torch.randperm(len(chunk_starts)).tolist()[:max_chunks] for _ in range(epochs)]
-        nets.append(net_i)
-        opts.append(opt_i)
-        scheds.append(sched_i)
-        perms_per_run.append(ep_perms)
-        streams.append(torch.cuda.Stream(device=dev) if dev.type == "cuda" else None)
-
-    # Параллельное обучение всех runs в независимых CUDA Streams с BF16 Tensor Cores и FP32 CrossEntropy
-    for ep_i in range(epochs):
-        for idx_r, net_i in enumerate(nets):
-            opt_i = opts[idx_r]
-            sched_i = scheds[idx_r]
-            perm = perms_per_run[idx_r][ep_i]
-            stm = streams[idx_r]
-            ctx = torch.cuda.stream(stm) if stm is not None else torch.enable_grad()
-            with ctx:
-                net_i.train()
-                for c_idx in perm:
-                    s_i = chunk_starts[c_idx]
-                    e_i = min(n_tr, s_i + eff_bsz)
-                    opt_i.zero_grad(set_to_none=True)
-                    with torch.amp.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_bf16):
-                        logits = net_i.forward_logits_chunk(x_tr_pad, s_i, e_i, sl)
-                    loss = F.cross_entropy(logits.float(), y_tr_t[s_i:e_i], weight=cw_t)
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(net_i.parameters(), 1.0)
-                    opt_i.step()
-                sched_i.step()
-    if dev.type == "cuda":
-        torch.cuda.synchronize(dev)
-
-    dt_per_run = (time.perf_counter() - t_par0) / max(1, len(run_ids))
     eval_starts = list(range(0, n_te, eval_bsz * eval_stride))
     ev_idx = np.concatenate([np.arange(s_i, min(n_te, s_i + eval_bsz)) for s_i in eval_starts])
     y_te_oh_sub = y_te_oh[ev_idx]
     dt_te_sub = dt_te[ev_idx]
 
-    for idx_r, r_i in enumerate(run_ids):
-        net = nets[idx_r]
-        net.eval()
-        probs_gpu_chunks = []
-        with torch.no_grad():
-            for s_i in eval_starts:
-                e_i = min(n_te, s_i + eval_bsz)
-                with torch.amp.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_bf16):
-                    logits_te = net.forward_logits_chunk(x_te_pad, s_i, e_i, sl)
-                probs_gpu_chunks.append(F.softmax(logits_te.float(), dim=-1))
-            probs = np.clip(torch.cat(probs_gpu_chunks, dim=0).cpu().numpy(), 1e-7, 1.0 - 1e-7)
-        ll = float(-np.mean(np.sum(y_te_oh_sub * np.log(probs), axis=1)))
-        ez = np.dot(probs, classes_vec)
-        ic = float(np.corrcoef(ez, dt_te_sub)[0, 1]) if np.std(ez) > 1e-7 and np.std(dt_te_sub) > 1e-7 else 0.0
-        try:
-            auc = float(roc_auc_score(y_te_oh_sub, probs, multi_class="ovr"))
-        except Exception:
-            auc = 0.5
-        k2 = max(1, int(len(dt_te_sub) * 0.02))
-        top_idx = np.argsort(np.abs(ez))[-k2:]
-        top2 = float(np.mean(np.sign(ez[top_idx]) * dt_te_sub[top_idx]))
-        score = ic + 0.15 * (auc - 0.5) - 0.03 * max(0.0, ll - 1.35)
-        if score > best_score:
-            best_score = score
-            best_m = {"ic_dt_ticks": round(ic, 4), "roc_auc_ovr": round(auc, 4), "log_loss": round(ll, 4), "top2pct_mean_ticks": round(top2, 2)}
+    # Обучение волнами по max_par_runs параллельных CUDA Streams (строго внутри 8 ГБ VRAM RTX 5060 Ti без PCIe-spillover)
+    for w0 in range(0, len(run_ids), max_par_runs):
+        wave_rids = run_ids[w0 : w0 + max_par_runs]
+        t_par0 = time.perf_counter()
+        nets = []
+        opts = []
+        scheds = []
+        streams = []
+        perms_per_run = []
+        for r_i in wave_rids:
+            torch.manual_seed(1000 * win_idx + 37 * r_i)
+            net_i = _TrainableKerasGraph(tpl_keras, arch).to(dev)
+            opt_i = torch.optim.AdamW(net_i.parameters(), lr=lr, weight_decay=1e-4, fused=use_fused)
+            sched_i = torch.optim.lr_scheduler.CosineAnnealingLR(opt_i, T_max=epochs, eta_min=lr * 0.1)
+            ep_perms = [torch.randperm(len(chunk_starts)).tolist()[:max_chunks] for _ in range(epochs)]
+            nets.append(net_i)
+            opts.append(opt_i)
+            scheds.append(sched_i)
+            perms_per_run.append(ep_perms)
+            streams.append(torch.cuda.Stream(device=dev) if dev.type == "cuda" else None)
+
+        for ep_i in range(epochs):
+            for idx_r, net_i in enumerate(nets):
+                opt_i = opts[idx_r]
+                sched_i = scheds[idx_r]
+                perm = perms_per_run[idx_r][ep_i]
+                stm = streams[idx_r]
+                ctx = torch.cuda.stream(stm) if stm is not None else torch.enable_grad()
+                with ctx:
+                    net_i.train()
+                    for c_idx in perm:
+                        s_i = chunk_starts[c_idx]
+                        e_i = min(n_tr, s_i + eff_bsz)
+                        opt_i.zero_grad(set_to_none=True)
+                        with torch.amp.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_bf16):
+                            logits = net_i.forward_logits_chunk(x_tr_pad, s_i, e_i, sl)
+                        loss = F.cross_entropy(logits.float(), y_tr_t[s_i:e_i], weight=cw_t)
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(net_i.parameters(), 1.0)
+                        opt_i.step()
+                    sched_i.step()
+            if dev.type == "cuda":
+                torch.cuda.synchronize(dev)
+
+        dt_per_run = (time.perf_counter() - t_par0) / max(1, len(wave_rids))
+
+        for idx_r, r_i in enumerate(wave_rids):
+            net = nets[idx_r]
+            net.eval()
+            probs_gpu_chunks = []
+            with torch.no_grad():
+                for s_i in eval_starts:
+                    e_i = min(n_te, s_i + eval_bsz)
+                    with torch.amp.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_bf16):
+                        logits_te = net.forward_logits_chunk(x_te_pad, s_i, e_i, sl)
+                    probs_gpu_chunks.append(F.softmax(logits_te.float(), dim=-1))
+                probs = np.clip(torch.cat(probs_gpu_chunks, dim=0).cpu().numpy(), 1e-7, 1.0 - 1e-7)
+            ll = float(-np.mean(np.sum(y_te_oh_sub * np.log(probs), axis=1)))
+            ez = np.dot(probs, classes_vec)
+            ic = float(np.corrcoef(ez, dt_te_sub)[0, 1]) if np.std(ez) > 1e-7 and np.std(dt_te_sub) > 1e-7 else 0.0
             try:
-                net.export_to_keras(out_keras)
+                auc = float(roc_auc_score(y_te_oh_sub, probs, multi_class="ovr"))
+            except Exception:
+                auc = 0.5
+            k2 = max(1, int(len(dt_te_sub) * 0.02))
+            top_idx = np.argsort(np.abs(ez))[-k2:]
+            top2 = float(np.mean(np.sign(ez[top_idx]) * dt_te_sub[top_idx]))
+            score = ic + 0.15 * (auc - 0.5) - 0.03 * max(0.0, ll - 1.35)
+            if score > best_score:
+                best_score = score
+                best_m = {"ic_dt_ticks": round(ic, 4), "roc_auc_ovr": round(auc, 4), "log_loss": round(ll, 4), "top2pct_mean_ticks": round(top2, 2)}
+                try:
+                    net.export_to_keras(out_keras)
+                except OSError:
+                    pass
+            meta = {
+                "window_id": win_tag, "model_type": arch, "coin": coin.upper(), "H": int(horizon), "seq_len": sl,
+                "runs": int(r_i),
+                "train_ts_range": [str(ts_tr[0])[:19], str(ts_tr[-1])[:19]],
+                "test_ts_range": [str(ts_te[0])[:19], str(ts_te[-1])[:19]],
+                "metrics_oos": best_m,
+                "feature_norm": {"mean": mean.tolist(), "std": std.tolist()},
+                "weights_file": f"model_{win_tag}.keras",
+            }
+            try:
+                with open(out_meta, "w") as f:
+                    json.dump(meta, f, indent=2)
             except OSError:
                 pass
-        meta = {
-            "window_id": win_tag, "model_type": arch, "coin": coin.upper(), "H": int(horizon), "seq_len": sl,
-            "runs": int(r_i),
-            "train_ts_range": [str(ts_tr[0])[:19], str(ts_tr[-1])[:19]],
-            "test_ts_range": [str(ts_te[0])[:19], str(ts_te[-1])[:19]],
-            "metrics_oos": best_m,
-            "feature_norm": {"mean": mean.tolist(), "std": std.tolist()},
-            "weights_file": f"model_{win_tag}.keras",
-        }
-        try:
-            with open(out_meta, "w") as f:
-                json.dump(meta, f, indent=2)
-        except OSError:
-            pass
-        print(f"  [{arch.upper()} H={horizon}s {win_tag} r{r_i:02d}/{runs}] ({dt_per_run:.1f}s eff) -> IC={ic:+.4f} | AUC={auc:.4f} | Loss={ll:.4f} | Top2%={top2:+.2f}t", flush=True)
-    del x_tr_pad, x_te_pad, y_tr_t, nets
+            print(f"  [{arch.upper()} H={horizon}s {win_tag} r{r_i:02d}/{runs}] ({dt_per_run:.1f}s eff) -> IC={ic:+.4f} | AUC={auc:.4f} | Loss={ll:.4f} | Top2%={top2:+.2f}t", flush=True)
+        del nets, opts, scheds, streams
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    del x_tr_pad, x_te_pad, y_tr_t
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return {"window": win_tag, "arch": arch, "cached": False, **(best_m or {})}
