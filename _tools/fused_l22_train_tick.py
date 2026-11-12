@@ -19,9 +19,9 @@ os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
 import torch
 import torch.nn.functional as F
 
-# Разбиение 420 каналов головы политики на:
+# Разбиение 444 каналов головы политики на:
 # - 334 чисто рыночных канала (зависят только от окна и шага [T, W, 334])
-# - 86 динамических агентских каналов (зависят от портфеля, 24 слотов, FIFO-очереди и микро-памяти)
+# - 110 динамических агентских каналов (портфель, 24 слота, FIFO-очередь 8D + микро-память 16D + послотовый прогресс очереди 24D)
 MKT_IDX_LIST = list(range(0, 318)) + list(range(348, 356)) + list(range(380, 388))
 AG_IDX_LIST = (
     list(range(318, 324))  # multi_6d (6)
@@ -30,8 +30,9 @@ AG_IDX_LIST = (
     + list(range(388, 396))  # acct_8d direct (8)
     + list(range(396, 404))  # queue_ahead_8d FIFO (8)
     + list(range(404, 420))  # policy micro-memory mem_h (16)
+    + list(range(420, 444))  # per-slot FIFO queue progress 24D: 12 Bid + 12 Ask (24)
 )
-assert len(MKT_IDX_LIST) == 334 and len(AG_IDX_LIST) == 86
+assert len(MKT_IDX_LIST) == 334 and len(AG_IDX_LIST) == 110
 
 
 @torch.no_grad()
@@ -275,8 +276,19 @@ def fused_l22_decoupled_tick(
         torch.zeros_like(ask_qty),
     ).to(dt)
 
-    z_ag = torch.cat([multi_6d, b_slot_12, a_slot_12, b_dist_12, a_dist_12, acct_8d, queue_8d, mem_h], dim=-1)
-    z_ag_g = z_ag.view(W, G, B, 86).permute(1, 0, 2, 3).reshape(G, M, 86)
+    b_qprog_12 = torch.where(
+        act_b_mask,
+        torch.clamp(1.0 - b_qa_rat_all, -0.5, 1.0),
+        torch.full_like(bid_qty, -1.0),
+    ).to(dt)
+    a_qprog_12 = torch.where(
+        act_a_mask,
+        torch.clamp(1.0 - a_qa_rat_all, -0.5, 1.0),
+        torch.full_like(ask_qty, -1.0),
+    ).to(dt)
+
+    z_ag = torch.cat([multi_6d, b_slot_12, a_slot_12, b_dist_12, a_dist_12, acct_8d, queue_8d, mem_h, b_qprog_12, a_qprog_12], dim=-1)
+    z_ag_g = z_ag.view(W, G, B, 110).permute(1, 0, 2, 3).reshape(G, M, 110)
     pre_ag = torch.bmm(z_ag_g, w1_ag_g).view(G, W, B, 384)
     pre_all = (pre_ag + pre_mkt_gw.unsqueeze(2)).reshape(G, M, 384)
 
@@ -526,6 +538,13 @@ def fused_l22_decoupled_tick(
     ask_qa0 = torch.where(valid_a, a_self_impact_qa.to(dt), ask_qa0)
     ask_act_s = torch.where(valid_a, act_lat_2d.expand_as(ask_act_s), ask_act_s)
 
+    # Пакетная перегрузка REST-шлюза (при > 4 мутаций стакана за 1с пейсинг 110ms растягивает RTT до 2 тиков):
+    n_mut_tot = n_cnl_b_step + n_cnl_a_step + n_plc_b_step + n_plc_a_step
+    if true_latency:
+        burst_delay = (n_mut_tot > 4).unsqueeze(1)
+        bid_act_s = torch.where(valid_b & burst_delay, (next_s_2d + 2).expand_as(bid_act_s), bid_act_s)
+        ask_act_s = torch.where(valid_a & burst_delay, (next_s_2d + 2).expand_as(ask_act_s), ask_act_s)
+
     nb1_1w = torch.clamp(nb1_w0, min=tick_size)
     na1_1w = torch.clamp(na1_w0, min=nb1_1w + tick_size)
     nb1 = nb1_1w.unsqueeze(1).expand(W, E).reshape(N, 1)
@@ -750,9 +769,9 @@ def fused_l22_decoupled_tick(
     sum_sq_dd_pct = sum_sq_dd_pct + dd_pct * dd_pct
     max_mtm_dd_pct = torch.maximum(max_mtm_dd_pct, dd_pct)
 
-    # Честная биржевая REST-нагрузка (0.0 при спокойном стоянии в очереди стакана!):
-    # Каждая реальная мутация книги (POST или DELETE) стоит вызова API и сброса FIFO-очереди.
-    mut_load_now = (n_cnl_b_step + n_cnl_a_step + n_plc_b_step + n_plc_a_step).float() / 4.0
+    # Честная биржевая REST-нагрузка (0.0 при спокойном стоянии в очереди стакана!) + квадратичная перегрузка шлюза при залпе > 2 мутаций/с:
+    burst_over = torch.clamp(n_mut_tot.float() - 2.0, min=0.0)
+    mut_load_now = (n_mut_tot.float() + 0.20 * burst_over * burst_over) / 4.0
     sum_mut_load = sum_mut_load + mut_load_now
     n_cancels = torch.clamp(n_cancels.long() + n_cnl_b_step + n_cnl_a_step, max=30000).to(torch.int16)
 
@@ -820,8 +839,8 @@ def evaluate_l22_dual_basket(
     w1_list, b1_list, wr1_list, br1_list, wr2_list, w2_list, b2_list, wrec_list, brec_list = [], [], [], [], [], [], [], [], []
     for st in cand_states:
         w1_raw = st["w1"].to(device=device, dtype=dt)
-        if w1_raw.shape[0] < 420:
-            pad = torch.zeros((420 - w1_raw.shape[0], w1_raw.shape[1]), dtype=dt, device=device)
+        if w1_raw.shape[0] < 444:
+            pad = torch.zeros((444 - w1_raw.shape[0], w1_raw.shape[1]), dtype=dt, device=device)
             w1_raw = torch.cat([w1_raw, pad], dim=0)
         w1_list.append(w1_raw)
         b1_list.append(st["b1"].to(device=device, dtype=dt).view(1, 384))

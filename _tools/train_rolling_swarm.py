@@ -156,12 +156,13 @@ def generate_rolling_windows_reverse(segments: list, H: int, K: float, n_target:
         })
         tr_s_pos += step
 
-    # Для макро-горизонта H>=60 добавляем свежее фронт-окно, если после последнего Train накопилось >250k сек
-    if H >= 60 and windows:
+    # Для горизонтов H>=12 добавляем свежее фронт-окно, если после последнего Train накопилось >= 6 часов (21,600 с)
+    if H >= 12 and windows:
         last_tr_e_pos = (len(windows) - 1) * step + t_train
-        target_te_len = 39597
+        target_te_len = min(39597, max(18000, step // 2))
         cand_tr_e = n_clean - buffer - target_te_len
-        if cand_tr_e - last_tr_e_pos >= 200000 and cand_tr_e >= t_train:
+        min_shift = max(21600, step // 4) if H < 60 else 120000
+        if cand_tr_e - last_tr_e_pos >= min_shift and cand_tr_e >= t_train:
             cand_tr_s = cand_tr_e - t_train
             cand_te_s = cand_tr_e + buffer
             windows.append({
@@ -210,19 +211,27 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
     from concurrent.futures import ThreadPoolExecutor
 
     coin = coin.lower()
-    labeled_path = BASE_DIR / "data" / "labeled" / coin / f"{coin}_labeled.parquet"
+    is_bo = coin.endswith("_bo")
+    base_coin = coin[:-3] if is_bo else coin
+    labeled_path = BASE_DIR / "data" / "labeled" / base_coin / f"{base_coin}_labeled.parquet"
     feats_json = BASE_DIR / "data" / "features" / f"selected_features_{coin}_h8s.json"
 
     if not labeled_path.exists() or not feats_json.exists():
-        print(f"❌ Файлы для {coin.upper()} не найдены!")
+        print(f"❌ Файлы для {coin.upper()} не найдены ({labeled_path}, {feats_json})!")
         return
 
     with open(feats_json) as f:
         feature_cols = json.load(f)["feature_order"]
 
     k_str = f"{K:g}"
-    target_c7_col = f"target_class_7_h{H}_k{k_str}"
-    target_dt_col = f"target_dt_ticks_h{H}_k{k_str}"
+    if is_bo:
+        target_c7_col = f"target_bo_class_7_h{H}_k{k_str}"
+        target_dt_col = f"target_bo_dt_ticks_h{H}_k{k_str}"
+        mmap_dir_name = "_mmap_cache_bo"
+    else:
+        target_c7_col = f"target_class_7_h{H}_k{k_str}"
+        target_dt_col = f"target_dt_ticks_h{H}_k{k_str}"
+        mmap_dir_name = "_mmap_cache"
 
     schema_cols = set(pq.read_schema(labeled_path).names)
     need_labeling = (target_c7_col not in schema_cols) or (target_dt_col not in schema_cols)
@@ -233,8 +242,10 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
         'ST_ofi_norm_300s', 'ST_cvd_5m', 'ST_cvd_norm_20s',
         'ST_bid_1_price', 'ST_ask_1_price', 'ST_bid_1_qty', 'ST_ask_1_qty',
         'ST_bids_vol_top5', 'ST_asks_vol_top5',
+        'BO_mid_price', 'BO_trade_vol', 'BO_spread', 'BO_spread_pct',
+        'BO_vol_300s_ticks', 'BO_vol_60s_ticks', 'BO_ofi_norm_300s', 'BO_cvd_5m',
     ]
-    mmap_x_path = BASE_DIR / "data" / "_mmap_cache" / "X_all.npy"
+    mmap_x_path = BASE_DIR / "data" / mmap_dir_name / "X_all.npy"
     use_mmap_x = mmap_x_path.exists()
 
     L = int(round(H * K))

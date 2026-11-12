@@ -120,31 +120,50 @@ def step1_sync_and_rebuild_dataset(coin: str = "prl"):
     print(f"🎉 Бинарный кэш data/_mmap_cache обновлён за {time.time() - t0:.1f}с!", flush=True)
 
 
-def step2_train_rolling_windows_6h(coin: str = "prl", epochs: int = 10, runs: int = 15):
+def step2_train_rolling_windows_6h(coin: str = "prl", epochs: int = 10, runs: int = 15, cache_subdir: str | None = None):
     """Шаг 2: Инкрементальное дообучение скользящих окон LightGBM + 6 нейросетей (H=5..120s, runs=15) и обновление альянсов."""
     from _tools.train_rolling_swarm import train_coin_horizon
     from _tools.fast_neural_engine import train_pytorch_window_fast
     from _tools.system_resources import SAFE_WORKERS
 
+    coin_l = coin.lower()
+    if cache_subdir is None:
+        cache_subdir = "_mmap_cache_bo" if coin_l.endswith("_bo") else "_mmap_cache"
+
     print("=" * 95)
-    print(f"🧬 [ШАГ 2/6] ДООБУЧЕНИЕ СКОЛЬЗЯЩИХ ОКОН РОЯ (LIGHTGBM + 6 НЕЙРОСЕТЕЙ, H=5..120s, runs={runs})")
+    print(f"🧬 [ШАГ 2/6] ДООБУЧЕНИЕ СКОЛЬЗЯЩИХ ОКОН РОЯ {coin_l.upper()} (LIGHTGBM + 6 НЕЙРОСЕТЕЙ, H=5..120s, runs={runs})")
     print("=" * 95)
-    cache_dir = BASE_DIR / "data" / "_mmap_cache"
+    cache_dir = BASE_DIR / "data" / cache_subdir
+    ts_all_arr = np.load(cache_dir / "ts_all.npy", allow_pickle=True)
+
     for h, k in HORIZON_PAIRS:
         n_w = int(np.load(cache_dir / f"h{h}_n_windows.npy"))
-        lgb_last_mp = BASE_DIR / "models" / coin / f"h{h}s_k{k:g}" / f"meta_win_{n_w-1:02d}.json"
-        if not lgb_last_mp.exists():
-            print(f"\n🔹 [LightGBM H={h}s, K={k}] Проверка и дообучение скользящих окон...")
-            train_coin_horizon(coin=coin, H=h, K=k, n_estimators=450, n_jobs=SAFE_WORKERS)
+        lgb_dir = BASE_DIR / "models" / coin_l / f"h{h}s_k{k:g}"
+        need_lgb = False
+        for w_chk in range(n_w):
+            mp_chk = lgb_dir / f"meta_win_{w_chk:02d}.json"
+            if not mp_chk.exists():
+                need_lgb = True
+                break
+            if w_chk >= max(0, n_w - 2):
+                tr_idx_chk = np.load(cache_dir / f"h{h}_tr_idx_{w_chk:02d}.npy")
+                exp_tr_range = [str(ts_all_arr[tr_idx_chk[0]])[:19], str(ts_all_arr[tr_idx_chk[-1]])[:19]]
+                if json.loads(mp_chk.read_text()).get("train_ts_range") != exp_tr_range:
+                    need_lgb = True
+                    break
+        if need_lgb:
+            print(f"\n🔹 [LightGBM {coin_l.upper()} H={h}s, K={k}] Проверка и дообучение скользящих окон...")
+            train_coin_horizon(coin=coin_l, H=h, K=k, n_estimators=450, n_jobs=SAFE_WORKERS)
         else:
-            print(f"\n🔹 [LightGBM H={h}s, K={k}] Все {n_w} окон уже обучены и актуальны.")
+            print(f"\n🔹 [LightGBM {coin_l.upper()} H={h}s, K={k}] Все {n_w} окон актуальны по временным меткам.")
         for arch in NEURAL_ARCHS:
             ep = (6 if h >= 90 else 8) if arch == "conv1d+gru" else (8 if h >= 90 else epochs)
             bsz = 4096 if h >= 60 else 2048
-            arch_dir = BASE_DIR / "models" / coin / f"{arch.replace('+', '_')}_h{h}s"
+            arch_dir = BASE_DIR / "models" / coin_l / f"{arch.replace('+', '_')}_h{h}s"
             for w_i in range(n_w):
                 mp = arch_dir / f"meta_win_{w_i:02d}.json"
-                lgb_mp = BASE_DIR / "models" / coin / f"h{h}s_k{k:g}" / f"meta_win_{w_i:02d}.json"
+                tr_idx_w = np.load(cache_dir / f"h{h}_tr_idx_{w_i:02d}.npy")
+                exp_tr_range = [str(ts_all_arr[tr_idx_w[0]])[:19], str(ts_all_arr[tr_idx_w[-1]])[:19]]
                 if mp.exists():
                     try:
                         open(mp, "r+").close()
@@ -153,14 +172,10 @@ def step2_train_rolling_windows_6h(coin: str = "prl", epochs: int = 10, runs: in
                     meta_obj = json.loads(mp.read_text())
                     age_sec = time.time() - mp.stat().st_mtime
                     cur_runs = int(meta_obj.get("runs", 3))
-                    ts_mismatch = False
-                    if lgb_mp.exists() and w_i >= n_w - 2:
-                        lgb_tr_range = json.loads(lgb_mp.read_text()).get("train_ts_range")
-                        if lgb_tr_range and meta_obj.get("train_ts_range") and meta_obj.get("train_ts_range") != lgb_tr_range:
-                            ts_mismatch = True
+                    ts_mismatch = (w_i >= max(0, n_w - 2)) and (meta_obj.get("train_ts_range") != exp_tr_range)
                     if not ts_mismatch and not ((age_sec < 43200 or w_i == n_w - 1) and cur_runs < runs):
                         continue
-                print(f"  🧠 [{arch.upper()} H={h}s] Обучение окна win_{w_i:02d}/{n_w-1} (runs={runs}, epochs={ep})...", flush=True)
+                print(f"  🧠 [{coin_l.upper()} {arch.upper()} H={h}s] Обучение окна win_{w_i:02d}/{n_w-1} (runs={runs}, epochs={ep})...", flush=True)
                 train_pytorch_window_fast(
                     cache_dir=str(cache_dir),
                     horizon=h,
@@ -171,6 +186,7 @@ def step2_train_rolling_windows_6h(coin: str = "prl", epochs: int = 10, runs: in
                     batch_size=bsz,
                     lr=2.2e-3,
                     force=True,
+                    coin=coin_l,
                 )
             manifest = []
             for w_i in range(n_w):
@@ -184,12 +200,13 @@ def step2_train_rolling_windows_6h(coin: str = "prl", epochs: int = 10, runs: in
                     pass
 
         # Пересборка мета-ансамбля ensemble_alliance_h{h}s.json
-        al_path = BASE_DIR / "models" / coin / f"ensemble_alliance_h{h}s.json"
-        al_live_path = BASE_DIR / "models" / coin / f"ensemble_alliance_live_h{h}s.json"
+        al_path = BASE_DIR / "models" / coin_l / f"ensemble_alliance_h{h}s.json"
+        al_live_path = BASE_DIR / "models" / coin_l / f"ensemble_alliance_live_h{h}s.json"
+        al_path.parent.mkdir(parents=True, exist_ok=True)
         selected_models = []
         weights = {}
         for a2 in NEURAL_ARCHS:
-            a2_dir = BASE_DIR / "models" / coin / f"{a2.replace('+', '_')}_h{h}s"
+            a2_dir = BASE_DIR / "models" / coin_l / f"{a2.replace('+', '_')}_h{h}s"
             for w_i in range(n_w):
                 mp = a2_dir / f"meta_win_{w_i:02d}.json"
                 if mp.exists():

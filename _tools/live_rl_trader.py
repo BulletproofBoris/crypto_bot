@@ -2417,6 +2417,21 @@ class LiveTriadRLTrader:
                             self.l7_mem_h = torch.zeros((1, 16), dtype=torch.float32)
                         ext_32_t = torch.cat([torch.tensor([acct_8d_list + queue_8d_list], dtype=torch.float32), self.l7_mem_h.float()], dim=-1)
                         z_aug = torch.cat([z_aug, ext_32_t], dim=-1)
+                    if int(self.l7_w1.shape[0]) >= 444:
+                        slot_qprog_24 = []
+                        for sl_q in self.bid_slots:
+                            if sl_q.get("id") is not None and float(sl_q.get("qty", 0.0)) > 1e-6:
+                                q_rat_s = float(np.clip(float(sl_q.get("qa", 0.0)) / (float(sl_q.get("qa0", 0.0)) + 10.0), 0.0, 1.5))
+                                slot_qprog_24.append(float(np.clip(1.0 - q_rat_s, -0.5, 1.0)))
+                            else:
+                                slot_qprog_24.append(-1.0)
+                        for sl_q in self.ask_slots:
+                            if sl_q.get("id") is not None and float(sl_q.get("qty", 0.0)) > 1e-6:
+                                q_rat_s = float(np.clip(float(sl_q.get("qa", 0.0)) / (float(sl_q.get("qa0", 0.0)) + 10.0), 0.0, 1.5))
+                                slot_qprog_24.append(float(np.clip(1.0 - q_rat_s, -0.5, 1.0)))
+                            else:
+                                slot_qprog_24.append(-1.0)
+                        z_aug = torch.cat([z_aug, torch.tensor([slot_qprog_24], dtype=torch.float32)], dim=-1)
                     pre_all = z_aug @ self.l7_w1 + self.l7_b1.squeeze(0)
                     if int(self.l7_w1.shape[1]) == 384:
                         h_base = torch.relu(pre_all[..., :256])
@@ -2438,7 +2453,13 @@ class LiveTriadRLTrader:
                         self.l7_mem_h = (rec_gate * self.l7_mem_h + (1.0 - rec_gate) * rec_u).detach()
                     raw_26 = torch.sigmoid(h1_t @ self.l7_w2 + self.l7_b2.squeeze(0)).squeeze(0).numpy()
                     self.last_l7_out = raw_26
-                    b_w_12 = raw_26[:12] if raw_26[24] <= 0.75 else np.zeros(12, dtype=np.float32)
+                    if raw_26[24] <= 0.75:
+                        b_w_12 = raw_26[:12]
+                    elif getattr(self, "l7_selective_front_cancel", False):
+                        b_w_12 = raw_26[:12].copy()
+                        b_w_12[:6] = 0.0
+                    else:
+                        b_w_12 = np.zeros(12, dtype=np.float32)
                     b_tot_s = float(np.sum(np.where(b_w_12 >= 0.08, b_w_12, 0.0)))
                     self.last_l7_target_exp_frac = float(np.clip(b_tot_s, 0.0, 1.0))
             except Exception as e_l7_step:

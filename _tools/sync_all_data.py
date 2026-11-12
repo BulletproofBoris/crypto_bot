@@ -689,20 +689,24 @@ def build_dataset_for_config(cfg, include_vps=True):
 
     return full_df
 
-def sync_and_process_all(include_vps=True):
+def sync_and_process_all(include_vps=True, download_only=False, build_only=False):
     """Выполняет полный пайплайн синхронизации."""
-    # 1. Синхронизируем Google Drive
-    try:
-        sync_gdrive()
-    except Exception as e:
-        logger.error(f"Ошибка при обращении к Google Drive: {e}")
-
-    # 2. Синхронизируем VPS (если включено)
-    if include_vps:
+    if not build_only:
+        # 1. Синхронизируем Google Drive
         try:
-            sync_vps_hot()
+            sync_gdrive()
         except Exception as e:
-            logger.error(f"Ошибка при скачивании данных с VPS: {e}")
+            logger.error(f"Ошибка при обращении к Google Drive: {e}")
+
+        # 2. Синхронизируем VPS (если включено)
+        if include_vps:
+            try:
+                sync_vps_hot()
+            except Exception as e:
+                logger.error(f"Ошибка при скачивании данных с VPS: {e}")
+
+    if download_only:
+        return None
 
     # 3. Склеиваем и создаем Parquet-датасеты (последовательно с очисткой RAM)
     import gc
@@ -771,6 +775,8 @@ def get_market_data(force_sync=True, include_vps=True):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Синхронизация и консолидация данных с Google Drive и VPS.")
     parser.add_argument("--no-vps", action="store_true", help="Не скачивать горячие данные с VPS (только Google Drive).")
+    parser.add_argument("--download-only", action="store_true", help="Только скачать свежие файлы с GDrive/VPS без сборки Parquet.")
+    parser.add_argument("--build-only", action="store_true", help="Только собрать Parquet из локальных кэшей без обращения к сети.")
     args = parser.parse_args()
 
-    sync_and_process_all(include_vps=not args.no_vps)
+    sync_and_process_all(include_vps=not args.no_vps, download_only=args.download_only, build_only=args.build_only)

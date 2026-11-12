@@ -633,6 +633,7 @@ def train_pytorch_window_fast(
     batch_size: int = 2048,
     lr: float = 2e-3,
     force: bool = False,
+    coin: str = "prl",
 ) -> dict:
     """Молниеносное обучение окна wavenet_tcn / cross_mixer на PyTorch CUDA (RTX 5060 Ti sm_120) с экспортом в .keras."""
     import json
@@ -643,7 +644,7 @@ def train_pytorch_window_fast(
     seq_map = {5: 15, 12: 42, 25: 75, 60: 180, 90: 180, 120: 180}
     sl = seq_map.get(int(horizon), min(180, int(horizon) * 3))
     win_tag = f"win_{win_idx:02d}"
-    arch_dir = Path("models/prl") / f"{arch.replace('+', '_')}_h{horizon}s"
+    arch_dir = Path("models") / coin.lower() / f"{arch.replace('+', '_')}_h{horizon}s"
     arch_dir.mkdir(parents=True, exist_ok=True)
     out_keras = arch_dir / f"model_{win_tag}.keras"
     out_meta = arch_dir / f"meta_{win_tag}.json"
@@ -653,6 +654,9 @@ def train_pytorch_window_fast(
         return {"window": win_tag, "arch": arch, "cached": True, **mo}
 
     templates = sorted(arch_dir.glob("model_win_*.keras"))
+    if not templates:
+        st_same_h = Path("models/prl") / f"{arch.replace('+', '_')}_h{horizon}s"
+        templates = sorted(st_same_h.glob("model_win_*.keras"))
     if not templates:
         fallback_dir = Path("models/prl") / f"{arch.replace('+', '_')}_h60s"
         templates = sorted(fallback_dir.glob("model_win_*.keras"))
@@ -800,7 +804,7 @@ def train_pytorch_window_fast(
             except OSError:
                 pass
         meta = {
-            "window_id": win_tag, "model_type": arch, "coin": "PRL", "H": int(horizon), "seq_len": sl,
+            "window_id": win_tag, "model_type": arch, "coin": coin.upper(), "H": int(horizon), "seq_len": sl,
             "runs": int(r_i),
             "train_ts_range": [str(ts_tr[0])[:19], str(ts_tr[-1])[:19]],
             "test_ts_range": [str(ts_te[0])[:19], str(ts_te[-1])[:19]],
