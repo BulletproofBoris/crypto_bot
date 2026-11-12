@@ -44,6 +44,7 @@ def _worker_label_pair(args):
 # Физические параметры биржи SafeTrade (шаг цены и минимальный лот)
 COIN_CONFIG = {
     'prl': {'tick_size': 0.005, 'typical_trade': 17.3, 'min_vol': 50.0},
+    'prl_bo': {'tick_size': 0.005, 'typical_trade': 17.3, 'min_vol': 50.0},
     'quantus': {'tick_size': 0.05, 'typical_trade': 2.2, 'min_vol': 2.0},
 }
 
