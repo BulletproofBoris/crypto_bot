@@ -403,7 +403,7 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
     if pending_tasks:
         from sklearn.utils.class_weight import compute_class_weight
 
-        n_win_workers = min(3, len(pending_tasks), max(1, n_jobs // 4))
+        n_win_workers = 1 if H >= 25 else min(2, len(pending_tasks), max(1, n_jobs // 4))
         lgb_threads = max(2, n_jobs // n_win_workers)
         y_all_arr = df['target_class'].values
         dt_all_arr = df['target_dt'].values
@@ -416,13 +416,10 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
             tr_idx = w.get('tr_idx', np.arange(tr_s, tr_e))
             te_idx = w.get('te_idx', np.arange(te_s, te_e))
 
-            tr_idx_fit = tr_idx[::3] if len(tr_idx) > 900_000 else (tr_idx[::2] if len(tr_idx) > 450_000 else tr_idx)
+            tr_idx_fit = tr_idx[::4] if len(tr_idx) >= 850_000 else (tr_idx[::2] if len(tr_idx) >= 400_000 else tr_idx)
             X_train = np.asarray(X_all[tr_idx_fit], dtype=np.float32)
             y_train = y_all_arr[tr_idx_fit] + 3
-
-            X_test = np.asarray(X_all[te_idx], dtype=np.float32)
-            y_test = y_all_arr[te_idx] + 3
-            dt_test = dt_all_arr[te_idx]
+            n_tr_len = int(len(X_train))
 
             base_weights = compute_class_weight('balanced', classes=np.arange(7), y=y_train)
             custom_weights = dict(enumerate(base_weights))
@@ -444,12 +441,20 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
                 colsample_bytree=0.8,
                 random_state=42 + idx,
                 n_jobs=lgb_threads,
+                max_bin=127 if H >= 60 else 255,
                 verbose=-1,
             )
             clf.fit(X_train, y_train, feature_name=feature_cols)
+            del X_train, y_train
+
+            X_test = np.asarray(X_all[te_idx], dtype=np.float32)
+            y_test = y_all_arr[te_idx] + 3
+            dt_test = dt_all_arr[te_idx]
+            n_te_len = int(len(X_test))
 
             probs_test = clf.predict_proba(X_test)
-            full_probs = np.zeros((len(X_test), 7), dtype=np.float32)
+            del X_test
+            full_probs = np.zeros((n_te_len, 7), dtype=np.float32)
             for col_i, cls_val in enumerate(clf.classes_):
                 if 0 <= cls_val < 7:
                     full_probs[:, cls_val] = probs_test[:, col_i]
@@ -474,6 +479,13 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
 
             model_path = out_dir / f"model_{win_id}.txt"
             clf.booster_.save_model(str(model_path))
+            del clf, probs_test, full_probs
+            import ctypes, gc
+            gc.collect()
+            try:
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
 
             fp_train = compute_regime_fingerprint(df.iloc[tr_idx])
             fp_test = compute_regime_fingerprint(df.iloc[te_idx])
@@ -486,8 +498,8 @@ def train_coin_horizon(coin: str, H: int, K: float, n_estimators: int, n_jobs: i
                 'L': H * K,
                 'train_ts_range': [ts_tr_start, ts_tr_end],
                 'test_ts_range': [ts_te_start, ts_te_end],
-                'n_train': int(len(X_train)),
-                'n_test': int(len(X_test)),
+                'n_train': n_tr_len,
+                'n_test': n_te_len,
                 'metrics_oos': {
                     'ic_dt_ticks': round(ic, 4),
                     'roc_auc_ovr': round(auc, 4),

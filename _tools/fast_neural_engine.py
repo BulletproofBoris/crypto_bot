@@ -869,6 +869,11 @@ def train_pytorch_window_fast(
 
     del x_tr_pad, x_te_pad, y_tr_t, y_te_oh, dt_te
     gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return {"window": win_tag, "arch": arch, "cached": False, **(best_m or {})}
