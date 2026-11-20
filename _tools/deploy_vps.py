@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""
+_tools/deploy_vps.py
+=============================================================================
+Единый скрипт синхронизации и мониторинга боевого бота на VPS (81.19.137.18).
+Запускается ВСЕГДА одной и той же командой без аргументов:
+    /home/restorator/crypto_bot/.venv/bin/python _tools/deploy_vps.py
+
+Автоматически определяет по локальному стейту (data/logs/.vps_sync_state.json):
+1. Изменился ли код (_tools/live_rl_trader.py и др.) -> загружает и перезапускает сервис.
+2. Изменился ли чемпион (models/prl/release_champion_v1.pt) -> загружает для Hot-Reload без рестарта.
+3. Всегда выводит статус сервиса, сводку кошелька/слотов и последние 50 строк лога.
+=============================================================================
+"""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+from _tools.vps_config import VPS_HOST, create_ssh_client
+
+STATE_PATH = BASE_DIR / "data" / "logs" / ".vps_sync_state.json"
+CODE_FILES = (
+    "_tools/vps_config.py",
+    "_tools/order_orchestrator.py",
+    "_tools/live_rl_trader.py",
+    "_tools/order3_live_bridge.py",
+    "_tools/fused_order3_clean_tick.py",
+    "_tools/l28_live_bridge.py",
+    "_tools/fused_l28_hierarchical_subcent_tick.py",
+    "_tools/hierarchical_regime_tree.py",
+    "_tools/build_l28_hierarchical_cache.py",
+    "_tools/l27_live_bridge.py",
+    "_tools/fused_l27_multimodal_tick.py",
+    "_tools/l26_live_bridge.py",
+    "_tools/fused_l26_endogenous_tick.py",
+    "_tools/fused_l25_regulator_tick.py",
+    "_tools/build_bo_swarm_36d_cache.py",
+    "_tools/live_feature_updater.py",
+    "_tools/vectorized_free_multi_order_env.py",
+    "_tools/swarm_router.py",
+    "_tools/learned_regime_router.py",
+    "_tools/multitask_lob_net.py",
+    "_tools/cross_venue_first_order_net.py",
+    "_tools/fast_neural_engine.py",
+    "_tools/collect_gate_realtime.py",
+    "_tools/collect_ourbit_realtime.py",
+    "_tools/watchdog_collectors.py",
+    "_tools/train_rl_execution.py",
+    "_tools/rotate_and_upload.py",
+    "_tools/collect_onchain_and_rules.py",
+    "_tools/vps_kpd_audit.py",
+)
+AUX_MODEL_FILES = (
+    "models/prl/cross_venue_first_order/cross_venue_first_order_v1.pt",
+    "models/prl/hierarchical_tree_index_l28.json",
+    "models/prl_bo/hierarchical_tree_index_l28.json",
+    "data/features/selected_features_prl_h8s.json",
+    "data/features/selected_features.json",
+)
+CHAMP_FILE = "models/prl/release_champion_v1.pt"
+
+
+def _discover_latest_wf_ubj_files() -> list[str]:
+    rels: list[str] = []
+    for sub in ("models/prl/variant_a_order1", "models/prl/order2_wf"):
+        d_root = BASE_DIR / sub
+        if not d_root.exists():
+            continue
+        wins = sorted([d for d in d_root.glob("win_*") if d.is_dir()], key=lambda p: int(p.name.split("_")[1]))
+        if wins:
+            for f in sorted(wins[-1].glob("*.ubj")):
+                rels.append(str(f.relative_to(BASE_DIR)))
+    return rels
+
+
+def _file_sig(p: Path) -> str:
+    if not p.exists():
+        return ""
+    h = hashlib.sha256()
+    h.update(p.read_bytes())
+    return h.hexdigest()[:16]
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def _remote_atomic_mv(ssh, tmp_rem: str, fin_rem: str) -> None:
+    cmd = f"mv -f {shlex.quote(tmp_rem)} {shlex.quote(fin_rem)}"
+    _, out_ch, err_ch = ssh.exec_command(cmd)
+    rc = out_ch.channel.recv_exit_status()
+    if rc != 0:
+        err_msg = err_ch.read().decode("utf-8", errors="ignore").strip()
+        raise RuntimeError(f"Remote mv failed (rc={rc}): {err_msg}")
+
+
+def main():
+    prev_state = {}
+    if STATE_PATH.exists():
+        try:
+            prev_state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            prev_state = {}
+
+    cur_state = {}
+    changed_code = []
+    for rel_f in CODE_FILES:
+        sig = _file_sig(BASE_DIR / rel_f)
+        cur_state[rel_f] = sig
+        if sig and prev_state.get(rel_f) != sig:
+            changed_code.append(rel_f)
+
+    changed_aux = []
+    for rel_m in list(AUX_MODEL_FILES) + _discover_latest_wf_ubj_files():
+        msig = _file_sig(BASE_DIR / rel_m)
+        if msig:
+            cur_state[rel_m] = msig
+            if prev_state.get(rel_m) != msig:
+                changed_aux.append(rel_m)
+
+    champ_sig = _file_sig(BASE_DIR / CHAMP_FILE)
+    cur_state[CHAMP_FILE] = champ_sig
+    changed_champ = bool(champ_sig and prev_state.get(CHAMP_FILE) != champ_sig)
+
+    print(f"🔌 Подключение к боевому VPS ({VPS_HOST or 'configured host'})...")
+    ssh = create_ssh_client(timeout=15.0)
+    try:
+        if changed_code or changed_aux or changed_champ:
+            rem_dirs = sorted({f"/opt/crypto_bot/{Path(r).parent}" for r in (changed_code + changed_aux + [CHAMP_FILE])})
+            if rem_dirs:
+                _, out_mk, _ = ssh.exec_command("mkdir -p " + " ".join(shlex.quote(d) for d in rem_dirs))
+                out_mk.channel.recv_exit_status()
+            sftp = ssh.open_sftp()
+            try:
+                for rel_f in changed_code + changed_aux:
+                    loc = BASE_DIR / rel_f
+                    tmp_rem = f"/opt/crypto_bot/{rel_f}.tmp"
+                    fin_rem = f"/opt/crypto_bot/{rel_f}"
+                    sftp.put(str(loc), tmp_rem)
+                    _remote_atomic_mv(ssh, tmp_rem, fin_rem)
+                    print(f"✅ [VPS SYNC] {rel_f} -> {fin_rem}")
+
+                if changed_champ:
+                    loc_c = BASE_DIR / CHAMP_FILE
+                    tmp_c = f"/opt/crypto_bot/{CHAMP_FILE}.tmp"
+                    fin_c = f"/opt/crypto_bot/{CHAMP_FILE}"
+                    sftp.put(str(loc_c), tmp_c)
+                    _remote_atomic_mv(ssh, tmp_c, fin_c)
+                    print(f"🔥 [VPS SYNC CHAMP] {loc_c.name} (sig={champ_sig}) -> {fin_c} (Hot-Reload)")
+            finally:
+                sftp.close()
+
+        if changed_code:
+            _, out_r, _ = ssh.exec_command(
+                "systemctl restart live-rl-prl-l9.service && sleep 6 && systemctl is-active live-rl-prl-l9.service"
+            )
+            print(f"🔄 [VPS SERVICE RESTART]: {out_r.read().decode('utf-8', errors='ignore').strip()}")
+
+        _atomic_write_json(STATE_PATH, cur_state)
+
+        cmd = (
+            "echo '=== SERVICE ==='; systemctl is-active live-rl-prl-l9.service; "
+            "echo '=== FILLS & HOT-RELOADS ==='; grep -E '24-SLOT FILL|HOT-RELOAD CHAMPION' /opt/crypto_bot/data/logs/live_rl_trader.log | tail -n 20; "
+            "echo '=== LOG (last 40 lines) ==='; tail -n 40 /opt/crypto_bot/data/logs/live_rl_trader.log"
+        )
+        _, out_t, _ = ssh.exec_command(cmd)
+        print(out_t.read().decode("utf-8", errors="ignore").strip())
+        from _tools.vps_kpd_audit import print_vps_kpd_summary
+        print_vps_kpd_summary(ssh)
+    finally:
+        ssh.close()
+
+    # Автоматическая фиксация и отправка (git commit & push) кода и актуального Чемпиона в Git
+    try:
+        subprocess.run(
+            ["git", "add", "STATUS_CONTEXT.md", "models/prl/release_champion_v1.pt", "models/prl/cross_venue_first_order", "_tools"],
+            cwd=str(BASE_DIR),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        diff_res = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            cwd=str(BASE_DIR),
+            check=False,
+        )
+        if diff_res.returncode != 0:
+            c_res = subprocess.run(
+                [
+                    "git",
+                    "commit",
+                    "-m",
+                    f"Auto-sync 24-slot engine & release_champion_v1.pt (sig={champ_sig})",
+                ],
+                cwd=str(BASE_DIR),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            p_res = subprocess.run(
+                ["git", "push"],
+                cwd=str(BASE_DIR),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            print(f"📦 [GIT PUSH]: rc={p_res.returncode} | {c_res.stdout.strip().splitlines()[-1] if c_res.stdout.strip() else ''} | {p_res.stderr.strip()}")
+    except Exception as e_git:
+        print(f"⚠️ [GIT PUSH WARN]: {e_git}")
+
+
+if __name__ == "__main__":
+    main()

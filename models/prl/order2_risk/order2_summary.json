@@ -1,0 +1,115 @@
+{
+  "n_samples": 3306887,
+  "n_train": 3004995,
+  "n_val": 301892,
+  "n_features": 38,
+  "feature_names": [
+    "log_bid_q1",
+    "log_ask_q1",
+    "log_bid_q5",
+    "log_ask_q5",
+    "log_buy_10s",
+    "log_sell_10s",
+    "log_buy_30s",
+    "log_sell_30s",
+    "spread_bps",
+    "imb_bbo",
+    "imb_top5",
+    "two_sided_flow",
+    "turnover_bid",
+    "arb_basis_bps",
+    "ez_h1s",
+    "conf_h1s",
+    "bias_h1s",
+    "ez_h2s",
+    "conf_h2s",
+    "bias_h2s",
+    "ez_h5s",
+    "conf_h5s",
+    "bias_h5s",
+    "ez_h10s",
+    "conf_h10s",
+    "bias_h10s",
+    "ez_h20s",
+    "conf_h20s",
+    "bias_h20s",
+    "ez_h40s",
+    "conf_h40s",
+    "bias_h40s",
+    "ez_h80s",
+    "conf_h80s",
+    "bias_h80s",
+    "ez_h160s",
+    "conf_h160s",
+    "bias_h160s"
+  ],
+  "total_elapsed_sec": 20.3,
+  "models": {
+    "adverse_selection_5s": {
+      "metric": "auc",
+      "score": 0.76,
+      "trees": 22,
+      "elapsed_sec": 2.0
+    },
+    "wave_exhaustion_10s": {
+      "metric": "auc",
+      "score": 0.8086,
+      "trees": 77,
+      "elapsed_sec": 2.0
+    },
+    "ask_sweep_5s": {
+      "metric": "auc",
+      "score": 0.74,
+      "trees": 5,
+      "elapsed_sec": 1.2
+    },
+    "guard_sweep_12s": {
+      "metric": "auc",
+      "score": 0.7385,
+      "trees": 12,
+      "elapsed_sec": 1.3
+    },
+    "guard_bleed_60s": {
+      "metric": "auc",
+      "score": 0.6974,
+      "trees": 18,
+      "elapsed_sec": 1.3
+    },
+    "guard_crash_300s": {
+      "metric": "auc",
+      "score": 0.5786,
+      "trees": 24,
+      "elapsed_sec": 1.3
+    },
+    "guard_exit_30s": {
+      "metric": "auc",
+      "score": 0.7201,
+      "trees": 16,
+      "elapsed_sec": 1.4
+    },
+    "exec_fill_30s": {
+      "metric": "auc",
+      "score": 0.7413,
+      "trees": 17,
+      "elapsed_sec": 4.9
+    },
+    "exec_frontrun_30s": {
+      "metric": "auc",
+      "score": 0.8892,
+      "trees": 45,
+      "elapsed_sec": 1.6
+    },
+    "carousel_success": {
+      "metric": "auc",
+      "score": 0.6619,
+      "trees": 34,
+      "elapsed_sec": 1.5
+    },
+    "carousel_capacity": {
+      "metric": "mae",
+      "score": 27.7299,
+      "trees": 0,
+      "elapsed_sec": 1.0
+    }
+  }
+}

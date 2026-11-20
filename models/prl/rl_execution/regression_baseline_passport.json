@@ -1,0 +1,167 @@
+{
+  "updated_at": "2026-10-31 23:08:52",
+  "regimes": [
+    {
+      "id": "R1_PUMP_BREAKOUT",
+      "title": "🚀 Памп и пробой вверх",
+      "net_pnl_usd": 1.1592,
+      "net_pnl_pct": 2.32,
+      "n_trades": 3,
+      "max_freeze_min": 4.7,
+      "max_dd_usd": 0.3606,
+      "requotes": 45
+    },
+    {
+      "id": "R2_TOXIC_DUMP",
+      "title": "🩸 Токсичный пролив вниз",
+      "net_pnl_usd": 0.1527,
+      "net_pnl_pct": 0.31,
+      "n_trades": 12,
+      "max_freeze_min": 14.5,
+      "max_dd_usd": 2.0367,
+      "requotes": 144
+    },
+    {
+      "id": "R3_WIDE_SPREAD_SCALP",
+      "title": "🦀 Живой коридор (спред >= 2т)",
+      "net_pnl_usd": 1.0207,
+      "net_pnl_pct": 2.04,
+      "n_trades": 4,
+      "max_freeze_min": 10.8,
+      "max_dd_usd": 0.5714,
+      "requotes": 92
+    },
+    {
+      "id": "R4_TIGHT_1TICK_CHOP",
+      "title": "🧱 Вязкий флэт (спред 1т)",
+      "net_pnl_usd": 0.1904,
+      "net_pnl_pct": 0.38,
+      "n_trades": 1,
+      "max_freeze_min": 44.6,
+      "max_dd_usd": 0.3407,
+      "requotes": 9
+    },
+    {
+      "id": "R5_UNDERWATER_RECOVERY",
+      "title": "🔄 Свежий рынок + выход из -6т",
+      "net_pnl_usd": 0.0434,
+      "net_pnl_pct": 0.09,
+      "n_trades": 3,
+      "max_freeze_min": 72.0,
+      "max_dd_usd": 1.0917,
+      "requotes": 11
+    },
+    {
+      "id": "R6_V_SHAPE_REVERSAL",
+      "title": "🎢 V-образный пролив и выкуп",
+      "net_pnl_usd": 1.0123,
+      "net_pnl_pct": 2.02,
+      "n_trades": 13,
+      "max_freeze_min": 22.2,
+      "max_dd_usd": 2.3983,
+      "requotes": 131
+    },
+    {
+      "id": "R7_WHIPSAW_SWING",
+      "title": "⚡ Высоковолатильные качели",
+      "net_pnl_usd": 1.2876,
+      "net_pnl_pct": 2.58,
+      "n_trades": 8,
+      "max_freeze_min": 26.4,
+      "max_dd_usd": 2.7074,
+      "requotes": 94
+    },
+    {
+      "id": "R8_STAIRCASE_GRIND_DOWN",
+      "title": "📉 Ступенчатый спуск (-9т)",
+      "net_pnl_usd": 1.0563,
+      "net_pnl_pct": 2.11,
+      "n_trades": 6,
+      "max_freeze_min": 6.4,
+      "max_dd_usd": 0.5876,
+      "requotes": 62
+    }
+  ],
+  "prev_frozen": [
+    {
+      "id": "R1_PUMP_BREAKOUT",
+      "title": "🚀 Памп и пробой вверх",
+      "net_pnl_usd": 0.2102,
+      "net_pnl_pct": 0.42,
+      "n_trades": 1,
+      "max_freeze_min": 0.3,
+      "max_dd_usd": 0.3606,
+      "requotes": 31
+    },
+    {
+      "id": "R2_TOXIC_DUMP",
+      "title": "🩸 Токсичный пролив вниз",
+      "net_pnl_usd": 2.3829,
+      "net_pnl_pct": 4.77,
+      "n_trades": 13,
+      "max_freeze_min": 26.1,
+      "max_dd_usd": 2.2372,
+      "requotes": 125
+    },
+    {
+      "id": "R3_WIDE_SPREAD_SCALP",
+      "title": "🦀 Живой коридор (спред >= 2т)",
+      "net_pnl_usd": 1.0207,
+      "net_pnl_pct": 2.04,
+      "n_trades": 4,
+      "max_freeze_min": 3.7,
+      "max_dd_usd": 0.5714,
+      "requotes": 89
+    },
+    {
+      "id": "R4_TIGHT_1TICK_CHOP",
+      "title": "🧱 Вязкий флэт (спред 1т)",
+      "net_pnl_usd": 0.1904,
+      "net_pnl_pct": 0.38,
+      "n_trades": 1,
+      "max_freeze_min": 44.6,
+      "max_dd_usd": 0.3407,
+      "requotes": 9
+    },
+    {
+      "id": "R5_UNDERWATER_RECOVERY",
+      "title": "🔄 Свежий рынок + выход из -6т",
+      "net_pnl_usd": -0.3378,
+      "net_pnl_pct": -0.68,
+      "n_trades": 0,
+      "max_freeze_min": 245.1,
+      "max_dd_usd": 1.6892,
+      "requotes": 0
+    },
+    {
+      "id": "R6_V_SHAPE_REVERSAL",
+      "title": "🎢 V-образный пролив и выкуп",
+      "net_pnl_usd": 1.111,
+      "net_pnl_pct": 2.22,
+      "n_trades": 8,
+      "max_freeze_min": 107.6,
+      "max_dd_usd": 3.4956,
+      "requotes": 35
+    },
+    {
+      "id": "R7_WHIPSAW_SWING",
+      "title": "⚡ Высоковолатильные качели",
+      "net_pnl_usd": 2.0209,
+      "net_pnl_pct": 4.04,
+      "n_trades": 7,
+      "max_freeze_min": 118.0,
+      "max_dd_usd": 2.9548,
+      "requotes": 67
+    },
+    {
+      "id": "R8_STAIRCASE_GRIND_DOWN",
+      "title": "📉 Ступенчатый спуск (-9т)",
+      "net_pnl_usd": 1.0563,
+      "net_pnl_pct": 2.11,
+      "n_trades": 6,
+      "max_freeze_min": 6.4,
+      "max_dd_usd": 0.5876,
+      "requotes": 56
+    }
+  ]
+}

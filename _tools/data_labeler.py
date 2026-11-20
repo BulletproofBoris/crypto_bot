@@ -1,0 +1,570 @@
+#!/usr/bin/env python3
+"""
+Production Data Labeling Engine for PRL/USDT and QUANTUS
+========================================================
+Поддерживает:
+1. Двойное квантование цены и ликвидности.
+2. Асимметричную эластичность стакана и кинематику волны.
+3. Разметку 7 и 5 квантильных классов.
+4. Защиту от утечки данных (Purging H шагов + Embargo gap).
+5. Сетки параметров:
+   - horizon = "5:Lmax:5", "[5,10,15]", "5"
+   - ratio   = "[3,4,5,6]", "3:6", "4"
+   - Динамический L_max = T_train // N (по умолчанию N = 5000).
+6. Объединение в единые Parquet-датасеты:
+   - data/labeled/{coin}_labeled.parquet (все таргеты и sample_split)
+   - data/labeled/all_coins_labeled.parquet (объединенный датасет всех монет)
+   - data/labeled/grid_validation_results.csv (сводка сходимости)
+"""
+
+import os
+import sys
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+import argparse
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
+from concurrent.futures import ProcessPoolExecutor
+try:
+    from _tools.system_resources import SAFE_WORKERS
+except ImportError:
+    SAFE_WORKERS = min(14, max(4, os.cpu_count() - 2 if os.cpu_count() else 4))
+
+def _worker_label_pair(args):
+    """Изолированный воркер для параллельного расчета таргетов пары (H, K)."""
+    df_mini, coin, H, K, min_vol, tick_size = args
+    res = compute_single_horizon_labels(df_mini, coin, H, K, min_vol, tick_size)
+    return (H, K, res)
+
+# Физические параметры биржи SafeTrade (шаг цены и минимальный лот)
+COIN_CONFIG = {
+    'prl': {'tick_size': 0.0001, 'typical_trade': 17.3, 'min_vol': 50.0},
+    'prl_bo': {'tick_size': 0.0001, 'typical_trade': 17.3, 'min_vol': 50.0},
+    'quantus': {'tick_size': 0.0001, 'typical_trade': 2.2, 'min_vol': 2.0},
+}
+
+# Пороги квантильных плато (откалиброваны под естественное распределение импульса z)
+TH_P1_P2 = 0.50   # noise/signal boundary: z >= 0.5M → directional signal
+TH_P2_P3 = 1.50   # signal/breakout boundary: z >= 1.5M → strong breakout
+TH_M1_M2 = -0.50
+TH_M2_M3 = -1.50
+
+def parse_ratio_spec(ratio_input):
+    """Парсит соотношение K = L/H (число, список или срез 3:6)."""
+    if isinstance(ratio_input, (int, float)):
+        return [float(ratio_input)]
+    s = str(ratio_input).strip()
+    if s.startswith('[') and s.endswith(']'):
+        s = s[1:-1].strip()
+    if ':' in s:
+        parts = [float(p.strip()) for p in s.split(':')]
+        if len(parts) == 2:
+            return [round(x, 2) for x in np.arange(parts[0], parts[1] + 0.001, 1.0)]
+        elif len(parts) == 3:
+            return [round(x, 2) for x in np.arange(parts[0], parts[1] + 0.001, parts[2])]
+    if ',' in s:
+        return [float(p.strip()) for p in s.split(',') if p.strip()]
+    return [float(s)]
+
+def parse_horizon_spec(horizon_input, L_max, K):
+    """
+    Парсит горизонт H для заданного K.
+    Поддерживает: 5, "5,10,15", "[5,10,15]", "5:30:5", "5:Lmax:5".
+    """
+    if isinstance(horizon_input, (int, float)):
+        return [int(horizon_input)]
+    s = str(horizon_input).strip()
+    if s.startswith('[') and s.endswith(']'):
+        s = s[1:-1].strip()
+    if ':' in s:
+        parts = [p.strip() for p in s.split(':')]
+        start = int(parts[0])
+        step = int(parts[2]) if len(parts) >= 3 else 5
+        end_str = parts[1].lower()
+        if end_str in ('lmax', 'hmax', 'auto', 'max'):
+            H_max = max(1, L_max // K)
+        else:
+            H_max = int(end_str)
+        h_vals = list(range(start, H_max + 1, step))
+        if not h_vals:
+            h_vals = [max(1, H_max)]
+        return h_vals
+    if ',' in s:
+        return [int(p.strip()) for p in s.split(',') if p.strip()]
+    if s.lower() in ('lmax', 'hmax', 'auto', 'max'):
+        return [max(1, L_max // K)]
+    return [int(s)]
+
+def compute_single_horizon_labels(df, coin, H, K, min_vol, tick_size=0.0001, venue="ST"):
+    """
+    Рассчитывает микроструктурные метрики и таргеты для пары (H, K)
+    с использованием горизонтно-адаптивного трехслойного динамического сопротивления M(H)
+    и статистического пола волатильности (L_vol >= 45s).
+    Поддерживает произвольные площадки (venue='ST' или venue='BO').
+    """
+    n = len(df)
+    L = int(round(H * K))
+    v_pref = f"{venue}_"
+    mid_col = f"{v_pref}mid_price"
+    spr_col = f"{v_pref}spread"
+    b1p_col = f"{v_pref}bid_1_price"
+    a1p_col = f"{v_pref}ask_1_price"
+    b1q_col = f"{v_pref}bid_1_qty"
+    a1q_col = f"{v_pref}ask_1_qty"
+    b2q_col = f"{v_pref}bid_2_qty"
+    a2q_col = f"{v_pref}ask_2_qty"
+    b5_col = f"{v_pref}bids_vol_top5"
+    a5_col = f"{v_pref}asks_vol_top5"
+    tr_col = f"{v_pref}trade_vol"
+
+    mid = df[mid_col].values
+    spread_ticks = df[spr_col].values / tick_size
+    b1_p = df[b1p_col].values
+    a1_p = df[a1p_col].values
+    b1_q = df[b1q_col].values
+    a1_q = df[a1q_col].values
+    b2_q = df[b2q_col].values if b2q_col in df.columns else b1_q
+    a2_q = df[a2q_col].values if a2q_col in df.columns else a1_q
+    b5 = df[b5_col].values
+    a5 = df[a5_col].values
+    trade_vol = df[tr_col].values if tr_col in df.columns else np.zeros(n, dtype=np.float32)
+    
+    # 1. Сдвиг цены в тиках и процентах
+    dt_ticks_full = np.zeros(n, dtype=int)
+    dt_ticks_full[:-H] = np.round((mid[H:] - mid[:-H]) / tick_size).astype(int)
+    ret_pct_full = np.zeros(n, dtype=np.float32)
+    ret_pct_full[:-H] = ((mid[H:] - mid[:-H]) / np.maximum(mid[:-H], 0.001) * 100.0).astype(np.float32)
+    
+    # 2. Локальная волатильность со статистическим полом L_vol >= 45s (SE <= 10.5%)
+    L_vol = max(45, L)
+    step_1s_ticks = np.zeros(n)
+    step_1s_ticks[1:] = (mid[1:] - mid[:-1]) / tick_size
+    vol_L = pd.Series(step_1s_ticks).rolling(L_vol, min_periods=max(5, L_vol // 2)).std().fillna(0.0).values
+    vol_L = np.nan_to_num(vol_L)
+    
+    # 3. Скользящие объемы стакана
+    q12_ask = a1_q + a2_q
+    q12_bid = b1_q + b2_q
+    eps_q = max(1e-4, min_vol * 0.01)
+    
+    a12_L = pd.Series(q12_ask).rolling(L_vol, min_periods=max(5, L_vol // 2)).median().fillna(1.0).values
+    b12_L = pd.Series(q12_bid).rolling(L_vol, min_periods=max(5, L_vol // 2)).median().fillna(1.0).values
+    asks_L = pd.Series(a5).rolling(L_vol, min_periods=max(5, L_vol // 2)).mean().fillna(min_vol).values
+    bids_L = pd.Series(b5).rolling(L_vol, min_periods=max(5, L_vol // 2)).mean().fillna(min_vol).values
+    
+    # 4. Робастная кинематика микроцены (устойчива при total_q < 1.0)
+    total_q1 = b1_q + a1_q
+    microprice = np.where(total_q1 > 1e-6, (b1_p * a1_q + a1_p * b1_q) / total_q1, mid)
+    micro_offset = np.clip((microprice - mid) / tick_size, -5.0, 5.0)
+    
+    t_wave = max(3, H // 3)
+    v_wave = (pd.Series(micro_offset) - pd.Series(micro_offset).shift(t_wave)).fillna(0).values / t_wave
+    v_wave = np.clip(v_wave, -2.0, 2.0)
+    d_vol = (pd.Series(vol_L) - pd.Series(vol_L).shift(t_wave)).fillna(0).values / t_wave
+    d_vol = np.clip(d_vol, -2.0, 2.0)
+    
+    # 5. Самоадаптивное динамическое сопротивление M(t, H)
+    # 5.1. Динамическая эластичность спреда к локальному режиму (300с медиана)
+    med_spread = pd.Series(spread_ticks).rolling(300, min_periods=30).median().bfill().values
+    med_spread = np.maximum(1.0, np.nan_to_num(med_spread, nan=1.0))
+    spread_ratio = np.clip(spread_ticks / med_spread, 0.2, 5.0)
+
+    # 5.2. Направленная асимметрия наклона книги заявок (Book Slope Asymmetry / Kyle's Lambda)
+    bid_dist = np.maximum(0.5, (mid - b1_p) / tick_size + 0.5)
+    ask_dist = np.maximum(0.5, (a1_p - mid) / tick_size + 0.5)
+    slope_bid = b5 / bid_dist
+    slope_ask = a5 / ask_dist
+    slope_ratio = np.clip(slope_bid / np.maximum(slope_ask, 1e-4), 0.3, 3.0)
+
+    # 5.3. Непрерывный масштаб горизонта (Continuous Horizon Scaling)
+    h_scale = (5.0 / (H + 4.0)) ** 0.5
+    dyn_sp_up = 0.22 * h_scale * (spread_ratio ** (-0.25)) * (slope_ratio ** 0.15)
+    dyn_sp_dn = 0.22 * h_scale * (spread_ratio ** (-0.25)) * (slope_ratio ** (-0.15))
+
+    # 5.4. Непрерывная глубина стакана и кинематика волны
+    depth_w12 = (5.0 / (H + 5.0)) * 0.08
+    depth_w5 = (H / (H + 5.0)) * 0.08
+    depth_up = (np.clip(asks_L / np.maximum(a5, min_vol), 0.4, 2.5) ** depth_w5) * (np.clip(a12_L / np.maximum(q12_ask, eps_q), 0.5, 2.0) ** depth_w12)
+    depth_dn = (np.clip(bids_L / np.maximum(b5, min_vol), 0.4, 2.5) ** depth_w5) * (np.clip(b12_L / np.maximum(q12_bid, eps_q), 0.5, 2.0) ** depth_w12)
+
+    kin_coef = 0.10 + 0.05 * (H / (H + 20.0))
+    kin_up = 1.0 + kin_coef * np.tanh(np.maximum(0, v_wave))
+    kin_dn = 1.0 + kin_coef * np.tanh(np.maximum(0, -v_wave))
+
+    # 5.5. Арбитражное смещение внешних поводырей (Lead-Lag Momentum)
+    if 'arb_spread_zscore_20s' in df.columns:
+        arb_z = np.clip(df['arb_spread_zscore_20s'].values, -3.0, 3.0)
+        arb_mult_up = np.exp(-0.04 * arb_z)
+        arb_mult_dn = np.exp(+0.04 * arb_z)
+    else:
+        arb_mult_up = 1.0
+        arb_mult_dn = 1.0
+
+    M_up_base = (spread_ticks * dyn_sp_up + vol_L * np.sqrt(H)) * depth_up * kin_up * arb_mult_up
+    M_dn_base = (spread_ticks * dyn_sp_dn + vol_L * np.sqrt(H)) * depth_dn * kin_dn * arb_mult_dn
+    M_up = np.maximum(0.5, np.nan_to_num(M_up_base, nan=1.0))
+    M_dn = np.maximum(0.5, np.nan_to_num(M_dn_base, nan=1.0))
+    
+    # 6. Нормированный импульс z
+    z = np.zeros(n, dtype=np.float32)
+    pos_mask = dt_ticks_full > 0
+    neg_mask = dt_ticks_full < 0
+    z[pos_mask] = (dt_ticks_full[pos_mask] / M_up[pos_mask]).astype(np.float32)
+    z[neg_mask] = (dt_ticks_full[neg_mask] / M_dn[neg_mask]).astype(np.float32)
+    z = np.nan_to_num(z, nan=0.0)
+    
+    # 8. Флаг фантомных котировок (Zero-Volume Liquidity Void):
+    # Сумма сделок вперед за горизонт (t, t+H]
+    trade_cumsum = np.pad(np.cumsum(trade_vol), (1, 0))
+    trade_vol_future_H = np.zeros(n, dtype=np.float32)
+    trade_vol_future_H[:-H] = trade_cumsum[1 + H : n + 1] - trade_cumsum[1 : n - H + 1]
+    is_void = (np.abs(dt_ticks_full) >= 5) & (trade_vol_future_H == 0)
+    
+    # Разметка 7 классов
+    class_7 = np.zeros(n, dtype=np.int8)
+    class_7[(dt_ticks_full > 0) & (z < TH_P1_P2)] = 1
+    class_7[(dt_ticks_full > 0) & (z >= TH_P1_P2) & (z < TH_P2_P3)] = 2
+    class_7[(dt_ticks_full > 0) & (z >= TH_P2_P3)] = 3
+    class_7[(dt_ticks_full < 0) & (z > TH_M1_M2)] = -1
+    class_7[(dt_ticks_full < 0) & (z <= TH_M1_M2) & (z > TH_M2_M3)] = -2
+    class_7[(dt_ticks_full < 0) & (z <= TH_M2_M3)] = -3
+    
+    # Разметка 5 классов
+    class_5 = np.zeros(n, dtype=np.int8)
+    class_5[(dt_ticks_full > 0) & (z < TH_P1_P2)] = 1
+    class_5[(dt_ticks_full > 0) & (z >= TH_P1_P2)] = 2
+    class_5[(dt_ticks_full < 0) & (z > TH_M1_M2)] = -1
+    class_5[(dt_ticks_full < 0) & (z <= TH_M1_M2)] = -2
+    
+    return {
+        'class_7': class_7,
+        'class_5': class_5,
+        'z': z,
+        'dt_ticks': dt_ticks_full,
+        'ret_pct': ret_pct_full,
+        'v_wave': v_wave.astype(np.float32),
+        'micro_offset': micro_offset.astype(np.float32),
+        'M_up': M_up.astype(np.float32),
+        'M_dn': M_dn.astype(np.float32),
+        'future_trade_vol_H': trade_vol_future_H,
+        'is_void': is_void,
+    }
+
+def compute_labels(df, coin="prl", horizon_sec=5, window_ratio=4, split_ratio=0.8, purge_sec=None, embargo_sec=0):
+    """
+    Сохраняет совместимость с одиночными вызовами (run_grid_validation.py).
+    Возвращает (tr_df, va_df, valid_df).
+    """
+    coin = coin.lower()
+    cfg = COIN_CONFIG.get(coin, COIN_CONFIG['prl'])
+    tick_size = cfg['tick_size']
+    min_vol = cfg['min_vol']
+
+    n = len(df)
+    H = int(horizon_sec)
+    L = int(H * window_ratio)
+    
+    purge_steps = int(purge_sec if purge_sec is not None else H)
+    embargo_steps = int(embargo_sec)
+    gap_steps = purge_steps + embargo_steps
+    
+    split_idx = int(n * split_ratio)
+    train_end = split_idx - gap_steps
+    val_start = split_idx
+    
+    res = compute_single_horizon_labels(df, coin, H, window_ratio, min_vol, tick_size)
+    
+    sample_split = np.full(n, 'unknown', dtype=object)
+    sample_split[:L] = 'warmup'
+    sample_split[L:train_end] = 'train'
+    sample_split[train_end:val_start] = 'purged' if embargo_steps == 0 else 'purged_embargo'
+    sample_split[val_start:n - H] = 'val'
+    sample_split[n - H:] = 'tail'
+    
+    out_df = df.copy()
+    out_df['target_class_7'] = res['class_7']
+    out_df['target_class_5'] = res['class_5']
+    out_df['target_velocity_z'] = res['z']
+    out_df['target_dt_ticks'] = res['dt_ticks']
+    out_df['target_ret_pct'] = res['ret_pct']
+    out_df['kinematic_v_wave'] = res['v_wave']
+    out_df['kinematic_micro_offset'] = res['micro_offset']
+    out_df['dynamic_scale_up'] = res['M_up']
+    out_df['dynamic_scale_dn'] = res['M_dn']
+    out_df['future_trade_vol_H'] = res['future_trade_vol_H']
+    out_df['is_liquidity_void'] = res['is_void']
+    out_df['sample_split'] = sample_split
+    out_df['is_valid_sample'] = (sample_split == 'train') | (sample_split == 'val')
+    
+    if isinstance(out_df.index, pd.DatetimeIndex) or out_df.index.name == 'timestamp':
+        out_df = out_df.reset_index()
+
+    tr_df = out_df.iloc[L:train_end].copy().reset_index(drop=True)
+    va_df = out_df.iloc[val_start:n - H].copy().reset_index(drop=True)
+    valid_df = pd.concat([tr_df, va_df], ignore_index=True)
+    return tr_df, va_df, valid_df
+
+def process_coin_labeling(
+    coin,
+    horizon_spec="5",
+    ratio_spec="4",
+    base_outdir="data/labeled",
+    split_ratio=0.8,
+    n_target=5000,
+    purge_sec=None,
+    embargo_sec=0,
+    save_legacy_splits=True,
+    pairs_spec=None
+):
+    """
+    Размечает датасет для монеты (одиночный или по сетке H и K).
+    Сохраняет объединенный датасет в один Parquet-файл.
+    """
+    coin = coin.lower()
+    in_file = f"data/features/{coin}_1s_features.parquet"
+    if not os.path.exists(in_file):
+        print(f"Ошибка: входной файл {in_file} не найден!")
+        return None, []
+        
+    cfg = COIN_CONFIG.get(coin, COIN_CONFIG['prl'])
+    tick_size = cfg['tick_size']
+    min_vol = cfg['min_vol']
+    
+    import gc
+    pf = pq.ParquetFile(in_file)
+    total_rows = pf.metadata.num_rows
+    schema_names = set(pf.schema_arrow.names)
+    train_80 = int(total_rows * split_ratio)
+    L_max = max(10, train_80 // n_target)
+    
+    if pairs_spec:
+        pairs = []
+        for item in str(pairs_spec).split(','):
+            if ':' in item:
+                h_str, k_str = item.split(':')
+                pairs.append((int(h_str.strip()), float(k_str.strip())))
+            elif '-' in item:
+                h_str, k_str = item.split('-')
+                pairs.append((int(h_str.strip()), float(k_str.strip())))
+    else:
+        ratios = parse_ratio_spec(ratio_spec)
+        pairs = []
+        for K in ratios:
+            h_vals = parse_horizon_spec(horizon_spec, L_max, K)
+            for H in h_vals:
+                pairs.append((H, K))
+            
+    if not pairs:
+        pairs = [(5, 3.0)]
+        
+    max_H = max(p[0] for p in pairs)
+    max_L = int(round(max(p[0] * p[1] for p in pairs)))
+    purge_steps = int(purge_sec if purge_sec is not None else max_H)
+    embargo_steps = int(embargo_sec)
+    gap_steps = purge_steps + embargo_steps
+    
+    split_idx = int(total_rows * split_ratio)
+    train_end = split_idx - gap_steps
+    val_start = split_idx
+    
+    print("\n" + "=" * 80)
+    print(f"🏷️ РАЗМЕТКА {coin.upper()}: Строк={total_rows:,} | Train(80%)={train_80:,} | L_max(N={n_target})={L_max}с")
+    print(f"   Сетка пар (H, K): {len(pairs)} комбинаций")
+    print(f"   Защита от утечки: Purge={purge_steps}с, Embargo={embargo_steps}с (Буфер={gap_steps}с)")
+    print("=" * 80)
+    
+    req_cols = [
+        'ST_mid_price', 'ST_spread', 'ST_bid_1_price', 'ST_ask_1_price',
+        'ST_bid_1_qty', 'ST_ask_1_qty', 'ST_bid_2_qty', 'ST_ask_2_qty',
+        'ST_bids_vol_top5', 'ST_asks_vol_top5', 'ST_trade_vol',
+        'is_data_gap', 'arb_spread_zscore_20s'
+    ]
+    df_mini = pq.read_table(in_file, columns=[c for c in req_cols if c in schema_names]).to_pandas()
+    
+    sample_split = np.full(total_rows, 'unknown', dtype=object)
+    sample_split[:max_L] = 'warmup'
+    sample_split[max_L:train_end] = 'train'
+    sample_split[train_end:val_start] = 'purged' if embargo_steps == 0 else 'purged_embargo'
+    sample_split[val_start:total_rows - max_H] = 'val'
+    sample_split[total_rows - max_H:] = 'tail'
+
+    if 'is_data_gap' in df_mini.columns:
+        raw_gap = (df_mini['is_data_gap'].values > 0)
+        if np.any(raw_gap):
+            post_gap_warmup = min(int(max_L), 300)
+            pre_gap_purge = min(int(max_H), 60)
+            # Расширяем маску разрыва назад на pre_gap_purge и вперед на post_gap_warmup
+            gap_series = pd.Series(raw_gap.astype(np.int32))
+            fwd_mask = gap_series.rolling(post_gap_warmup + 1, min_periods=1).max().values > 0
+            bwd_mask = gap_series.iloc[::-1].rolling(pre_gap_purge + 1, min_periods=1).max().iloc[::-1].values > 0
+            full_gap_mask = (raw_gap | fwd_mask | bwd_mask) & ((sample_split == 'train') | (sample_split == 'val'))
+            n_gap_purged = int(np.sum(full_gap_mask))
+            if n_gap_purged > 0:
+                sample_split[full_gap_mask] = 'purged_gap'
+                print(f"   🧹 Исключено технических разрывов связи (is_data_gap + буфер): {n_gap_purged:,} строк")
+    
+    primary_pair = (5, 4) if (5, 4) in pairs else pairs[0]
+    grid_records = []
+    
+    tr_mask = (sample_split == 'train')
+    va_mask = (sample_split == 'val')
+    extra_cols = {}
+    extra_cols['coin'] = np.full(total_rows, coin.upper(), dtype=object)
+    extra_cols['sample_split'] = sample_split
+    extra_cols['is_valid_sample'] = (sample_split == 'train') | (sample_split == 'val')
+
+    print(f"  ⚡ Низкоуровневый расчет {len(pairs)} комбинаций (H, K) без дублирования RAM...")
+    pair_results = [
+        (H, K, compute_single_horizon_labels(df_mini, coin, H, K, min_vol, tick_size))
+        for H, K in pairs
+    ]
+    del df_mini
+    gc.collect()
+
+    for H, K, res in pair_results:
+        L = int(round(H * K))
+        
+        # Добавляем таргеты с суффиксами в общий датасет
+        suffix = f"_h{H}_k{K:g}"
+        extra_cols[f'target_class_7{suffix}'] = res['class_7']
+        extra_cols[f'target_class_5{suffix}'] = res['class_5']
+        extra_cols[f'target_velocity_z{suffix}'] = res['z']
+        extra_cols[f'target_dt_ticks{suffix}'] = res['dt_ticks']
+        extra_cols[f'target_ret_pct{suffix}'] = res['ret_pct']
+        extra_cols[f'kinematic_v_wave{suffix}'] = res['v_wave']
+        extra_cols[f'dynamic_scale_up{suffix}'] = res['M_up']
+        extra_cols[f'dynamic_scale_dn{suffix}'] = res['M_dn']
+        extra_cols[f'is_liquidity_void_h{H}'] = res['is_void']
+        
+        # Для базовой пары устанавливаем стандартные имена без суффиксов
+        if (H, K) == primary_pair:
+            extra_cols['target_class_7'] = res['class_7']
+            extra_cols['target_class_5'] = res['class_5']
+            extra_cols['target_velocity_z'] = res['z']
+            extra_cols['target_dt_ticks'] = res['dt_ticks']
+            extra_cols['target_ret_pct'] = res['ret_pct']
+            extra_cols['kinematic_v_wave'] = res['v_wave']
+            extra_cols['kinematic_micro_offset'] = res['micro_offset']
+            extra_cols['dynamic_scale_up'] = res['M_up']
+            extra_cols['dynamic_scale_dn'] = res['M_dn']
+            extra_cols['future_trade_vol_H'] = res['future_trade_vol_H']
+            extra_cols['is_liquidity_void'] = res['is_void']
+            
+        # Метрики сходимости
+        z_col = res['z']
+        dt_col = res['dt_ticks']
+        c7_col = res['class_7']
+        
+        m_tr_p2 = tr_mask & (c7_col == 2)
+        m_va_p2 = va_mask & (c7_col == 2)
+        z_tr_p2 = z_col[m_tr_p2].mean() if np.any(m_tr_p2) else 0.0
+        z_va_p2 = z_col[m_va_p2].mean() if np.any(m_va_p2) else 0.0
+        err_z_p2 = abs(abs(z_va_p2) - abs(z_tr_p2)) / abs(z_tr_p2) * 100.0 if z_tr_p2 != 0 else 0.0
+        
+        m_tr_m2 = tr_mask & (c7_col == -2)
+        m_va_m2 = va_mask & (c7_col == -2)
+        z_tr_m2 = z_col[m_tr_m2].mean() if np.any(m_tr_m2) else 0.0
+        z_va_m2 = z_col[m_va_m2].mean() if np.any(m_va_m2) else 0.0
+        err_z_m2 = abs(abs(z_va_m2) - abs(z_tr_m2)) / abs(z_tr_m2) * 100.0 if z_tr_m2 != 0 else 0.0
+        
+        grid_records.append({
+            'coin': coin.upper(),
+            'K': K,
+            'H': H,
+            'L': L,
+            'L_max': L_max,
+            'z_tr_p2': z_tr_p2,
+            'z_va_p2': z_va_p2,
+            'err_z_p2': err_z_p2,
+            'z_tr_m2': z_tr_m2,
+            'z_va_m2': z_va_m2,
+            'err_z_m2': err_z_m2,
+            'pct_flat': (c7_col[tr_mask] == 0).mean() * 100.0
+        })
+
+    # Вывод результатов
+    print(f"\n📊 СХОДИМОСТЬ СЕТКИ ДЛЯ {coin.upper()}:")
+    print(f"{'K':<3} | {'H':<4} | {'L':<4} | {'E[z] Class +2':<15} | {'Err(+2)':<8} | {'E[z] Class -2':<15} | {'Err(-2)':<8} | {'Статус'}")
+    print("-" * 85)
+    for r in grid_records:
+        max_err = max(r['err_z_p2'], r['err_z_m2'])
+        st = "🎯 < 5%" if max_err < 5.0 else ("✅ < 10%" if max_err < 10.0 else "⚠️ Хвост")
+        print(f"{r['K']:<3} | {r['H']:<4} | {r['L']:<4} | {r['z_tr_p2']:+.4f} -> {r['z_va_p2']:+.4f} | {r['err_z_p2']:5.1f}%  | {r['z_tr_m2']:+.4f} -> {r['z_va_m2']:+.4f} | {r['err_z_m2']:5.1f}%  | {st}")
+    print("-" * 85)
+
+    # Сохраняем единый датасет для монеты напрямую через PyArrow без создания 4 ГБ Pandas DataFrame
+    import pyarrow as pa
+    os.makedirs(base_outdir, exist_ok=True)
+    coin_outdir = os.path.join(base_outdir, coin)
+    os.makedirs(coin_outdir, exist_ok=True)
+    
+    unified_coin_path = os.path.join(coin_outdir, f"{coin}_labeled.parquet")
+    base_tbl = pq.read_table(in_file)
+    existing_col_names = set(base_tbl.schema.names)
+    for col_name, col_arr in extra_cols.items():
+        pa_arr = pa.array(col_arr)
+        if col_name in existing_col_names:
+            idx_c = base_tbl.schema.get_field_index(col_name)
+            base_tbl = base_tbl.set_column(idx_c, col_name, pa_arr)
+        else:
+            base_tbl = base_tbl.append_column(col_name, pa_arr)
+            existing_col_names.add(col_name)
+    del extra_cols
+    gc.collect()
+    tmp_unified = unified_coin_path + ".tmp"
+    pq.write_table(base_tbl, tmp_unified, compression="zstd")
+    os.replace(tmp_unified, unified_coin_path)
+    print(f"💾 Единый размеченный датасет {coin.upper()}: {unified_coin_path} ({base_tbl.num_rows:,} строк, {base_tbl.num_columns} колонок)")
+    del base_tbl
+    gc.collect()
+    return None, grid_records
+
+def main():
+    parser = argparse.ArgumentParser(description="Multi-Asset Dynamic Dataset Labeling Engine")
+    parser.add_argument("--coin", type=str, default="prl", choices=["prl", "quantus", "all"], help="Монета для разметки (по умолчанию prl)")
+    parser.add_argument("--horizon", type=str, default="5", help="Горизонт H или интервал (например: 5, '5,10,15', '5:Lmax:5', '5:30:5')")
+    parser.add_argument("--ratio", type=str, default="4", help="Соотношение K=L/H или интервал (например: 4, '[3,4,5,6]', '3,4,5', '3:6')")
+    parser.add_argument("--pairs", type=str, default="5:3,12:3.5,25:3,60:3", help="Явный список пар H:K через запятую (по умолчанию: '5:3,12:3.5,25:3,60:3')")
+    parser.add_argument("--outdir", type=str, default="data/labeled", help="Выходная директория")
+    parser.add_argument("--split-ratio", type=float, default=0.8, help="Доля обучающей выборки Train (по умолчанию 0.8)")
+    parser.add_argument("--n-target", type=int, default=5000, help="Минимум независимых отсчетов N для расчета L_max = T_train // N (по умолчанию 5000)")
+    parser.add_argument("--purge-sec", type=int, default=None, help="Зазор Purging в секундах (по умолчанию равен max H)")
+    parser.add_argument("--embargo-sec", type=int, default=360, help="Зазор Embargo в секундах (по умолчанию 360с для защиты от памяти фильтр-банка)")
+    parser.add_argument("--no-legacy-splits", action="store_true", help="Не сохранять отдельные train/val файлы")
+    args = parser.parse_args()
+    
+    coins = ["prl", "quantus"] if args.coin == "all" else [args.coin]
+    all_records = []
+    import gc
+    for c in coins:
+        _, recs = process_coin_labeling(
+            coin=c,
+            horizon_spec=args.horizon,
+            ratio_spec=args.ratio,
+            base_outdir=args.outdir,
+            split_ratio=args.split_ratio,
+            n_target=args.n_target,
+            purge_sec=args.purge_sec,
+            embargo_sec=args.embargo_sec,
+            save_legacy_splits=not args.no_legacy_splits,
+            pairs_spec=args.pairs
+        )
+        if recs:
+            all_records.extend(recs)
+        gc.collect()
+        
+    # Сохранение сводной CSV-таблицы валидации сетки
+    if all_records:
+        csv_path = os.path.join(args.outdir, "grid_validation_results.csv")
+        pd.DataFrame(all_records).to_csv(csv_path, index=False)
+        print(f"📈 Сводная таблица сходимости сетки сохранена: {csv_path}")
+
+    print("\n✅ Разметка данных успешно завершена!")
+
+if __name__ == '__main__':
+    main()

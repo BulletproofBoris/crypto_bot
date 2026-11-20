@@ -1,0 +1,24 @@
+{
+  "version": 21,
+  "isolated_ln": true,
+  "in_dim": 44,
+  "n_ticks": 2951618,
+  "four_venue_start_idx": 2746859,
+  "sealed_blind_overnight_range": [
+    2913891,
+    2951498
+  ],
+  "wide_33h_oos_mean_auc": 0.85387,
+  "pre_blind_val_p1_auc": 0.8513,
+  "pre_blind_val_4venue_auc": 0.85387,
+  "sealed_blind_overnight_auc": 0.80605,
+  "delta_4venue_over_st_only": 0.00119,
+  "oos_head_aucs": {
+    "cv_sweep_12s": 0.87437,
+    "cv_bleed_60s": 0.74101,
+    "cv_rebound_30s": 0.87445,
+    "clean_fill_b0": 0.84187,
+    "clean_fill_bm1": 0.82285,
+    "clean_fill_bm2": 0.68174
+  }
+}

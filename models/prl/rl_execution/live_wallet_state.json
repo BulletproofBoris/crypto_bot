@@ -1,0 +1,82 @@
+{
+  "updated_at": "2026-11-09T10:49:47.063149+00:00",
+  "initial_budget_usd": 1022.54,
+  "bot_cash_usd": 994.069405,
+  "pos_qty": 17.3009,
+  "avg_entry": 1.6455,
+  "hold_sec": 1328,
+  "realized_pnl_usd": 0.0,
+  "net_deposits_usd": 1022.54,
+  "deposits_log": [
+    {
+      "ts_utc": "2026-10-30T06:39:21.549186+00:00",
+      "asset": "PRL",
+      "qty": 34.3926,
+      "price_usd": 1.67,
+      "usd_equiv": 57.4356,
+      "new_budget_usd": 152.2302
+    },
+    {
+      "ts_utc": "2026-10-31T21:00:04.016661+00:00",
+      "asset": "PRL",
+      "qty": 35.6444,
+      "price_usd": 1.45,
+      "usd_equiv": 51.6844,
+      "new_budget_usd": 203.9146
+    },
+    {
+      "ts_utc": "2026-11-02T10:50:24.519000+00:00",
+      "asset": "PRL",
+      "qty": 38.0713,
+      "price_usd": 1.53,
+      "usd_equiv": 58.2491,
+      "new_budget_usd": 262.1637
+    },
+    {
+      "ts_utc": "2026-11-03T10:52:16.425895+00:00",
+      "asset": "PRL",
+      "qty": 31.9926,
+      "price_usd": 1.37,
+      "usd_equiv": 43.8299,
+      "new_budget_usd": 305.9936
+    },
+    {
+      "ts_utc": "2026-11-08T12:36:02.772002+00:00",
+      "asset": "PRL",
+      "qty": 146.8579,
+      "price_usd": 1.78,
+      "usd_equiv": 261.4071,
+      "new_budget_usd": 567.4006
+    },
+    {
+      "ts_utc": "2026-11-17T10:28:00.000000+00:00",
+      "asset": "BASELINE_RESET",
+      "qty": 0.0,
+      "price_usd": 1.6455,
+      "usd_equiv": 1022.54,
+      "new_budget_usd": 1022.54,
+      "note": "Reset baseline capital to 100% for Order-3 Champion v1"
+    }
+  ],
+  "n_trades": 343,
+  "reserved_account_usdt": 0.0,
+  "user_reserved_coin": 0.0,
+  "active_bid_id": null,
+  "active_bid_p": 0.0,
+  "active_bid_q": 0.0,
+  "active_ask_id": 722151750,
+  "active_ask_p": 1.63,
+  "active_ask_q": 350.8873,
+  "slot2_ask_id": null,
+  "slot2_ask_p": 0.0,
+  "slot2_ask_q": 0.0,
+  "extra_slots": [],
+  "last_buy_fill_ts": 1794220491.505,
+  "split_done_for_pos": false,
+  "car_state": 0,
+  "car_sell_px": 1.62,
+  "car_cycles": 17,
+  "cooldown_until_ts": 1794190991.959,
+  "last_exit_ts": 1794218005.394,
+  "last_exit_price": 1.63
+}
