@@ -15,7 +15,7 @@ Key Properties:
 """
 
 import os
-os.environ["CUPY_CACHE_DIR"] = "/tmp/cupy_cache"
+os.environ["CUPY_CACHE_DIR"] = str((os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scratch", ".cupy_cache"))))
 import sys
 import json
 import time

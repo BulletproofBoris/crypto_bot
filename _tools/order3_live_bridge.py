@@ -24,12 +24,14 @@ from _tools.fused_order3_clean_tick import (
     MKT_DIM_ORDER3,
     AG_DIM_ORDER3,
     TOTAL_DIM_ORDER3,
+    MEM_DIM_ORDER3,
     K_MODES_ORDER3,
     EXPERT_OUT_DIM_ORDER3,
     MOE_OUT_DIM_ORDER3,
     ROUTER_IN_DIM_ORDER3,
     ROUTER_H_DIM_ORDER3,
     REG_IN_DIM_ORDER3,
+    REG_H_DIM_ORDER3,
     TOKEN_REFILL_PER_SEC_ORDER3,
     TOKEN_BUCKET_CAP_ORDER3,
     _fanned_slot_softmax,
@@ -85,51 +87,94 @@ class Order3LiveInferenceEngine:
         self.b_res1 = ck["b_res1"].view(1, 128).to(device=self.device, dtype=torch.float32)
         self.w_res2 = ck["w_res2"].to(device=self.device, dtype=torch.float32)
 
-        # Латентная микро-память (16D)
-        self.w_rec = ck["w_rec"].to(device=self.device, dtype=torch.float32)
-        self.b_rec = ck["b_rec"].view(1, 32).to(device=self.device, dtype=torch.float32)
+        # Латентная многомасштабная память (16D -> 32D с бесшовной совместимостью L46/L48)
+        wrec_raw = ck["w_rec"].to(dtype=torch.float32)
+        brec_raw = ck["b_rec"].to(dtype=torch.float32).view(1, -1)
+        if brec_raw.numel() != 2 * MEM_DIM_ORDER3:
+            wrec_pad = torch.zeros((256, 2 * MEM_DIM_ORDER3), dtype=torch.float32)
+            brec_pad = torch.zeros((1, 2 * MEM_DIM_ORDER3), dtype=torch.float32)
+            wrec_pad[:, :16] = wrec_raw[:, :16]
+            wrec_pad[:, 32:48] = wrec_raw[:, 16:32]
+            brec_pad[:, :16] = brec_raw[:, :16]
+            brec_pad[:, 32:48] = brec_raw[:, 16:32]
+            wrec_raw, brec_raw = wrec_pad, brec_pad
+        self.w_rec = wrec_raw.to(device=self.device)
+        self.b_rec = brec_raw.view(1, 2 * MEM_DIM_ORDER3).to(device=self.device)
 
         # Авто-определение числа мод K (поддержка как K=4, так и расширенных K=8 чекпоинтов!)
         self.k_modes = int(ck["b_gate2"].numel())
         self.moe_out_dim = self.k_modes * EXPERT_OUT_DIM_ORDER3
-        self.reg_in_dim = 24 + self.k_modes
+        self.reg_in_dim = 28 + self.k_modes
 
-        # Контекстный маршрутизатор (с бесшовной обратной совместимостью 288D -> 295D)
+        # Контекстный маршрутизатор (с бесшовной обратной совместимостью 288D / 295D -> 311D)
         wg1_raw = ck["w_gate1"].to(dtype=torch.float32)
         if wg1_raw.shape[0] != ROUTER_IN_DIM_ORDER3:
             wg1_adap = torch.zeros((ROUTER_IN_DIM_ORDER3, ROUTER_H_DIM_ORDER3), dtype=torch.float32)
-            copy_r = min(ROUTER_IN_DIM_ORDER3, wg1_raw.shape[0])
-            wg1_adap[:copy_r, :] = wg1_raw[:copy_r, :]
+            if wg1_raw.shape[0] == 295 and ROUTER_IN_DIM_ORDER3 >= 311:
+                wg1_adap[:288, :] = wg1_raw[:288, :]
+                wg1_adap[304:311, :] = wg1_raw[288:295, :]
+            else:
+                copy_r = min(ROUTER_IN_DIM_ORDER3, wg1_raw.shape[0])
+                wg1_adap[:copy_r, :] = wg1_raw[:copy_r, :]
             wg1_raw = wg1_adap
         self.w_gate1 = wg1_raw.to(device=self.device)
         self.b_gate1 = ck["b_gate1"].view(1, ROUTER_H_DIM_ORDER3).to(device=self.device, dtype=torch.float32)
         self.w_gate2 = ck["w_gate2"].to(device=self.device, dtype=torch.float32)
         self.b_gate2 = ck["b_gate2"].view(1, self.k_modes).to(device=self.device, dtype=torch.float32)
 
-        # MoE эксперты
-        self.w2_moe = ck["w2_moe"].to(device=self.device, dtype=torch.float32)
-        self.b2_moe = ck["b2_moe"].view(1, self.moe_out_dim).to(device=self.device, dtype=torch.float32)
+        # MoE эксперты (с бесшовной обратной совместимостью 45D -> 48D на моду)
+        w2m_raw = ck["w2_moe"].to(dtype=torch.float32)
+        b2m_raw = ck["b2_moe"].to(dtype=torch.float32).view(1, -1)
+        if b2m_raw.numel() != self.moe_out_dim:
+            old_ed = b2m_raw.numel() // self.k_modes
+            w2m_old = w2m_raw.view(256, self.k_modes, old_ed)
+            b2m_old = b2m_raw.view(1, self.k_modes, old_ed)
+            w2m_pad = torch.zeros((256, self.k_modes, EXPERT_OUT_DIM_ORDER3), dtype=torch.float32)
+            b2m_pad = torch.zeros((1, self.k_modes, EXPERT_OUT_DIM_ORDER3), dtype=torch.float32)
+            c_ed = min(old_ed, EXPERT_OUT_DIM_ORDER3)
+            w2m_pad[:, :, :c_ed] = w2m_old[:, :, :c_ed]
+            b2m_pad[:, :, :c_ed] = b2m_old[:, :, :c_ed]
+            if old_ed <= 45 and EXPERT_OUT_DIM_ORDER3 >= 48:
+                b2m_pad[:, :, 47] = 6.0
+            w2m_raw = w2m_pad.reshape(256, self.moe_out_dim)
+            b2m_raw = b2m_pad.reshape(1, self.moe_out_dim)
+        self.w2_moe = w2m_raw.to(device=self.device)
+        self.b2_moe = b2m_raw.view(1, self.moe_out_dim).to(device=self.device)
 
-        # Регулятор слотов (с бесшовной обратной совместимостью 26D -> 28D / 32D)
+        # Регулятор слотов (с бесшовной обратной совместимостью 26D / 32D->48 -> 36D->64)
         wreg1_raw = ck["w_reg1"].to(dtype=torch.float32)
-        if wreg1_raw.shape[0] != self.reg_in_dim:
-            wreg1_adap = torch.zeros((self.reg_in_dim, 48), dtype=torch.float32)
-            if wreg1_raw.shape[0] == 26 and self.reg_in_dim >= 28:
-                wreg1_adap[:22, :] = wreg1_raw[:22, :]
-                wreg1_adap[24:28, :] = wreg1_raw[22:26, :]
+        breg1b_raw = ck["b_reg1_b"].to(dtype=torch.float32).view(1, -1)
+        breg1a_raw = ck["b_reg1_a"].to(dtype=torch.float32).view(1, -1)
+        wreg2_raw = ck["w_reg2"].to(dtype=torch.float32)
+        if wreg1_raw.shape != (self.reg_in_dim, REG_H_DIM_ORDER3):
+            old_ri, old_rh = wreg1_raw.shape
+            wreg1_adap = torch.zeros((self.reg_in_dim, REG_H_DIM_ORDER3), dtype=torch.float32)
+            breg1b_adap = torch.zeros((1, REG_H_DIM_ORDER3), dtype=torch.float32)
+            breg1a_adap = torch.zeros((1, REG_H_DIM_ORDER3), dtype=torch.float32)
+            wreg2_adap = torch.zeros((REG_H_DIM_ORDER3, 2), dtype=torch.float32)
+            cr_h = min(old_rh, REG_H_DIM_ORDER3)
+            if old_ri == 24 + self.k_modes and self.reg_in_dim == 28 + self.k_modes:
+                wreg1_adap[:24, :cr_h] = wreg1_raw[:24, :cr_h]
+                wreg1_adap[28 : 28 + self.k_modes, :cr_h] = wreg1_raw[24 : 24 + self.k_modes, :cr_h]
+            elif old_ri == 26:
+                wreg1_adap[:22, :cr_h] = wreg1_raw[:22, :cr_h]
+                wreg1_adap[28:32, :cr_h] = wreg1_raw[22:26, :cr_h]
             else:
-                cr_reg = min(self.reg_in_dim, wreg1_raw.shape[0])
-                wreg1_adap[:cr_reg, :] = wreg1_raw[:cr_reg, :]
-            wreg1_raw = wreg1_adap
+                cr_reg = min(self.reg_in_dim, old_ri)
+                wreg1_adap[:cr_reg, :cr_h] = wreg1_raw[:cr_reg, :cr_h]
+            breg1b_adap[:, :cr_h] = breg1b_raw[:, :cr_h]
+            breg1a_adap[:, :cr_h] = breg1a_raw[:, :cr_h]
+            wreg2_adap[:cr_h, :] = wreg2_raw[:cr_h, :]
+            wreg1_raw, breg1b_raw, breg1a_raw, wreg2_raw = wreg1_adap, breg1b_adap, breg1a_adap, wreg2_adap
         self.w_reg1 = wreg1_raw.to(device=self.device)
-        self.b_reg1_b = ck["b_reg1_b"].view(1, 48).to(device=self.device, dtype=torch.float32)
-        self.b_reg1_a = ck["b_reg1_a"].view(1, 48).to(device=self.device, dtype=torch.float32)
-        self.w_reg2 = ck["w_reg2"].to(device=self.device, dtype=torch.float32)
+        self.b_reg1_b = breg1b_raw.view(1, REG_H_DIM_ORDER3).to(device=self.device)
+        self.b_reg1_a = breg1a_raw.view(1, REG_H_DIM_ORDER3).to(device=self.device)
+        self.w_reg2 = wreg2_raw.to(device=self.device)
         self.b_reg2_b = ck["b_reg2_b"].view(1, 2).to(device=self.device, dtype=torch.float32)
         self.b_reg2_a = ck["b_reg2_a"].view(1, 2).to(device=self.device, dtype=torch.float32)
 
         # Внутреннее состояние
-        self.mem_h = torch.zeros((1, 16), dtype=torch.float32, device=self.device)
+        self.mem_h = torch.zeros((1, MEM_DIM_ORDER3), dtype=torch.float32, device=self.device)
         self.api_tokens = float(LIVE_TOKEN_BUCKET_CAP)
         self.last_ts = time.time()
         self.echelon_k01 = torch.linspace(0.0, 1.0, 12, dtype=torch.float32, device=self.device)
@@ -160,17 +205,27 @@ class Order3LiveInferenceEngine:
         bid_act_12: Optional[np.ndarray] = None,
         ask_act_12: Optional[np.ndarray] = None,
         now_ts: float = 0.0,
+        bid_qa_12: Optional[np.ndarray] = None,
+        bid_qa0_12: Optional[np.ndarray] = None,
+        ask_qa_12: Optional[np.ndarray] = None,
+        ask_qa0_12: Optional[np.ndarray] = None,
+        bp_10: Optional[np.ndarray] = None,
+        bq_10: Optional[np.ndarray] = None,
+        ap_10: Optional[np.ndarray] = None,
+        aq_10: Optional[np.ndarray] = None,
+        roll_sell_1s: float = 10.0,
+        roll_buy_1s: float = 10.0,
+        hold_sec: float = 0.0,
     ) -> Dict[str, Any]:
         """
-        Полный шаг инференса Order-3.
-        Возвращает параметры распределения объемов, целевые цены и дискретные команды регулятора слотов.
+        Полный шаг инференса Order-3 (L46/L48 100% паритет с fused_order3_clean_tick.py).
         """
         # Тензоры
         zm = _scale_mkt_44d(torch.from_numpy(z_mkt_39d).to(device=self.device, dtype=torch.float32).view(1, MKT_DIM_ORDER3), torch.float32)
         za = torch.from_numpy(z_ag_110d).to(device=self.device, dtype=torch.float32).view(1, AG_DIM_ORDER3)
         za_norm = _normalize_agent_z110_per_block(za, torch.float32)
 
-        # 1. 150D -> 384
+        # 1. 170D -> 384
         pre_all = (zm @ self.w1_mkt + self.b1) + (za_norm @ self.w1_ag)
         h_base = torch.relu(pre_all[:, :256])
         h_gate = (2.0 * torch.sigmoid(pre_all[:, 256:384])).repeat_interleave(2, dim=-1)
@@ -181,26 +236,41 @@ class Order3LiveInferenceEngine:
         res_mid = torch.relu(res_pre[:, :64]) * (2.0 * torch.sigmoid(res_pre[:, 64:128]))
         h2 = h1 + res_mid @ self.w_res2
 
-        # Латентная двухмасштабная микропамять (8D fast ~4s + 8D slow ~46s)
+        # 4-горизонтная латентная память 32D (~3.7s, ~45s, ~180s, ~735s)
         rec_raw = h2 @ self.w_rec + self.b_rec
-        rec_u = torch.tanh(rec_raw[:, :16])
-        rec_gate = torch.cat([torch.sigmoid(rec_raw[:, 16:24] + 1.0), torch.sigmoid(rec_raw[:, 24:32] + 3.8)], dim=-1)
+        rec_u = torch.tanh(rec_raw[:, :MEM_DIM_ORDER3])
+        rec_gate = torch.cat(
+            [
+                torch.sigmoid(rec_raw[:, 32:40] + 1.0),
+                torch.sigmoid(rec_raw[:, 40:48] + 3.8),
+                torch.sigmoid(rec_raw[:, 48:56] + 5.2),
+                torch.sigmoid(rec_raw[:, 56:64] + 6.6),
+            ],
+            dim=-1,
+        )
         self.mem_h = rec_gate * self.mem_h + (1.0 - rec_gate) * rec_u
 
-        # Контекстный маршрутизатор (295D -> 64 -> 4; в точности как в симуляторе — сырые acct_8d и queue_8d до LayerNorm!)
+        # Контекстный маршрутизатор (311D -> 64 -> K)
         acct_8d = za[:, 54:62]
         queue_8d = za[:, 62:70]
-        r_extra_7d = torch.cat([zm[:, 0:1], zm[:, 40:44], zm[:, 44:45], zm[:, 48:49]], dim=-1)
-        router_in = torch.cat([h2, acct_8d, queue_8d, self.mem_h, r_extra_7d], dim=-1)
+        r_extra_16d = torch.cat(
+            [
+                zm[:, 0:1], zm[:, 40:44], zm[:, 44:45], zm[:, 48:49],
+                zm[:, 29:34], zm[:, 36:37], zm[:, 39:40], zm[:, 55:56], zm[:, 12:13],
+            ],
+            dim=-1,
+        )
+        router_in = torch.cat([h2, acct_8d, queue_8d, self.mem_h, r_extra_16d], dim=-1)
         r_hid = F.silu(router_in @ self.w_gate1 + self.b_gate1)
         g_mode = torch.softmax((r_hid @ self.w_gate2 + self.b_gate2).float(), dim=-1)
 
-        # K Латентных экспертов (K=4 или K=8)
+        # K Латентных экспертов
         moe_all = (h2 @ self.w2_moe + self.b2_moe).float().view(1, self.k_modes, EXPERT_OUT_DIM_ORDER3)
-        strat_raw = (g_mode.unsqueeze(-1) * moe_all).sum(dim=1).squeeze(0)  # [45]
+        strat_raw = (g_mode.unsqueeze(-1) * moe_all).sum(dim=1).squeeze(0)  # [48]
 
-        # 1C. 100% Эндогенная экспозиция [0..1] и распределение долей (полный паритет с fused_order3_clean_tick.py):
+        # 1C. 100% Эндогенная экспозиция [0..1], распределение долей и резерв каскадной постановки renorm_blend:
         exp_bid_frac = float(torch.sigmoid(strat_raw[0]).item())
+        renorm_blend = float(torch.sigmoid(strat_raw[47]).item())
 
         tau_b_t = 0.08 + 2.42 * torch.sigmoid(strat_raw[34:35])
         tau_a_t = 0.08 + 2.42 * torch.sigmoid(strat_raw[35:36])
@@ -210,11 +280,11 @@ class Order3LiveInferenceEngine:
         pi_b_t = _fanned_slot_softmax(strat_raw[1:13].unsqueeze(0), tau_b_t, max_share_b_t, floor=0.005).squeeze(0)
         pi_a_t = _fanned_slot_softmax(strat_raw[13:25].unsqueeze(0), tau_a_t, max_share_a_t, floor=0.005).squeeze(0)
 
-        # 2. Непрерывный эндогенный Taker-вентиль (только физические ограничения лота >= 2.0 PRL и API-токена >= 1.0):
+        # 2. Непрерывный эндогенный Taker-вентиль:
         u_taker = float(torch.tanh(F.relu(strat_raw[25])).item())
         max_slip_pct = 0.005 + 0.145 * float(torch.sigmoid(strat_raw[36]).item())
 
-        # 3. 100% Эндогенная полно-спредовая геометрия 24 слотов (весь легальный maker-коридор [b1..a1-tick] и двухмасштабный Ask-прицел!):
+        # 3. Независимая полно-спредовая геометрия 24 слотов (развязанные span_a/gamma_a [45..46]):
         spread_room = max(0.0, a1 - b1 - tick_sz)
         inside_b = spread_room * float(torch.sigmoid(strat_raw[37]).item())
         retreat_b = b1 * 0.04 * float(torch.sigmoid(strat_raw[38]).item())
@@ -226,14 +296,13 @@ class Order3LiveInferenceEngine:
         max_maker_bid = max(tick_sz, a1 - tick_sz)
         t_bid_px = torch.clamp(torch.round(torch.clamp(raw_t_bid, max=max_maker_bid) / tick_sz) * tick_sz, min=tick_sz)
 
-        # Ask геометрия (развязанный микрометрический шаг inside_a на [43] + двухмасштабный ask_edge_pct на [42])
         ref_entry = float(trader_entry) * (1.0 + 2.0 * maker_fee) if (pos_qty >= 2.0 and trader_entry > 1e-4) else a1
         skew_blend = float(torch.sigmoid(strat_raw[41]).item())
         z42_t = strat_raw[42]
         t42_s = float(torch.tanh(z42_t * 0.25).item())
         ask_edge_pct = 0.0035 * float(torch.tanh(z42_t).item()) + 0.0765 * (t42_s * t42_s * t42_s)
-        span_a_usd = a1 * (0.0005 + 0.2495 * float(torch.sigmoid(strat_raw[39] + 0.5 * z42_t).item()))
-        gamma_a = 0.40 + 2.10 * float(torch.sigmoid(strat_raw[40]).item())
+        span_a_usd = a1 * (0.0005 + 0.2495 * float(torch.sigmoid(strat_raw[39] + 0.5 * z42_t + strat_raw[45]).item()))
+        gamma_a = 0.40 + 2.10 * float(torch.sigmoid(strat_raw[40] + strat_raw[46]).item())
 
         inside_a = spread_room * float(torch.sigmoid(strat_raw[43]).item())
         anchor_base_a = a1 + skew_blend * (ref_entry - a1) + a1 * ask_edge_pct - inside_a
@@ -332,7 +401,37 @@ class Order3LiveInferenceEngine:
             slot_edge_a = torch.zeros_like(t_ask_px)
         slot_exec_a = zm[:, 45:46].squeeze(0).expand(12)
 
-        feat_b_26 = torch.cat(
+        # 4D датчики реальной FIFO-очереди и долгого удержания (1-в-1 с fused_order3_clean_tick.py):
+        bqa_t = torch.from_numpy(bid_qa_12).to(device=self.device, dtype=torch.float32) if bid_qa_12 is not None else torch.zeros_like(cur_b_qty)
+        bqa0_t = torch.from_numpy(bid_qa0_12).to(device=self.device, dtype=torch.float32) if bid_qa0_12 is not None else torch.zeros_like(cur_b_qty)
+        aqa_t = torch.from_numpy(ask_qa_12).to(device=self.device, dtype=torch.float32) if ask_qa_12 is not None else torch.zeros_like(cur_a_qty)
+        aqa0_t = torch.from_numpy(ask_qa0_12).to(device=self.device, dtype=torch.float32) if ask_qa0_12 is not None else torch.zeros_like(cur_a_qty)
+        qprog_b = torch.where(had_b_pre, torch.clamp(1.0 - bqa_t / (bqa0_t + 10.0), 0.0, 1.0), torch.zeros_like(cur_b_qty))
+        qprog_a = torch.where(had_a_pre, torch.clamp(1.0 - aqa_t / (aqa0_t + 10.0), 0.0, 1.0), torch.zeros_like(cur_a_qty))
+        qa_eta_b = torch.where(had_b_pre, torch.clamp(torch.log1p(bqa_t / max(10.0, float(roll_sell_1s))) / 4.0, 0.0, 2.5), torch.zeros_like(cur_b_qty))
+        qa_eta_a = torch.where(had_a_pre, torch.clamp(torch.log1p(aqa_t / max(10.0, float(roll_buy_1s))) / 4.0, 0.0, 2.5), torch.zeros_like(cur_a_qty))
+
+        if bp_10 is not None and bq_10 is not None:
+            bp10_t = torch.as_tensor(bp_10, dtype=torch.float32, device=self.device).view(10)
+            bq10_t = torch.as_tensor(bq_10, dtype=torch.float32, device=self.device).view(10)
+            diff_b = torch.abs(bp10_t.unsqueeze(0) - t_bid_px.unsqueeze(1)) < (0.45 * tick_sz)
+            t_vis_bq = torch.where(diff_b, bq10_t.unsqueeze(0), torch.zeros_like(bq10_t.unsqueeze(0))).sum(dim=1)
+        else:
+            t_vis_bq = torch.zeros_like(t_bid_px)
+        if ap_10 is not None and aq_10 is not None:
+            ap10_t = torch.as_tensor(ap_10, dtype=torch.float32, device=self.device).view(10)
+            aq10_t = torch.as_tensor(aq_10, dtype=torch.float32, device=self.device).view(10)
+            diff_a = torch.abs(ap10_t.unsqueeze(0) - t_ask_px.unsqueeze(1)) < (0.45 * tick_sz)
+            t_vis_aq = torch.where(diff_a, aq10_t.unsqueeze(0), torch.zeros_like(aq10_t.unsqueeze(0))).sum(dim=1)
+        else:
+            t_vis_aq = torch.zeros_like(t_ask_px)
+
+        wall_b_log = torch.clamp(torch.log1p((t_vis_bq * t_bid_px) / bud_1d) / 2.0, 0.0, 2.5)
+        wall_a_log = torch.clamp(torch.log1p((t_vis_aq * t_ask_px) / bud_1d) / 2.0, 0.0, 2.5)
+        hl_val = min(2.0, math.log1p(max(0.0, float(hold_sec)) / 60.0) / 4.0) if pos_qty >= 2.0 else 0.0
+        hold_long_2d = torch.full((12,), hl_val, dtype=torch.float32, device=self.device)
+
+        feat_b_36 = torch.cat(
             [
                 torch.stack(
                     [
@@ -342,13 +441,13 @@ class Order3LiveInferenceEngine:
                     dim=-1,
                 ),
                 ctx_4d_b.unsqueeze(0).expand(12, 4),
-                torch.stack([tot_side_b, neigh_val_b, mean_age_b, api_ratio_2d, ech_2d, sp_rel_2d, slot_edge_b, slot_exec_b], dim=-1),
+                torch.stack([tot_side_b, neigh_val_b, mean_age_b, api_ratio_2d, ech_2d, sp_rel_2d, slot_edge_b, slot_exec_b, qprog_b, qa_eta_b, wall_b_log, hold_long_2d], dim=-1),
                 g_mode_12,
             ],
             dim=-1,
         )
 
-        feat_a_26 = torch.cat(
+        feat_a_36 = torch.cat(
             [
                 torch.stack(
                     [
@@ -358,14 +457,14 @@ class Order3LiveInferenceEngine:
                     dim=-1,
                 ),
                 ctx_4d_a.unsqueeze(0).expand(12, 4),
-                torch.stack([tot_side_a, neigh_val_a, mean_age_a, api_ratio_2d, ech_2d, sp_rel_2d, slot_edge_a, slot_exec_a], dim=-1),
+                torch.stack([tot_side_a, neigh_val_a, mean_age_a, api_ratio_2d, ech_2d, sp_rel_2d, slot_edge_a, slot_exec_a, qprog_a, qa_eta_a, wall_a_log, hold_long_2d], dim=-1),
                 g_mode_12,
             ],
             dim=-1,
         )
 
-        rb_h = F.silu(feat_b_26 @ self.w_reg1 + self.b_reg1_b)
-        ra_h = F.silu(feat_a_26 @ self.w_reg1 + self.b_reg1_a)
+        rb_h = F.silu(feat_b_36 @ self.w_reg1 + self.b_reg1_b)
+        ra_h = F.silu(feat_a_36 @ self.w_reg1 + self.b_reg1_a)
         rb_out = rb_h @ self.w_reg2 + self.b_reg2_b  # [12, 2]
         ra_out = ra_h @ self.w_reg2 + self.b_reg2_a
 
@@ -376,6 +475,7 @@ class Order3LiveInferenceEngine:
 
         return {
             "exp_bid_frac": exp_bid_frac,
+            "renorm_blend": renorm_blend,
             "u_taker": u_taker,
             "max_slip_pct": max_slip_pct,
             "pi_bid": pi_b_t.cpu().numpy(),
@@ -388,6 +488,10 @@ class Order3LiveInferenceEngine:
             "g_cnl_b": g_cnl_b,
             "g_plc_a": g_plc_a,
             "g_cnl_a": g_cnl_a,
+            "cnl_logit_b": rb_out[:, 1].cpu().numpy(),
+            "cnl_logit_a": ra_out[:, 1].cpu().numpy(),
+            "t_vis_bq": t_vis_bq.cpu().numpy(),
+            "t_vis_aq": t_vis_aq.cpu().numpy(),
             "g_mode": g_mode.squeeze(0).cpu().numpy(),
             "api_tokens": self.api_tokens,
         }
@@ -478,21 +582,41 @@ def _eval_latest_wf_ubj_live(trader, b1: float, a1: float) -> Tuple[Optional[np.
         aq10 = getattr(trader, "last_clean_aq_10", np.full(10, 10.0, dtype=np.float32))
         bq1, aq1 = max(0.0, float(bq10[0])), max(0.0, float(aq10[0]))
         bq5, aq5 = max(0.0, float(np.sum(bq10[:5]))), max(0.0, float(np.sum(aq10[:5])))
-        buy10 = max(0.0, float(getattr(trader, "last_buy_vol_10s", 0.0)))
+        now_wf = time.time()
         fh = list(getattr(trader, "flow_hist_10s", []))
+        buy10 = max(0.0, float(getattr(trader, "last_buy_vol_10s", 0.0)))
         sell10 = max(0.0, float(sum(x[3] for x in fh[-10:]))) if fh else 0.0
-        buy30, sell30 = buy10 * 3.0, sell10 * 3.0
+
+        # Точный 30-секундный буфер потока и 15-секундный сдвиг спреда (1-в-1 с walkforward_order2_trainer.py!):
+        fh30 = _LIVE_WF_CACHE.setdefault("flow_hist_30s", [])
+        last_fh_ts = float(_LIVE_WF_CACHE.get("last_fh_ts", 0.0))
+        if fh:
+            for item_f in fh:
+                ts_f = float(item_f[0])
+                if ts_f > last_fh_ts + 1e-6:
+                    fh30.append((ts_f, max(0.0, float(item_f[2])), max(0.0, float(item_f[3]))))
+                    last_fh_ts = ts_f
+            _LIVE_WF_CACHE["last_fh_ts"] = last_fh_ts
+        fh30[:] = [x for x in fh30 if (now_wf - x[0]) <= 30.5]
+        if len(fh30) >= 3:
+            buy30 = max(buy10, float(sum(x[1] for x in fh30)))
+            sell30 = max(sell10, float(sum(x[2] for x in fh30)))
+        else:
+            buy30, sell30 = buy10 * 3.0, sell10 * 3.0
+
         st_mid = max(1e-4, 0.5 * (b1 + a1))
         bo_b1 = float(getattr(trader, "last_bo_b1", 0.0))
         bo_a1 = float(getattr(trader, "last_bo_a1", 0.0))
         bo_mid = 0.5 * (bo_b1 + bo_a1) if (bo_b1 > 1e-4 and bo_a1 > 1e-4) else st_mid
         arb_bps = float(np.clip((bo_mid - st_mid) / st_mid * 1e4, -100.0, 100.0))
         sp_bps = float(np.clip((a1 - b1) / st_mid * 1e4, 1.0, 150.0))
-        prev_sp = float(_LIVE_WF_CACHE.get("prev_sp_bps", sp_bps))
-        _LIVE_WF_CACHE["prev_sp_bps"] = 0.93 * prev_sp + 0.07 * sp_bps
+        sp_hist = _LIVE_WF_CACHE.setdefault("sp_hist_15s", [])
+        sp_hist.append((now_wf, sp_bps))
+        sp_hist[:] = [x for x in sp_hist if (now_wf - x[0]) <= 20.0]
+        past_sp = next((x[1] for x in sp_hist if (now_wf - x[0]) >= 14.0), sp_hist[0][1])
         lob_18 = [
             math.log1p(bq1), math.log1p(aq1), math.log1p(bq5), math.log1p(aq5),
-            bq1 / (bq5 + 1e-4), aq1 / (aq5 + 1e-4), sp_bps, sp_bps - prev_sp,
+            bq1 / (bq5 + 1e-4), aq1 / (aq5 + 1e-4), sp_bps, sp_bps - past_sp,
             math.log1p(buy10), math.log1p(sell10), math.log1p(buy30), math.log1p(sell30),
             (bq1 - aq1) / (bq1 + aq1 + 1e-4), (bq5 - aq5) / (bq5 + aq5 + 1e-4),
             min(10.0, min(buy30, sell30) / (max(bq1, aq1) + 50.0)),
@@ -749,13 +873,64 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
         z_ag[68] = float(zm_sc[44]) if len(zm_sc) > 44 else 0.0
         z_ag[69] = float(zm_sc[48]) if len(zm_sc) > 48 else 0.0
 
-        z_ag[70:86] = trader.order3_engine.mem_h.squeeze(0).cpu().numpy()
+        z_ag[70:86] = trader.order3_engine.mem_h[:, :16].squeeze(0).cpu().numpy()
         z_ag[86:98] = np.where(b_qty > 1e-6, np.clip(np.where(b_act_ts > 0, (now_ts - b_act_ts) / 60.0, 0.0), 0.0, 2.0), -1.0)
         z_ag[98:110] = np.where(a_qty > 1e-6, np.clip(np.where(a_act_ts > 0, (now_ts - a_act_ts) / 60.0, 0.0), 0.0, 2.0), -1.0)
 
     else:
         b_act_ts = np.array([float(s.get("act_ts", 0.0)) for s in trader.bid_slots], dtype=np.float32)
         a_act_ts = np.array([float(s.get("act_ts", 0.0)) for s in trader.ask_slots], dtype=np.float32)
+
+    # Синхронизация живой FIFO-очереди слотов (qa / qa0) по чистому 10-уровневому стакану (1-в-1 с fused_order3_clean_tick.py):
+    bp10_live = np.asarray(getattr(trader, "last_clean_bp_10", [b1] * 10), dtype=np.float32)[:10]
+    ap10_live = np.asarray(getattr(trader, "last_clean_ap_10", [a1] * 10), dtype=np.float32)[:10]
+    bq10_live = np.asarray(getattr(trader, "last_clean_bq_10", np.zeros(10, dtype=np.float32)), dtype=np.float32)[:10]
+    aq10_live = np.asarray(getattr(trader, "last_clean_aq_10", np.zeros(10, dtype=np.float32)), dtype=np.float32)[:10]
+    t_sz = float(getattr(trader, "exec_tick_size", trader.tick_size))
+    fh_live = list(getattr(trader, "flow_hist_10s", []))
+    rs_1s = max(10.0, float(sum(x[3] for x in fh_live[-10:])) / 10.0) if fh_live else 10.0
+    rb_1s = max(10.0, float(getattr(trader, "last_buy_vol_10s", 100.0)) / 10.0)
+    last_qa_step_ts = float(getattr(trader, "_last_qa_drain_ts", 0.0))
+    sv_since = float(sum(max(0.0, float(x[3])) for x in fh_live if float(x[0]) > last_qa_step_ts + 1e-6)) if (fh_live and last_qa_step_ts > 0.0) else 0.0
+    bv_since = float(sum(max(0.0, float(x[2])) for x in fh_live if float(x[0]) > last_qa_step_ts + 1e-6)) if (fh_live and last_qa_step_ts > 0.0) else 0.0
+    if fh_live:
+        trader._last_qa_drain_ts = float(fh_live[-1][0])
+
+    b_qa_arr = np.zeros(12, dtype=np.float32)
+    b_qa0_arr = np.zeros(12, dtype=np.float32)
+    a_qa_arr = np.zeros(12, dtype=np.float32)
+    a_qa0_arr = np.zeros(12, dtype=np.float32)
+    for si in range(12):
+        sb = trader.bid_slots[si]
+        if sb.get("id") is not None and b_qty[si] > 1e-6:
+            qa_cur = float(sb.get("qa", 0.0))
+            qa0_cur = float(sb.get("qa0", qa_cur))
+            if float(sb.get("acc_fill", 0.0)) > 1e-4:
+                qa_cur = 0.0
+            elif b_px[si] <= b1 + 0.1 * t_sz:
+                if sv_since > 0.0 and b1 <= b_px[si] + 0.1 * t_sz:
+                    above_bq = float(np.sum(bq10_live[bp10_live > (b_px[si] + 0.5 * t_sz)]))
+                    qa_cur = max(0.0, qa_cur - max(0.0, sv_since - above_bq))
+                m_b = np.abs(bp10_live - b_px[si]) < (0.45 * t_sz)
+                vis_bq = float(np.sum(bq10_live[m_b])) if np.any(m_b) else 0.0
+                qa_cur = min(qa_cur, vis_bq)
+            sb["qa"] = qa_cur
+            b_qa_arr[si], b_qa0_arr[si] = qa_cur, qa0_cur
+        sa = trader.ask_slots[si]
+        if sa.get("id") is not None and a_qty[si] > 1e-6:
+            qa_cur = float(sa.get("qa", 0.0))
+            qa0_cur = float(sa.get("qa0", qa_cur))
+            if float(sa.get("acc_fill", 0.0)) > 1e-4:
+                qa_cur = 0.0
+            elif a_px[si] >= a1 - 0.1 * t_sz:
+                if bv_since > 0.0 and a1 >= a_px[si] - 0.1 * t_sz:
+                    below_aq = float(np.sum(aq10_live[ap10_live < (a_px[si] - 0.5 * t_sz)]))
+                    qa_cur = max(0.0, qa_cur - max(0.0, bv_since - below_aq))
+                m_a = np.abs(ap10_live - a_px[si]) < (0.45 * t_sz)
+                vis_aq = float(np.sum(aq10_live[m_a])) if np.any(m_a) else 0.0
+                qa_cur = min(qa_cur, vis_aq)
+            sa["qa"] = qa_cur
+            a_qa_arr[si], a_qa0_arr[si] = qa_cur, qa0_cur
 
     plan = trader.order3_engine.forward_tick(
         z_mkt_39d=z_mkt,
@@ -769,54 +944,68 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
         bid_qty_12=b_qty,
         ask_px_12=a_px,
         ask_qty_12=a_qty,
-        tick_sz=float(getattr(trader, "exec_tick_size", trader.tick_size)),
+        tick_sz=t_sz,
         maker_fee=0.0010,
         trader_entry=float(trader.avg_entry),
         bid_act_12=b_act_ts,
         ask_act_12=a_act_ts,
         now_ts=now_ts,
+        bid_qa_12=b_qa_arr,
+        bid_qa0_12=b_qa0_arr,
+        ask_qa_12=a_qa_arr,
+        ask_qa0_12=a_qa0_arr,
+        bp_10=bp10_live,
+        bq_10=bq10_live,
+        ap_10=ap10_live,
+        aq_10=aq10_live,
+        roll_sell_1s=rs_1s,
+        roll_buy_1s=rb_1s,
+        hold_sec=float(getattr(trader, "hold_sec", 0.0)),
     )
 
     p_prec = int(getattr(trader, "price_precision", 4))
     a_prec = int(getattr(trader, "amount_precision", 4))
     min_amt = float(getattr(trader, "min_order_amount", 2.0))
-    t_sz = float(getattr(trader, "exec_tick_size", trader.tick_size))
 
-    # =========================================================================
-    # 🧠 100% ЧИСТОЕ ЭНДОГЕННОЕ ИСПОЛНЕНИЕ ORDER-3 (0 ЭМПИРИЧЕСКИХ ОГРАНИЧЕНИЙ!)
-    # Нейросеть единолично определяет:
-    #   - Taker-выход u_taker и допустимое проскальзывание max_slip_pct
-    #   - Долю капитала exp_bid_frac ∈ [0..1] и веер весов pi_bid / pi_ask
-    #   - Целевые цены всех 24 слотов t_bid_px / t_ask_px (включая продажу в плюс или стоп-лосс)
-    #   - Команды постановки и снятия каждого слота g_plc_b/a, g_cnl_b/a (без ручных таймеров!)
-    # Сохранены ТОЛЬКО физические законы биржи SafeTrade (баланс >= 0, лот >= 2.0 PRL, тик $0.0001, API token-bucket)
-    # =========================================================================
     u_taker = float(plan.get("u_taker", 0.0))
     max_slip_pct = float(plan.get("max_slip_pct", 0.02))
+    renorm_b = float(plan.get("renorm_blend", 1.0))
 
-    # 1. Эндогенный Taker-вентиль (только физические ограничения лота >= min_amt и API-токена >= 1.0):
+    # 1. Эндогенный Taker-вентиль БЕЗ карательного сноса обеспеченных Ask-слотов при частичном хеджировании:
     if (float(trader.pos_qty) * u_taker) >= min_amt and trader.order3_engine.api_tokens >= 1.0:
-        open_ask_oids = [s["id"] for s in trader.ask_slots if s.get("id") is not None]
-        if open_ask_oids:
-            if len(open_ask_oids) >= 2:
+        raw_sq = float(trader.pos_qty) * u_taker
+        sell_q = float(trader.pos_qty) if (float(trader.pos_qty) - raw_sq) < min_amt else raw_sq
+        rem_pos_est = max(0.0, float(trader.pos_qty) - sell_q)
+        cum_aq = 0.0
+        drop_ask_oids = []
+        drop_ask_slots = []
+        for s in range(12):
+            if trader.ask_slots[s].get("id") is not None:
+                sq_s = float(trader.ask_slots[s].get("qty", 0.0))
+                cum_aq += sq_s
+                keep_s = (rem_pos_est >= min_amt) and (cum_aq <= rem_pos_est + 1e-5) and (sq_s >= min_amt)
+                if not keep_s:
+                    drop_ask_oids.append(trader.ask_slots[s]["id"])
+                    drop_ask_slots.append(s)
+        if drop_ask_oids:
+            n_open_all_a = sum(1 for s in trader.ask_slots if s.get("id") is not None)
+            if len(drop_ask_oids) >= 2 and len(drop_ask_oids) == n_open_all_a:
                 try:
                     raw_all_a = trader.client.cancel_all_orders(trader.market, side="sell")
                     c_m = {o.get("id"): o for o in (raw_all_a if isinstance(raw_all_a, list) else []) if isinstance(o, dict) and o.get("id") is not None}
                     trader.order3_engine.api_tokens = max(0.0, trader.order3_engine.api_tokens - 1.0)
                 except Exception:
-                    raw_c = list(trader._io_pool.map(trader._safe_cancel_oid, open_ask_oids))
-                    c_m = {oid: rc for oid, rc in zip(open_ask_oids, raw_c) if isinstance(rc, dict)}
-                    trader.order3_engine.api_tokens = max(0.0, trader.order3_engine.api_tokens - float(len(open_ask_oids)))
+                    raw_c = list(trader._io_pool.map(trader._safe_cancel_oid, drop_ask_oids))
+                    c_m = {oid: rc for oid, rc in zip(drop_ask_oids, raw_c) if isinstance(rc, dict)}
+                    trader.order3_engine.api_tokens = max(0.0, trader.order3_engine.api_tokens - float(len(drop_ask_oids)))
             else:
-                raw_c = list(trader._io_pool.map(trader._safe_cancel_oid, open_ask_oids))
-                c_m = {oid: rc for oid, rc in zip(open_ask_oids, raw_c) if isinstance(rc, dict)}
-                trader.order3_engine.api_tokens = max(0.0, trader.order3_engine.api_tokens - float(len(open_ask_oids)))
+                raw_c = list(trader._io_pool.map(trader._safe_cancel_oid, drop_ask_oids))
+                c_m = {oid: rc for oid, rc in zip(drop_ask_oids, raw_c) if isinstance(rc, dict)}
+                trader.order3_engine.api_tokens = max(0.0, trader.order3_engine.api_tokens - float(len(drop_ask_oids)))
             trader._sync_24slot_orders(b1, count_hold=False, pre_fetched_orders=c_m)
-            for s in range(12):
-                if trader.ask_slots[s].get("id") in open_ask_oids:
+            for s in drop_ask_slots:
+                if trader.ask_slots[s].get("id") in drop_ask_oids:
                     trader.ask_slots[s] = {"slot": s, "id": None, "px": 0.0, "qty": 0.0, "act_ts": 0.0, "acc_fill": 0.0}
-        raw_sq = float(trader.pos_qty) * u_taker
-        sell_q = float(trader.pos_qty) if (float(trader.pos_qty) - raw_sq) < min_amt else raw_sq
         sell_q = math.floor(min(sell_q, float(getattr(trader, "ex_coin_free", trader.pos_qty)) or float(trader.pos_qty)) * 10000.0) / 10000.0
         if sell_q >= min_amt:
             lim_cross_px = round(max(t_sz, math.floor((b1 * (1.0 - max_slip_pct)) / t_sz) * t_sz), p_prec)
@@ -824,7 +1013,8 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
                 res_t = trader.client.place_limit_order(trader.market, "sell", sell_q, lim_cross_px, price_precision=p_prec, amount_precision=a_prec, min_amount=min_amt)
                 trader.order3_engine.api_tokens = max(0.0, trader.order3_engine.api_tokens - 1.0)
                 if res_t and res_t.get("id") is not None:
-                    trader.ask_slots[0] = {"slot": 0, "id": res_t.get("id"), "px": float(res_t.get("price", lim_cross_px)), "qty": float(res_t.get("origin_amount", sell_q)), "act_ts": now_ts, "acc_fill": 0.0}
+                    free_s = next((si for si in range(12) if trader.ask_slots[si].get("id") is None), 0)
+                    trader.ask_slots[free_s] = {"slot": free_s, "id": res_t.get("id"), "px": float(res_t.get("price", lim_cross_px)), "qty": float(res_t.get("origin_amount", sell_q)), "act_ts": now_ts, "acc_fill": 0.0}
                     print(f"  ⚡ [ENDOGENOUS TAKER EXIT ({u_taker:.0%})] id={res_t.get('id')} | {sell_q:.4f} PRL @ >=${lim_cross_px:.{p_prec}f}")
                 trader._sync_24slot_orders(b1, count_hold=False)
                 trader._save_wallet()
@@ -832,27 +1022,37 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
                 print(f"  ⚠️ [ENDOGENOUS TAKER WARN]: {e_tk}")
             return
 
-    # 2. Снятие ордеров строго по решению Послотового Нейро-Регулятора g_cnl_b / g_cnl_a (+ физика скрещивания спреда):
+    # 2. Ранжированное по срочности снятие ордеров (1-в-1 с fused_order3_clean_tick.py):
     to_cnl_b, to_cnl_a = [], []
+    cand_cb = []
     for s in range(12):
         if trader.bid_slots[s].get("id") is not None:
             cur_p = float(trader.bid_slots[s].get("px", 0.0))
             crossed_ask = cur_p >= (a1 - 0.1 * t_sz)
-            want_cnl = crossed_ask or bool(plan["g_cnl_b"][s])
-            if want_cnl and trader.order3_engine.api_tokens >= 1.0:
-                to_cnl_b.append((s, trader.bid_slots[s]["id"], crossed_ask))
-                trader.order3_engine.api_tokens -= 1.0
+            if crossed_ask or bool(plan["g_cnl_b"][s]):
+                prio = float(plan["cnl_logit_b"][s]) + (100.0 if crossed_ask else 0.0)
+                cand_cb.append((prio, s, trader.bid_slots[s]["id"], crossed_ask))
+    cand_cb.sort(key=lambda x: x[0], reverse=True)
+    for _, s, oid, crossed_ask in cand_cb:
+        if trader.order3_engine.api_tokens >= 1.0:
+            to_cnl_b.append((s, oid, crossed_ask))
+            trader.order3_engine.api_tokens -= 1.0
 
     hp_now = float(trader.pos_qty) >= min_amt
+    cand_ca = []
     for s in range(12):
         if trader.ask_slots[s].get("id") is not None:
             cur_p = float(trader.ask_slots[s].get("px", 0.0))
             crossed_bid = cur_p <= (b1 + 0.1 * t_sz)
-            want_cnl = (not hp_now) or crossed_bid or bool(plan["g_cnl_a"][s])
-            if want_cnl and (not hp_now or trader.order3_engine.api_tokens >= 1.0):
-                to_cnl_a.append((s, trader.ask_slots[s]["id"], crossed_bid or (not hp_now)))
-                if hp_now:
-                    trader.order3_engine.api_tokens -= 1.0
+            if (not hp_now) or crossed_bid or bool(plan["g_cnl_a"][s]):
+                prio = float(plan["cnl_logit_a"][s]) + (100.0 if (crossed_bid or not hp_now) else 0.0)
+                cand_ca.append((prio, s, trader.ask_slots[s]["id"], crossed_bid or (not hp_now)))
+    cand_ca.sort(key=lambda x: x[0], reverse=True)
+    for _, s, oid, is_cr in cand_ca:
+        if (not hp_now) or trader.order3_engine.api_tokens >= 1.0:
+            to_cnl_a.append((s, oid, is_cr))
+            if hp_now:
+                trader.order3_engine.api_tokens -= 1.0
 
     if to_cnl_b or to_cnl_a:
         n_open_b = sum(1 for s in trader.bid_slots if s.get("id") is not None)
@@ -966,14 +1166,16 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
     b_tasks = []
     for s in sel_b:
         px_s = round(float(plan["t_bid_px"][s]), p_prec)
-        share_s = (float(plan["pi_bid"][s]) + 1e-5) / max(1e-6, sum_pi_b)
+        full_sh_b = (float(plan["pi_bid"][s]) + 1e-5) / max(1e-6, sum_pi_b)
+        raw_sh_b = min(float(plan["pi_bid"][s]), full_sh_b)
+        share_s = renorm_b * full_sh_b + (1.0 - renorm_b) * raw_sh_b
         q_s = math.floor(((avail_b_usd * share_s * 0.999) / max(1e-6, px_s * 1.001)) * 10000.0) / 10000.0
         if q_s >= min_amt and px_s > 0:
             b_tasks.append((s, q_s, px_s))
         else:
             trader.order3_engine.api_tokens = min(LIVE_TOKEN_BUCKET_CAP, trader.order3_engine.api_tokens + 1.0)
 
-    # 4. Постановка Ask-слотов 1-в-1 с fused_order3_clean_tick.py (100% перенормировка avail_a_qty по открытым слотам sel_a):
+    # 4. Постановка Ask-слотов 1-в-1 с fused_order3_clean_tick.py (эндогенный резерв renorm_blend):
     res_a_qty = sum(float(s.get("qty", 0.0)) for s in trader.ask_slots if s.get("id") is not None)
     avail_a_qty = max(0.0, min(float(trader.pos_qty) - res_a_qty, float(getattr(trader, "ex_coin_free", trader.pos_qty))))
 
@@ -991,7 +1193,9 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
     a_tasks = []
     for s in sel_a:
         px_s = round(max(b1 + t_sz, float(plan["t_ask_px"][s])), p_prec)
-        share_a = (float(plan["pi_ask"][s]) + 1e-5) / max(1e-6, sum_pi_a)
+        full_sh_a = (float(plan["pi_ask"][s]) + 1e-5) / max(1e-6, sum_pi_a)
+        raw_sh_a = min(float(plan["pi_ask"][s]), full_sh_a)
+        share_a = renorm_b * full_sh_a + (1.0 - renorm_b) * raw_sh_a
         q_s = math.floor((avail_a_qty * share_a) * 10000.0) / 10000.0
         if q_s >= min_amt:
             a_tasks.append((s, q_s, px_s))
@@ -1012,12 +1216,14 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
                 q_act = float(res_o.get("origin_amount", q_req))
                 p_act = float(res_o.get("price", p_req))
                 if side_s == "buy":
+                    init_qa_b = 0.0 if p_act > (b1 + 0.1 * t_sz) else float(plan["t_vis_bq"][s])
                     trader.ex_usdt_free = max(0.0, trader.ex_usdt_free - q_act * p_act * 1.001)
-                    trader.bid_slots[s] = {"slot": s, "id": oid_n, "px": p_act, "qty": q_act, "act_ts": now_ts, "acc_fill": 0.0}
+                    trader.bid_slots[s] = {"slot": s, "id": oid_n, "px": p_act, "qty": q_act, "act_ts": now_ts, "acc_fill": 0.0, "qa": init_qa_b, "qa0": init_qa_b}
                     print(f"  📥 [NEURAL PLACE BID #{s:02d}] id={oid_n} | {q_act:.4f} PRL @ ${p_act:.{p_prec}f} (Mode#{m_idx}={m_prob:.0%} | E={exp_b:.0%})")
                 else:
+                    init_qa_a = 0.0 if p_act < (a1 - 0.1 * t_sz) else float(plan["t_vis_aq"][s])
                     trader.ex_coin_free = max(0.0, float(getattr(trader, "ex_coin_free", 0.0)) - q_act)
-                    trader.ask_slots[s] = {"slot": s, "id": oid_n, "px": p_act, "qty": q_act, "act_ts": now_ts, "acc_fill": 0.0}
+                    trader.ask_slots[s] = {"slot": s, "id": oid_n, "px": p_act, "qty": q_act, "act_ts": now_ts, "acc_fill": 0.0, "qa": init_qa_a, "qa0": init_qa_a}
                     print(f"  📤 [NEURAL PLACE ASK #{s:02d}] id={oid_n} | {q_act:.4f} PRL @ ${p_act:.{p_prec}f} (Mode#{m_idx}={m_prob:.0%})")
 
     if b_tasks or a_tasks or to_cnl_b or to_cnl_a:

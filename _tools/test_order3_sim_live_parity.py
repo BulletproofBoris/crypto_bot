@@ -26,6 +26,7 @@ from _tools.order3_live_bridge import Order3LiveInferenceEngine
 from _tools.fused_order3_clean_tick import (
     MKT_DIM_ORDER3,
     AG_DIM_ORDER3,
+    MEM_DIM_ORDER3,
     K_MODES_ORDER3,
     EXPERT_OUT_DIM_ORDER3,
     _fanned_slot_softmax,
@@ -68,7 +69,7 @@ def main():
     )
     engine.mem_h.zero_()
 
-    ref_mem_h = torch.zeros((1, 16), dtype=torch.float32)
+    ref_mem_h = torch.zeros((1, MEM_DIM_ORDER3), dtype=torch.float32)
     latencies_ms = []
     max_pi_err = 0.0
     max_px_err = 0.0
@@ -83,7 +84,7 @@ def main():
         z_ag[0] = 0.5
         z_ag[54] = 1.0
         z_ag[55] = (pos_qty * b1) / budget
-        z_ag[70:86] = engine.mem_h.squeeze(0).numpy()
+        z_ag[70:86] = engine.mem_h[:, :16].squeeze(0).numpy()
 
         bid_px = np.linspace(b1, b1 * 0.985, 12, dtype=np.float32)
         bid_qty = np.full(12, 12.0, dtype=np.float32)
@@ -100,9 +101,23 @@ def main():
             rp = h1 @ engine.w_res1 + engine.b_res1
             h2 = h1 + (torch.relu(rp[:, :64]) * (2.0 * torch.sigmoid(rp[:, 64:128]))) @ engine.w_res2
             rr = h2 @ engine.w_rec + engine.b_rec
-            rg = torch.cat([torch.sigmoid(rr[:, 16:24] + 1.0), torch.sigmoid(rr[:, 24:32] + 3.8)], dim=-1)
-            ref_mem_h = rg * ref_mem_h + (1.0 - rg) * torch.tanh(rr[:, :16])
-            r_extra = torch.cat([zm[:, 0:1], zm[:, 40:44], zm[:, 44:45], zm[:, 48:49]], dim=-1)
+            rg = torch.cat(
+                [
+                    torch.sigmoid(rr[:, 32:40] + 1.0),
+                    torch.sigmoid(rr[:, 40:48] + 3.8),
+                    torch.sigmoid(rr[:, 48:56] + 5.2),
+                    torch.sigmoid(rr[:, 56:64] + 6.6),
+                ],
+                dim=-1,
+            )
+            ref_mem_h = rg * ref_mem_h + (1.0 - rg) * torch.tanh(rr[:, :MEM_DIM_ORDER3])
+            r_extra = torch.cat(
+                [
+                    zm[:, 0:1], zm[:, 40:44], zm[:, 44:45], zm[:, 48:49],
+                    zm[:, 29:34], zm[:, 36:37], zm[:, 39:40], zm[:, 55:56], zm[:, 12:13],
+                ],
+                dim=-1,
+            )
             rin = torch.cat([h2, za_raw[:, 54:62], za_raw[:, 62:70], ref_mem_h, r_extra], dim=-1)
             gm = torch.softmax(F.silu(rin @ engine.w_gate1 + engine.b_gate1) @ engine.w_gate2 + engine.b_gate2, dim=-1)
             moe = (h2 @ engine.w2_moe + engine.b2_moe).view(1, engine.k_modes, EXPERT_OUT_DIM_ORDER3)
@@ -121,8 +136,8 @@ def main():
             skew_blend = float(torch.sigmoid(sr[41]).item())
             t42_s = float(torch.tanh(sr[42] * 0.25).item())
             ask_edge_pct = 0.0035 * float(torch.tanh(sr[42]).item()) + 0.0765 * (t42_s * t42_s * t42_s)
-            span_a_usd = a1 * (0.0005 + 0.2495 * float(torch.sigmoid(sr[39] + 0.5 * sr[42]).item()))
-            gamma_a = 0.40 + 2.10 * float(torch.sigmoid(sr[40]).item())
+            span_a_usd = a1 * (0.0005 + 0.2495 * float(torch.sigmoid(sr[39] + 0.5 * sr[42] + sr[45]).item()))
+            gamma_a = 0.40 + 2.10 * float(torch.sigmoid(sr[40] + sr[46]).item())
             inside_a = spread_room * float(torch.sigmoid(sr[43]).item())
             anchor_base_a = a1 + skew_blend * (entry_px * 1.0020 - a1) + a1 * ask_edge_pct - inside_a
             raw_t_ask = anchor_base_a + span_a_usd * torch.pow(echelon_k01, gamma_a)

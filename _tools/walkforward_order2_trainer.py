@@ -187,7 +187,7 @@ def compute_numba_targets(bid_p, ask_p, bid_q1, ask_q1, sell_v, buy_v, bps_15, b
                     if b90_vol >= q_ahead_a:
                         t_sell = k
                         break
-                if t_sell > 0:
+                if t_sell > 0 and (ask_p[t + t_fill] - b0) >= (b0 * 0.0024):
                     min_b_cycle = bid_p[t + t_fill + 1]
                     for k in range(t_fill + 2, t_sell + 1):
                         if bid_p[t + k] < min_b_cycle:

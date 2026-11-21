@@ -13,6 +13,7 @@ _tools/deploy_vps.py
 =============================================================================
 """
 
+import argparse
 import hashlib
 import json
 import os
@@ -107,6 +108,14 @@ def _remote_atomic_mv(ssh, tmp_rem: str, fin_rem: str) -> None:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Синхронизация и мониторинг боевого бота на VPS")
+    parser.add_argument(
+        "--no-start",
+        action="store_true",
+        help="Выгрузить код/модели на VPS и остановить сервис без запуска торговли",
+    )
+    args = parser.parse_args()
+
     prev_state = {}
     if STATE_PATH.exists():
         try:
@@ -162,7 +171,12 @@ def main():
             finally:
                 sftp.close()
 
-        if changed_code:
+        if args.no_start:
+            _, out_r, _ = ssh.exec_command(
+                "systemctl stop live-rl-prl-l9.service; systemctl is-active live-rl-prl-l9.service"
+            )
+            print(f"⏸️ [VPS STAGE ONLY — SERVICE STOPPED]: {out_r.read().decode('utf-8', errors='ignore').strip()}")
+        elif changed_code:
             _, out_r, _ = ssh.exec_command(
                 "systemctl restart live-rl-prl-l9.service && sleep 6 && systemctl is-active live-rl-prl-l9.service"
             )

@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import math
 import os
-os.environ.setdefault('TRITON_CACHE_DIR', '/tmp/triton_cache')
-os.environ.setdefault('TORCHINDUCTOR_CACHE_DIR', '/tmp/inductor_cache')
+os.environ.setdefault('TRITON_CACHE_DIR', '/home/restorator/crypto_bot/scratch/.triton_cache')
+os.environ.setdefault('TORCHINDUCTOR_CACHE_DIR', '/home/restorator/crypto_bot/scratch/.inductor_cache')
 os.environ.setdefault('TORCHINDUCTOR_COMPILE_THREADS', '1')
+os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
 
 import torch
 import torch.nn.functional as F
@@ -21,12 +22,14 @@ MKT_DIM_ORDER3 = 60
 AG_DIM_ORDER3 = 110
 TOTAL_DIM_ORDER3 = 170
 
+MEM_DIM_ORDER3 = 32
 K_MODES_ORDER3 = 8
-EXPERT_OUT_DIM_ORDER3 = 45
-MOE_OUT_DIM_ORDER3 = K_MODES_ORDER3 * EXPERT_OUT_DIM_ORDER3  # 360
-ROUTER_IN_DIM_ORDER3 = 295  # h2(256) + acct_8d(8) + queue_8d(8) + mem_h(16) + direct_fee_macro_carousel_7d(7)
+EXPERT_OUT_DIM_ORDER3 = 48
+MOE_OUT_DIM_ORDER3 = K_MODES_ORDER3 * EXPERT_OUT_DIM_ORDER3  # 384
+ROUTER_IN_DIM_ORDER3 = 256 + 8 + 8 + MEM_DIM_ORDER3 + 16  # 320: h2(256) + acct_8d(8) + queue_8d(8) + mem_h(32) + extra_7d(7) + crash_radar_9d(9)
 ROUTER_H_DIM_ORDER3 = 64
-REG_IN_DIM_ORDER3 = 24 + K_MODES_ORDER3  # 24D признаков слота + K_MODES_ORDER3 (32D при K=8)
+REG_IN_DIM_ORDER3 = 28 + K_MODES_ORDER3  # 28D признаков слота (вкл. 4D FIFO-очереди/долгого удержания) + K_MODES_ORDER3 (36D при K=8)
+REG_H_DIM_ORDER3 = 64
 TOKEN_REFILL_PER_SEC_ORDER3 = 1.2
 TOKEN_BUCKET_CAP_ORDER3 = 8.0
 
@@ -305,9 +308,9 @@ def _order3_clean_tick_step(
     b_slot_age_12 = torch.where(act_b_mask, torch.clamp((s_cur_f - bid_act_s.float()) / 60.0, 0.0, 2.0), torch.full_like(bid_qty, -1.0)).to(dt)
     a_slot_age_12 = torch.where(act_a_mask, torch.clamp((s_cur_f - ask_act_s.float()) / 60.0, 0.0, 2.0), torch.full_like(ask_qty, -1.0)).to(dt)
 
-    # 1. Прямой проход 60D+110D ствола Signal Stack v2 + латентная микропамять mem_h (16D):
+    # 1. Прямой проход 60D+110D ствола Signal Stack v2 + 4-горизонтная латентная память mem_h (32D: ~3.7s, ~45s, ~180s, ~735s):
     z_ag_raw = torch.cat(
-        [multi_6d, b_slot_12, a_slot_12, b_dist_12, a_dist_12, acct_8d, queue_8d, mem_h, b_slot_age_12, a_slot_age_12],
+        [multi_6d, b_slot_12, a_slot_12, b_dist_12, a_dist_12, acct_8d, queue_8d, mem_h[:, :16], b_slot_age_12, a_slot_age_12],
         dim=-1,
     )
     z_ag = _normalize_agent_z110_per_block(z_ag_raw, dt)
@@ -324,24 +327,38 @@ def _order3_clean_tick_step(
     h2 = h1 + torch.bmm(res_mid, wr2_g)
 
     rec_raw = torch.bmm(h2, w_rec_g) + b_rec_g
-    rec_u = torch.tanh(rec_raw[:, :, :16])
-    rec_gate = torch.cat([torch.sigmoid(rec_raw[:, :, 16:24] + 1.0), torch.sigmoid(rec_raw[:, :, 24:32] + 3.8)], dim=-1)
-    mem_prev_g = mem_h.view(W, G, B, 16).permute(1, 0, 2, 3).reshape(G, M, 16)
+    rec_u = torch.tanh(rec_raw[:, :, :MEM_DIM_ORDER3])
+    rec_gate = torch.cat(
+        [
+            torch.sigmoid(rec_raw[:, :, 32:40] + 1.0),
+            torch.sigmoid(rec_raw[:, :, 40:48] + 3.8),
+            torch.sigmoid(rec_raw[:, :, 48:56] + 5.2),
+            torch.sigmoid(rec_raw[:, :, 56:64] + 6.6),
+        ],
+        dim=-1,
+    )
+    mem_prev_g = mem_h.view(W, G, B, MEM_DIM_ORDER3).permute(1, 0, 2, 3).reshape(G, M, MEM_DIM_ORDER3)
     mem_next_g = rec_gate * mem_prev_g + (1.0 - rec_gate) * rec_u
-    mem_h = mem_next_g.view(G, W, B, 16).permute(1, 0, 2, 3).reshape(N, 16)
+    mem_h = mem_next_g.view(G, W, B, MEM_DIM_ORDER3).permute(1, 0, 2, 3).reshape(N, MEM_DIM_ORDER3)
 
-    # 1B. Контекстный Маршрутизатор (295D -> 64 -> 4D: fee-net спред, макро 44D, wave_exhaustion и carousel_success!):
+    # 1B. Контекстный Маршрутизатор (320D -> 64 -> K=8: mem_h[32D] + прямой 9D радар краха Order-2/Order-1/BigONE!):
     acct_g = acct_8d.view(W, G, B, 8).permute(1, 0, 2, 3).reshape(G, M, 8)
     queue_g = queue_8d.view(W, G, B, 8).permute(1, 0, 2, 3).reshape(G, M, 8)
-    r_extra_7d = torch.cat([mkt_w[:, 0:1], mkt_w[:, 40:44], mkt_w[:, 44:45], mkt_w[:, 48:49]], dim=-1).to(dt)
-    r_extra_g = r_extra_7d.view(W, G, B, 7).permute(1, 0, 2, 3).reshape(G, M, 7)
-    router_in_g = torch.cat([h2, acct_g, queue_g, mem_next_g, r_extra_g], dim=-1)  # [G, M, 295]
+    r_extra_16d = torch.cat(
+        [
+            mkt_w[:, 0:1], mkt_w[:, 40:44], mkt_w[:, 44:45], mkt_w[:, 48:49],
+            mkt_w[:, 29:34], mkt_w[:, 36:37], mkt_w[:, 39:40], mkt_w[:, 55:56], mkt_w[:, 12:13],
+        ],
+        dim=-1,
+    ).to(dt)
+    r_extra_g = r_extra_16d.view(W, G, B, 16).permute(1, 0, 2, 3).reshape(G, M, 16)
+    router_in_g = torch.cat([h2, acct_g, queue_g, mem_next_g, r_extra_g], dim=-1)  # [G, M, 320]
     r_hid_g = F.silu(torch.bmm(router_in_g, w_gate1_g) + b_gate1_g)     # [G, M, 64]
-    gate_logits_g = torch.bmm(r_hid_g, w_gate2_g).float() + b_gate2_g.float()  # [G, M, 4]
-    g_mode_g = torch.softmax(gate_logits_g, dim=-1)                      # [G, M, 4]
+    gate_logits_g = torch.bmm(r_hid_g, w_gate2_g).float() + b_gate2_g.float()  # [G, M, K]
+    g_mode_g = torch.softmax(gate_logits_g, dim=-1)                      # [G, M, K]
 
     moe_all_g = (torch.bmm(h2, w2_moe_g).float() + b2_moe_g.float()).view(G, M, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
-    strat_raw_g = (g_mode_g.unsqueeze(-1) * moe_all_g).sum(dim=2)        # [G, M, 45]
+    strat_raw_g = (g_mode_g.unsqueeze(-1) * moe_all_g).sum(dim=2)        # [G, M, 48]
     strat_raw = strat_raw_g.view(G, W, B, EXPERT_OUT_DIM_ORDER3).permute(1, 0, 2, 3).reshape(N, EXPERT_OUT_DIM_ORDER3)
     g_mode = g_mode_g.view(G, W, B, K_MODES_ORDER3).permute(1, 0, 2, 3).reshape(N, K_MODES_ORDER3)
 
@@ -350,8 +367,9 @@ def _order3_clean_tick_step(
     mode_ent_step = -(g_mode * torch.log(torch.clamp(g_mode, min=1e-6))).sum(dim=-1)
     sum_mode_ent = sum_mode_ent + mode_ent_step
 
-    # 1C. 100% Эндогенная экспозиция [0..1] и распределение долей (0 мертвых зон и 0 эмпирических потолков):
+    # 1C. 100% Эндогенная экспозиция [0..1], распределение долей и непрерывный резерв каскадной постановки renorm_blend:
     exp_bid_frac = torch.sigmoid(strat_raw[:, 0])
+    renorm_blend = torch.sigmoid(strat_raw[:, 47:48])
 
     tau_b = 0.08 + 2.42 * torch.sigmoid(strat_raw[:, 34:35])
     tau_a = 0.08 + 2.42 * torch.sigmoid(strat_raw[:, 35:36])
@@ -359,7 +377,7 @@ def _order3_clean_tick_step(
     max_share_a = 0.08 + 0.92 * torch.sigmoid(strat_raw[:, 44:45] + 0.25)
     pi_bid = _fanned_slot_softmax(strat_raw[:, 1:13], tau_b, max_share_b, floor=0.005)
     pi_ask = _fanned_slot_softmax(strat_raw[:, 13:25], tau_a, max_share_a, floor=0.005)
-    # 2. Непрерывный эндогенный Taker-вентиль (только физические ограничения лота >= 2.0 PRL и API-токена >= 1.0):
+    # 2. Непрерывный эндогенный Taker-вентиль БЕЗ карательного сноса обеспеченных Ask-очередей при частичном хеджировании:
     u_taker = torch.tanh(F.relu(strat_raw[:, 25]))
     max_slip_pct = 0.005 + 0.145 * torch.sigmoid(strat_raw[:, 36])
     raw_sell_q = pos_qty * u_taker
@@ -379,25 +397,30 @@ def _order3_clean_tick_step(
     proceeds = (take_10 * b_p10).sum(dim=1) * (1.0 - taker_fee)
     rem_pos = torch.clamp(pos_qty - actual_taker_q, min=0.0)
     rem_frac = torch.where(pos_qty > 1e-6, rem_pos / torch.clamp(pos_qty, min=1e-6), torch.zeros_like(pos_qty))
-    full_exit = rem_pos <= 1e-5
+    full_exit = rem_pos < 2.0
 
     cash = torch.where(exec_taker, cash + proceeds, cash)
     pos_qty = torch.where(exec_taker, rem_pos, pos_qty)
     pos_cost_usd = torch.where(exec_taker, pos_cost_usd * rem_frac, pos_cost_usd)
-    avg_entry = torch.where(exec_taker & full_exit, torch.zeros_like(avg_entry), avg_entry)
-    min_buy_px = torch.where(exec_taker & full_exit, torch.zeros_like(min_buy_px), min_buy_px)
+    avg_entry = torch.where(exec_taker & (rem_pos <= 1e-5), torch.zeros_like(avg_entry), avg_entry)
+    min_buy_px = torch.where(exec_taker & (rem_pos <= 1e-5), torch.zeros_like(min_buy_px), min_buy_px)
     low_tranche_qty = torch.where(exec_taker, low_tranche_qty * rem_frac, low_tranche_qty)
-    mid_buy_px = torch.where(exec_taker & full_exit, torch.zeros_like(mid_buy_px), mid_buy_px)
+    mid_buy_px = torch.where(exec_taker & (rem_pos <= 1e-5), torch.zeros_like(mid_buy_px), mid_buy_px)
     mid_tranche_qty = torch.where(exec_taker, mid_tranche_qty * rem_frac, mid_tranche_qty)
-    had_ask_taker_cnt = torch.where(exec_taker, (ask_qty > 1e-6).long().sum(dim=1), torch.zeros(N, dtype=torch.long, device=ask_qty.device))
-    ask_qty = torch.where(exec_taker.unsqueeze(1), torch.zeros_like(ask_qty), ask_qty)
-    ask_px = torch.where(exec_taker.unsqueeze(1), torch.zeros_like(ask_px), ask_px)
-    ask_qa = torch.where(exec_taker.unsqueeze(1), torch.zeros_like(ask_qa), ask_qa)
-    ask_qa0 = torch.where(exec_taker.unsqueeze(1), torch.zeros_like(ask_qa0), ask_qa0)
+
+    # Снимаем ТОЛЬКО те Ask-слоты, которым не хватает оставшегося rem_pos (передние очереди выживают!):
+    cum_ask_pre = torch.cumsum(ask_qty, dim=1)
+    keep_ask_on_taker = (~full_exit.unsqueeze(1)) & (cum_ask_pre <= rem_pos.unsqueeze(1) + 1e-5) & (ask_qty >= 2.0)
+    drop_ask_taker = exec_taker.unsqueeze(1) & (ask_qty > 1e-6) & (~keep_ask_on_taker)
+    had_ask_taker_cnt = drop_ask_taker.long().sum(dim=1)
+    ask_qty = torch.where(drop_ask_taker, torch.zeros_like(ask_qty), ask_qty)
+    ask_px = torch.where(drop_ask_taker, torch.zeros_like(ask_px), ask_px)
+    ask_qa = torch.where(drop_ask_taker, torch.zeros_like(ask_qa), ask_qa)
+    ask_qa0 = torch.where(drop_ask_taker, torch.zeros_like(ask_qa0), ask_qa0)
     api_tokens = torch.where(exec_taker, torch.clamp(api_tokens - 1.0 - had_ask_taker_cnt.float(), min=0.0), api_tokens)
     n_fills = torch.clamp(n_fills.long() + exec_taker.long(), max=2000000).to(torch.int32)
 
-    # 3. 100% Эндогенная полно-спредовая геометрия 24 слотов (весь легальный maker-коридор [b1..a1-tick] и глубина стакана!):
+    # 3. 100% Эндогенная полно-спредовая геометрия 24 слотов с независимой шириной и кривизной Ask [45..46]:
     spread_room = torch.clamp(a1 - b1 - tick_size, min=0.0)
     inside_b = spread_room * torch.sigmoid(strat_raw[:, 37])
     retreat_b = b1 * 0.04 * torch.sigmoid(strat_raw[:, 38])
@@ -416,8 +439,8 @@ def _order3_clean_tick_step(
     z42 = strat_raw[:, 42]
     t42_slow = torch.tanh(z42 * 0.25)
     ask_edge_pct = 0.0035 * torch.tanh(z42) + 0.0765 * (t42_slow * t42_slow * t42_slow)
-    span_a_usd = a1 * (0.0005 + 0.2495 * torch.sigmoid(strat_raw[:, 39] + 0.5 * z42))
-    gamma_a = 0.40 + 2.10 * torch.sigmoid(strat_raw[:, 40])
+    span_a_usd = a1 * (0.0005 + 0.2495 * torch.sigmoid(strat_raw[:, 39] + 0.5 * z42 + strat_raw[:, 45]))
+    gamma_a = 0.40 + 2.10 * torch.sigmoid(strat_raw[:, 40] + strat_raw[:, 46])
 
     inside_a = spread_room * torch.sigmoid(strat_raw[:, 43])
     anchor_base_a = a1 + skew_blend * (ref_entry - a1) + a1 * ask_edge_pct - inside_a
@@ -498,7 +521,19 @@ def _order3_clean_tick_step(
     )
     slot_exec_a = mkt_w[:, 45:46].expand(N, S)
 
-    feat_b_26 = torch.cat(
+    # 4D датчики реальной FIFO-очереди и долгого горизонта удержания (снимает слепоту регулятора к qprog и стенам L2!):
+    qprog_b = torch.where(had_b_pre, torch.clamp(1.0 - bid_qa / (bid_qa0.float() + 10.0), 0.0, 1.0), torch.zeros_like(bid_qty))
+    qprog_a = torch.where(had_a_pre, torch.clamp(1.0 - ask_qa / (ask_qa0.float() + 10.0), 0.0, 1.0), torch.zeros_like(ask_qty))
+    qa_eta_b = torch.where(had_b_pre, torch.clamp(torch.log1p(bid_qa / roll_sell_n.unsqueeze(1)) / 4.0, 0.0, 2.5), torch.zeros_like(bid_qty))
+    qa_eta_a = torch.where(had_a_pre, torch.clamp(torch.log1p(ask_qa / roll_buy_n.unsqueeze(1)) / 4.0, 0.0, 2.5), torch.zeros_like(ask_qty))
+    t_vis_bq = _lookup_sparse_bid_lob_q(b_p10_1w, b_q10_raw_1w, t_bid_px, W, E, S, tick_size)
+    t_vis_aq = _lookup_sparse_ask_lob_q(a_p10_1w, a_q10_raw_1w, t_ask_px, W, E, S, tick_size)
+    wall_b_log = torch.clamp(torch.log1p((t_vis_bq * t_bid_px) / bud_2d) / 2.0, 0.0, 2.5)
+    wall_a_log = torch.clamp(torch.log1p((t_vis_aq * t_ask_px) / bud_2d) / 2.0, 0.0, 2.5)
+    hold_long_1d = torch.where(hp_now, torch.clamp(torch.log1p(torch.clamp(s_cur_f - entry_s.float(), min=0.0) / 60.0) / 4.0, 0.0, 2.0), torch.zeros_like(b1))
+    hold_long_2d = hold_long_1d.unsqueeze(1).expand(N, S)
+
+    feat_b_36 = torch.cat(
         [
             torch.stack(
                 [
@@ -508,12 +543,12 @@ def _order3_clean_tick_step(
                 dim=-1,
             ),
             ctx_4d_b.unsqueeze(1).expand(N, S, 4),
-            torch.stack([tot_side_b, neigh_val_b, mean_age_b, api_ratio_2d, ech_2d, sp_rel_2d, slot_edge_b, slot_exec_b], dim=-1),
+            torch.stack([tot_side_b, neigh_val_b, mean_age_b, api_ratio_2d, ech_2d, sp_rel_2d, slot_edge_b, slot_exec_b, qprog_b, qa_eta_b, wall_b_log, hold_long_2d], dim=-1),
             g_mode_s,
         ],
         dim=-1,
     ).to(dt)
-    feat_a_26 = torch.cat(
+    feat_a_36 = torch.cat(
         [
             torch.stack(
                 [
@@ -523,14 +558,14 @@ def _order3_clean_tick_step(
                 dim=-1,
             ),
             ctx_4d_a.unsqueeze(1).expand(N, S, 4),
-            torch.stack([tot_side_a, neigh_val_a, mean_age_a, api_ratio_2d, ech_2d, sp_rel_2d, slot_edge_a, slot_exec_a], dim=-1),
+            torch.stack([tot_side_a, neigh_val_a, mean_age_a, api_ratio_2d, ech_2d, sp_rel_2d, slot_edge_a, slot_exec_a, qprog_a, qa_eta_a, wall_a_log, hold_long_2d], dim=-1),
             g_mode_s,
         ],
         dim=-1,
     ).to(dt)
 
-    fb_g = feat_b_26.view(W, G, B, S, REG_IN_DIM_ORDER3).permute(1, 0, 2, 3, 4).reshape(G, M * S, REG_IN_DIM_ORDER3)
-    fa_g = feat_a_26.view(W, G, B, S, REG_IN_DIM_ORDER3).permute(1, 0, 2, 3, 4).reshape(G, M * S, REG_IN_DIM_ORDER3)
+    fb_g = feat_b_36.view(W, G, B, S, REG_IN_DIM_ORDER3).permute(1, 0, 2, 3, 4).reshape(G, M * S, REG_IN_DIM_ORDER3)
+    fa_g = feat_a_36.view(W, G, B, S, REG_IN_DIM_ORDER3).permute(1, 0, 2, 3, 4).reshape(G, M * S, REG_IN_DIM_ORDER3)
     rb_h = F.silu(torch.bmm(fb_g, w_reg1_g) + b_reg1_b_g)
     ra_h = F.silu(torch.bmm(fa_g, w_reg1_g) + b_reg1_a_g)
     rb_out = (torch.bmm(rb_h, w_reg2_g).float() + b_reg2_b_g.float()).view(G, W, B, S, 2).permute(1, 0, 2, 3, 4).reshape(N, S, 2)
@@ -539,18 +574,25 @@ def _order3_clean_tick_step(
     g_cnl_b = rb_out[:, :, 1] > 0.0
     g_plc_a = ra_out[:, :, 0] > 0.0
     g_cnl_a = ra_out[:, :, 1] > 0.0
-    # 5. 100% Эндогенное управление постановкой/отменой + Перенормировка 100% выделенного пула аллокатора по открытым слотам (0 эмпирических капов!):
+    # 5. Ранжированное по срочности снятие ордеров + Эндогенный резерв каскадной постановки renorm_blend:
     crossed_b = bid_px >= (a1.unsqueeze(1) - 0.1 * tick_size)
     want_cnl_b = had_b_pre & (crossed_b | g_cnl_b)
+    prio_cnl_b = torch.where(want_cnl_b, rb_out[:, :, 1] + crossed_b.float() * 100.0, torch.full_like(bid_qty, -1e4))
+    ord_cb = torch.argsort(prio_cnl_b, dim=1, descending=True)
+    inv_cb = torch.argsort(ord_cb, dim=1)
+    want_cb_s = torch.gather(want_cnl_b.float(), 1, ord_cb)
+    allow_cb_s = (want_cb_s.cumsum(dim=1) <= api_tokens.unsqueeze(1) + 1e-4) & (want_cb_s > 0.5)
+    clear_b = torch.gather(allow_cb_s, 1, inv_cb)
+    api_tokens = torch.clamp(api_tokens - clear_b.float().sum(dim=1), min=0.0)
 
     crossed_a = ask_px <= (b1.unsqueeze(1) + 0.1 * tick_size)
     want_cnl_a = had_a_pre & ((~hp_now_mask) | crossed_a | g_cnl_a)
-    cum_cnl = want_cnl_b.float().cumsum(dim=1)
-    clear_b = want_cnl_b & (cum_cnl <= api_tokens.unsqueeze(1) + 1e-4)
-    api_tokens = torch.clamp(api_tokens - clear_b.float().sum(dim=1), min=0.0)
-
-    cum_cnl_a = want_cnl_a.float().cumsum(dim=1)
-    clear_a = want_cnl_a & ((~hp_now_mask) | (cum_cnl_a <= api_tokens.unsqueeze(1) + 1e-4))
+    prio_cnl_a = torch.where(want_cnl_a, ra_out[:, :, 1] + (crossed_a | (~hp_now_mask)).float() * 100.0, torch.full_like(ask_qty, -1e4))
+    ord_ca = torch.argsort(prio_cnl_a, dim=1, descending=True)
+    inv_ca = torch.argsort(ord_ca, dim=1)
+    want_ca_s = torch.gather(want_cnl_a.float(), 1, ord_ca)
+    allow_ca_s = (~hp_now_mask) & (want_ca_s > 0.5) | ((want_ca_s.cumsum(dim=1) <= api_tokens.unsqueeze(1) + 1e-4) & (want_ca_s > 0.5))
+    clear_a = torch.gather(allow_ca_s, 1, inv_ca)
     api_tokens = torch.clamp(api_tokens - (clear_a & hp_now_mask).float().sum(dim=1), min=0.0)
 
     n_cnl_b_step = clear_b.long().sum(dim=1)
@@ -581,7 +623,9 @@ def _order3_clean_tick_step(
 
     pi_sel_b = torch.where(want_place_b, pi_bid + 1e-5, torch.zeros_like(pi_bid))
     sum_pi_sel_b = pi_sel_b.sum(dim=1, keepdim=True)
-    share_sel_b = torch.where(sum_pi_sel_b > 1e-6, pi_sel_b / torch.clamp(sum_pi_sel_b, min=1e-6), torch.zeros_like(pi_sel_b))
+    full_share_b = torch.where(sum_pi_sel_b > 1e-6, pi_sel_b / torch.clamp(sum_pi_sel_b, min=1e-6), torch.zeros_like(pi_sel_b))
+    raw_share_b = torch.where(want_place_b, torch.minimum(pi_bid, full_share_b), torch.zeros_like(pi_bid))
+    share_sel_b = renorm_blend * full_share_b + (1.0 - renorm_blend) * raw_share_b
     plc_b_qty = (avail_b_usd.unsqueeze(1) * share_sel_b) / (t_bid_px * (1.0 + maker_fee))
     valid_b = want_place_b & (plc_b_qty >= 2.0)
     plc_b_qty = torch.where(valid_b, plc_b_qty, torch.zeros_like(plc_b_qty))
@@ -590,9 +634,8 @@ def _order3_clean_tick_step(
     n_req_b_step = (clear_b & valid_b).long().sum(dim=1)
 
     # Честная физическая FIFO-очередь биржи L2 (0 искусственных штрафов за объем > $50!):
-    exact_b_q_2d = _lookup_sparse_bid_lob_q(b_p10_1w, b_q10_raw_1w, t_bid_px, W, E, S, tick_size)
     inside_sp_b = t_bid_px > (b1.unsqueeze(1) + 0.1 * tick_size)
-    base_b_qa = torch.where(inside_sp_b, torch.zeros_like(exact_b_q_2d), exact_b_q_2d)
+    base_b_qa = torch.where(inside_sp_b, torch.zeros_like(t_vis_bq), t_vis_bq)
 
     bid_px = torch.where(valid_b, t_bid_px, bid_px)
     bid_qty = torch.where(valid_b, plc_b_qty, bid_qty)
@@ -611,7 +654,9 @@ def _order3_clean_tick_step(
 
     pi_sel_a = torch.where(want_place_a, pi_ask + 1e-5, torch.zeros_like(pi_ask))
     sum_pi_sel_a = pi_sel_a.sum(dim=1, keepdim=True)
-    share_sel_a = torch.where(sum_pi_sel_a > 1e-6, pi_sel_a / torch.clamp(sum_pi_sel_a, min=1e-6), torch.zeros_like(pi_sel_a))
+    full_share_a = torch.where(sum_pi_sel_a > 1e-6, pi_sel_a / torch.clamp(sum_pi_sel_a, min=1e-6), torch.zeros_like(pi_sel_a))
+    raw_share_a = torch.where(want_place_a, torch.minimum(pi_ask, full_share_a), torch.zeros_like(pi_ask))
+    share_sel_a = renorm_blend * full_share_a + (1.0 - renorm_blend) * raw_share_a
     plc_a_qty = unreserved_pos * share_sel_a
     valid_a = want_place_a & (plc_a_qty >= 2.0)
     plc_a_qty = torch.where(valid_a, plc_a_qty, torch.zeros_like(plc_a_qty))
@@ -619,9 +664,8 @@ def _order3_clean_tick_step(
     api_tokens = torch.clamp(api_tokens - valid_a.float().sum(dim=1), min=0.0)
     n_req_a_step = (clear_a & valid_a).long().sum(dim=1)
 
-    exact_a_q_2d = _lookup_sparse_ask_lob_q(a_p10_1w, a_q10_raw_1w, t_ask_px, W, E, S, tick_size)
     inside_sp_a = t_ask_px < (a1.unsqueeze(1) - 0.1 * tick_size)
-    base_a_qa = torch.where(inside_sp_a, torch.zeros_like(exact_a_q_2d), exact_a_q_2d)
+    base_a_qa = torch.where(inside_sp_a, torch.zeros_like(t_vis_aq), t_vis_aq)
 
     ask_px = torch.where(valid_a, t_ask_px, ask_px)
     ask_qty = torch.where(valid_a, plc_a_qty, ask_qty)
@@ -805,7 +849,7 @@ def _order3_clean_tick_step(
     rem_ord_a = torch.clamp(ask_qty - f_qa, min=0.0)
     ask_qty = torch.where(has_slot_a, torch.where((rem_ord_a >= 2.0) & (pos_qty.unsqueeze(1) >= 2.0), torch.minimum(rem_ord_a, pos_qty.unsqueeze(1)), torch.zeros_like(rem_ord_a)), ask_qty)
 
-    # 7. Честная траекторная просадка по реальному Bid-ликвидационному курсу nb1 (0 фантомного арбитража полуспреда!):
+    # 7. Честная траекторная просадка по реальному Bid-ликвидационному курсу nb1 (0 фантомного буфера полуспреда!):
     nb1_1d = nb1.squeeze(1)
     mtm_eq = torch.clamp(cash + pos_qty * nb1_1d * (1.0 - maker_fee), min=1e-2)
     peak_mtm_eq = torch.maximum(peak_mtm_eq, mtm_eq)
@@ -882,17 +926,17 @@ def _get_or_build_order3_cudagraph(
         "bg1_c": torch.zeros((C, 1, ROUTER_H_DIM_ORDER3), dtype=dt, device=device),
         "wg2_c": torch.zeros((C, ROUTER_H_DIM_ORDER3, K_MODES_ORDER3), dtype=dt, device=device),
         "bg2_c": torch.zeros((C, 1, K_MODES_ORDER3), dtype=torch.float32, device=device),
-        "wrec_c": torch.zeros((C, 256, 32), dtype=dt, device=device),
-        "brec_c": torch.zeros((C, 1, 32), dtype=dt, device=device),
-        "wreg1_c": torch.zeros((C, REG_IN_DIM_ORDER3, 48), dtype=dt, device=device),
-        "breg1b_c": torch.zeros((C, 1, 48), dtype=dt, device=device),
-        "breg1a_c": torch.zeros((C, 1, 48), dtype=dt, device=device),
-        "wreg2_c": torch.zeros((C, 48, 2), dtype=dt, device=device),
+        "wrec_c": torch.zeros((C, 256, 2 * MEM_DIM_ORDER3), dtype=dt, device=device),
+        "brec_c": torch.zeros((C, 1, 2 * MEM_DIM_ORDER3), dtype=dt, device=device),
+        "wreg1_c": torch.zeros((C, REG_IN_DIM_ORDER3, REG_H_DIM_ORDER3), dtype=dt, device=device),
+        "breg1b_c": torch.zeros((C, 1, REG_H_DIM_ORDER3), dtype=dt, device=device),
+        "breg1a_c": torch.zeros((C, 1, REG_H_DIM_ORDER3), dtype=dt, device=device),
+        "wreg2_c": torch.zeros((C, REG_H_DIM_ORDER3, 2), dtype=dt, device=device),
         "breg2b_c": torch.zeros((C, 1, 2), dtype=torch.float32, device=device),
         "breg2a_c": torch.zeros((C, 1, 2), dtype=torch.float32, device=device),
         "echelon_k01": torch.linspace(0.0, 1.0, S, dtype=torch.float32, device=device),
         "budget": torch.full((N,), 1000.0, dtype=torch.float32, device=device),
-        "mem_h": torch.zeros((N, 16), dtype=dt, device=device),
+        "mem_h": torch.zeros((N, MEM_DIM_ORDER3), dtype=dt, device=device),
         "cash": torch.full((N,), 1000.0, dtype=torch.float32, device=device),
         "pos_qty": torch.zeros(N, dtype=torch.float32, device=device),
         "pos_cost_usd": torch.zeros(N, dtype=torch.float32, device=device),
@@ -1013,10 +1057,11 @@ def evaluate_order3_basket(
     taker_fee: float = 0.0010,
     device: torch.device = torch.device('cuda'),
     true_latency: bool = True,
+    pad_to_max_c: bool = True,
 ) -> list[dict]:
     # Монолитный батч до 192 групп (1,152 агента и 18,432 стакана за 1 проход на GPU!) благодаря потоковому pre_mkt_blk
     C_total = len(cand_states)
-    max_chunk_c = 192
+    max_chunk_c = 160
     if C_total > max_chunk_c:
         all_res = []
         for c0 in range(0, C_total, max_chunk_c):
@@ -1037,13 +1082,14 @@ def evaluate_order3_basket(
                 taker_fee=taker_fee,
                 device=device,
                 true_latency=true_latency,
+                pad_to_max_c=pad_to_max_c,
             )
             all_res.extend(sub_res)
         return all_res
 
-    # Авто-паддинг малых батчей (C=1 на старте, C=32 на Val) под единый CUDAGraph(192): 1 компиляция на весь запуск и 0s eager-простоя!
+    # Авто-паддинг малых батчей (C=1 на старте, C=32 на Val) под единый CUDAGraph(160): 1 компиляция на весь запуск и 0s eager-простоя!
     orig_c = C_total
-    if device.type == "cuda" and 0 < C_total < max_chunk_c:
+    if pad_to_max_c and device.type == "cuda" and 0 < C_total < max_chunk_c:
         target_c = max_chunk_c
         for k_cg in _ORDER3_CUDAGRAPH_CACHE:
             if k_cg[0] == len(val_windows) and k_cg[2] == win_len and k_cg[5] == str(device):
@@ -1071,18 +1117,77 @@ def evaluate_order3_basket(
         wr1_l.append(st['w_res1'].to(device=device, dtype=dt))
         br1_l.append(st['b_res1'].to(device=device, dtype=dt).view(1, 128))
         wr2_l.append(st['w_res2'].to(device=device, dtype=dt))
-        w2m_l.append(st['w2_moe'].to(device=device, dtype=dt))
-        b2m_l.append(st['b2_moe'].to(device=device, dtype=torch.float32).view(1, MOE_OUT_DIM_ORDER3))
-        wg1_l.append(st['w_gate1'].to(device=device, dtype=dt))
+        w2m_t = st['w2_moe'].to(device=device, dtype=torch.float32)
+        b2m_t = st['b2_moe'].to(device=device, dtype=torch.float32)
+        if b2m_t.numel() != MOE_OUT_DIM_ORDER3:
+            old_exp_d = b2m_t.numel() // K_MODES_ORDER3
+            w2m_old = w2m_t.view(256, K_MODES_ORDER3, old_exp_d)
+            b2m_old = b2m_t.view(1, K_MODES_ORDER3, old_exp_d)
+            w2m_pad = torch.zeros((256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3), dtype=torch.float32, device=device)
+            b2m_pad = torch.zeros((1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3), dtype=torch.float32, device=device)
+            c_ed = min(old_exp_d, EXPERT_OUT_DIM_ORDER3)
+            w2m_pad[:, :, :c_ed] = w2m_old[:, :, :c_ed]
+            b2m_pad[:, :, :c_ed] = b2m_old[:, :, :c_ed]
+            if old_exp_d <= 45 and EXPERT_OUT_DIM_ORDER3 >= 48:
+                b2m_pad[:, :, 47] = 6.0  # sigmoid(6.0)=0.9975 -> 100% паритет перенормировки со старыми чекпоинтами L46!
+            w2m_t = w2m_pad.reshape(256, MOE_OUT_DIM_ORDER3)
+            b2m_t = b2m_pad.reshape(1, MOE_OUT_DIM_ORDER3)
+        w2m_l.append(w2m_t.to(dtype=dt))
+        b2m_l.append(b2m_t.view(1, MOE_OUT_DIM_ORDER3))
+
+        wg1_t = st['w_gate1'].to(device=device, dtype=torch.float32)
+        if wg1_t.shape[0] != ROUTER_IN_DIM_ORDER3:
+            wg1_pad = torch.zeros((ROUTER_IN_DIM_ORDER3, ROUTER_H_DIM_ORDER3), dtype=torch.float32, device=device)
+            if wg1_t.shape[0] == 295 and ROUTER_IN_DIM_ORDER3 >= 311:
+                wg1_pad[:288, :] = wg1_t[:288, :]
+                wg1_pad[304:311, :] = wg1_t[288:295, :]
+            else:
+                cr = min(wg1_t.shape[0], ROUTER_IN_DIM_ORDER3)
+                wg1_pad[:cr, :] = wg1_t[:cr, :]
+            wg1_t = wg1_pad
+        wg1_l.append(wg1_t.to(dtype=dt))
         bg1_l.append(st['b_gate1'].to(device=device, dtype=dt).view(1, ROUTER_H_DIM_ORDER3))
         wg2_l.append(st['w_gate2'].to(device=device, dtype=dt))
         bg2_l.append(st['b_gate2'].to(device=device, dtype=torch.float32).view(1, K_MODES_ORDER3))
-        wrec_l.append(st['w_rec'].to(device=device, dtype=dt))
-        brec_l.append(st['b_rec'].to(device=device, dtype=dt).view(1, 32))
-        wreg1_l.append(st['w_reg1'].to(device=device, dtype=dt))
-        breg1b_l.append(st['b_reg1_b'].to(device=device, dtype=dt).view(1, 48))
-        breg1a_l.append(st['b_reg1_a'].to(device=device, dtype=dt).view(1, 48))
-        wreg2_l.append(st['w_reg2'].to(device=device, dtype=dt))
+
+        wrec_t = st['w_rec'].to(device=device, dtype=torch.float32)
+        brec_t = st['b_rec'].to(device=device, dtype=torch.float32).view(1, -1)
+        if brec_t.numel() != 2 * MEM_DIM_ORDER3:
+            wrec_pad = torch.zeros((256, 2 * MEM_DIM_ORDER3), dtype=torch.float32, device=device)
+            brec_pad = torch.zeros((1, 2 * MEM_DIM_ORDER3), dtype=torch.float32, device=device)
+            wrec_pad[:, :16] = wrec_t[:, :16]
+            wrec_pad[:, 32:48] = wrec_t[:, 16:32]
+            brec_pad[:, :16] = brec_t[:, :16]
+            brec_pad[:, 32:48] = brec_t[:, 16:32]
+            wrec_t, brec_t = wrec_pad, brec_pad
+        wrec_l.append(wrec_t.to(dtype=dt))
+        brec_l.append(brec_t.to(dtype=dt).view(1, 2 * MEM_DIM_ORDER3))
+
+        wreg1_t = st['w_reg1'].to(device=device, dtype=torch.float32)
+        breg1b_t = st['b_reg1_b'].to(device=device, dtype=torch.float32).view(1, -1)
+        breg1a_t = st['b_reg1_a'].to(device=device, dtype=torch.float32).view(1, -1)
+        wreg2_t = st['w_reg2'].to(device=device, dtype=torch.float32)
+        if wreg1_t.shape != (REG_IN_DIM_ORDER3, REG_H_DIM_ORDER3):
+            old_ri, old_rh = wreg1_t.shape
+            wreg1_pad = torch.zeros((REG_IN_DIM_ORDER3, REG_H_DIM_ORDER3), dtype=torch.float32, device=device)
+            breg1b_pad = torch.zeros((1, REG_H_DIM_ORDER3), dtype=torch.float32, device=device)
+            breg1a_pad = torch.zeros((1, REG_H_DIM_ORDER3), dtype=torch.float32, device=device)
+            wreg2_pad = torch.zeros((REG_H_DIM_ORDER3, 2), dtype=torch.float32, device=device)
+            cr_h = min(old_rh, REG_H_DIM_ORDER3)
+            if old_ri == 32 and REG_IN_DIM_ORDER3 == 36:
+                wreg1_pad[:24, :cr_h] = wreg1_t[:24, :cr_h]
+                wreg1_pad[28:36, :cr_h] = wreg1_t[24:32, :cr_h]
+            else:
+                cr_i = min(old_ri, REG_IN_DIM_ORDER3)
+                wreg1_pad[:cr_i, :cr_h] = wreg1_t[:cr_i, :cr_h]
+            breg1b_pad[:, :cr_h] = breg1b_t[:, :cr_h]
+            breg1a_pad[:, :cr_h] = breg1a_t[:, :cr_h]
+            wreg2_pad[:cr_h, :] = wreg2_t[:cr_h, :]
+            wreg1_t, breg1b_t, breg1a_t, wreg2_t = wreg1_pad, breg1b_pad, breg1a_pad, wreg2_pad
+        wreg1_l.append(wreg1_t.to(dtype=dt))
+        breg1b_l.append(breg1b_t.to(dtype=dt).view(1, REG_H_DIM_ORDER3))
+        breg1a_l.append(breg1a_t.to(dtype=dt).view(1, REG_H_DIM_ORDER3))
+        wreg2_l.append(wreg2_t.to(dtype=dt))
         breg2b_l.append(st['b_reg2_b'].to(device=device, dtype=torch.float32).view(1, 2))
         breg2a_l.append(st['b_reg2_a'].to(device=device, dtype=torch.float32).view(1, 2))
 
@@ -1135,7 +1240,7 @@ def evaluate_order3_basket(
     env_budgets_e = budget_tiers.unsqueeze(0).expand(C, B_bud).reshape(E)
     budget = env_budgets_e.unsqueeze(0).expand(W, E).reshape(N).contiguous()
 
-    mem_h = torch.zeros((N, 16), dtype=dt, device=device)
+    mem_h = torch.zeros((N, MEM_DIM_ORDER3), dtype=dt, device=device)
     cash = budget.clone()
     pos_qty = torch.zeros(N, dtype=torch.float32, device=device)
     pos_cost_usd = torch.zeros(N, dtype=torch.float32, device=device)
@@ -1202,7 +1307,7 @@ def evaluate_order3_basket(
     total_sim_steps = win_len - 1
     t_blk_sz = 240
 
-    if device.type == "cuda" and C >= 32:
+    if device.type == "cuda" and (C >= 32 or not pad_to_max_c):
         cg_entry = _get_or_build_order3_cudagraph(
             W=W, C=C, win_len=win_len, t_blk_sz=t_blk_sz, dt=dt, device=device,
             tick_sz=tick_sz, maker_fee=maker_fee, taker_fee=taker_fee, true_latency=true_latency,
@@ -1323,10 +1428,28 @@ def evaluate_order3_basket(
     max_dd_pct = torch.maximum(max_dd_pct, end_dd_pct)
 
     n_steps_f = float(win_len - 1)
-    ref_eq = start_mtm_eq
+    # Точный побитовый эталон пассивного портфеля (L2 ликвидация + точная траекторная просадка по всем шагам s=1..win_len-1 -> 0 сделок === 0.0000 bp!):
+    init_liq_10_q = torch.clamp(torch.minimum(init_pos_0.unsqueeze(1) - prev_end_bq, end_bq10), min=0.0)
+    init_exc_q = torch.clamp(init_pos_0 - init_liq_10_q.sum(dim=1), min=0.0)
+    passive_carry_val = (init_liq_10_q * end_b10).sum(dim=1) * (1.0 - maker_fee) + init_exc_q * tail_px * (1.0 - taker_fee)
+    passive_end_eq = torch.clamp(init_cash_0 + passive_carry_val, min=1.0)
+    ref_eq = torch.where(init_pos_0 > 1e-6, passive_end_eq, start_mtm_eq)
+
+    # Пошаговая траекторная просадка пассивного портфеля имеет размер всего [win_len-1, W, B_bud] (~4 МБ VRAM, 0 нагрузки на C!):
+    ic_wb = init_cash_0.view(W, C, B_bud)[:, 0, :]
+    ip_wb = init_pos_0.view(W, C, B_bud)[:, 0, :]
+    se_wb = start_mtm_eq.view(W, C, B_bud)[:, 0, :]
+    b1_seq_tw = torch.clamp(b1_w_all[1:win_len], min=tick_sz).unsqueeze(2)  # [T, W, 1]
+    p_eq_twb = torch.clamp(ic_wb.unsqueeze(0) + ip_wb.unsqueeze(0) * b1_seq_tw * (1.0 - maker_fee), min=1e-2)
+    p_peak_twb = torch.maximum(se_wb.unsqueeze(0), torch.cummax(p_eq_twb, dim=0).values)
+    pass_mld_wb = torch.clamp(torch.log(p_peak_twb / p_eq_twb), min=0.0).mean(dim=0)  # [W, B_bud]
+    pass_mld_we = pass_mld_wb.unsqueeze(1).expand(W, C, B_bud).reshape(W, E)
+
     dlog_eq = torch.log(end_cash / ref_eq).view(W, E)
-    mean_log_dd = (sum_log_dd / n_steps_f).view(W, E)
-    traj_growth_bp = 10000.0 * (dlog_eq - 0.65 * mean_log_dd)
+    raw_mean_log_dd = (sum_log_dd / n_steps_f).view(W, E)
+    # Вычитаем точную пассивную просадку: если агент спас инвентарь от провала рынка, rel_mean_log_dd < 0 (заслуженный бонус спасения эквити, но с мягким потолком -25 bp):
+    rel_mean_log_dd = torch.clamp(raw_mean_log_dd - pass_mld_we, min=-0.0025)
+    traj_growth_bp = 10000.0 * (dlog_eq - 0.65 * rel_mean_log_dd)
     mtm_delta_pct = (100.0 * (end_cash - ref_eq) / budget).view(W, E)
     w_dd_mat = max_dd_pct.view(W, E)
     w_fills_mat = n_fills.float().view(W, E)
@@ -1339,36 +1462,72 @@ def evaluate_order3_basket(
     clean_idx = [wi for wi, (_, _, r0, _) in enumerate(val_windows) if r0 <= 0.01]
     inv_idx = [wi for wi, (_, _, r0, _) in enumerate(val_windows) if r0 > 0.01]
 
-    # 100% честная экономическая агрегация (Median q50 + Quantile q30 + Unclipped Mean + CVaR25 — 0 читерства редким снайпингом!):
+    # Двухногая экономическая агрегация (100% защита от читерства занулением exp_bid_frac!):
     beta_risk = 0.06
     ln2 = math.log(2.0)
     M_wb = W * B_bud
     g_mat = traj_growth_bp.view(W, C, B_bud).permute(1, 0, 2).reshape(C, M_wb)  # [C, W*B]
     ent_bp_v = (-torch.logsumexp(-beta_risk * g_mat, dim=1) + math.log(float(M_wb))) / beta_risk
-    q_mat = torch.quantile(g_mat, torch.tensor([0.15, 0.35, 0.50, 0.65, 0.85], device=device), dim=1)  # [5, C]
+    q_mat = torch.quantile(g_mat, torch.tensor([0.15, 0.35, 0.50, 0.65, 0.85], device=device), dim=1)
     k_cvar = max(1, M_wb // 4)
     cvar25_v = torch.topk(g_mat, k_cvar, dim=1, largest=False).values.mean(dim=1)
     mean_g_v = g_mat.mean(dim=1)
-    downside_v = torch.sqrt(torch.mean(torch.clamp(-g_mat, min=0.0) ** 2, dim=1))
-    # Мягкая вогнутая лог-полезность на положительных окнах для широты охвата (не режет доход в потолок, но ценит регулярную прибыль на десятках окон!):
-    broad_g_v = torch.where(g_mat > 0.0, 20.0 * torch.log1p(g_mat / 20.0), g_mat).mean(dim=1)
 
     mtm_wcb = mtm_delta_pct.view(W, C, B_bud)
     cl_ev_v = mtm_wcb[clean_idx].mean(dim=(0, 2)) if clean_idx else torch.zeros(C, device=device)
     inv_ev_v = mtm_wcb[inv_idx].mean(dim=(0, 2)) if inv_idx else torch.zeros(C, device=device)
     full_ev_v = mtm_wcb.mean(dim=(0, 2))
 
+    # Ножка 1 (Основная, 82%): чистый двухсторонний маркетмейкинг из кэша (clean_idx):
     if clean_idx:
         cl_g_mat = traj_growth_bp[clean_idx].view(len(clean_idx), C, B_bud).permute(1, 0, 2).reshape(C, len(clean_idx) * B_bud)
+        cl_q_mat = torch.quantile(cl_g_mat, torch.tensor([0.15, 0.35, 0.50], device=device), dim=1)
         cl_mean_g_v = cl_g_mat.mean(dim=1)
-        cl_cvar_v = torch.topk(cl_g_mat, max(1, cl_g_mat.shape[1] // 3), dim=1, largest=False).values.mean(dim=1)
+        cl_broad_v = torch.where(cl_g_mat > 0.0, 20.0 * torch.log1p(cl_g_mat / 20.0), cl_g_mat).mean(dim=1)
+        cl_cvar25_v = torch.topk(cl_g_mat, max(1, cl_g_mat.shape[1] // 4), dim=1, largest=False).values.mean(dim=1)
+        cl_cvar15_v = torch.topk(cl_g_mat, max(1, (cl_g_mat.shape[1] * 15) // 100), dim=1, largest=False).values.mean(dim=1)
+        cl_cvar10_v = torch.topk(cl_g_mat, max(1, cl_g_mat.shape[1] // 10), dim=1, largest=False).values.mean(dim=1)
+        cl_down_v = torch.sqrt(torch.mean(torch.clamp(-cl_g_mat, min=0.0) ** 2, dim=1))
+        cl_tail_pen = 0.45 * torch.clamp(-14.0 - cl_cvar15_v, min=0.0) + 0.35 * torch.clamp(-25.0 - cl_cvar10_v, min=0.0)
+        # Anti-Outlier лог-демпфер на единичные супер-окна пампа (> +0.30%), чтобы исключить переобучение Val ценой просадки на медвежьих окнах:
+        cl_mtm_sub = mtm_wcb[clean_idx]
+        cl_ev_rob_v = torch.where(
+            cl_mtm_sub > 0.30,
+            0.30 + 0.20 * torch.log1p((cl_mtm_sub - 0.30) / 0.20),
+            cl_mtm_sub,
+        ).mean(dim=(0, 2))
+        cl_mean_rob_v = torch.where(
+            cl_g_mat > 35.0,
+            35.0 + 20.0 * torch.log1p((cl_g_mat - 35.0) / 20.0),
+            cl_g_mat,
+        ).mean(dim=1)
+        geo_clean = (
+            0.45 * cl_broad_v
+            + 0.32 * cl_q_mat[2]
+            + 0.18 * cl_q_mat[1]
+            + 0.22 * cl_mean_rob_v
+            + 55.0 * cl_ev_rob_v
+            + 0.40 * cl_cvar25_v
+            - 0.30 * cl_down_v
+            - cl_tail_pen
+        )
     else:
-        cl_mean_g_v = mean_g_v
-        cl_cvar_v = cvar25_v
+        geo_clean = torch.zeros(C, device=device)
+
+    # Ножка 2 (Стресс-прививка инвентаря, 18%): альфа разгрузки и защиты перегруженного портфеля относительно пассивного удержания:
+    if inv_idx:
+        inv_g_mat = traj_growth_bp[inv_idx].view(len(inv_idx), C, B_bud).permute(1, 0, 2).reshape(C, len(inv_idx) * B_bud)
+        inv_mean_g_v = inv_g_mat.mean(dim=1)
+        inv_q50_v = torch.median(inv_g_mat, dim=1).values
+        inv_cvar25_v = torch.topk(inv_g_mat, max(1, inv_g_mat.shape[1] // 4), dim=1, largest=False).values.mean(dim=1)
+        geo_inv = 0.35 * inv_mean_g_v + 0.25 * inv_q50_v + 45.0 * inv_ev_v + 0.30 * inv_cvar25_v
+    else:
+        geo_inv = torch.zeros(C, device=device)
 
     dd_v = w_dd_mat.view(W, C, B_bud).max(dim=0).values.mean(dim=1)
     fills_wcb = w_fills_mat.view(W, C, B_bud)
     fills_v = fills_wcb.sum(dim=0).mean(dim=1)
+    cl_fills_v = fills_wcb[clean_idx].sum(dim=0).mean(dim=1) if clean_idx else fills_v
     turn_wcb = (sum_mut / torch.clamp(budget, min=100.0)).view(W, C, B_bud)
     cl_turn_v = turn_wcb[clean_idx].mean(dim=(0, 2)) if clean_idx else turn_wcb.mean(dim=(0, 2))
     cancels_v = w_cancels_mat.view(W, C, B_bud).sum(dim=0).mean(dim=1)
@@ -1380,16 +1539,14 @@ def evaluate_order3_basket(
     h_cond_v = mode_ent_mat.view(W, C, B_bud).mean(dim=(0, 2))
     mi_bits_v = torch.clamp((h_marg_v - h_cond_v) / ln2, min=0.0)
 
-    # 100% чистый денежный функционал (Broad Log-Utility + Median q50 + Unclipped Mean + CVaR25; 0 сделок === 0.00 bp!):
-    geo_v = (
-        0.45 * broad_g_v
-        + 0.30 * q_mat[2]
-        + 0.15 * q_mat[1]
-        + 0.25 * cl_mean_g_v
-        + 60.0 * cl_ev_v
-        + 0.30 * cl_cvar_v
-        - 0.25 * downside_v
-    )
+    if clean_idx and inv_idx:
+        # Положительный бонус inv_idx доступен ТОЛЬКО реально прибыльным на чистом кэше маркетмейкерам с нормальным оборотом:
+        active_mm_gate = torch.clamp(cl_turn_v / 0.04, 0.0, 1.0) * (geo_clean > 0.0).float()
+        geo_v = 0.85 * geo_clean + 0.15 * torch.where(geo_inv > 0.0, geo_inv * active_mm_gate, geo_inv)
+    elif clean_idx:
+        geo_v = geo_clean
+    else:
+        geo_v = geo_inv
 
     # Единый перенос компактной матрицы метрик [C, 16] на CPU!
     stats_cpu = torch.stack(
