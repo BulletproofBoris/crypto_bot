@@ -204,7 +204,8 @@ def run_extended_oos(
 
     champ_dir = BASE_DIR / "models/prl/order3_champion"
     candidates_spec = [
-        ("L46 Live Champion (v1)", BASE_DIR / "models/prl/release_champion_v1.pt"),
+        ("★ Current Champion v1", BASE_DIR / "models/prl/release_champion_v1.pt"),
+        ("Prev Live Champion (L46)", BASE_DIR / "models/prl/release_champion_v1_bak_l46.pt"),
         ("L48 Island-0 Best", champ_dir / "bak_l48_qmoe/island_0_best.pt"),
         ("L48 Global Best", champ_dir / "bak_l48_qmoe/global_best.pt"),
         ("L49 Global Best", champ_dir / "bak_l49_dual_shield/global_best.pt"),
@@ -218,6 +219,24 @@ def run_extended_oos(
         ("L52 Island-1 Best", champ_dir / "bak_l52/island_1_best.pt"),
         ("L52 Global Best", champ_dir / "bak_l52/global_best.pt"),
         ("L52 Soup Top3", champ_dir / "bak_l52/order3_soup_top3.pt"),
+        ("L53 Island-0 Best", champ_dir / "bak_l53/island_0_best.pt"),
+        ("L53 Island-1 Best", champ_dir / "bak_l53/island_1_best.pt"),
+        ("L53 Global Best", champ_dir / "bak_l53/global_best.pt"),
+        ("L53 Soup Isl0", champ_dir / "bak_l53/soup_isl0.pt"),
+        ("L53 Soup Top3", champ_dir / "bak_l53/order3_soup_top3.pt"),
+        ("L54 Island-0 Best", champ_dir / "bak_l54/island_0_best.pt"),
+        ("L54 Island-1 Best", champ_dir / "bak_l54/island_1_best.pt"),
+        ("L54 Global Best", champ_dir / "bak_l54/global_best.pt"),
+        ("L54 Soup Isl0", champ_dir / "bak_l54/soup_isl0.pt"),
+        ("L54 Soup Top3", champ_dir / "bak_l54/order3_soup_top3.pt"),
+        ("Chimera(R54+B53)", champ_dir / "bak_l55/chimera_54_53.pt"),
+        ("Chimera(R54+B50)", champ_dir / "bak_l55/chimera_54_50.pt"),
+        ("L55 Global Best", champ_dir / "bak_l55/global_best.pt"),
+        ("L55 Soup Top3", champ_dir / "bak_l55/order3_soup_top3.pt"),
+        ("L56 Island-0 Best", champ_dir / "bak_l56/island_0_best.pt"),
+        ("L56 Island-1 Best", champ_dir / "bak_l56/island_1_best.pt"),
+        ("L56 Global Best", champ_dir / "bak_l56/global_best.pt"),
+        ("L56 Soup Top3", champ_dir / "bak_l56/order3_soup_top3.pt"),
         ("Current Latest", champ_dir / "global_best.pt"),
         ("Current Soup", champ_dir / "order3_soup_top3.pt"),
     ]
@@ -237,7 +256,7 @@ def run_extended_oos(
                 models.append((tag, {k: (v.to(dtype=mkt_dtype) if hasattr(v, "shape") else v) for k, v in ck.items()}))
 
     baskets_cfg = []
-    if brand_new_rows >= 2400:
+    if brand_new_rows >= 1800:
         baskets_cfg.append((f"1_BRAND_NEW_LIVE_{brand_new_rows/3600:.2f}h [{fresh_cut//1000}k..{total_rows//1000}k] (Clean)", fresh_cut, total_rows, 28, 0.0))
         baskets_cfg.append((f"2_BRAND_NEW_LIVE_{brand_new_rows/3600:.2f}h [{fresh_cut//1000}k..{total_rows//1000}k] (25% Inv)", fresh_cut, total_rows, 28, 0.25))
     if total_rows - oos_cut >= macro_win_len + 1000:
@@ -246,6 +265,9 @@ def run_extended_oos(
     if total_rows - 600042 >= macro_win_len + 1000 and oos_cut != 600042:
         baskets_cfg.append((f"5_MARATHON_LIVE_WINDOW_{(total_rows-600042)/3600:.1f}h [600k..{total_rows//1000}k] (Clean)", 600042, total_rows, 56, 0.0))
         baskets_cfg.append((f"6_MARATHON_LIVE_WINDOW_{(total_rows-600042)/3600:.1f}h [600k..{total_rows//1000}k] (25% Inv)", 600042, total_rows, 56, 0.25))
+    if total_rows - 640588 >= macro_win_len + 1000:
+        baskets_cfg.append((f"7_DAY_MARATHON_LIVE_{(total_rows-640588)/3600:.1f}h [640k..{total_rows//1000}k] (Clean)", 640588, total_rows, 56, 0.0))
+        baskets_cfg.append((f"8_DAY_MARATHON_LIVE_{(total_rows-640588)/3600:.1f}h [640k..{total_rows//1000}k] (25% Inv)", 640588, total_rows, 56, 0.25))
 
     all_reports = {}
     regime_reports = {}

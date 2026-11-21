@@ -77,8 +77,8 @@ def _discover_latest_wf_ubj_files() -> list[str]:
         if not d_root.exists():
             continue
         wins = sorted([d for d in d_root.glob("win_*") if d.is_dir()], key=lambda p: int(p.name.split("_")[1]))
-        if wins:
-            for f in sorted(wins[-1].glob("*.ubj")):
+        for w_dir in wins[-2:]:
+            for f in sorted(w_dir.glob("*.ubj")):
                 rels.append(str(f.relative_to(BASE_DIR)))
     return rels
 
@@ -176,11 +176,14 @@ def main():
                 "systemctl stop live-rl-prl-l9.service; systemctl is-active live-rl-prl-l9.service"
             )
             print(f"⏸️ [VPS STAGE ONLY — SERVICE STOPPED]: {out_r.read().decode('utf-8', errors='ignore').strip()}")
-        elif changed_code:
-            _, out_r, _ = ssh.exec_command(
-                "systemctl restart live-rl-prl-l9.service && sleep 6 && systemctl is-active live-rl-prl-l9.service"
-            )
-            print(f"🔄 [VPS SERVICE RESTART]: {out_r.read().decode('utf-8', errors='ignore').strip()}")
+        else:
+            _, out_act, _ = ssh.exec_command("systemctl is-active live-rl-prl-l9.service")
+            is_act = out_act.read().decode("utf-8", errors="ignore").strip() == "active"
+            if changed_code or changed_aux or not is_act:
+                _, out_r, _ = ssh.exec_command(
+                    "systemctl restart live-rl-prl-l9.service && sleep 6 && systemctl is-active live-rl-prl-l9.service"
+                )
+                print(f"🔄 [VPS SERVICE RESTART]: {out_r.read().decode('utf-8', errors='ignore').strip()}")
 
         _atomic_write_json(STATE_PATH, cur_state)
 

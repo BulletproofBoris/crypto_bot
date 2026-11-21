@@ -555,7 +555,7 @@ def train_order3(
 
     # Равномерная каузальная решетка из 7 зон Val и 8 зон Train на [600 .. oos_start - macro_win_len - 500] со строгим Purge >= macro_win_len + 200:
     purge_gap = macro_win_len + 250
-    val_span_starts = 3200
+    val_span_starts = 4500
     avail_pre_oos = oos_start - purge_gap
     n_val_zones = 7
     zone_pitch = (avail_pre_oos - 600) // (n_val_zones + 1)
@@ -588,10 +588,17 @@ def train_order3(
                 out_b.append((f"{prefix}{k_i:02d}", int(idx_v), 0.0, 0.0))
         return out_b
 
-    # Расширенная анти-оверфит корзина Val из 42 пар = 84 окон (52% веса на памп $2.39, медвежий каскад и V-пролив!):
-    base_zc = [4, 5, 5, 6, 7, 7, 8] if len(val_zones) == 7 else [max(3, (3 * n_bask_w) // (2 * len(val_zones)))] * len(val_zones)
-    val_macro_idx = np.concatenate([np.linspace(zlo, zhi, num=zc, dtype=int) for (zlo, zhi), zc in zip(val_zones, base_zc)])
-    val_micro_idx = np.concatenate([np.linspace(zlo + 300, zhi + 3600, num=zc, dtype=int) for (zlo, zhi), zc in zip(val_zones, base_zc)])
+    # Двухфазная шахматная анти-оверфит корзина Val из 49 пар = 98 окон (53% веса на памп $2.39, обрывы с вершины и медвежий каскад!):
+    base_zc = [5, 5, 6, 7, 8, 9, 9] if len(val_zones) == 7 else [max(4, (7 * n_bask_w) // (4 * len(val_zones)))] * len(val_zones)
+    mac_parts, mic_parts = [], []
+    for (zlo, zhi), zc in zip(val_zones, base_zc):
+        g_m = np.linspace(zlo, zhi, num=zc, dtype=int)
+        # Шахматное фазовое смещение нечетных окон внутри зоны [zlo..zhi] ломает синхронизацию входа под шаг сетки!
+        phase_off = np.array([(337 if (j % 2 == 1) else 0) for j in range(zc)], dtype=int)
+        mac_parts.append(np.clip(g_m + phase_off, zlo, zhi))
+        mic_parts.append(np.clip(np.linspace(zlo + 250, zhi + 3600, num=zc, dtype=int) + phase_off, zlo, zhi + 3800))
+    val_macro_idx = np.concatenate(mac_parts)
+    val_micro_idx = np.concatenate(mic_parts)
     val_macro_basket = _assign_stratified_inv(val_macro_idx, "VMAC", inv_stress_frac)
     val_micro_basket = _assign_stratified_inv(val_micro_idx, "VMIC", inv_stress_frac)
 
@@ -619,12 +626,13 @@ def train_order3(
             out_tr.append((f"{'TMIC' if is_micro else 'TMAC'}{k_t:02d}", s_t, float(r0), float(roff)))
         return out_tr
 
-    def _eval_basket_chunked(cands: list[dict], bask: list, w_len: int) -> list[dict]:
+    def _eval_basket_chunked(cands: list[dict], bask: list, w_len: int, calib_jitter_std: float = 0.0) -> list[dict]:
         if len(bask) <= n_bask_w:
             return evaluate_order3_basket(
                 mkt_39d_all=mkt_gpu, b10_all=b10_gpu, a10_all=a10_gpu,
                 bq10_all=bq10_gpu, aq10_all=aq10_gpu, sv_all=sv_gpu, bv_all=bv_gpu,
                 cand_states=cands, val_windows=bask, win_len=w_len, tick_sz=tick_sz, device=device,
+                calib_jitter_std=calib_jitter_std,
             )
         chunks_res = []
         weights = []
@@ -636,6 +644,7 @@ def train_order3(
                 mkt_39d_all=mkt_gpu, b10_all=b10_gpu, a10_all=a10_gpu,
                 bq10_all=bq10_gpu, aq10_all=aq10_gpu, sv_all=sv_gpu, bv_all=bv_gpu,
                 cand_states=cands, val_windows=sub_padded, win_len=w_len, tick_sz=tick_sz, device=device,
+                calib_jitter_std=calib_jitter_std,
             )
             chunks_res.append(r_sub)
             weights.append(float(len(sub_b)))
@@ -656,9 +665,16 @@ def train_order3(
             out_m.append(d)
         return out_m
 
-    def eval_dual_scale(cands: list[dict], mac_bask: list, mic_bask: list, mac_len: int | None = None, enforce_mi: bool = False) -> list[dict]:
-        r_mac = _eval_basket_chunked(cands, mac_bask, (mac_len or macro_win_len))
-        r_mic = _eval_basket_chunked(cands, mic_bask, micro_win_len)
+    def eval_dual_scale(
+        cands: list[dict],
+        mac_bask: list,
+        mic_bask: list,
+        mac_len: int | None = None,
+        enforce_mi: bool = False,
+        calib_jitter_std: float = 0.0,
+    ) -> list[dict]:
+        r_mac = _eval_basket_chunked(cands, mac_bask, (mac_len or macro_win_len), calib_jitter_std=calib_jitter_std)
+        r_mic = _eval_basket_chunked(cands, mic_bask, micro_win_len, calib_jitter_std=calib_jitter_std)
         merged = []
         for a, b in zip(r_mac, r_mic):
             # Сбалансированный двухмасштабный скор (Macro 100m + Micro 25m) + барьер против коллапса K=8 роутера в одну моду:
@@ -700,22 +716,29 @@ def train_order3(
         f"Blind OOS={len(oos_macro_basket)+len(oos_micro_basket)}w ({oos_span/3600:.1f}ч) [{oos_start:,}..{oos_end_micro:,}]"
     )
 
-    # 3. Финальный коронационный старт от абсолютных лидеров слепого турнира (L48 Global + L51 Island-0 + L46 Live + MasterSoups):
+    # 3. Коронационный старт L56 от четверки триумфаторов всех слепых турниров (L53 Isl1 + L54 Soup + Chimera54_50 + Chimera54_53 + L53 Isl0):
     policy = MultimodalMoEPolicyOrder3(n_groups=n_groups, n_budgets=6, device=device)
-    live_v1_p = BASE_DIR / "models" / "prl" / "release_champion_v1.pt"
-    l51_isl0_p = SAVE_DIR / "bak_l51" / "island_0_best.pt"
+    l46_bak_p = BASE_DIR / "models" / "prl" / "release_champion_v1_bak_l46.pt"
+    live_v1_p = l46_bak_p if l46_bak_p.exists() else (BASE_DIR / "models" / "prl" / "release_champion_v1.pt")
+    l54_soup_p = SAVE_DIR / "bak_l54" / "soup_isl0.pt"
+    l53_isl1_p = SAVE_DIR / "bak_l53" / "island_1_best.pt"
+    l53_isl0_p = SAVE_DIR / "bak_l53" / "island_0_best.pt"
+    ch_54_50_p = SAVE_DIR / "bak_l55" / "chimera_54_50.pt"
+    ch_54_53_p = SAVE_DIR / "bak_l55" / "chimera_54_53.pt"
     l50_glob_p = SAVE_DIR / "bak_l50" / "global_best.pt"
-    l48_glob_p = SAVE_DIR / "bak_l48_qmoe" / "global_best.pt"
     is_warm_l43 = True
     seed_l46 = live_v1_p if live_v1_p.exists() else LATEST_CHAMP_PATH
-    log_msg(f"🧩 Коронационный мульти-семянной старт [{wf_version}]: L48 Global + L51 Island-0 + L46 Live + MasterSoups...")
+    log_msg(f"🧩 Коронационный старт [{wf_version}]: L53 Isl1 + L54 Soup + Chimera(R54+B50) + Chimera(R54+B53) + L53 Isl0...")
 
     st_l46_base = policy.load_initial_champion(seed_l46)
-    st_l51_isl0 = policy.load_initial_champion(l51_isl0_p) if l51_isl0_p.exists() else st_l46_base
+    st_l54_soup = policy.load_initial_champion(l54_soup_p) if l54_soup_p.exists() else st_l46_base
+    st_l53_isl1 = policy.load_initial_champion(l53_isl1_p) if l53_isl1_p.exists() else st_l54_soup
+    st_l53_isl0 = policy.load_initial_champion(l53_isl0_p) if l53_isl0_p.exists() else st_l53_isl1
+    st_ch_54_50 = policy.load_initial_champion(ch_54_50_p) if ch_54_50_p.exists() else st_l54_soup
+    st_ch_54_53 = policy.load_initial_champion(ch_54_53_p) if ch_54_53_p.exists() else st_l54_soup
     st_l50_glob = policy.load_initial_champion(l50_glob_p) if l50_glob_p.exists() else st_l46_base
-    st_l48_glob = policy.load_initial_champion(l48_glob_p) if l48_glob_p.exists() else st_l46_base
 
-    def _build_router_preserving_blend(st_router: dict, st_body: dict, body_w: float = 0.45) -> dict:
+    def _build_router_preserving_blend(st_router: dict, st_body: dict, body_w: float = 0.40) -> dict:
         gate_keys = {"w_gate1", "b_gate1", "w_gate2", "b_gate2"}
         st_m = {}
         for k in MultimodalMoEPolicyOrder3.PARAM_KEYS:
@@ -726,13 +749,15 @@ def train_order3(
         st_n = _normalize_weights_order3(st_m, policy.dtype)
         return {k: v.detach().cpu().clone() for k, v in st_n.items()}
 
-    st_ms_51_48 = _build_router_preserving_blend(st_l51_isl0, st_l48_glob, body_w=0.45)
-    st_ms_51_46 = _build_router_preserving_blend(st_l51_isl0, st_l46_base, body_w=0.45)
+    l52_soup_p = SAVE_DIR / "bak_l52" / "order3_soup_top3.pt"
+    st_l52_soup = policy.load_initial_champion(l52_soup_p) if l52_soup_p.exists() else st_l46_base
+    st_ms_53i1_54 = _build_router_preserving_blend(st_l53_isl1, st_l54_soup, body_w=0.35)
+    st_ms_53i0_54 = _build_router_preserving_blend(st_l53_isl0, st_l54_soup, body_w=0.35)
 
     seed_pool = (
-        [st_l51_isl0, st_l48_glob, st_ms_51_48, st_ms_51_46, st_l46_base, st_l50_glob]
+        [st_l53_isl1, st_l53_isl0, st_ch_54_50, st_l50_glob, st_ms_53i1_54, st_l52_soup]
         if island_id == 0
-        else [st_l48_glob, st_ms_51_46, st_l51_isl0, st_ms_51_48, st_l46_base, st_l50_glob]
+        else [st_ms_53i1_54, st_ms_53i0_54, st_ch_54_53, st_ch_54_50, st_l52_soup, st_l46_base]
     )
     resume_iter = 0
     for res_p in [SAVE_DIR / "islands" / f"island_{island_id}_best.pt", SAVE_DIR / "global_best.pt", RESUME_CHAMP_PATH]:
@@ -911,7 +936,9 @@ def train_order3(
         cand_list = policy.get_candidate_states()
 
         t_batch = time.time()
-        tr_results = eval_dual_scale(cand_list, sample_train_basket(False), sample_train_basket(True), enforce_mi=True)
+        tr_results = eval_dual_scale(
+            cand_list, sample_train_basket(False), sample_train_basket(True), enforce_mi=True, calib_jitter_std=0.045
+        )
 
         tr_geos = np.array([r["geo_score_bp"] for r in tr_results], dtype=np.float64)
         es_cands = policy.build_openai_es_candidates(center, tr_geos, lr_scales=(0.35, 0.75, 1.25, 1.85))

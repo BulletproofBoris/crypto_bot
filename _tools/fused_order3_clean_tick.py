@@ -1058,6 +1058,7 @@ def evaluate_order3_basket(
     device: torch.device = torch.device('cuda'),
     true_latency: bool = True,
     pad_to_max_c: bool = True,
+    calib_jitter_std: float = 0.0,
 ) -> list[dict]:
     # Монолитный батч до 192 групп (1,152 агента и 18,432 стакана за 1 проход на GPU!) благодаря потоковому pre_mkt_blk
     C_total = len(cand_states)
@@ -1083,6 +1084,7 @@ def evaluate_order3_basket(
                 device=device,
                 true_latency=true_latency,
                 pad_to_max_c=pad_to_max_c,
+                calib_jitter_std=calib_jitter_std,
             )
             all_res.extend(sub_res)
         return all_res
@@ -1220,7 +1222,24 @@ def evaluate_order3_basket(
     t_steps_cl = torch.clamp(t_steps, max=total_max_t)
 
     # Потоковый расчет z_mkt_w (pre_mkt считается блоками по 240 шагов: 10x экономия VRAM, 0 OOM на C=192!)
-    z_mkt_w = _scale_mkt_44d(mkt_39d_all[t_steps_cl[:win_len - 1]], dt).contiguous()  # [win_len - 1, W, 44]
+    raw_mkt_slice = mkt_39d_all[t_steps_cl[:win_len - 1]]
+    if calib_jitter_std > 0.0 and raw_mkt_slice.shape[-1] >= 56:
+        # Оконно-постоянная прививка против дрейфа калибровки при смене каузальных окон Order-1/2 (win_k -> win_{k+1}), ТОЛЬКО на Train!
+        raw_mkt_slice = raw_mkt_slice.float().clone()
+        s_o2a = 1.0 + torch.randn((1, W, 5), device=device) * calib_jitter_std
+        b_o2a = torch.randn((1, W, 5), device=device) * (0.35 * calib_jitter_std)
+        raw_mkt_slice[..., 29:34] = torch.clamp(raw_mkt_slice[..., 29:34] * s_o2a + b_o2a, 0.0, 1.0)
+        s_o2b = 1.0 + torch.randn((1, W, 6), device=device) * calib_jitter_std
+        b_o2b = torch.randn((1, W, 6), device=device) * (0.35 * calib_jitter_std)
+        raw_mkt_slice[..., 44:50] = torch.clamp(raw_mkt_slice[..., 44:50] * s_o2b + b_o2b, 0.0, 1.0)
+        s_o1 = 1.0 + torch.randn((1, W, 6), device=device) * calib_jitter_std
+        b_o1 = torch.randn((1, W, 6), device=device) * (0.45 * calib_jitter_std)
+        raw_mkt_slice[..., 34:40] = torch.clamp(raw_mkt_slice[..., 34:40] * s_o1 + b_o1, -3.0, 3.0)
+        s_o1f = 1.0 + torch.randn((1, W, 6), device=device) * calib_jitter_std
+        b_o1f = torch.randn((1, W, 6), device=device) * (0.30 * calib_jitter_std)
+        raw_mkt_slice[..., 50:56] = raw_mkt_slice[..., 50:56] * s_o1f + b_o1f
+        raw_mkt_slice[..., 52:55] = torch.clamp(raw_mkt_slice[..., 52:55], 0.0, 1.0)
+    z_mkt_w = _scale_mkt_44d(raw_mkt_slice, dt).contiguous()  # [win_len - 1, W, 60]
 
     b10_w_all = b10_all[t_steps_cl].contiguous()
     a10_w_all = a10_all[t_steps_cl].contiguous()
@@ -1478,6 +1497,7 @@ def evaluate_order3_basket(
     inv_ev_v = mtm_wcb[inv_idx].mean(dim=(0, 2)) if inv_idx else torch.zeros(C, device=device)
     full_ev_v = mtm_wcb.mean(dim=(0, 2))
 
+    fills_wcb = w_fills_mat.view(W, C, B_bud)
     # Ножка 1 (Основная, 82%): чистый двухсторонний маркетмейкинг из кэша (clean_idx):
     if clean_idx:
         cl_g_mat = traj_growth_bp[clean_idx].view(len(clean_idx), C, B_bud).permute(1, 0, 2).reshape(C, len(clean_idx) * B_bud)
@@ -1487,10 +1507,19 @@ def evaluate_order3_basket(
         cl_cvar25_v = torch.topk(cl_g_mat, max(1, cl_g_mat.shape[1] // 4), dim=1, largest=False).values.mean(dim=1)
         cl_cvar15_v = torch.topk(cl_g_mat, max(1, (cl_g_mat.shape[1] * 15) // 100), dim=1, largest=False).values.mean(dim=1)
         cl_cvar10_v = torch.topk(cl_g_mat, max(1, cl_g_mat.shape[1] // 10), dim=1, largest=False).values.mean(dim=1)
+        cl_cvar05_v = torch.topk(cl_g_mat, max(1, cl_g_mat.shape[1] // 20), dim=1, largest=False).values.mean(dim=1)
+        cl_min_g_v = cl_g_mat.min(dim=1).values
         cl_down_v = torch.sqrt(torch.mean(torch.clamp(-cl_g_mat, min=0.0) ** 2, dim=1))
-        cl_tail_pen = 0.45 * torch.clamp(-14.0 - cl_cvar15_v, min=0.0) + 0.35 * torch.clamp(-25.0 - cl_cvar10_v, min=0.0)
-        # Anti-Outlier лог-демпфер на единичные супер-окна пампа (> +0.30%), чтобы исключить переобучение Val ценой просадки на медвежьих окнах:
+        # Трехслойный Cliff-Breaker без избыточного одиночного стопа: режет хвост CVaR15/10/05, сохраняя живой оборот L53!
+        cl_tail_pen = (
+            0.45 * torch.clamp(-15.0 - cl_cvar15_v, min=0.0)
+            + 0.35 * torch.clamp(-26.0 - cl_cvar10_v, min=0.0)
+            + 0.40 * torch.clamp(-45.0 - cl_cvar05_v, min=0.0)
+        )
+        # Anti-Outlier лог-демпфер на единичные супер-окна пампа (> +0.30%), гладкая дифференцируемая награда за широту!
         cl_mtm_sub = mtm_wcb[clean_idx]
+        pos_win_frac = (cl_mtm_sub > 0.015).float().mean(dim=(0, 2))
+        breadth_bonus = 5.0 * pos_win_frac * torch.sigmoid(cl_ev_v * 60.0)
         cl_ev_rob_v = torch.where(
             cl_mtm_sub > 0.30,
             0.30 + 0.20 * torch.log1p((cl_mtm_sub - 0.30) / 0.20),
@@ -1503,12 +1532,13 @@ def evaluate_order3_basket(
         ).mean(dim=1)
         geo_clean = (
             0.45 * cl_broad_v
-            + 0.32 * cl_q_mat[2]
-            + 0.18 * cl_q_mat[1]
-            + 0.22 * cl_mean_rob_v
-            + 55.0 * cl_ev_rob_v
-            + 0.40 * cl_cvar25_v
-            - 0.30 * cl_down_v
+            + 0.28 * cl_q_mat[2]
+            + 0.16 * cl_q_mat[1]
+            + 0.26 * cl_mean_rob_v
+            + 65.0 * cl_ev_rob_v
+            + breadth_bonus
+            + 0.38 * cl_cvar25_v
+            - 0.28 * cl_down_v
             - cl_tail_pen
         )
     else:
@@ -1517,10 +1547,20 @@ def evaluate_order3_basket(
     # Ножка 2 (Стресс-прививка инвентаря, 18%): альфа разгрузки и защиты перегруженного портфеля относительно пассивного удержания:
     if inv_idx:
         inv_g_mat = traj_growth_bp[inv_idx].view(len(inv_idx), C, B_bud).permute(1, 0, 2).reshape(C, len(inv_idx) * B_bud)
-        inv_mean_g_v = inv_g_mat.mean(dim=1)
+        inv_mean_rob_v = torch.where(
+            inv_g_mat > 40.0,
+            40.0 + 20.0 * torch.log1p((inv_g_mat - 40.0) / 20.0),
+            inv_g_mat,
+        ).mean(dim=1)
+        inv_mtm_sub = mtm_wcb[inv_idx]
+        inv_ev_rob_v = torch.where(
+            inv_mtm_sub > 0.35,
+            0.35 + 0.20 * torch.log1p((inv_mtm_sub - 0.35) / 0.20),
+            inv_mtm_sub,
+        ).mean(dim=(0, 2))
         inv_q50_v = torch.median(inv_g_mat, dim=1).values
         inv_cvar25_v = torch.topk(inv_g_mat, max(1, inv_g_mat.shape[1] // 4), dim=1, largest=False).values.mean(dim=1)
-        geo_inv = 0.35 * inv_mean_g_v + 0.25 * inv_q50_v + 45.0 * inv_ev_v + 0.30 * inv_cvar25_v
+        geo_inv = 0.35 * inv_mean_rob_v + 0.25 * inv_q50_v + 40.0 * inv_ev_rob_v + 0.35 * inv_cvar25_v
     else:
         geo_inv = torch.zeros(C, device=device)
 
@@ -1540,9 +1580,9 @@ def evaluate_order3_basket(
     mi_bits_v = torch.clamp((h_marg_v - h_cond_v) / ln2, min=0.0)
 
     if clean_idx and inv_idx:
-        # Положительный бонус inv_idx доступен ТОЛЬКО реально прибыльным на чистом кэше маркетмейкерам с нормальным оборотом:
-        active_mm_gate = torch.clamp(cl_turn_v / 0.04, 0.0, 1.0) * (geo_clean > 0.0).float()
-        geo_v = 0.85 * geo_clean + 0.15 * torch.where(geo_inv > 0.0, geo_inv * active_mm_gate, geo_inv)
+        # Гладкий дифференцируемый вентиль (0 при Turn=0, ненулевой градиент по CleanEV и Turn на всей области!):
+        active_mm_gate = torch.clamp(cl_turn_v / 0.07, 0.0, 1.0) * torch.sigmoid(geo_clean / 2.5) * torch.sigmoid(cl_ev_v * 60.0)
+        geo_v = 0.82 * geo_clean + 0.18 * torch.where(geo_inv > 0.0, geo_inv * active_mm_gate, geo_inv)
     elif clean_idx:
         geo_v = geo_clean
     else:
