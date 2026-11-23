@@ -336,15 +336,21 @@ class Order3LiveInferenceEngine:
         had_a_pre = cur_a_qty > 1e-6
 
         if bid_act_12 is not None and now_ts > 0:
-            b_act_t = torch.from_numpy(bid_act_12).to(device=self.device, dtype=torch.float32)
-            age_b_norm = torch.where(had_b_pre, torch.log1p(torch.clamp(float(now_ts) - b_act_t, min=0.0)) / 6.0, torch.zeros_like(cur_b_qty))
+            b_act_f64 = np.asarray(bid_act_12, dtype=np.float64)
+            b_dt_f64 = np.where(b_act_f64 > 0.0, np.maximum(0.0, float(now_ts) - b_act_f64), 0.0)
+            b_dt_t = torch.from_numpy(b_dt_f64.astype(np.float32)).to(device=self.device)
+            age_b_norm = torch.where(had_b_pre, torch.log1p(b_dt_t) / 6.0, torch.zeros_like(cur_b_qty))
         else:
+            b_dt_t = None
             age_b_norm = torch.zeros(12, dtype=torch.float32, device=self.device)
 
         if ask_act_12 is not None and now_ts > 0:
-            a_act_t = torch.from_numpy(ask_act_12).to(device=self.device, dtype=torch.float32)
-            age_a_norm = torch.where(had_a_pre, torch.log1p(torch.clamp(float(now_ts) - a_act_t, min=0.0)) / 6.0, torch.zeros_like(cur_a_qty))
+            a_act_f64 = np.asarray(ask_act_12, dtype=np.float64)
+            a_dt_f64 = np.where(a_act_f64 > 0.0, np.maximum(0.0, float(now_ts) - a_act_f64), 0.0)
+            a_dt_t = torch.from_numpy(a_dt_f64.astype(np.float32)).to(device=self.device)
+            age_a_norm = torch.where(had_a_pre, torch.log1p(a_dt_t) / 6.0, torch.zeros_like(cur_a_qty))
         else:
+            a_dt_t = None
             age_a_norm = torch.zeros(12, dtype=torch.float32, device=self.device)
 
         bud_1d = max(25.0, tot_bud_eff)
@@ -362,15 +368,13 @@ class Order3LiveInferenceEngine:
 
         cur_dist_b = torch.where(had_b_pre, torch.clamp(((b1 - cur_b_px) / b1) * 12.0, -0.5, 3.0), torch.zeros_like(cur_b_qty))
         cur_dist_a = torch.where(had_a_pre, torch.clamp(((cur_a_px - a1) / a1) * 12.0, -0.5, 3.0), torch.zeros_like(cur_a_qty))
-        if bid_act_12 is not None and now_ts > 0:
-            b_act_t = torch.from_numpy(bid_act_12).to(device=self.device, dtype=torch.float32)
-            b_age_s = torch.where(had_b_pre, torch.clamp((float(now_ts) - b_act_t) / 60.0, 0.0, 2.0), torch.zeros_like(cur_b_qty))
+        if b_dt_t is not None:
+            b_age_s = torch.where(had_b_pre, torch.clamp(b_dt_t / 60.0, 0.0, 2.0), torch.zeros_like(cur_b_qty))
         else:
             b_age_s = torch.zeros(12, dtype=torch.float32, device=self.device)
 
-        if ask_act_12 is not None and now_ts > 0:
-            a_act_t = torch.from_numpy(ask_act_12).to(device=self.device, dtype=torch.float32)
-            a_age_s = torch.where(had_a_pre, torch.clamp((float(now_ts) - a_act_t) / 60.0, 0.0, 2.0), torch.zeros_like(cur_a_qty))
+        if a_dt_t is not None:
+            a_age_s = torch.where(had_a_pre, torch.clamp(a_dt_t / 60.0, 0.0, 2.0), torch.zeros_like(cur_a_qty))
         else:
             a_age_s = torch.zeros(12, dtype=torch.float32, device=self.device)
 
@@ -606,16 +610,24 @@ def _eval_latest_wf_ubj_live(trader, b1: float, a1: float) -> Tuple[Optional[np.
         bq5, aq5 = max(0.0, float(np.sum(bq10[:5]))), max(0.0, float(np.sum(aq10[:5])))
         now_wf = time.time()
         fh = list(getattr(trader, "flow_hist_10s", []))
+        fh_ts = list(getattr(trader, "flow_ts_hist_30s", []))
         buy10 = max(0.0, float(getattr(trader, "last_buy_vol_10s", 0.0)))
         sell10 = max(0.0, float(sum(x[3] for x in fh[-10:]))) if fh else 0.0
 
         # Точный 30-секундный буфер потока и 15-секундный сдвиг спреда (1-в-1 с walkforward_order2_trainer.py!):
         fh30 = _LIVE_WF_CACHE.setdefault("flow_hist_30s", [])
         last_fh_ts = float(_LIVE_WF_CACHE.get("last_fh_ts", 0.0))
-        if fh:
+        if fh_ts:
+            for item_t in fh_ts:
+                ts_f = float(item_t[0])
+                if ts_f > last_fh_ts + 1e-6:
+                    fh30.append((ts_f, max(0.0, float(item_t[1])), max(0.0, float(item_t[2]))))
+                    last_fh_ts = ts_f
+            _LIVE_WF_CACHE["last_fh_ts"] = last_fh_ts
+        elif fh:
             for item_f in fh:
                 ts_f = float(item_f[0])
-                if ts_f > last_fh_ts + 1e-6:
+                if ts_f > 1e9 and ts_f > last_fh_ts + 1e-6:
                     fh30.append((ts_f, max(0.0, float(item_f[2])), max(0.0, float(item_f[3]))))
                     last_fh_ts = ts_f
             _LIVE_WF_CACHE["last_fh_ts"] = last_fh_ts
@@ -914,15 +926,15 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
         z_ag[59] = 1.0 if np.any(b_qty > 1e-6) else 0.0
         z_ag[60] = 1.0 if np.any(a_qty > 1e-6) else 0.0
         z_ag[61] = (np.sum(b_qty > 1e-6) - np.sum(a_qty > 1e-6)) / 12.0
-        b_act_ts = np.array([float(s.get("act_ts", 0.0)) for s in trader.bid_slots], dtype=np.float32)
-        a_act_ts = np.array([float(s.get("act_ts", 0.0)) for s in trader.ask_slots], dtype=np.float32)
+        b_act_ts = np.array([float(s.get("act_ts", 0.0)) for s in trader.bid_slots], dtype=np.float64)
+        a_act_ts = np.array([float(s.get("act_ts", 0.0)) for s in trader.ask_slots], dtype=np.float64)
 
         has_b = np.any(b_qty > 1e-6)
         has_a = np.any(a_qty > 1e-6)
         best_b_idx = int(np.argmin(np.where(b_qty > 1e-6, b1 - b_px, 999.0))) if has_b else 0
         best_a_idx = int(np.argmin(np.where(a_qty > 1e-6, a_px - a1, 999.0))) if has_a else 0
-        best_b_act = b_act_ts[best_b_idx]
-        best_a_act = a_act_ts[best_a_idx]
+        best_b_act = float(b_act_ts[best_b_idx])
+        best_a_act = float(a_act_ts[best_a_idx])
         best_b_age = min(2.0, max(0.0, (now_ts - best_b_act) / 60.0)) if (has_b and best_b_act > 0) else 0.0
         best_a_age = min(2.0, max(0.0, (now_ts - best_a_act) / 60.0)) if (has_a and best_a_act > 0) else 0.0
 
@@ -937,12 +949,12 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
         z_ag[69] = float(zm_sc[48]) if len(zm_sc) > 48 else 0.0
 
         z_ag[70:86] = trader.order3_engine.mem_h[:, :16].squeeze(0).cpu().numpy()
-        z_ag[86:98] = np.where(b_qty > 1e-6, np.clip(np.where(b_act_ts > 0, (now_ts - b_act_ts) / 60.0, 0.0), 0.0, 2.0), -1.0)
-        z_ag[98:110] = np.where(a_qty > 1e-6, np.clip(np.where(a_act_ts > 0, (now_ts - a_act_ts) / 60.0, 0.0), 0.0, 2.0), -1.0)
+        z_ag[86:98] = np.where(b_qty > 1e-6, np.clip(np.where(b_act_ts > 0.0, (float(now_ts) - b_act_ts) / 60.0, 0.0), 0.0, 2.0), -1.0).astype(np.float32)
+        z_ag[98:110] = np.where(a_qty > 1e-6, np.clip(np.where(a_act_ts > 0.0, (float(now_ts) - a_act_ts) / 60.0, 0.0), 0.0, 2.0), -1.0).astype(np.float32)
 
     else:
-        b_act_ts = np.array([float(s.get("act_ts", 0.0)) for s in trader.bid_slots], dtype=np.float32)
-        a_act_ts = np.array([float(s.get("act_ts", 0.0)) for s in trader.ask_slots], dtype=np.float32)
+        b_act_ts = np.array([float(s.get("act_ts", 0.0)) for s in trader.bid_slots], dtype=np.float64)
+        a_act_ts = np.array([float(s.get("act_ts", 0.0)) for s in trader.ask_slots], dtype=np.float64)
 
     # Синхронизация живой FIFO-очереди слотов (qa / qa0) по чистому 10-уровневому стакану (1-в-1 с fused_order3_clean_tick.py):
     bp10_live = np.asarray(getattr(trader, "last_clean_bp_10", [b1] * 10), dtype=np.float32)[:10]
@@ -951,13 +963,21 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
     aq10_live = np.asarray(getattr(trader, "last_clean_aq_10", np.zeros(10, dtype=np.float32)), dtype=np.float32)[:10]
     t_sz = float(getattr(trader, "exec_tick_size", trader.tick_size))
     fh_live = list(getattr(trader, "flow_hist_10s", []))
+    fh_ts_live = list(getattr(trader, "flow_ts_hist_30s", []))
     rs_1s = max(10.0, float(sum(x[3] for x in fh_live[-10:])) / 10.0) if fh_live else 10.0
     rb_1s = max(10.0, float(getattr(trader, "last_buy_vol_10s", 100.0)) / 10.0)
     last_qa_step_ts = float(getattr(trader, "_last_qa_drain_ts", 0.0))
-    sv_since = float(sum(max(0.0, float(x[3])) for x in fh_live if float(x[0]) > last_qa_step_ts + 1e-6)) if (fh_live and last_qa_step_ts > 0.0) else 0.0
-    bv_since = float(sum(max(0.0, float(x[2])) for x in fh_live if float(x[0]) > last_qa_step_ts + 1e-6)) if (fh_live and last_qa_step_ts > 0.0) else 0.0
-    if fh_live:
+    if fh_ts_live:
+        sv_since = float(sum(max(0.0, float(x[2])) for x in fh_ts_live if float(x[0]) > last_qa_step_ts + 1e-6)) if last_qa_step_ts > 0.0 else 0.0
+        bv_since = float(sum(max(0.0, float(x[1])) for x in fh_ts_live if float(x[0]) > last_qa_step_ts + 1e-6)) if last_qa_step_ts > 0.0 else 0.0
+        trader._last_qa_drain_ts = float(fh_ts_live[-1][0])
+    elif fh_live and float(fh_live[-1][0]) > 1e9:
+        sv_since = float(sum(max(0.0, float(x[3])) for x in fh_live if float(x[0]) > last_qa_step_ts + 1e-6)) if last_qa_step_ts > 0.0 else 0.0
+        bv_since = float(sum(max(0.0, float(x[2])) for x in fh_live if float(x[0]) > last_qa_step_ts + 1e-6)) if last_qa_step_ts > 0.0 else 0.0
         trader._last_qa_drain_ts = float(fh_live[-1][0])
+    else:
+        sv_since = max(0.0, float(fh_live[-1][3])) if fh_live else 0.0
+        bv_since = max(0.0, float(fh_live[-1][2])) if fh_live else 0.0
 
     b_qa_arr = np.zeros(12, dtype=np.float32)
     b_qa0_arr = np.zeros(12, dtype=np.float32)

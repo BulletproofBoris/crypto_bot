@@ -1930,9 +1930,12 @@ class LiveTriadRLTrader:
 
         if not hasattr(self, "flow_hist_10s"):
             self.flow_hist_10s = deque(maxlen=11)
+        if not hasattr(self, "flow_ts_hist_30s"):
+            self.flow_ts_hist_30s = deque(maxlen=45)
         buy_v1 = float(r.get("ST_buy_vol", r.get("ST_buy_vol_1s", 0.0)) or 0.0)
         sell_v1 = float(r.get("ST_sell_vol", r.get("ST_sell_vol_1s", 0.0)) or 0.0)
         self.flow_hist_10s.append((self.last_b1_q, self.last_a1_q, buy_v1, sell_v1))
+        self.flow_ts_hist_30s.append((time.time(), buy_v1, sell_v1))
         self.last_buy_vol_10s = float(sum(x[2] for x in list(self.flow_hist_10s)[-10:]))
 
         st_mid_now = max(1e-4, 0.5 * (b1 + a1))
@@ -3547,13 +3550,13 @@ class LiveTriadRLTrader:
         bid_qty_cur = np.array([float(s.get("qty", 0.0)) if s.get("id") is not None else 0.0 for s in self.bid_slots], dtype=np.float32)
         bid_qa_cur = np.array([float(s.get("qa", 0.0)) if s.get("id") is not None else 0.0 for s in self.bid_slots], dtype=np.float32)
         bid_qa0_cur = np.array([float(s.get("qa0", 0.0)) if s.get("id") is not None else 0.0 for s in self.bid_slots], dtype=np.float32)
-        bid_act_cur = np.array([float(s.get("act_ts", now_ts)) if s.get("id") is not None else now_ts for s in self.bid_slots], dtype=np.float32)
+        bid_act_cur = np.array([float(s.get("act_ts", now_ts)) if s.get("id") is not None else now_ts for s in self.bid_slots], dtype=np.float64)
 
         ask_px_cur = np.array([float(s.get("px", 0.0)) if s.get("id") is not None else 0.0 for s in self.ask_slots], dtype=np.float32)
         ask_qty_cur = np.array([float(s.get("qty", 0.0)) if s.get("id") is not None else 0.0 for s in self.ask_slots], dtype=np.float32)
         ask_qa_cur = np.array([float(s.get("qa", 0.0)) if s.get("id") is not None else 0.0 for s in self.ask_slots], dtype=np.float32)
         ask_qa0_cur = np.array([float(s.get("qa0", 0.0)) if s.get("id") is not None else 0.0 for s in self.ask_slots], dtype=np.float32)
-        ask_act_cur = np.array([float(s.get("act_ts", now_ts)) if s.get("id") is not None else now_ts for s in self.ask_slots], dtype=np.float32)
+        ask_act_cur = np.array([float(s.get("act_ts", now_ts)) if s.get("id") is not None else now_ts for s in self.ask_slots], dtype=np.float64)
 
         had_b_pre = bid_qty_cur > 1e-6
         had_a_pre = ask_qty_cur > 1e-6

@@ -59,6 +59,10 @@ class LiveFeatureStreamer:
         self.st_trades_path = self.rt_dir / "prlusdt" / "trades.csv"
         self.bo_depth_path = self.rt_dir / "prlusdt_bigone" / "depth_bigone.csv"
         self.bo_trades_path = self.rt_dir / "prlusdt_bigone" / "trades_bigone.csv"
+        self.gate_depth_path = self.rt_dir / "prlusdt_gate" / "depth_gate.csv"
+        self.gate_trades_path = self.rt_dir / "prlusdt_gate" / "trades_gate.csv"
+        self.our_depth_path = self.rt_dir / "prlusdt_ourbit" / "depth_ourbit.csv"
+        self.our_trades_path = self.rt_dir / "prlusdt_ourbit" / "trades_ourbit.csv"
         self.macro_path = self.rt_dir / "macro_binance" / "binance_macro.csv"
         self.onchain_path = self.rt_dir / "onchain" / "prl_onchain.csv"
 
@@ -70,13 +74,23 @@ class LiveFeatureStreamer:
         self.st_vol_hist = deque([0.0] * 60, maxlen=60)
         self.bo_delta_hist = deque([0.0] * 900, maxlen=900)
         self.bo_vol_hist = deque([0.0] * 60, maxlen=60)
+        self.gate_delta_hist = deque([0.0] * 900, maxlen=900)
+        self.gate_vol_hist = deque([0.0] * 60, maxlen=60)
+        self.our_delta_hist = deque([0.0] * 900, maxlen=900)
+        self.our_vol_hist = deque([0.0] * 60, maxlen=60)
 
         self._st_trade_pos = 0
         self._bo_trade_pos = 0
+        self._gate_trade_pos = 0
+        self._our_trade_pos = 0
         self._seen_st_trade_ids = deque(maxlen=500)
         self._seen_st_trade_set = set()
         self._seen_bo_trade_ids = deque(maxlen=500)
         self._seen_bo_trade_set = set()
+        self._seen_gate_trade_ids = deque(maxlen=500)
+        self._seen_gate_trade_set = set()
+        self._seen_our_trade_ids = deque(maxlen=500)
+        self._seen_our_trade_set = set()
         self._last_block_height = -1
         self._sec_since_block = 10.0
         self._diff_1h_ago = 0.0
@@ -355,9 +369,25 @@ class LiveFeatureStreamer:
                 pass
         return buckets
 
+    _DERIVED_MARKERS = (
+        "_ofi_", "_cvd_norm_", "_vol_intensity_", "_imbalance_ema_", "_imb_band_",
+        "_vol_5s_ticks", "_vol_20s_ticks", "_vol_60s_ticks", "_vol_300s_ticks",
+        "_ret_5s_ticks", "_ret_20s_ticks", "_ret_60s_ticks", "_ret_300s_ticks",
+        "_vol_ratio_", "_wave_vel_", "_wave_accel_", "_wave_to_spread_",
+        "_dist_ticks", "_book_slope_", "_log_slope_ratio", "_convexity_top10",
+        "_liquidity_density_decay", "_queue_depletion_", "_cancel_to_trade_ratio_",
+        "_trade_arrival_accel", "_absorption_", "_whale_sweep_ratio_",
+        "_semi_vol_20s", "_volatility_skewness_20s", "_range_to_spread_20s",
+        "_rolls_spread_proxy", "_noise_to_signal_", "leadlag_", "arb_gate_", "arb_our_",
+        "arb_spread_zscore_", "arb_mid_diff_ticks",
+    )
+
     def _append_row_buffers(self, d: dict):
         self.raw_rows.append(d)
-        self.compact_rows.append({k: v for k, v in d.items() if k not in self._DROP_L2_11_50})
+        self.compact_rows.append({
+            k: v for k, v in d.items()
+            if k not in self._DROP_L2_11_50 and not any(m in k for m in self._DERIVED_MARKERS)
+        })
 
     def _warmup_from_seed_and_rt(self, seed_df: pd.DataFrame):
         base_dict = seed_df.iloc[-1].to_dict()
@@ -368,17 +398,22 @@ class LiveFeatureStreamer:
 
         st_lines = self._tail_lines(self.st_depth_path, n=800)
         bo_lines = self._tail_lines(self.bo_depth_path, n=400)
+        gate_lines = self._tail_lines(self.gate_depth_path, n=400)
+        our_lines = self._tail_lines(self.our_depth_path, n=400)
         m_lines = self._tail_lines(self.macro_path, n=400)
         on_lines = self._tail_lines(self.onchain_path, n=200)
         st_tr_Map = self._bucket_trades(self._tail_lines(self.st_trades_path, n=1500), "ST", self._seen_st_trade_ids, self._seen_st_trade_set)
         bo_tr_Map = self._bucket_trades(self._tail_lines(self.bo_trades_path, n=1500), "BO", self._seen_bo_trade_ids, self._seen_bo_trade_set)
+        gate_tr_Map = self._bucket_trades(self._tail_lines(self.gate_trades_path, n=1500), "GATE", self._seen_gate_trade_ids, self._seen_gate_trade_set)
+        our_tr_Map = self._bucket_trades(self._tail_lines(self.our_trades_path, n=1500), "OUR", self._seen_our_trade_ids, self._seen_our_trade_set)
 
         if st_lines:
             self.raw_rows.clear()
             self.compact_rows.clear()
             now_sec = self._extract_ts_sec(st_lines[-1].split(",", 1)[0]) or int(datetime.now(timezone.utc).timestamp())
-            if bo_lines:
-                now_sec = max(now_sec, self._extract_ts_sec(bo_lines[-1].split(",", 1)[0]))
+            for x_lns in (bo_lines, gate_lines, our_lines):
+                if x_lns:
+                    now_sec = max(now_sec, self._extract_ts_sec(x_lns[-1].split(",", 1)[0]))
 
             # Прогреваем 1-часовую сложность и возраст последнего блока по истории prl_onchain.csv
             if on_lines:
@@ -411,6 +446,12 @@ class LiveFeatureStreamer:
                 bb, bs, _ = bo_tr_Map.get(s, (0.0, 0.0, 0))
                 self.bo_delta_hist.append(bb - bs)
                 self.bo_vol_hist.append(bb + bs)
+                gb, gs, _ = gate_tr_Map.get(s, (0.0, 0.0, 0))
+                self.gate_delta_hist.append(gb - gs)
+                self.gate_vol_hist.append(gb + gs)
+                ob, os_, _ = our_tr_Map.get(s, (0.0, 0.0, 0))
+                self.our_delta_hist.append(ob - os_)
+                self.our_vol_hist.append(ob + os_)
 
             def _index_by_sec(lns: list[str]) -> list[tuple[int, str]]:
                 out_l = []
@@ -422,19 +463,29 @@ class LiveFeatureStreamer:
 
             st_seq = _index_by_sec(st_lines)
             bo_seq = _index_by_sec(bo_lines)
+            gate_seq = _index_by_sec(gate_lines)
+            our_seq = _index_by_sec(our_lines)
             m_seq = _index_by_sec(m_lines)
             on_seq = _index_by_sec(on_lines)
-            p_st = p_bo = p_m = p_on = 0
+            p_st = p_bo = p_gate = p_our = p_m = p_on = 0
 
             d = dict(base_dict)
             if st_seq:
                 self._parse_50lvl_line(st_seq[0][1], "ST", d)
             if bo_seq:
                 self._parse_50lvl_line(bo_seq[0][1], "BO", d)
+            if gate_seq:
+                self._parse_50lvl_line(gate_seq[0][1], "GATE", d)
+            if our_seq:
+                self._parse_50lvl_line(our_seq[0][1], "OUR", d)
             if m_seq:
                 self._parse_macro_line(m_seq[0][1], d)
             if on_seq:
                 self._parse_onchain_line(on_seq[0][1], d, advance_timer=False)
+
+            last_bo_s = bo_seq[0][0] if bo_seq else now_sec
+            last_gate_s = gate_seq[0][0] if gate_seq else now_sec
+            last_our_s = our_seq[0][0] if our_seq else now_sec
 
             for s in range(now_sec - self.buf_len + 1, now_sec + 1):
                 d = dict(d)
@@ -443,7 +494,19 @@ class LiveFeatureStreamer:
                     p_st += 1
                 while p_bo < len(bo_seq) and bo_seq[p_bo][0] <= s:
                     self._parse_50lvl_line(bo_seq[p_bo][1], "BO", d)
+                    last_bo_s = bo_seq[p_bo][0]
                     p_bo += 1
+                while p_gate < len(gate_seq) and gate_seq[p_gate][0] <= s:
+                    self._parse_50lvl_line(gate_seq[p_gate][1], "GATE", d)
+                    last_gate_s = gate_seq[p_gate][0]
+                    p_gate += 1
+                while p_our < len(our_seq) and our_seq[p_our][0] <= s:
+                    self._parse_50lvl_line(our_seq[p_our][1], "OUR", d)
+                    last_our_s = our_seq[p_our][0]
+                    p_our += 1
+                d["BO_sec_since_tick"] = float(max(0, s - last_bo_s))
+                d["GATE_sec_since_tick"] = float(max(0, s - last_gate_s))
+                d["OUR_sec_since_tick"] = float(max(0, s - last_our_s))
                 while p_m < len(m_seq) and m_seq[p_m][0] <= s:
                     self._parse_macro_line(m_seq[p_m][1], d)
                     p_m += 1
@@ -459,6 +522,8 @@ class LiveFeatureStreamer:
                 for pfx, tmap, dhist, vhist in (
                     ("ST", st_tr_Map, self.st_delta_hist, self.st_vol_hist),
                     ("BO", bo_tr_Map, self.bo_delta_hist, self.bo_vol_hist),
+                    ("GATE", gate_tr_Map, self.gate_delta_hist, self.gate_vol_hist),
+                    ("OUR", our_tr_Map, self.our_delta_hist, self.our_vol_hist),
                 ):
                     bv, sv, cnt = tmap.get(s, (0.0, 0.0, 0))
                     tv = bv + sv
@@ -488,7 +553,12 @@ class LiveFeatureStreamer:
                 d["_ts"] = pd.Timestamp(s, unit="s", tz="UTC")
                 self._append_row_buffers(d)
 
-        for p, attr in ((self.st_trades_path, "_st_trade_pos"), (self.bo_trades_path, "_bo_trade_pos")):
+        for p, attr in (
+            (self.st_trades_path, "_st_trade_pos"),
+            (self.bo_trades_path, "_bo_trade_pos"),
+            (self.gate_trades_path, "_gate_trade_pos"),
+            (self.our_trades_path, "_our_trade_pos"),
+        ):
             if p.exists():
                 try:
                     setattr(self, attr, p.stat().st_size)
@@ -569,13 +639,23 @@ class LiveFeatureStreamer:
         if own_orders:
             self._strip_own_l2(d, own_orders)
 
-        # 2. Горячий стакан BigONE + макро Binance + живые сделки
+        # 2. Горячий стакан BigONE + Gate.io + Ourbit + макро Binance + живые сделки
+        now_s = int(now_utc.timestamp())
         bo_tail = self._tail_lines(self.bo_depth_path, n=1)
         if bo_tail:
             self._parse_50lvl_line(bo_tail[-1], "BO", d)
             bo_sec = self._extract_ts_sec(bo_tail[-1].split(",", 1)[0])
-            now_s = int(now_utc.timestamp())
             d["BO_sec_since_tick"] = float(max(0, now_s - bo_sec)) if bo_sec > 0 else 0.0
+        gate_tail = self._tail_lines(self.gate_depth_path, n=1)
+        if gate_tail:
+            self._parse_50lvl_line(gate_tail[-1], "GATE", d)
+            gate_sec = self._extract_ts_sec(gate_tail[-1].split(",", 1)[0])
+            d["GATE_sec_since_tick"] = float(max(0, now_s - gate_sec)) if gate_sec > 0 else 0.0
+        our_tail = self._tail_lines(self.our_depth_path, n=1)
+        if our_tail:
+            self._parse_50lvl_line(our_tail[-1], "OUR", d)
+            our_sec = self._extract_ts_sec(our_tail[-1].split(",", 1)[0])
+            d["OUR_sec_since_tick"] = float(max(0, now_s - our_sec)) if our_sec > 0 else 0.0
         m_tail = self._tail_lines(self.macro_path, n=1)
         if m_tail:
             self._parse_macro_line(m_tail[-1], d)
@@ -588,6 +668,8 @@ class LiveFeatureStreamer:
 
         self._poll_trades(self.st_trades_path, "ST", d, "_st_trade_pos", self._seen_st_trade_ids, self._seen_st_trade_set, self.st_delta_hist, self.st_vol_hist)
         self._poll_trades(self.bo_trades_path, "BO", d, "_bo_trade_pos", self._seen_bo_trade_ids, self._seen_bo_trade_set, self.bo_delta_hist, self.bo_vol_hist)
+        self._poll_trades(self.gate_trades_path, "GATE", d, "_gate_trade_pos", self._seen_gate_trade_ids, self._seen_gate_trade_set, self.gate_delta_hist, self.gate_vol_hist)
+        self._poll_trades(self.our_trades_path, "OUR", d, "_our_trade_pos", self._seen_our_trade_ids, self._seen_our_trade_set, self.our_delta_hist, self.our_vol_hist)
 
         # Кросс-биржевые мгновенные спреды
         if "BO_bid_1_price" in d and "ST_ask_1_price" in d:
@@ -608,14 +690,14 @@ class LiveFeatureStreamer:
         # 3. Векторный расчет банка фильтров W=[5, 20, 60, 300]с на окне буфера
         df_win = self._compute_window_features()
         out_last = df_win.iloc[-1:].fillna(0.0).reset_index(drop=True)
-        st_l2_11_50 = {k: float(d.get(k, 0.0) or 0.0) for k in self._DROP_L2_11_50 if k.startswith("ST_")}
-        if st_l2_11_50:
-            out_last = pd.concat([out_last, pd.DataFrame([st_l2_11_50])], axis=1)
+        extra_l2_11_50 = {k: float(d.get(k, 0.0) or 0.0) for k in self._DROP_L2_11_50 if k not in out_last.columns}
+        if extra_l2_11_50:
+            out_last = pd.concat([out_last, pd.DataFrame([extra_l2_11_50])], axis=1)
         return out_last
 
     _DROP_L2_11_50 = frozenset(
         f"{p}_{side}_{i}_{k}"
-        for p in ("ST", "BO")
+        for p in ("ST", "BO", "GATE", "OUR")
         for side in ("bid", "ask")
         for i in range(11, 51)
         for k in ("price", "qty")
@@ -629,6 +711,10 @@ class LiveFeatureStreamer:
             df_win = add_exchange_filter_bank(df_win, "ST", coin=self.coin)
         if "BO_mid_price" in df_win.columns:
             df_win = add_exchange_filter_bank(df_win, "BO", coin=self.coin)
+        if "GATE_mid_price" in df_win.columns:
+            df_win = add_exchange_filter_bank(df_win, "GATE", coin=self.coin)
+        if "OUR_mid_price" in df_win.columns:
+            df_win = add_exchange_filter_bank(df_win, "OUR", coin=self.coin)
         df_win = add_cross_exchange_and_macro_filters(df_win, coin=self.coin)
         if ssb_saved is not None:
             df_win["onchain_seconds_since_block"] = ssb_saved
