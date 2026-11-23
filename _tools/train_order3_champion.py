@@ -99,7 +99,7 @@ def _normalize_weights_order3(state: dict, dtype: torch.dtype) -> dict:
         nk = torch.linalg.vector_norm(wk, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
         w2m_parts.append(wk * torch.clamp(62.0 / nk, max=1.0))
     out["w2_moe"] = torch.cat(w2m_parts, dim=-1).to(dtype)
-    out["b2_moe"] = torch.clamp(state["b2_moe"].float(), -5.0, 5.0).to(dtype)
+    out["b2_moe"] = torch.clamp(state["b2_moe"].float(), -7.5, 6.5).to(dtype)
 
     for k, cap in (
         ("w_res1", 65.0),
@@ -263,6 +263,8 @@ class MultimodalMoEPolicyOrder3:
             if old_exp_d <= 45 and EXPERT_OUT_DIM_ORDER3 >= 48:
                 # Инициализация [47] renorm_blend = +4.5 -> 98.9% стартовый паритет с L46 с открытым градиентом для каскадного резерва!
                 b2m_new[:, :, 47] = 4.50
+            if old_exp_d <= 48 and EXPERT_OUT_DIM_ORDER3 >= 50:
+                b2m_new[:, :, 48:50] = -7.0
 
             if old_k < K_MODES_ORDER3:
                 ref_m = min(1, old_k - 1)
@@ -380,8 +382,10 @@ class MultimodalMoEPolicyOrder3:
 
         dw1 = _anti_ring((TOTAL_DIM_ORDER3, 384), sig_trunk, low_rank=16).to(self.dtype)
         dw1[:, 0:1, :] *= 2.40
-        dw1[:, 1:40, :] *= 1.60
-        dw1[:, 40:MKT_DIM_ORDER3, :] *= 2.60
+        dw1[:, 1:40, :] *= 1.50
+        dw1[:, 40:60, :] *= 2.20
+        if MKT_DIM_ORDER3 > 60:
+            dw1[:, 60:MKT_DIM_ORDER3, :] *= 4.20  # ускоренное подключение 12D Wave Radar + 30m/60m структуры волн!
         dw1[:, MKT_DIM_ORDER3:, :] *= 0.90
 
         self.w1[2 : 2 + 2 * half].copy_(base_gpu["w1"].unsqueeze(0) + dw1)
@@ -394,13 +398,26 @@ class MultimodalMoEPolicyOrder3:
         moe_sig = 0.0085 * float(sigma_scale)
         dw2m = _anti_ring((256, MOE_OUT_DIM_ORDER3), moe_sig, low_rank=16)
         db2m = _anti_ring((1, MOE_OUT_DIM_ORDER3), moe_sig * 1.35)
+        if EXPERT_OUT_DIM_ORDER3 >= 50:
+            dw2m_v = dw2m.view(-1, 256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+            db2m_v = db2m.view(-1, 1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+            dw2m_v[:, :, :7, 25] *= 0.15  # защита рабочих волновых мод 0..6 от случайного включения тайм-стопа u_taker!
+            db2m_v[:, :, :7, 25] *= 0.15
+            dw2m_v[:, :, :, 48] *= 0.35
+            db2m_v[:, :, :, 48] *= 0.35
+            dw2m_v[:, :, :, 49] *= 3.40   # активная калибровка гладкого wave_hold_pct [0..+10%] по модам!
+            db2m_v[:, :, :, 49] *= 3.80
+            dw2m_v[:, :, :, 0] *= 1.80
+            db2m_v[:, :, :, 0] *= 2.00
         self.w2_moe[2 : 2 + 2 * half].copy_(base_gpu["w2_moe"].unsqueeze(0) + dw2m.to(self.dtype))
         self.b2_moe[2 : 2 + 2 * half].copy_(base_gpu["b2_moe"].unsqueeze(0) + db2m.to(self.dtype))
 
         dw_g1 = _anti_ring((ROUTER_IN_DIM_ORDER3, ROUTER_H_DIM_ORDER3), moe_sig * 1.85, low_rank=12).to(self.dtype)
         dw_g1[:, 272:311, :] *= 2.40  # активный фокус на 32D многомасштабной памяти и макро/карусельных каналах!
         if ROUTER_IN_DIM_ORDER3 > 311:
-            dw_g1[:, 311:, :] *= 3.20  # ускоренное подключение 9D радара краха Order-2/Order-1/BigONE в роутер!
+            dw_g1[:, 311:min(320, ROUTER_IN_DIM_ORDER3), :] *= 2.80
+        if ROUTER_IN_DIM_ORDER3 > 320:
+            dw_g1[:, 320:, :] *= 4.50  # прямое подключение 6D Wave Radar [w_5m..p_top_15m] в роутер мод K=8!
         self.w_gate1[2 : 2 + 2 * half].copy_(base_gpu["w_gate1"].unsqueeze(0) + dw_g1)
         self.b_gate1[2 : 2 + 2 * half].copy_(base_gpu["b_gate1"].unsqueeze(0) + _anti_ring((1, ROUTER_H_DIM_ORDER3), moe_sig * 1.35).to(self.dtype))
         dw_g2 = _anti_ring((ROUTER_H_DIM_ORDER3, K_MODES_ORDER3), moe_sig * 2.00)
@@ -518,9 +535,9 @@ def train_order3(
     log_msg(f"🚀 ORDER-3 WFv2 ISLAND #{island_id}/{num_islands} ({island_mode.upper()}) ON {device} | GROUPS={n_groups} (POP={n_groups * 6})")
     log_msg("=" * 90)
 
-    # 1. Загрузка строго каузальных 60D данных Signal Stack v2 и выделение РЕАЛЬНОЙ суб-центовой эпохи SafeTrade ($0.0001 tick!)
-    log_msg("📦 Загрузка каузальной 60D матрицы Signal Stack v2 и выделение эпохи суб-центового тика $0.0001...")
-    mkt_raw = np.load(BASE_DIR / "data/cache/rl_hybrid_market_obs_60d.npz", mmap_mode="r")
+    # 1. Загрузка строго каузальных 72D данных Signal Stack v3 (Wave Radar + Micro + Macro) на тике $0.0001
+    log_msg("📦 Загрузка каузальной 72D матрицы Signal Stack v3 (Wave Radar) и выделение эпохи суб-центового тика $0.0001...")
+    mkt_raw = np.load(BASE_DIR / "data/cache/rl_hybrid_market_obs_72d.npz", mmap_mode="r")
     lob_raw = np.load(BASE_DIR / "data/cache/rl_guard_lob_cache_600h.npz", mmap_mode="r")
 
     b1_full = lob_raw["bid_p"][:, 0]
@@ -528,11 +545,11 @@ def train_order3(
     subcent_offset = int(subcent_hits[0]) if len(subcent_hits) > 0 else 0
     log_msg(f"🔍 Обнаружена граница перехода биржи на тик $0.0001: idx={subcent_offset:,} (отсечено {subcent_offset:,} старых $0.01 тиков!)")
 
-    mkt_sub = np.asarray(mkt_raw["market_obs_60d"][subcent_offset:], dtype=np.float32)
+    mkt_sub = np.asarray(mkt_raw["market_obs_72d"][subcent_offset:], dtype=np.float32)
     total_rows = len(mkt_sub)
     tick_sz = 0.0001
-    if win_len > total_rows // 10:
-        win_len = 1801
+    if win_len > total_rows // 8:
+        win_len = 9001
 
     mkt_gpu = torch.from_numpy(mkt_sub).to(device=device, dtype=torch.bfloat16)
     b10_gpu = torch.from_numpy(np.asarray(lob_raw["bid_p"][subcent_offset:, :10], dtype=np.float32)).to(device=device)
@@ -542,34 +559,35 @@ def train_order3(
     sv_gpu = torch.from_numpy(np.asarray(lob_raw["sell_vol"][subcent_offset:], dtype=np.float32)).to(device=device)
     bv_gpu = torch.from_numpy(np.asarray(lob_raw["buy_vol"][subcent_offset:], dtype=np.float32)).to(device=device)
 
-    # 2. Автоматическое Purged Multi-Regime разбиение с инвентарной стресс-прививкой (0% пересечений Train / Val / Blind OOS!):
-    macro_win_len = min(win_len, 6001)
-    micro_win_len = 1501
-    n_bask_w = max(28, n_val_windows)
+    # 2. Автоматическое Purged Multi-Regime волновое разбиение (Macro = 5401с = 90м волновой цикл, Micro = 1801с = 30м свинг!):
+    macro_win_len = min(win_len, 5401)
+    micro_win_len = 1801
+    n_bask_w = max(24, n_val_windows)
     oos_ticks = max(macro_win_len + 7200, int(round(oos_hours * 3600.0)))
     oos_start = max(360000, total_rows - oos_ticks) if total_rows >= 480000 else int(total_rows * 0.80)
     oos_end_macro = total_rows - macro_win_len - 100
     oos_end_micro = total_rows - micro_win_len - 100
     oos_span = max(1, total_rows - oos_start)
-    n_oos_w = max(n_bask_w, min(84, int(round(n_bask_w * (oos_span / 61200.0)))))
+    n_oos_w = max(n_bask_w, min(72, int(round(n_bask_w * (oos_span / 61200.0)))))
 
-    # Равномерная каузальная решетка из 7 зон Val и 8 зон Train на [600 .. oos_start - macro_win_len - 500] со строгим Purge >= macro_win_len + 200:
+    # Равномерная каузальная решетка из 8 зон Val и 9 зон Train со строгим Purge >= macro_win_len + 250 (= 9251с):
     purge_gap = macro_win_len + 250
-    val_span_starts = 4500
+    val_span_starts = 4200
     avail_pre_oos = oos_start - purge_gap
-    n_val_zones = 7
-    zone_pitch = (avail_pre_oos - 600) // (n_val_zones + 1)
+    n_val_zones = 8
+    v_lo_grid = np.linspace(38000, min(599500, max(90000, avail_pre_oos - val_span_starts - 16000)), num=n_val_zones, dtype=int)
     val_zones = []
     tr_segments = []
     prev_tr_lo = 600
     for z_i in range(n_val_zones):
-        v_lo = 600 + (z_i + 1) * zone_pitch - (val_span_starts + purge_gap) // 2
+        v_lo = max(prev_tr_lo + 2500 + purge_gap, int(v_lo_grid[z_i]))
         v_hi = v_lo + val_span_starts
         tr_hi = max(prev_tr_lo + 2000, v_lo - purge_gap)
         tr_segments.append((prev_tr_lo, tr_hi))
         val_zones.append((v_lo, v_hi))
         prev_tr_lo = v_hi + purge_gap
-    tr_segments.append((prev_tr_lo, max(prev_tr_lo + 2000, avail_pre_oos)))
+    if avail_pre_oos - prev_tr_lo >= 2500:
+        tr_segments.append((prev_tr_lo, avail_pre_oos))
 
     # Стратифицированные профили стартового портфеля (65% чистый кэш + 35% перегруженный/просевший инвентарь для прививки от ножей!):
     inv_profiles = [(0.25, 0.004), (0.45, 0.008), (0.65, 0.014)]
@@ -588,8 +606,8 @@ def train_order3(
                 out_b.append((f"{prefix}{k_i:02d}", int(idx_v), 0.0, 0.0))
         return out_b
 
-    # Двухфазная шахматная анти-оверфит корзина Val из 49 пар = 98 окон (53% веса на памп $2.39, обрывы с вершины и медвежий каскад!):
-    base_zc = [5, 5, 6, 7, 8, 9, 9] if len(val_zones) == 7 else [max(4, (7 * n_bask_w) // (4 * len(val_zones)))] * len(val_zones)
+    # Двухфазная шахматная анти-оверфит корзина Val из 56 пар = 112 окон (ровно 2 чанка по 28, включая памп $2.39 и водопад $2.18->$1.59!):
+    base_zc = [4, 5, 6, 7, 8, 8, 9, 9] if len(val_zones) == 8 else ([5, 5, 6, 7, 8, 9, 9] if len(val_zones) == 7 else [max(4, (7 * n_bask_w) // (4 * len(val_zones)))] * len(val_zones))
     mac_parts, mic_parts = [], []
     for (zlo, zhi), zc in zip(val_zones, base_zc):
         g_m = np.linspace(zlo, zhi, num=zc, dtype=int)
@@ -607,9 +625,9 @@ def train_order3(
     oos_macro_basket = _assign_stratified_inv(oos_macro_idx, "OMAC", 0.0)
     oos_micro_basket = _assign_stratified_inv(oos_micro_idx, "OMIC", 0.0)
 
-    # Повышенный вес свежих волатильных и медвежьих зон (сегменты 4..7 = 69% выборки Train!):
+    # Повышенный вес свежих волатильных и медвежьих зон (сегменты 4..8 = 73% выборки Train!):
     rng_train = np.random.default_rng(20261150 + island_id * 1009 + (int(time.time()) % 9973))
-    raw_w = np.array([0.06, 0.07, 0.08, 0.10, 0.14, 0.18, 0.18, 0.19][:len(tr_segments)], dtype=np.float64)
+    raw_w = np.array([0.05, 0.06, 0.07, 0.09, 0.12, 0.14, 0.15, 0.16, 0.16][:len(tr_segments)], dtype=np.float64)
     tr_seg_probs = raw_w / raw_w.sum()
 
     def sample_train_basket(is_micro: bool = False) -> list[tuple[str, int, float, float]]:
@@ -626,13 +644,16 @@ def train_order3(
             out_tr.append((f"{'TMIC' if is_micro else 'TMAC'}{k_t:02d}", s_t, float(r0), float(roff)))
         return out_tr
 
-    def _eval_basket_chunked(cands: list[dict], bask: list, w_len: int, calib_jitter_std: float = 0.0) -> list[dict]:
-        if len(bask) <= n_bask_w:
+    def _eval_basket_chunked(
+        cands: list[dict], bask: list, w_len: int, calib_jitter_std: float = 0.0, enforce_activity_floor: bool = False
+    ) -> list[dict]:
+        # Строго фиксированный W = n_bask_w гарантирует 100% переиспользование одного CUDA Graph в 16 ГБ VRAM без OOM!
+        if len(bask) == n_bask_w:
             return evaluate_order3_basket(
                 mkt_39d_all=mkt_gpu, b10_all=b10_gpu, a10_all=a10_gpu,
                 bq10_all=bq10_gpu, aq10_all=aq10_gpu, sv_all=sv_gpu, bv_all=bv_gpu,
                 cand_states=cands, val_windows=bask, win_len=w_len, tick_sz=tick_sz, device=device,
-                calib_jitter_std=calib_jitter_std,
+                calib_jitter_std=calib_jitter_std, enforce_activity_floor=enforce_activity_floor,
             )
         chunks_res = []
         weights = []
@@ -644,7 +665,7 @@ def train_order3(
                 mkt_39d_all=mkt_gpu, b10_all=b10_gpu, a10_all=a10_gpu,
                 bq10_all=bq10_gpu, aq10_all=aq10_gpu, sv_all=sv_gpu, bv_all=bv_gpu,
                 cand_states=cands, val_windows=sub_padded, win_len=w_len, tick_sz=tick_sz, device=device,
-                calib_jitter_std=calib_jitter_std,
+                calib_jitter_std=calib_jitter_std, enforce_activity_floor=enforce_activity_floor,
             )
             chunks_res.append(r_sub)
             weights.append(float(len(sub_b)))
@@ -673,8 +694,12 @@ def train_order3(
         enforce_mi: bool = False,
         calib_jitter_std: float = 0.0,
     ) -> list[dict]:
-        r_mac = _eval_basket_chunked(cands, mac_bask, (mac_len or macro_win_len), calib_jitter_std=calib_jitter_std)
-        r_mic = _eval_basket_chunked(cands, mic_bask, micro_win_len, calib_jitter_std=calib_jitter_std)
+        r_mac = _eval_basket_chunked(
+            cands, mac_bask, (mac_len or macro_win_len), calib_jitter_std=calib_jitter_std, enforce_activity_floor=enforce_mi
+        )
+        r_mic = _eval_basket_chunked(
+            cands, mic_bask, micro_win_len, calib_jitter_std=calib_jitter_std, enforce_activity_floor=enforce_mi
+        )
         merged = []
         for a, b in zip(r_mac, r_mic):
             # Сбалансированный двухмасштабный скор (Macro 100m + Micro 25m) + барьер против коллапса K=8 роутера в одну моду:
@@ -749,15 +774,278 @@ def train_order3(
         st_n = _normalize_weights_order3(st_m, policy.dtype)
         return {k: v.detach().cpu().clone() for k, v in st_n.items()}
 
-    l52_soup_p = SAVE_DIR / "bak_l52" / "order3_soup_top3.pt"
-    st_l52_soup = policy.load_initial_champion(l52_soup_p) if l52_soup_p.exists() else st_l46_base
-    st_ms_53i1_54 = _build_router_preserving_blend(st_l53_isl1, st_l54_soup, body_w=0.35)
-    st_ms_53i0_54 = _build_router_preserving_blend(st_l53_isl0, st_l54_soup, body_w=0.35)
+    l52_isl1_p = SAVE_DIR / "bak_l52" / "island_1_best.pt"
+    l56_isl0_p = SAVE_DIR / "bak_l56" / "island_0_best.pt"
+    l57_isl0_p = SAVE_DIR / "bak_l57" / "island_0_best.pt"
+    l57_soup_p = SAVE_DIR / "bak_l57" / "order3_soup_top3.pt"
+    st_l52_isl1 = policy.load_initial_champion(l52_isl1_p) if l52_isl1_p.exists() else st_l46_base
+    st_l56_isl0 = policy.load_initial_champion(l56_isl0_p) if l56_isl0_p.exists() else st_l53_isl0
+    st_l57_isl0 = policy.load_initial_champion(l57_isl0_p) if l57_isl0_p.exists() else st_l53_isl0
+    st_l57_soup = policy.load_initial_champion(l57_soup_p) if l57_soup_p.exists() else st_l57_isl0
 
+    def _build_bid_ask_split_chimera(st_bid: dict, st_ask: dict) -> dict:
+        """Хирургический синтез: ствол + роутер + все Bid-каналы от st_bid (L53), Ask/Exit-каналы от st_ask (L57)!"""
+        ask_ch = [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 30, 31, 32, 33, 35, 36, 41, 42, 43, 45, 46]
+        out_c = {k: st_bid[k].detach().cpu().float().clone() for k in MultimodalMoEPolicyOrder3.PARAM_KEYS}
+        w2_b = out_c["w2_moe"].view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        b2_b = out_c["b2_moe"].view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        w2_a = st_ask["w2_moe"].detach().cpu().float().view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        b2_a = st_ask["b2_moe"].detach().cpu().float().view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        for ch_i in ask_ch:
+            w2_b[:, :, ch_i] = w2_a[:, :, ch_i]
+            b2_b[:, :, ch_i] = b2_a[:, :, ch_i]
+        out_c["w2_moe"] = w2_b.reshape(256, MOE_OUT_DIM_ORDER3)
+        out_c["b2_moe"] = b2_b.reshape(1, MOE_OUT_DIM_ORDER3)
+        out_c["b_reg1_a"] = st_ask["b_reg1_a"].detach().cpu().float().clone()
+        out_c["b_reg2_a"] = st_ask["b_reg2_a"].detach().cpu().float().clone()
+        st_n = _normalize_weights_order3(out_c, policy.dtype)
+        return {k: v.to(device=device, dtype=policy.dtype) for k, v in st_n.items()}
+
+    st_chim_b53_a57 = _build_bid_ask_split_chimera(st_l53_isl0, st_l57_isl0)
+    l58_isl1_p = SAVE_DIR / "bak_l58" / "island_1_best.pt"
+    l58_isl0_p = SAVE_DIR / "bak_l58" / "island_0_best.pt"
+    l58_soup_p = SAVE_DIR / "bak_l58" / "order3_soup_top3.pt"
+    st_l58_isl1 = policy.load_initial_champion(l58_isl1_p) if l58_isl1_p.exists() else st_chim_b53_a57
+    st_l58_isl0 = policy.load_initial_champion(l58_isl0_p) if l58_isl0_p.exists() else st_chim_b53_a57
+    st_l58_soup = policy.load_initial_champion(l58_soup_p) if l58_soup_p.exists() else st_l58_isl1
+    st_chim_b53_a58i1 = _build_bid_ask_split_chimera(st_l53_isl0, st_l58_isl1)
+    st_ms_53i0_52i1 = {k: v.to(device=device, dtype=policy.dtype) for k, v in _build_router_preserving_blend(st_l53_isl0, st_l52_isl1, body_w=0.28).items()}
+    st_ms_53i0_56i0 = {k: v.to(device=device, dtype=policy.dtype) for k, v in _build_router_preserving_blend(st_l53_isl0, st_l56_isl0, body_w=0.25).items()}
+
+    l61_soup_p = SAVE_DIR / "bak_l61" / "order3_soup_top3.pt"
+    l61_isl0_p = SAVE_DIR / "bak_l61" / "island_0_best.pt"
+    l61_isl1_p = SAVE_DIR / "bak_l61" / "island_1_best.pt"
+    l60_isl0_p = SAVE_DIR / "bak_l60" / "island_0_best.pt"
+    l47_live_p = SAVE_DIR / "bak_l47_lcm" / "global_best.pt"
+    st_l60_isl0 = policy.load_initial_champion(l60_isl0_p) if l60_isl0_p.exists() else st_l58_isl1
+    st_l61_soup = policy.load_initial_champion(l61_soup_p) if l61_soup_p.exists() else st_l60_isl0
+    st_l61_isl0 = policy.load_initial_champion(l61_isl0_p) if l61_isl0_p.exists() else st_l61_soup
+    st_l61_isl1 = policy.load_initial_champion(l61_isl1_p) if l61_isl1_p.exists() else st_l61_soup
+    st_l47_live = policy.load_initial_champion(l47_live_p) if l47_live_p.exists() else st_l61_soup
+
+    def _build_high_turnover_seed(st_base: dict, exp_b: float, ret_b: float, span_b: float, edge_a: float, span_a: float, damp: float = 0.30) -> dict:
+        """
+        Высокооборотная двухсторонняя инициализация L62 (x50..x100 к обороту с защитой безубытка):
+        - Моды 0..6: активная загрузка капитала, близкая сетка Bid/Ask, запрет рыночного слива u_taker,
+          строгая привязка Ask выше avg_entry*(1+2*maker_fee) (skew_blend -> 1.0, inside_a -> 0),
+        - Мода #7: аварийный щит эвакуации водопадов,
+        - Регулятор: нейрон подтяжки зависших ордеров (>90с и уход цены >1.2%) -> 0 залипания кэша на растущем рынке!
+        """
+        out_a = {k: st_base[k].detach().cpu().float().clone() for k in MultimodalMoEPolicyOrder3.PARAM_KEYS}
+        w2 = out_a["w2_moe"].view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        b2 = out_a["b2_moe"].view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        for ch, val, d_f in [
+            (0, exp_b, damp),
+            (25, -5.5, 0.15),
+            (38, ret_b, damp),
+            (39, span_b, damp),
+            (41, 4.2, 0.20),
+            (42, edge_a, damp),
+            (43, -4.2, 0.20),
+            (45, span_a, damp),
+        ]:
+            w2[:, :7, ch] = w2[:, :7, ch] * d_f
+            b2[:, :7, ch] = val
+        b2[:, 7, 0] = -4.0
+
+        w1_r = out_a["w_reg1"]
+        bb_r = out_a["b_reg1_b"]
+        ba_r = out_a["b_reg1_a"]
+        w2_r = out_a["w_reg2"]
+        imp = w1_r.abs().sum(dim=0) * w2_r.abs().sum(dim=1)
+        u = int(torch.argmin(imp).item())
+        w1_r[:, u] = 0.0
+        w2_r[u, 0] = 0.0
+        w1_r[1, u] = 4.0
+        w1_r[5, u] = 6.0
+        w1_r[7, u] = 4.0
+        bb_r[0, u] = -(4.0 + 6.0 * 0.28 + 4.0 * 1.45)
+        ba_r[0, u] = -14.0
+        w2_r[u, 1] = 4.8
+        out_a["b_reg2_b"][0, 0] = max(float(out_a["b_reg2_b"][0, 0]), 1.0)
+        out_a["b_reg2_a"][0, 0] = max(float(out_a["b_reg2_a"][0, 0]), 1.0)
+
+        out_a["w2_moe"] = w2.reshape(256, MOE_OUT_DIM_ORDER3)
+        out_a["b2_moe"] = b2.reshape(1, MOE_OUT_DIM_ORDER3)
+        st_n = _normalize_weights_order3(out_a, policy.dtype)
+        return {k: v.to(device=device, dtype=policy.dtype) for k, v in st_n.items()}
+
+    st_ht_bal = _build_high_turnover_seed(st_l61_soup, exp_b=1.4, ret_b=-2.6, span_b=-2.4, edge_a=0.65, span_a=-2.6, damp=0.35)
+    st_ht_fast = _build_high_turnover_seed(st_l61_isl0, exp_b=1.9, ret_b=-3.3, span_b=-3.0, edge_a=0.80, span_a=-3.2, damp=0.25)
+    st_ht_turbo = _build_high_turnover_seed(st_l61_isl1, exp_b=2.2, ret_b=-3.8, span_b=-3.5, edge_a=0.95, span_a=-3.6, damp=0.20)
+    st_ht_l47 = _build_high_turnover_seed(_build_bid_ask_split_chimera(st_l47_live, st_l61_soup), exp_b=1.6, ret_b=-2.9, span_b=-2.8, edge_a=0.70, span_a=-3.0, damp=0.35)
+    l62_isl1_p = SAVE_DIR / "bak_l62" / "island_1_best.pt"
+    l62_isl0_p = SAVE_DIR / "bak_l62" / "island_0_best.pt"
+    l62_soup_p = SAVE_DIR / "bak_l62" / "order3_soup_top3.pt"
+    st_l62_isl1 = policy.load_initial_champion(l62_isl1_p) if l62_isl1_p.exists() else st_ht_fast
+    st_l62_isl0 = policy.load_initial_champion(l62_isl0_p) if l62_isl0_p.exists() else st_ht_fast
+    st_l62_soup = policy.load_initial_champion(l62_soup_p) if l62_soup_p.exists() else st_l62_isl1
+
+    def _build_strict_edge_bridge(st_hi_turn: dict, st_prof: dict, alpha_turn: float, inside_b_bias: float = -3.0, min_edge_a: float = 0.78) -> dict:
+        """
+        Золотой мост L63 между высокооборотным ядром L62 (50x оборот) и профитным L61 (+1.13%):
+        - Убирает агрессивный перехлест Bid под Ask1-1tick (inside_b <= 5% спреда -> 0 переплаты на входе!),
+        - Жестко фиксирует Ask от точки безубытка с двойной комиссией (skew_blend -> 0.99, inside_a -> 0, edge_a >= +23 bp)!
+        """
+        gate_k = {"w_gate1", "b_gate1", "w_gate2", "b_gate2"}
+        out_b = {}
+        for k in MultimodalMoEPolicyOrder3.PARAM_KEYS:
+            if k in gate_k:
+                out_b[k] = st_hi_turn[k].detach().cpu().float().clone()
+            else:
+                out_b[k] = (1.0 - alpha_turn) * st_prof[k].detach().cpu().float() + alpha_turn * st_hi_turn[k].detach().cpu().float()
+        w2 = out_b["w2_moe"].view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        b2 = out_b["b2_moe"].view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        w2[:, :7, 25] *= 0.15
+        b2[:, :7, 25] = -5.5
+        w2[:, :7, 37] *= 0.25
+        b2[:, :7, 37] = inside_b_bias
+        w2[:, :7, 41] *= 0.20
+        b2[:, :7, 41] = 4.5
+        w2[:, :7, 43] *= 0.20
+        b2[:, :7, 43] = -4.5
+        b2[:, :7, 42] = torch.clamp(b2[:, :7, 42], min=min_edge_a)
+        out_b["w2_moe"] = w2.reshape(256, MOE_OUT_DIM_ORDER3)
+        out_b["b2_moe"] = b2.reshape(1, MOE_OUT_DIM_ORDER3)
+        st_n = _normalize_weights_order3(out_b, policy.dtype)
+        return {k: v.to(device=device, dtype=policy.dtype) for k, v in st_n.items()}
+
+    st_br_100 = _build_strict_edge_bridge(st_l62_isl1, st_l61_soup, alpha_turn=1.00, inside_b_bias=-2.8, min_edge_a=0.75)
+    st_br_80 = _build_strict_edge_bridge(st_l62_isl0, st_l61_soup, alpha_turn=0.80, inside_b_bias=-3.2, min_edge_a=0.82)
+    st_br_65 = _build_strict_edge_bridge(st_l62_soup, st_l61_soup, alpha_turn=0.65, inside_b_bias=-3.4, min_edge_a=0.88)
+    st_br_50 = _build_strict_edge_bridge(st_l62_isl1, st_l61_soup, alpha_turn=0.50, inside_b_bias=-3.5, min_edge_a=0.92)
+    l63_isl1_p = SAVE_DIR / "bak_l63" / "island_1_best.pt"
+    l63_soup_p = SAVE_DIR / "bak_l63" / "order3_soup_top3.pt"
+    st_l63_isl1 = policy.load_initial_champion(l63_isl1_p) if l63_isl1_p.exists() else st_br_100
+    st_l63_soup = policy.load_initial_champion(l63_soup_p) if l63_soup_p.exists() else st_l63_isl1
+
+    def _build_l64_coronation_seed(st_act: dict, st_shield: dict, ret_add: float, edge_min: float, shield_modes: tuple[int, ...] = (6, 7)) -> dict:
+        """
+        Коронационный мультимодальный синтез L64:
+        - Рабочие моды (0..5): высокооборотное ядро L63 с расширенной чистой маржой Ask (+35..+75 bp сверх 2*fee!),
+        - Защитные краш-моды (shield_modes): щит L61 (+$11.91 на V-цикле!) для мгновенного ухода от ножей -25.9%!
+        """
+        out_c = {k: st_act[k].detach().cpu().float().clone() for k in MultimodalMoEPolicyOrder3.PARAM_KEYS}
+        w2 = out_c["w2_moe"].view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        b2 = out_c["b2_moe"].view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        w2_sh = st_shield["w2_moe"].detach().cpu().float().view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        b2_sh = st_shield["b2_moe"].detach().cpu().float().view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        for m_i in range(K_MODES_ORDER3):
+            if m_i in shield_modes:
+                w2[:, m_i, :] = w2_sh[:, m_i, :]
+                b2[:, m_i, :] = b2_sh[:, m_i, :]
+            else:
+                b2[:, m_i, 37] = -4.5
+                b2[:, m_i, 38] = b2[:, m_i, 38] + ret_add
+                b2[:, m_i, 41] = 5.0
+                b2[:, m_i, 43] = -5.0
+                b2[:, m_i, 42] = torch.clamp(b2[:, m_i, 42] + edge_min, min=edge_min)
+        out_c["w2_moe"] = w2.reshape(256, MOE_OUT_DIM_ORDER3)
+        out_c["b2_moe"] = b2.reshape(1, MOE_OUT_DIM_ORDER3)
+        st_n = _normalize_weights_order3(out_c, policy.dtype)
+        return {k: v.to(device=device, dtype=policy.dtype) for k, v in st_n.items()}
+
+    l64_isl1_p = SAVE_DIR / "bak_l64" / "island_1_best.pt"
+    l64_plus_p = SAVE_DIR / "bak_l64" / "l64_plus_margin.pt"
+    l64_sw_p = SAVE_DIR / "bak_l64" / "l64_sweetspot_a.pt"
+    st_l64_isl1 = policy.load_initial_champion(l64_isl1_p) if l64_isl1_p.exists() else st_wm_bal
+    st_l64_plus = policy.load_initial_champion(l64_plus_p) if l64_plus_p.exists() else st_wm_pos
+    st_l64_sw = policy.load_initial_champion(l64_sw_p) if l64_sw_p.exists() else st_wm_fast
+
+    l65_isl0_p = SAVE_DIR / "bak_l65" / "island_0_best.pt"
+    st_l65_isl0 = policy.load_initial_champion(l65_isl0_p) if l65_isl0_p.exists() else st_l64_plus
+
+    def _build_l66_patient_wave_seed(
+        base_st: dict,
+        exp_bias: float,
+        ret_b: float,
+        span_b: float,
+        wave49_z: float,
+        edge42: float = 1.8,
+        keep_mode7_crash: bool = True,
+        requote_bias: float = -10.2,
+    ) -> dict:
+        """
+        Терпеливый волновой компаундер L66 (+$34.69 на 45ч V-цикле, +$112.65 на 7 сутках еще ДО старта ES!):
+        - Отключает преждевременный тайм-стоп u_taker (w2[:, :7, 25] = 0.0) в рабочих модах 0..6, позволяя удерживать волны +2.5%..+6.0%,
+        - Сохраняет защитную краш-моду #7 для эвакуации водопадов -25.9%,
+        - Регулятор переставляет отставшие Bid каждые ~60-90с вслед за растущим рынком, не трогая стоящие Ask!
+        """
+        st_p = {k: base_st[k].detach().cpu().float().clone() for k in MultimodalMoEPolicyOrder3.PARAM_KEYS}
+        w2 = st_p["w2_moe"].view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        b2 = st_p["b2_moe"].view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        b2[:, :, 48] = -7.0
+        b2[:, :, 49] = -7.0
+
+        m_end = 7 if keep_mode7_crash else 8
+        w2[:, :m_end, 25] = 0.0
+        b2[:, :m_end, 25] = -7.2
+        if keep_mode7_crash:
+            w2[:, 7, 25] *= 0.45
+            b2[:, 7, 25] -= 1.2
+
+        for m in range(m_end):
+            w2[:, m, 0] *= 0.35
+            b2[:, m, 0] = exp_bias if m < 5 else (exp_bias - 1.2)
+            w2[:, m, 37] *= 0.25
+            b2[:, m, 37] = -4.0
+            w2[:, m, 38] *= 0.30
+            b2[:, m, 38] = ret_b
+            w2[:, m, 39] *= 0.30
+            b2[:, m, 39] = span_b
+            w2[:, m, 41] *= 0.20
+            b2[:, m, 41] = 5.5
+            w2[:, m, 42] *= 0.35
+            b2[:, m, 42] = edge42
+            w2[:, m, 43] *= 0.20
+            b2[:, m, 43] = -5.5
+            w2[:, m, 45] *= 0.35
+            b2[:, m, 45] = -2.2
+            b2[:, m, 49] = wave49_z if m != 2 else -4.0
+
+        w1_r, bb_r, ba_r, w2_r = st_p["w_reg1"], st_p["b_reg1_b"], st_p["b_reg1_a"], st_p["w_reg2"]
+        imp_r = w1_r.abs().sum(dim=0) * w2_r.abs().sum(dim=1)
+        u = int(torch.argmin(imp_r).item())
+        w1_r[:, u] = 0.0
+        w2_r[u, 0] = 0.0
+        w1_r[1, u] = 4.0
+        w1_r[5, u] = 6.0
+        w1_r[7, u] = 4.0
+        bb_r[0, u] = requote_bias
+        ba_r[0, u] = -16.0
+        w2_r[u, 1] = 4.6
+        st_p["b_reg2_b"][0, 0] = max(float(st_p["b_reg2_b"][0, 0]), 1.2)
+        st_p["b_reg2_a"][0, 0] = max(float(st_p["b_reg2_a"][0, 0]), 1.2)
+
+        st_p["w2_moe"] = w2.reshape(256, MOE_OUT_DIM_ORDER3)
+        st_p["b2_moe"] = b2.reshape(1, MOE_OUT_DIM_ORDER3)
+        st_n = _normalize_weights_order3(st_p, policy.dtype)
+        return {k: v.to(device=device, dtype=policy.dtype) for k, v in st_n.items()}
+
+    st_pw_notkr = _build_l66_patient_wave_seed(st_l64_plus, exp_bias=1.6, ret_b=-2.6, span_b=-2.5, wave49_z=0.1, edge42=1.8, keep_mode7_crash=False)
+    st_pw_l53 = _build_l66_patient_wave_seed(st_l53_isl0, exp_bias=1.8, ret_b=-3.0, span_b=-2.8, wave49_z=0.7, edge42=1.8, keep_mode7_crash=True)
+    st_pw_l65 = _build_l66_patient_wave_seed(st_l65_isl0, exp_bias=1.6, ret_b=-2.8, span_b=-2.6, wave49_z=0.1, edge42=1.8, keep_mode7_crash=True)
+    st_pw_l61_25 = _build_l66_patient_wave_seed(st_l61_soup, exp_bias=1.8, ret_b=-3.0, span_b=-2.8, wave49_z=0.1, edge42=1.8, keep_mode7_crash=True)
+    st_pw_l61_38 = _build_l66_patient_wave_seed(st_l61_soup, exp_bias=2.0, ret_b=-3.2, span_b=-2.8, wave49_z=0.7, edge42=2.0, keep_mode7_crash=True)
+    def _load_gpu_seed(p_seed: Path, fallback_st: dict) -> dict:
+        if p_seed.exists():
+            st_cpu = policy.load_initial_champion(p_seed)
+            return {k: v.to(device=device, dtype=policy.dtype) for k, v in st_cpu.items()}
+        return fallback_st
+
+    st_l66_soup = _load_gpu_seed(SAVE_DIR / "bak_l66" / "order3_soup_top3.pt", st_pw_l53)
+    st_hyb_60pw_40l66 = _load_gpu_seed(SAVE_DIR / "bak_l66" / "hyb_60pw25_40l66.pt", st_pw_notkr)
+    st_hyb_50_50 = _load_gpu_seed(SAVE_DIR / "bak_l66" / "hyb_50pw38_50pw25.pt", st_pw_notkr)
+    st_hyb_60l66_40pw = _load_gpu_seed(SAVE_DIR / "bak_l66" / "hyb_60l66_40pw25.pt", st_l66_soup)
+    st_ms_53i0_52i1 = st_hyb_60pw_40l66
+    st_ms_53i0_56i0 = st_hyb_50_50
+    is_warm_l43 = True
+
+    # L67 Grand Kelly Realized Compounder: объединение +$312 (+24.22% за 7 сут = $44.57/сут!) и щита L66_Soup (DD 3.57%-8.11%)!
     seed_pool = (
-        [st_l53_isl1, st_l53_isl0, st_ch_54_50, st_l50_glob, st_ms_53i1_54, st_l52_soup]
+        [st_hyb_60pw_40l66, st_hyb_50_50, st_hyb_60l66_40pw, st_l66_soup, st_pw_l53, st_pw_notkr]
         if island_id == 0
-        else [st_ms_53i1_54, st_ms_53i0_54, st_ch_54_53, st_ch_54_50, st_l52_soup, st_l46_base]
+        else [st_hyb_50_50, st_hyb_60pw_40l66, st_pw_notkr, st_hyb_60l66_40pw, st_l66_soup, st_pw_l61_38]
     )
     resume_iter = 0
     for res_p in [SAVE_DIR / "islands" / f"island_{island_id}_best.pt", SAVE_DIR / "global_best.pt", RESUME_CHAMP_PATH]:
@@ -803,6 +1091,10 @@ def train_order3(
     )
 
     elite_archive = [(best_geo_bp, {k: v.clone() for k, v in best_state.items()})]
+    aux_elites = [st_ms_53i0_52i1, st_ms_53i0_56i0] if island_id == 0 else [st_l53_isl0, st_l56_isl0]
+    aux_res = eval_dual_scale(aux_elites, val_macro_basket, val_micro_basket, enforce_mi=True)
+    for ax_st, ax_r in zip(aux_elites, aux_res):
+        elite_archive.append((float(ax_r["geo_score_bp"]), {k: v.clone() for k, v in ax_st.items()}))
 
     # 5. Главный цикл оптимизации с Low-Rank OpenAI-ES + Auto-Phase Step-Down (P1 -> P2 -> P3) и полным чекпоинтом состояния
     patience = 0
@@ -1078,7 +1370,7 @@ def train_order3(
     # Оставляем уникальные состояния для честного смешивания:
     uniq_elites = []
     for g_e, w_e in elite_archive:
-        if not uniq_elites or float(torch.max(torch.abs(w_e["w1"].float() - uniq_elites[-1][1]["w1"].float())).item()) > 1e-5:
+        if not uniq_elites or float(torch.max(torch.abs(w_e["w1"].detach().cpu().float() - uniq_elites[-1][1]["w1"].detach().cpu().float())).item()) > 1e-5:
             uniq_elites.append((g_e, w_e))
 
     final_cand = best_state
@@ -1126,15 +1418,15 @@ def main():
     parser.add_argument("--groups", type=int, default=160, help="Number of candidate groups")
     parser.add_argument("--iters", type=int, default=800, help="Maximum iterations")
     parser.add_argument("--hours", type=float, default=2.0, help="Time budget in hours")
-    parser.add_argument("--win-len", type=int, default=6001, help="Macro window length in ticks")
-    parser.add_argument("--val-windows", type=int, default=28, help="Number of windows per basket")
+    parser.add_argument("--win-len", type=int, default=9001, help="Macro window length in ticks")
+    parser.add_argument("--val-windows", type=int, default=24, help="Number of windows per basket")
     parser.add_argument("--island-id", type=int, default=0, help="Island ID (0..num_islands-1)")
     parser.add_argument("--num-islands", type=int, default=2, help="Total active islands in ring")
     parser.add_argument("--early-stop-min", type=float, default=32.0, help="Early stopping stagnation minutes (0 to disable)")
     parser.add_argument("--island-mode", type=str, default="exploit", choices=["exploit", "balanced", "explore", "wide"], help="Island Mode")
     parser.add_argument("--log-file", type=str, default=None, help="Custom log file")
-    parser.add_argument("--wf-version", type=str, default="pure_wf_v19_l49_cvar_shield", help="Lesson / WF version tag")
-    parser.add_argument("--oos-hours", type=float, default=17.0, help="Blind OOS tail hours reserved at end of dataset")
+    parser.add_argument("--wf-version", type=str, default="pure_wf_v35_l65_wave_rider", help="Lesson / WF version tag")
+    parser.add_argument("--oos-hours", type=float, default=22.0, help="Blind OOS tail hours reserved at end of dataset")
     parser.add_argument("--inv-stress", type=float, default=0.35, help="Fraction of windows with pre-loaded inventory stress")
     args = parser.parse_args()
 

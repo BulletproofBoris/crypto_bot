@@ -136,6 +136,8 @@ class Order3LiveInferenceEngine:
             b2m_pad[:, :, :c_ed] = b2m_old[:, :, :c_ed]
             if old_ed <= 45 and EXPERT_OUT_DIM_ORDER3 >= 48:
                 b2m_pad[:, :, 47] = 6.0
+            if old_ed <= 48 and EXPERT_OUT_DIM_ORDER3 >= 50:
+                b2m_pad[:, :, 48:50] = -12.0
             w2m_raw = w2m_pad.reshape(256, self.moe_out_dim)
             b2m_raw = b2m_pad.reshape(1, self.moe_out_dim)
         self.w2_moe = w2m_raw.to(device=self.device)
@@ -250,23 +252,24 @@ class Order3LiveInferenceEngine:
         )
         self.mem_h = rec_gate * self.mem_h + (1.0 - rec_gate) * rec_u
 
-        # Контекстный маршрутизатор (311D -> 64 -> K)
+        # Контекстный маршрутизатор (326D -> 64 -> K, с бесшовной обратной совместимостью 288D / 295D / 320D -> 326D)
         acct_8d = za[:, 54:62]
         queue_8d = za[:, 62:70]
-        r_extra_16d = torch.cat(
+        r_extra_22d = torch.cat(
             [
                 zm[:, 0:1], zm[:, 40:44], zm[:, 44:45], zm[:, 48:49],
                 zm[:, 29:34], zm[:, 36:37], zm[:, 39:40], zm[:, 55:56], zm[:, 12:13],
+                zm[:, 60:66],
             ],
             dim=-1,
         )
-        router_in = torch.cat([h2, acct_8d, queue_8d, self.mem_h, r_extra_16d], dim=-1)
+        router_in = torch.cat([h2, acct_8d, queue_8d, self.mem_h, r_extra_22d], dim=-1)
         r_hid = F.silu(router_in @ self.w_gate1 + self.b_gate1)
         g_mode = torch.softmax((r_hid @ self.w_gate2 + self.b_gate2).float(), dim=-1)
 
-        # K Латентных экспертов
+        # K Латентных экспертов (EXPERT_OUT_DIM_ORDER3 = 50)
         moe_all = (h2 @ self.w2_moe + self.b2_moe).float().view(1, self.k_modes, EXPERT_OUT_DIM_ORDER3)
-        strat_raw = (g_mode.unsqueeze(-1) * moe_all).sum(dim=1).squeeze(0)  # [48]
+        strat_raw = (g_mode.unsqueeze(-1) * moe_all).sum(dim=1).squeeze(0)  # [50]
 
         # 1C. 100% Эндогенная экспозиция [0..1], распределение долей и резерв каскадной постановки renorm_blend:
         exp_bid_frac = float(torch.sigmoid(strat_raw[0]).item())
@@ -280,11 +283,12 @@ class Order3LiveInferenceEngine:
         pi_b_t = _fanned_slot_softmax(strat_raw[1:13].unsqueeze(0), tau_b_t, max_share_b_t, floor=0.005).squeeze(0)
         pi_a_t = _fanned_slot_softmax(strat_raw[13:25].unsqueeze(0), tau_a_t, max_share_a_t, floor=0.005).squeeze(0)
 
-        # 2. Непрерывный эндогенный Taker-вентиль:
+        # 2. Непрерывные эндогенные Taker-вентили (Exit ch 25 + Impulse Wave Buy ch 48):
         u_taker = float(torch.tanh(F.relu(strat_raw[25])).item())
+        u_taker_buy = float(torch.tanh(F.relu(strat_raw[48] - 1.2)).item())
         max_slip_pct = 0.005 + 0.145 * float(torch.sigmoid(strat_raw[36]).item())
 
-        # 3. Независимая полно-спредовая геометрия 24 слотов (развязанные span_a/gamma_a [45..46]):
+        # 3. Независимая полно-спредовая геометрия 24 слотов + гладкий дифференцируемый Wave-Hold Ask Target (+0..+10%, ch 49):
         spread_room = max(0.0, a1 - b1 - tick_sz)
         inside_b = spread_room * float(torch.sigmoid(strat_raw[37]).item())
         retreat_b = b1 * 0.04 * float(torch.sigmoid(strat_raw[38]).item())
@@ -300,7 +304,8 @@ class Order3LiveInferenceEngine:
         skew_blend = float(torch.sigmoid(strat_raw[41]).item())
         z42_t = strat_raw[42]
         t42_s = float(torch.tanh(z42_t * 0.25).item())
-        ask_edge_pct = 0.0035 * float(torch.tanh(z42_t).item()) + 0.0765 * (t42_s * t42_s * t42_s)
+        wave_hold_pct = 0.10 * float(torch.sigmoid(strat_raw[49] - 1.2).item())
+        ask_edge_pct = 0.0035 * float(torch.tanh(z42_t).item()) + 0.0765 * (t42_s * t42_s * t42_s) + wave_hold_pct
         span_a_usd = a1 * (0.0005 + 0.2495 * float(torch.sigmoid(strat_raw[39] + 0.5 * z42_t + strat_raw[45]).item()))
         gamma_a = 0.40 + 2.10 * float(torch.sigmoid(strat_raw[40] + strat_raw[46]).item())
 
@@ -477,6 +482,8 @@ class Order3LiveInferenceEngine:
             "exp_bid_frac": exp_bid_frac,
             "renorm_blend": renorm_blend,
             "u_taker": u_taker,
+            "u_taker_buy": u_taker_buy,
+            "wave_hold_pct": wave_hold_pct,
             "max_slip_pct": max_slip_pct,
             "pi_bid": pi_b_t.cpu().numpy(),
             "pi_ask": pi_a_t.cpu().numpy(),
@@ -545,6 +552,20 @@ def _eval_latest_wf_ubj_live(trader, b1: float, a1: float) -> Tuple[Optional[np.
                 bst2.feature_names = None
                 bst2.set_param({"nthread": 1})
                 o2_models.append(bst2)
+            ow_dir = BASE_DIR / "models/prl/order1_wave_wf"
+            ow_models = []
+            if ow_dir.exists():
+                ow_wins = sorted([d for d in ow_dir.glob("win_*") if d.is_dir()], key=lambda p: int(p.name.split("_")[1]))
+                if ow_wins:
+                    ww_latest = ow_wins[-1]
+                    for wnm in ("wave_ret_h300s", "wave_ret_h900s", "wave_ret_h1800s", "wave_ret_h3600s", "wave_launch_30m", "wave_top_15m"):
+                        mfw = ww_latest / f"{wnm}.ubj"
+                        if mfw.exists():
+                            bstw = xgb.Booster()
+                            bstw.load_model(str(mfw))
+                            bstw.feature_names = None
+                            bstw.set_param({"nthread": 1})
+                            ow_models.append(bstw)
             _LIVE_WF_CACHE.update({
                 "ready": "ok",
                 "xgb": xgb,
@@ -552,6 +573,7 @@ def _eval_latest_wf_ubj_live(trader, b1: float, a1: float) -> Tuple[Optional[np.
                 "x_buf": np.zeros((1, len(num_cols)), dtype=np.float32),
                 "o1_models": o1_models,
                 "o2_models": o2_models,
+                "ow_models": ow_models,
                 "c_vals": np.array([-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0], dtype=np.float32),
             })
         if _LIVE_WF_CACHE.get("ready") != "ok":
@@ -626,6 +648,9 @@ def _eval_latest_wf_ubj_live(trader, b1: float, a1: float) -> Tuple[Optional[np.
         r11 = np.array([float(m.inplace_predict(x66)[0]) for m in _LIVE_WF_CACHE["o2_models"]], dtype=np.float32)
         _LIVE_WF_CACHE["last_conf8"] = conf8
         _LIVE_WF_CACHE["last_tail_skew_20s"] = tail_skew_20s
+        ow_mods = _LIVE_WF_CACHE.get("ow_models") or []
+        if len(ow_mods) == 6:
+            _LIVE_WF_CACHE["last_wave6"] = np.array([float(m.inplace_predict(x_row)[0]) for m in ow_mods], dtype=np.float32)
         trader.last_p_adverse = float(np.clip(r11[0], 0.0, 1.0))
         trader.last_p_exhaust = float(np.clip(r11[1], 0.0, 1.0))
         trader.last_p_ask_sweep = float(np.clip(r11[2], 0.0, 1.0))
@@ -785,6 +810,44 @@ def build_live_hybrid_market_obs_40d(trader, b1: float, a1: float) -> np.ndarray
         z[57] = float(math.tanh(slp_r * 0.40))
         z[58] = float(math.tanh(((gt_m - st_mid) / st_mid) * 50.0)) if (gt_m > 1e-4 and gt_s <= 30.0) else 0.0
         z[59] = float(math.tanh(((ou_m - st_mid) / st_mid) * 50.0)) if (ou_m > 1e-4 and ou_s <= 30.0) else 0.0
+
+    if MKT_DIM_ORDER3 >= 72:
+        w6_live = _LIVE_WF_CACHE.get("last_wave6")
+        if w6_live is not None and len(w6_live) == 6:
+            z[60] = float(math.tanh(float(w6_live[0]) * 1.5))
+            z[61] = float(math.tanh(float(w6_live[1]) * 0.85))
+            z[62] = float(math.tanh(float(w6_live[2]) * 0.50))
+            z[63] = float(math.tanh(float(w6_live[3]) * 0.30))
+            z[64] = float(np.clip(w6_live[4], 0.0, 1.0))
+            z[65] = float(np.clip(w6_live[5], 0.0, 1.0))
+        else:
+            z[64] = 0.25
+            z[65] = 0.25
+        now_m = time.time()
+        mh = _LIVE_WF_CACHE.setdefault("mid_hist_3600s", [])
+        if not mh:
+            bh_warm = list(getattr(trader, "bid_hist_1h", []))[-3600:]
+            if len(bh_warm) >= 10:
+                sp_half = max(0.0, 0.5 * (a1 - b1))
+                n_bh = len(bh_warm)
+                mh.extend((now_m - float(n_bh - i), float(v) + sp_half) for i, v in enumerate(bh_warm))
+        mh.append((now_m, st_mid))
+        if len(mh) > 4000 or (mh and (now_m - mh[0][0]) > 3660.0):
+            mh[:] = [x for x in mh if (now_m - x[0]) <= 3605.0]
+        m_5m = next((x[1] for x in reversed(mh) if (now_m - x[0]) >= 295.0), mh[0][1])
+        m_15m = next((x[1] for x in reversed(mh) if (now_m - x[0]) >= 895.0), mh[0][1])
+        m_60m = mh[0][1]
+        vals_30m = [x[1] for x in mh if (now_m - x[0]) <= 1805.0] or [st_mid]
+        vals_60m = [x[1] for x in mh] or [st_mid]
+        mn_1800, mx_1800 = min(vals_30m), max(vals_30m)
+        mn_3600, mx_3600 = min(vals_60m), max(vals_60m)
+        rng_1h = max(mx_3600 - mn_3600, st_mid * 0.005)
+        z[66] = float(math.tanh((st_mid / max(m_5m, 1e-4) - 1.0) * 25.0))
+        z[67] = float(math.tanh((st_mid / max(m_15m, 1e-4) - 1.0) * 16.0))
+        z[68] = float(math.tanh((st_mid / max(m_60m, 1e-4) - 1.0) * 10.0))
+        z[69] = float(np.clip(((st_mid - mn_3600) / rng_1h) * 2.0 - 1.0, -1.0, 1.0))
+        z[70] = float(math.tanh(((st_mid - mn_1800) / st_mid) * 25.0))
+        z[71] = float(math.tanh(((mx_1800 - st_mid) / st_mid) * 25.0))
 
     return z
 
@@ -968,8 +1031,31 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
     min_amt = float(getattr(trader, "min_order_amount", 2.0))
 
     u_taker = float(plan.get("u_taker", 0.0))
+    u_taker_buy = float(plan.get("u_taker_buy", 0.0))
     max_slip_pct = float(plan.get("max_slip_pct", 0.02))
     renorm_b = float(plan.get("renorm_blend", 1.0))
+
+    # 1B. Импульсный Taker-Buy вентиль на старте волны (1-в-1 с fused_order3_clean_tick.py):
+    if u_taker_buy > 1e-4 and u_taker <= 1e-4 and trader.order3_engine.api_tokens >= 1.0:
+        res_b_pre = sum(float(s.get("qty", 0.0)) * float(s.get("px", 0.0)) * 1.001 for s in trader.bid_slots if s.get("id") is not None)
+        free_c_tb = max(0.0, min(float(trader.bot_cash_usd) * 0.996 - res_b_pre, float(trader.ex_usdt_free)))
+        rem_e_tb = max(0.0, tot_eq * 0.996 * float(plan["exp_bid_frac"]) - float(trader.pos_qty) * b1 - res_b_pre)
+        tb_usd = min(free_c_tb, rem_e_tb) * u_taker_buy
+        lim_buy_px = round(math.ceil((a1 * (1.0 + min(0.03, max_slip_pct))) / t_sz) * t_sz, p_prec)
+        buy_q_tb = math.floor((tb_usd / max(1e-6, lim_buy_px * 1.002)) * 10000.0) / 10000.0
+        if buy_q_tb >= min_amt:
+            try:
+                res_tb = trader.client.place_limit_order(trader.market, "buy", buy_q_tb, lim_buy_px, price_precision=p_prec, amount_precision=a_prec, min_amount=min_amt)
+                trader.order3_engine.api_tokens = max(0.0, trader.order3_engine.api_tokens - 1.0)
+                if res_tb and res_tb.get("id") is not None:
+                    free_sb = next((si for si in range(12) if trader.bid_slots[si].get("id") is None), 0)
+                    trader.bid_slots[free_sb] = {"slot": free_sb, "id": res_tb.get("id"), "px": float(res_tb.get("price", lim_buy_px)), "qty": float(res_tb.get("origin_amount", buy_q_tb)), "act_ts": now_ts, "acc_fill": 0.0}
+                    print(f"  🚀 [ENDOGENOUS WAVE TAKER BUY ({u_taker_buy:.0%})] id={res_tb.get('id')} | {buy_q_tb:.4f} PRL @ <=${lim_buy_px:.{p_prec}f}")
+                trader._sync_24slot_orders(b1, count_hold=False)
+                trader._save_wallet()
+            except Exception as e_tb:
+                print(f"  ⚠️ [ENDOGENOUS TAKER BUY WARN]: {e_tb}")
+            return
 
     # 1. Эндогенный Taker-вентиль БЕЗ карательного сноса обеспеченных Ask-слотов при частичном хеджировании:
     if (float(trader.pos_qty) * u_taker) >= min_amt and trader.order3_engine.api_tokens >= 1.0:

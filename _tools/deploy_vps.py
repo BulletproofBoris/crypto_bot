@@ -72,7 +72,7 @@ CHAMP_FILE = "models/prl/release_champion_v1.pt"
 
 def _discover_latest_wf_ubj_files() -> list[str]:
     rels: list[str] = []
-    for sub in ("models/prl/variant_a_order1", "models/prl/order2_wf"):
+    for sub in ("models/prl/variant_a_order1", "models/prl/order2_wf", "models/prl/order1_wave_wf"):
         d_root = BASE_DIR / sub
         if not d_root.exists():
             continue

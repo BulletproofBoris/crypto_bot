@@ -34,21 +34,21 @@ from _tools.fused_order3_clean_tick import (
     _scale_mkt_44d,
 )
 
-MKT_PATH = BASE_DIR / "data/cache/rl_hybrid_market_obs_60d.npz"
+MKT_PATH = BASE_DIR / "data/cache/rl_hybrid_market_obs_72d.npz"
 LOB_PATH = BASE_DIR / "data/cache/rl_guard_lob_cache_600h.npz"
 CHAMP_PATH = BASE_DIR / "models/prl/release_champion_v1.pt"
 
 
 def main():
     print("=" * 80)
-    print("🧪 ORDER-3 TRUE BITWISE SIM / LIVE PARITY & LATENCY VERIFICATION (SIGNAL STACK V2 60D)")
+    print("🧪 ORDER-3 TRUE BITWISE SIM / LIVE PARITY & LATENCY VERIFICATION (SIGNAL STACK V3 72D)")
     print("=" * 80)
 
     # Используем CPU, как на боевом VPS, для честного замера латентности без 14с холодного старта CUDA
     engine = Order3LiveInferenceEngine(checkpoint_path=CHAMP_PATH, device="cpu")
     print("  ✅ Order3LiveInferenceEngine (CPU) инициализирован.")
 
-    mkt_raw = np.load(MKT_PATH, mmap_mode="r")["market_obs_60d"]
+    mkt_raw = np.load(MKT_PATH, mmap_mode="r")["market_obs_72d"]
     lob_raw = np.load(LOB_PATH, mmap_mode="r")
     assert mkt_raw.shape[1] == MKT_DIM_ORDER3, f"Expected {MKT_DIM_ORDER3}D market matrix, got {mkt_raw.shape}"
     col_stds = np.std(np.asarray(mkt_raw[3016277::100], dtype=np.float32), axis=0)
@@ -73,11 +73,13 @@ def main():
     latencies_ms = []
     max_pi_err = 0.0
     max_px_err = 0.0
+    b1_arr = np.asarray(lob_raw["bid_p"][:, 0], dtype=np.float32)
+    a1_arr = np.asarray(lob_raw["ask_p"][:, 0], dtype=np.float32)
 
     for idx in indices:
         z_mkt = mkt_raw[idx]
-        b1 = max(0.0001, float(lob_raw["bid_p"][idx, 0]))
-        a1 = max(b1 + 0.0001, float(lob_raw["ask_p"][idx, 0]))
+        b1 = max(0.0001, float(b1_arr[idx]))
+        a1 = max(b1 + 0.0001, float(a1_arr[idx]))
         budget, pos_qty, cash, entry_px = 1024.0, 150.0, 740.0, b1 * 1.002
 
         z_ag = np.zeros(110, dtype=np.float32)
@@ -115,6 +117,7 @@ def main():
                 [
                     zm[:, 0:1], zm[:, 40:44], zm[:, 44:45], zm[:, 48:49],
                     zm[:, 29:34], zm[:, 36:37], zm[:, 39:40], zm[:, 55:56], zm[:, 12:13],
+                    zm[:, 60:66],
                 ],
                 dim=-1,
             )
@@ -135,7 +138,8 @@ def main():
 
             skew_blend = float(torch.sigmoid(sr[41]).item())
             t42_s = float(torch.tanh(sr[42] * 0.25).item())
-            ask_edge_pct = 0.0035 * float(torch.tanh(sr[42]).item()) + 0.0765 * (t42_s * t42_s * t42_s)
+            wave_hold_pct = 0.10 * float(torch.sigmoid(sr[49] - 1.2).item())
+            ask_edge_pct = 0.0035 * float(torch.tanh(sr[42]).item()) + 0.0765 * (t42_s * t42_s * t42_s) + wave_hold_pct
             span_a_usd = a1 * (0.0005 + 0.2495 * float(torch.sigmoid(sr[39] + 0.5 * sr[42] + sr[45]).item()))
             gamma_a = 0.40 + 2.10 * float(torch.sigmoid(sr[40] + sr[46]).item())
             inside_a = spread_room * float(torch.sigmoid(sr[43]).item())

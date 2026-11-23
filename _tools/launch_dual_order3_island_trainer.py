@@ -32,12 +32,15 @@ def main():
     parser.add_argument("--val-windows", type=int, default=16, help="Number of windows in Train/Val/OOS baskets")
     parser.add_argument("--early-stop-min", type=float, default=40.0, help="Early stopping stagnation minutes")
     parser.add_argument("--islands", type=int, default=2, choices=[2, 4], help="Total islands (2 = 1 per GPU dedicated, 4 = 2 per GPU interleaved)")
+    parser.add_argument("--wf-version", type=str, default="pure_wf_v27_l57_allweather_compounder", help="Lesson / WF version tag")
+    parser.add_argument("--oos-hours", type=float, default=16.0, help="Blind OOS tail hours reserved at end of dataset")
+    parser.add_argument("--inv-stress", type=float, default=0.20, help="Fraction of windows with pre-loaded inventory stress")
     args = parser.parse_args()
 
-    # Очистка директории островной миграции для чистого старта
+    # Очистка директории островной миграции для чистого старта нового урока
     islands_dir = BASE_DIR / "models" / "prl" / "order3_champion" / "islands"
     islands_dir.mkdir(parents=True, exist_ok=True)
-    for old_isl in islands_dir.glob("island_*_best.pt*"):
+    for old_isl in list(islands_dir.glob("island_*_best.pt*")) + list(islands_dir.glob("island_*_progress.pt*")):
         try:
             old_isl.unlink()
         except OSError:
@@ -68,6 +71,9 @@ def main():
             "--num-islands", str(args.islands),
             "--early-stop-min", str(args.early_stop_min),
             "--island-mode", mode,
+            "--wf-version", str(args.wf_version),
+            "--oos-hours", str(args.oos_hours),
+            "--inv-stress", str(args.inv_stress),
             "--log-file", str(log_path),
         ]
 

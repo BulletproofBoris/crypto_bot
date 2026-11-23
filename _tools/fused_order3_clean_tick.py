@@ -18,15 +18,15 @@ os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
 import torch
 import torch.nn.functional as F
 
-MKT_DIM_ORDER3 = 60
+MKT_DIM_ORDER3 = 72
 AG_DIM_ORDER3 = 110
-TOTAL_DIM_ORDER3 = 170
+TOTAL_DIM_ORDER3 = 182
 
 MEM_DIM_ORDER3 = 32
 K_MODES_ORDER3 = 8
-EXPERT_OUT_DIM_ORDER3 = 48
-MOE_OUT_DIM_ORDER3 = K_MODES_ORDER3 * EXPERT_OUT_DIM_ORDER3  # 384
-ROUTER_IN_DIM_ORDER3 = 256 + 8 + 8 + MEM_DIM_ORDER3 + 16  # 320: h2(256) + acct_8d(8) + queue_8d(8) + mem_h(32) + extra_7d(7) + crash_radar_9d(9)
+EXPERT_OUT_DIM_ORDER3 = 50
+MOE_OUT_DIM_ORDER3 = K_MODES_ORDER3 * EXPERT_OUT_DIM_ORDER3  # 400
+ROUTER_IN_DIM_ORDER3 = 256 + 8 + 8 + MEM_DIM_ORDER3 + 22  # 326: h2(256) + acct_8d(8) + queue_8d(8) + mem_h(32) + extra_16d + wave_radar_6d!
 ROUTER_H_DIM_ORDER3 = 64
 REG_IN_DIM_ORDER3 = 28 + K_MODES_ORDER3  # 28D признаков слота (вкл. 4D FIFO-очереди/долгого удержания) + K_MODES_ORDER3 (36D при K=8)
 REG_H_DIM_ORDER3 = 64
@@ -83,6 +83,14 @@ def _scale_mkt_44d(z_mkt: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
         zm[..., 56] = zm[..., 56] * 2.5
         zm[..., 57] = zm[..., 57] * 1.2
         zm[..., 58:60] = zm[..., 58:60] * 3.0
+    if zm.shape[-1] >= 72:
+        # Signal Stack v3 (12D Wave Radar 5m..60m + геометрия макро-волн):
+        zm[..., 60:64] = zm[..., 60:64] * 2.2
+        zm[..., 64] = (zm[..., 64] - 0.18) * 3.2
+        zm[..., 65] = (zm[..., 65] - 0.10) * 4.0
+        zm[..., 66:69] = zm[..., 66:69] * 2.2
+        zm[..., 69] = zm[..., 69] * 1.5
+        zm[..., 70:72] = (zm[..., 70:72] - 0.20) * 2.5
     return zm.to(dt)
 
 
@@ -341,18 +349,19 @@ def _order3_clean_tick_step(
     mem_next_g = rec_gate * mem_prev_g + (1.0 - rec_gate) * rec_u
     mem_h = mem_next_g.view(G, W, B, MEM_DIM_ORDER3).permute(1, 0, 2, 3).reshape(N, MEM_DIM_ORDER3)
 
-    # 1B. Контекстный Маршрутизатор (320D -> 64 -> K=8: mem_h[32D] + прямой 9D радар краха Order-2/Order-1/BigONE!):
+    # 1B. Контекстный Маршрутизатор (326D -> 64 -> K=8: mem_h[32D] + 16D Crash Radar + 6D Wave Radar 5m..60m!):
     acct_g = acct_8d.view(W, G, B, 8).permute(1, 0, 2, 3).reshape(G, M, 8)
     queue_g = queue_8d.view(W, G, B, 8).permute(1, 0, 2, 3).reshape(G, M, 8)
-    r_extra_16d = torch.cat(
+    r_extra_22d = torch.cat(
         [
             mkt_w[:, 0:1], mkt_w[:, 40:44], mkt_w[:, 44:45], mkt_w[:, 48:49],
             mkt_w[:, 29:34], mkt_w[:, 36:37], mkt_w[:, 39:40], mkt_w[:, 55:56], mkt_w[:, 12:13],
+            mkt_w[:, 60:66],
         ],
         dim=-1,
     ).to(dt)
-    r_extra_g = r_extra_16d.view(W, G, B, 16).permute(1, 0, 2, 3).reshape(G, M, 16)
-    router_in_g = torch.cat([h2, acct_g, queue_g, mem_next_g, r_extra_g], dim=-1)  # [G, M, 320]
+    r_extra_g = r_extra_22d.view(W, G, B, 22).permute(1, 0, 2, 3).reshape(G, M, 22)
+    router_in_g = torch.cat([h2, acct_g, queue_g, mem_next_g, r_extra_g], dim=-1)  # [G, M, 326]
     r_hid_g = F.silu(torch.bmm(router_in_g, w_gate1_g) + b_gate1_g)     # [G, M, 64]
     gate_logits_g = torch.bmm(r_hid_g, w_gate2_g).float() + b_gate2_g.float()  # [G, M, K]
     g_mode_g = torch.softmax(gate_logits_g, dim=-1)                      # [G, M, K]
@@ -420,7 +429,43 @@ def _order3_clean_tick_step(
     api_tokens = torch.where(exec_taker, torch.clamp(api_tokens - 1.0 - had_ask_taker_cnt.float(), min=0.0), api_tokens)
     n_fills = torch.clamp(n_fills.long() + exec_taker.long(), max=2000000).to(torch.int32)
 
-    # 3. 100% Эндогенная полно-спредовая геометрия 24 слотов с независимой шириной и кривизной Ask [45..46]:
+    # 2B. Эндогенный импульсный вход в волну u_taker_buy [ch 48] по реальному 10-уровневому Ask-стакану:
+    u_taker_buy = torch.tanh(F.relu(strat_raw[:, 48] - 1.2))
+    tot_bud_pre_tb = torch.maximum(budget, cash + pos_qty * b1)
+    res_b_pre_tb = (bid_qty * bid_px * (1.0 + maker_fee)).sum(dim=1)
+    free_c_tb = torch.clamp(cash * 0.996 - res_b_pre_tb, min=0.0)
+    rem_exp_tb = torch.clamp(tot_bud_pre_tb * 0.994 * exp_bid_frac - pos_qty * a1 - res_b_pre_tb, min=0.0)
+    want_tb_usd = torch.minimum(free_c_tb, rem_exp_tb) * u_taker_buy
+    is_tb = (~exec_taker) & (u_taker_buy > 1e-4) & (want_tb_usd >= 2.0 * a1 * (1.0 + taker_fee)) & (api_tokens >= 1.5)
+
+    a_p10 = a_p10_1w.unsqueeze(1).expand(W, E, 10).reshape(N, 10)
+    a_q10_honest = a_q10_raw_1w.unsqueeze(1).expand(W, E, 10).reshape(N, 10)
+    max_buy_cross_px = (a1 * 1.012).unsqueeze(1)
+    elig_aq10 = torch.where(a_p10 <= max_buy_cross_px + 0.1 * tick_size, a_q10_honest, torch.zeros_like(a_q10_honest))
+    lvl_cost10 = elig_aq10 * a_p10 * (1.0 + taker_fee)
+    cum_cost10 = torch.cumsum(lvl_cost10, dim=1)
+    prev_cost10 = cum_cost10 - lvl_cost10
+    rem_usd10 = torch.clamp(want_tb_usd.unsqueeze(1) - prev_cost10, min=0.0)
+    buy_take_10 = torch.minimum(elig_aq10, rem_usd10 / torch.clamp(a_p10 * (1.0 + taker_fee), min=tick_size))
+    actual_tb_q = buy_take_10.sum(dim=1)
+    exec_tb = is_tb & (actual_tb_q >= 2.0)
+    tb_cost_raw = (buy_take_10 * a_p10).sum(dim=1)
+    tb_cost_tot = tb_cost_raw * (1.0 + taker_fee)
+    tb_avg_px = tb_cost_raw / torch.clamp(actual_tb_q, min=1e-6)
+
+    old_q_tb = pos_qty
+    new_q_tb = old_q_tb + actual_tb_q
+    entry_s = torch.where(exec_tb & (old_q_tb <= 1e-6), s_cur_i16.expand_as(entry_s), entry_s)
+    avg_entry = torch.where(exec_tb, (old_q_tb * avg_entry + tb_cost_raw) / torch.clamp(new_q_tb, min=1e-6), avg_entry)
+    min_buy_px = torch.where(exec_tb, torch.where(old_q_tb <= 1e-6, tb_avg_px, torch.minimum(min_buy_px, tb_avg_px)), min_buy_px)
+    low_tranche_qty = torch.where(exec_tb & (old_q_tb <= 1e-6), actual_tb_q, low_tranche_qty)
+    pos_cost_usd = torch.where(exec_tb, pos_cost_usd + tb_cost_tot, pos_cost_usd)
+    cash = torch.where(exec_tb, torch.clamp(cash - tb_cost_tot, min=0.0), cash)
+    pos_qty = torch.where(exec_tb, new_q_tb, pos_qty)
+    api_tokens = torch.where(exec_tb, torch.clamp(api_tokens - 1.0, min=0.0), api_tokens)
+    n_fills = torch.clamp(n_fills.long() + exec_tb.long(), max=2000000).to(torch.int32)
+
+    # 3. 100% Эндогенная полно-спредовая + волновая геометрия 24 слотов (раскрытие цели Ask до +12% в волне [ch 49]!):
     spread_room = torch.clamp(a1 - b1 - tick_size, min=0.0)
     inside_b = spread_room * torch.sigmoid(strat_raw[:, 37])
     retreat_b = b1 * 0.04 * torch.sigmoid(strat_raw[:, 38])
@@ -438,7 +483,8 @@ def _order3_clean_tick_step(
     skew_blend = torch.sigmoid(strat_raw[:, 41])
     z42 = strat_raw[:, 42]
     t42_slow = torch.tanh(z42 * 0.25)
-    ask_edge_pct = 0.0035 * torch.tanh(z42) + 0.0765 * (t42_slow * t42_slow * t42_slow)
+    wave_hold_pct = 0.10 * torch.sigmoid(strat_raw[:, 49] - 1.2)
+    ask_edge_pct = 0.0035 * torch.tanh(z42) + 0.0765 * (t42_slow * t42_slow * t42_slow) + wave_hold_pct
     span_a_usd = a1 * (0.0005 + 0.2495 * torch.sigmoid(strat_raw[:, 39] + 0.5 * z42 + strat_raw[:, 45]))
     gamma_a = 0.40 + 2.10 * torch.sigmoid(strat_raw[:, 40] + strat_raw[:, 46])
 
@@ -863,7 +909,7 @@ def _order3_clean_tick_step(
     prev_mtm_eq = mtm_eq
 
     n_req_step = n_req_b_step + n_req_a_step
-    traded_usd_step = tot_cost_raw + tot_rev + torch.where(exec_taker, proceeds, torch.zeros_like(proceeds))
+    traded_usd_step = tot_cost_raw + tot_rev + torch.where(exec_tb, tb_cost_raw, torch.zeros_like(tb_cost_raw))
     sum_mut_load = sum_mut_load + traded_usd_step
     n_cancels = torch.clamp(n_cancels.long() + n_cnl_b_step + n_cnl_a_step, max=2000000).to(torch.int32)
     n_requeues = torch.clamp(n_requeues.long() + n_req_step, max=2000000).to(torch.int32)
@@ -1054,11 +1100,12 @@ def evaluate_order3_basket(
     win_len: int,
     tick_sz: float,
     maker_fee: float = 0.0010,
-    taker_fee: float = 0.0010,
+    taker_fee: float = 0.0020,
     device: torch.device = torch.device('cuda'),
     true_latency: bool = True,
     pad_to_max_c: bool = True,
     calib_jitter_std: float = 0.0,
+    enforce_activity_floor: bool = False,
 ) -> list[dict]:
     # Монолитный батч до 192 групп (1,152 агента и 18,432 стакана за 1 проход на GPU!) благодаря потоковому pre_mkt_blk
     C_total = len(cand_states)
@@ -1085,6 +1132,7 @@ def evaluate_order3_basket(
                 true_latency=true_latency,
                 pad_to_max_c=pad_to_max_c,
                 calib_jitter_std=calib_jitter_std,
+                enforce_activity_floor=enforce_activity_floor,
             )
             all_res.extend(sub_res)
         return all_res
@@ -1114,7 +1162,15 @@ def evaluate_order3_basket(
     wg1_l, bg1_l, wg2_l, bg2_l, wrec_l, brec_l = [], [], [], [], [], []
     wreg1_l, breg1b_l, breg1a_l, wreg2_l, breg2b_l, breg2a_l = [], [], [], [], [], []
     for st in cand_states:
-        w1_l.append(st['w1'].to(device=device, dtype=dt))
+        w1_t = st['w1'].to(device=device, dtype=torch.float32)
+        if w1_t.shape[0] != TOTAL_DIM_ORDER3:
+            old_mkt_d = w1_t.shape[0] - AG_DIM_ORDER3
+            w1_pad = torch.zeros((TOTAL_DIM_ORDER3, 384), dtype=torch.float32, device=device)
+            cm = min(MKT_DIM_ORDER3, max(0, old_mkt_d))
+            w1_pad[:cm, :] = w1_t[:cm, :]
+            w1_pad[MKT_DIM_ORDER3:, :] = w1_t[old_mkt_d:, :]
+            w1_t = w1_pad
+        w1_l.append(w1_t.to(dtype=dt))
         b1_l.append(st['b1'].to(device=device, dtype=dt).view(1, 384))
         wr1_l.append(st['w_res1'].to(device=device, dtype=dt))
         br1_l.append(st['b_res1'].to(device=device, dtype=dt).view(1, 128))
@@ -1132,6 +1188,8 @@ def evaluate_order3_basket(
             b2m_pad[:, :, :c_ed] = b2m_old[:, :, :c_ed]
             if old_exp_d <= 45 and EXPERT_OUT_DIM_ORDER3 >= 48:
                 b2m_pad[:, :, 47] = 6.0  # sigmoid(6.0)=0.9975 -> 100% паритет перенормировки со старыми чекпоинтами L46!
+            if old_exp_d <= 48 and EXPERT_OUT_DIM_ORDER3 >= 50:
+                b2m_pad[:, :, 48:50] = -12.0  # 0.00e+00 паритет старых чекпоинтов при гладком sigmoid(z49 - 1.2)!
             w2m_t = w2m_pad.reshape(256, MOE_OUT_DIM_ORDER3)
             b2m_t = b2m_pad.reshape(1, MOE_OUT_DIM_ORDER3)
         w2m_l.append(w2m_t.to(dtype=dt))
@@ -1431,8 +1489,14 @@ def evaluate_order3_basket(
                     tick_sz, maker_fee, taker_fee, true_latency,
                 )
 
-    # 100% честная терминальная ликвидация по реальной 10-уровневой книге покупателей end_b10/end_bq10 (0 арбитража полуспреда end_mid!):
+    # 100% честная терминальная ликвидация по реальной 10-уровневой книге покупателей end_b10/end_bq10:
+    # На коротких тренировочных окнах (enforce_activity_floor=True) рабочий ММ-инвентарь (<=35% бюджета, не в глубоком пробое)
+    # оценивается по ожидаемому лимитному выходу (mid * (1 - 1.2*maker_fee)), снимая искусственный штраф "казни по таймеру",
+    # который загонял exp_bid_frac -> 0.0001! Весь избыточный/аварийный объем и все слепые OOS-тесты идут строго по L2 end_b10!
     end_b10 = torch.clamp(b10_w_all[win_len - 1], min=tick_sz).unsqueeze(1).expand(W, E, 10).reshape(N, 10)
+    end_a1 = torch.clamp(a1_w_all[win_len - 1], min=tick_sz).unsqueeze(1).expand(W, E).reshape(N)
+    end_b1 = end_b10[:, 0]
+    end_mid = 0.5 * (end_b1 + torch.maximum(end_a1, end_b1 + tick_sz))
     end_bq10 = torch.clamp(bq10_w_all[win_len - 1], min=0.0).unsqueeze(1).expand(W, E, 10).reshape(N, 10)
     cum_end_bq = torch.cumsum(end_bq10, dim=1)
     prev_end_bq = cum_end_bq - end_bq10
@@ -1440,7 +1504,23 @@ def evaluate_order3_basket(
     liq_10_tot = liq_10_q.sum(dim=1)
     excess_end_q = torch.clamp(pos_qty - liq_10_tot, min=0.0)
     tail_px = torch.clamp(end_b10[:, -1] * 0.985, min=tick_sz)
-    carry_val = (liq_10_q * end_b10).sum(dim=1) * (1.0 - maker_fee) + excess_end_q * tail_px * (1.0 - taker_fee)
+    strict_l2_carry = (liq_10_q * end_b10).sum(dim=1) * (1.0 - maker_fee) + excess_end_q * tail_px * (1.0 - taker_fee)
+    if enforce_activity_floor:
+        work_cap_q = (0.45 * budget) / torch.clamp(end_mid, min=tick_sz)
+        healthy_mm = (init_pos_0 <= 1e-6) & (avg_entry > 1e-4) & (end_mid >= avg_entry * 0.988)
+        maker_q = torch.where(healthy_mm, torch.minimum(pos_qty, work_cap_q), torch.zeros_like(pos_qty))
+        rem_l2_q = torch.clamp(pos_qty - maker_q, min=0.0)
+        rem_liq_10 = torch.clamp(torch.minimum(rem_l2_q.unsqueeze(1) - prev_end_bq, end_bq10), min=0.0)
+        rem_exc = torch.clamp(rem_l2_q - rem_liq_10.sum(dim=1), min=0.0)
+        # 0 штрафа за открытую здоровую сделку (cost-basis нейтральность), НО 0 бумажной прибыли без РЕАЛЬНОГО закрытия в USDT!
+        cost_neutral_px = torch.minimum(end_mid * (1.0 - 1.2 * maker_fee), avg_entry * (1.0 + maker_fee))
+        carry_val = (
+            maker_q * cost_neutral_px
+            + (rem_liq_10 * end_b10).sum(dim=1) * (1.0 - maker_fee)
+            + rem_exc * tail_px * (1.0 - taker_fee)
+        )
+    else:
+        carry_val = strict_l2_carry
     rem = pos_qty > 1e-6
     end_cash = torch.clamp(torch.where(rem, cash + carry_val, cash), min=1.0)
     end_dd_pct = 100.0 * torch.clamp(peak_mtm_eq - end_cash, min=0.0) / budget
@@ -1466,9 +1546,9 @@ def evaluate_order3_basket(
 
     dlog_eq = torch.log(end_cash / ref_eq).view(W, E)
     raw_mean_log_dd = (sum_log_dd / n_steps_f).view(W, E)
-    # Вычитаем точную пассивную просадку: если агент спас инвентарь от провала рынка, rel_mean_log_dd < 0 (заслуженный бонус спасения эквити, но с мягким потолком -25 bp):
+    # Вычитаем точную пассивную просадку: мягкий вес 0.30 не наказывает здоровые откаты -0.5% внутри +5% волны!
     rel_mean_log_dd = torch.clamp(raw_mean_log_dd - pass_mld_we, min=-0.0025)
-    traj_growth_bp = 10000.0 * (dlog_eq - 0.65 * rel_mean_log_dd)
+    traj_growth_bp = 10000.0 * (dlog_eq - 0.30 * rel_mean_log_dd)
     mtm_delta_pct = (100.0 * (end_cash - ref_eq) / budget).view(W, E)
     w_dd_mat = max_dd_pct.view(W, E)
     w_fills_mat = n_fills.float().view(W, E)
@@ -1503,64 +1583,66 @@ def evaluate_order3_basket(
         cl_g_mat = traj_growth_bp[clean_idx].view(len(clean_idx), C, B_bud).permute(1, 0, 2).reshape(C, len(clean_idx) * B_bud)
         cl_q_mat = torch.quantile(cl_g_mat, torch.tensor([0.15, 0.35, 0.50], device=device), dim=1)
         cl_mean_g_v = cl_g_mat.mean(dim=1)
-        cl_broad_v = torch.where(cl_g_mat > 0.0, 20.0 * torch.log1p(cl_g_mat / 20.0), cl_g_mat).mean(dim=1)
+        cl_broad_v = torch.where(cl_g_mat > 0.0, 250.0 * torch.log1p(cl_g_mat / 250.0), cl_g_mat).mean(dim=1)
         cl_cvar25_v = torch.topk(cl_g_mat, max(1, cl_g_mat.shape[1] // 4), dim=1, largest=False).values.mean(dim=1)
         cl_cvar15_v = torch.topk(cl_g_mat, max(1, (cl_g_mat.shape[1] * 15) // 100), dim=1, largest=False).values.mean(dim=1)
         cl_cvar10_v = torch.topk(cl_g_mat, max(1, cl_g_mat.shape[1] // 10), dim=1, largest=False).values.mean(dim=1)
         cl_cvar05_v = torch.topk(cl_g_mat, max(1, cl_g_mat.shape[1] // 20), dim=1, largest=False).values.mean(dim=1)
         cl_min_g_v = cl_g_mat.min(dim=1).values
         cl_down_v = torch.sqrt(torch.mean(torch.clamp(-cl_g_mat, min=0.0) ** 2, dim=1))
-        # Трехслойный Cliff-Breaker без избыточного одиночного стопа: режет хвост CVaR15/10/05, сохраняя живой оборот L53!
+        # Трехслойный Cliff-Breaker для многочасовых волн: режет глубокие катастрофы (> -45..-120 bp), разрешая рабочие стопы на ложных пробоях!
         cl_tail_pen = (
-            0.45 * torch.clamp(-15.0 - cl_cvar15_v, min=0.0)
-            + 0.35 * torch.clamp(-26.0 - cl_cvar10_v, min=0.0)
-            + 0.40 * torch.clamp(-45.0 - cl_cvar05_v, min=0.0)
+            0.38 * torch.clamp(-45.0 - cl_cvar15_v, min=0.0)
+            + 0.35 * torch.clamp(-80.0 - cl_cvar10_v, min=0.0)
+            + 0.42 * torch.clamp(-135.0 - cl_cvar05_v, min=0.0)
         )
-        # Anti-Outlier лог-демпфер на единичные супер-окна пампа (> +0.30%), гладкая дифференцируемая награда за широту!
+        # Сняты микроскальперские потолки 0.45% / 50 bp: полный сложный рост капитала на волнах до +8.0% / +800 bp!
         cl_mtm_sub = mtm_wcb[clean_idx]
-        pos_win_frac = (cl_mtm_sub > 0.015).float().mean(dim=(0, 2))
-        breadth_bonus = 5.0 * pos_win_frac * torch.sigmoid(cl_ev_v * 60.0)
+        pos_win_frac = (cl_mtm_sub > 0.05).float().mean(dim=(0, 2))
+        big_wave_frac = (cl_mtm_sub > 0.65).float().mean(dim=(0, 2))
+        breadth_bonus = 16.0 * pos_win_frac * torch.sigmoid(cl_ev_v * 12.0) + 32.0 * big_wave_frac * torch.sigmoid(cl_ev_v * 8.0)
         cl_ev_rob_v = torch.where(
-            cl_mtm_sub > 0.30,
-            0.30 + 0.20 * torch.log1p((cl_mtm_sub - 0.30) / 0.20),
+            cl_mtm_sub > 8.0,
+            8.0 + 2.5 * torch.log1p((cl_mtm_sub - 8.0) / 2.5),
             cl_mtm_sub,
         ).mean(dim=(0, 2))
         cl_mean_rob_v = torch.where(
-            cl_g_mat > 35.0,
-            35.0 + 20.0 * torch.log1p((cl_g_mat - 35.0) / 20.0),
+            cl_g_mat > 800.0,
+            800.0 + 250.0 * torch.log1p((cl_g_mat - 800.0) / 250.0),
             cl_g_mat,
         ).mean(dim=1)
         geo_clean = (
-            0.45 * cl_broad_v
-            + 0.28 * cl_q_mat[2]
-            + 0.16 * cl_q_mat[1]
-            + 0.26 * cl_mean_rob_v
-            + 65.0 * cl_ev_rob_v
+            0.40 * cl_broad_v
+            + 0.14 * cl_q_mat[2]
+            + 0.10 * cl_q_mat[1]
+            + 0.68 * cl_mean_rob_v
+            + 220.0 * cl_ev_rob_v
             + breadth_bonus
-            + 0.38 * cl_cvar25_v
-            - 0.28 * cl_down_v
-            - cl_tail_pen
+            + 0.24 * cl_cvar25_v
+            - 0.18 * cl_down_v
+            - 0.70 * cl_tail_pen
         )
     else:
         geo_clean = torch.zeros(C, device=device)
 
-    # Ножка 2 (Стресс-прививка инвентаря, 18%): альфа разгрузки и защиты перегруженного портфеля относительно пассивного удержания:
+    # Ножка 2 (Стресс-прививка инвентаря, 15%): альфа разгрузки водопада (inv_cvar15) + полное удержание многопроцентного ралли:
     if inv_idx:
         inv_g_mat = traj_growth_bp[inv_idx].view(len(inv_idx), C, B_bud).permute(1, 0, 2).reshape(C, len(inv_idx) * B_bud)
         inv_mean_rob_v = torch.where(
-            inv_g_mat > 40.0,
-            40.0 + 20.0 * torch.log1p((inv_g_mat - 40.0) / 20.0),
+            inv_g_mat > 500.0,
+            500.0 + 150.0 * torch.log1p((inv_g_mat - 500.0) / 150.0),
             inv_g_mat,
         ).mean(dim=1)
         inv_mtm_sub = mtm_wcb[inv_idx]
         inv_ev_rob_v = torch.where(
-            inv_mtm_sub > 0.35,
-            0.35 + 0.20 * torch.log1p((inv_mtm_sub - 0.35) / 0.20),
+            inv_mtm_sub > 5.0,
+            5.0 + 1.5 * torch.log1p((inv_mtm_sub - 5.0) / 1.5),
             inv_mtm_sub,
         ).mean(dim=(0, 2))
         inv_q50_v = torch.median(inv_g_mat, dim=1).values
         inv_cvar25_v = torch.topk(inv_g_mat, max(1, inv_g_mat.shape[1] // 4), dim=1, largest=False).values.mean(dim=1)
-        geo_inv = 0.35 * inv_mean_rob_v + 0.25 * inv_q50_v + 40.0 * inv_ev_rob_v + 0.35 * inv_cvar25_v
+        inv_cvar15_v = torch.topk(inv_g_mat, max(1, (inv_g_mat.shape[1] * 15) // 100), dim=1, largest=False).values.mean(dim=1)
+        geo_inv = 0.30 * inv_mean_rob_v + 0.20 * inv_q50_v + 45.0 * inv_ev_rob_v + 0.20 * inv_cvar25_v + 0.30 * inv_cvar15_v
     else:
         geo_inv = torch.zeros(C, device=device)
 
@@ -1568,6 +1650,7 @@ def evaluate_order3_basket(
     fills_wcb = w_fills_mat.view(W, C, B_bud)
     fills_v = fills_wcb.sum(dim=0).mean(dim=1)
     cl_fills_v = fills_wcb[clean_idx].sum(dim=0).mean(dim=1) if clean_idx else fills_v
+    cl_fills_pw = cl_fills_v / max(1.0, float(len(clean_idx)))
     turn_wcb = (sum_mut / torch.clamp(budget, min=100.0)).view(W, C, B_bud)
     cl_turn_v = turn_wcb[clean_idx].mean(dim=(0, 2)) if clean_idx else turn_wcb.mean(dim=(0, 2))
     cancels_v = w_cancels_mat.view(W, C, B_bud).sum(dim=0).mean(dim=1)
@@ -1579,12 +1662,27 @@ def evaluate_order3_basket(
     h_cond_v = mode_ent_mat.view(W, C, B_bud).mean(dim=(0, 2))
     mi_bits_v = torch.clamp((h_marg_v - h_cond_v) / ln2, min=0.0)
 
+    # Волновой + широкоспредовый фильтр БЕЗ штрафа за удержание многочасовой волны (0 штрафа q50_turn_phr, фильтр против холостого комиссионного churn!):
+    win_hrs = max(0.25, float(win_len - 1) / 3600.0)
+    cl_fills_phr = cl_fills_pw / win_hrs
+    cl_turn_phr = cl_turn_v / win_hrs
+    if enforce_activity_floor and len(clean_idx) >= 8:
+        dead_mm_pen = (
+            26.0 * torch.clamp(1.0 - cl_turn_phr / 0.055, min=0.0)
+            + 10.0 * torch.clamp(1.0 - cl_fills_phr / 0.45, min=0.0)
+            + 24.0 * torch.clamp(cl_turn_phr - 0.50, min=0.0) * torch.sigmoid(-cl_ev_v * 35.0)
+        )
+        # Прямая премия за чистую долларовую доходность (cl_ev_v %) после всех комиссий на волнах 2.5%..8% и широком спреде!
+        profit_vol_bonus = 260.0 * torch.clamp(cl_ev_v, min=0.0, max=8.0) * torch.clamp(cl_turn_phr / 0.06, min=0.25, max=1.5)
+    else:
+        dead_mm_pen = torch.zeros(C, device=device)
+        profit_vol_bonus = torch.zeros(C, device=device)
+
     if clean_idx and inv_idx:
-        # Гладкий дифференцируемый вентиль (0 при Turn=0, ненулевой градиент по CleanEV и Turn на всей области!):
-        active_mm_gate = torch.clamp(cl_turn_v / 0.07, 0.0, 1.0) * torch.sigmoid(geo_clean / 2.5) * torch.sigmoid(cl_ev_v * 60.0)
-        geo_v = 0.82 * geo_clean + 0.18 * torch.where(geo_inv > 0.0, geo_inv * active_mm_gate, geo_inv)
+        active_mm_gate = torch.clamp(cl_turn_phr / 0.07, 0.0, 1.0) * torch.sigmoid((geo_clean + 10.0) / 4.0) * torch.sigmoid(cl_ev_v * 20.0)
+        geo_v = 0.85 * (geo_clean + profit_vol_bonus - dead_mm_pen) + 0.15 * torch.where(geo_inv > 0.0, geo_inv * active_mm_gate, geo_inv)
     elif clean_idx:
-        geo_v = geo_clean
+        geo_v = geo_clean + profit_vol_bonus - dead_mm_pen
     else:
         geo_v = geo_inv
 
