@@ -1668,18 +1668,18 @@ def evaluate_order3_basket(
     cl_turn_phr = cl_turn_v / win_hrs
     if enforce_activity_floor and len(clean_idx) >= 8:
         dead_mm_pen = (
-            26.0 * torch.clamp(1.0 - cl_turn_phr / 0.055, min=0.0)
-            + 10.0 * torch.clamp(1.0 - cl_fills_phr / 0.45, min=0.0)
-            + 24.0 * torch.clamp(cl_turn_phr - 0.50, min=0.0) * torch.sigmoid(-cl_ev_v * 35.0)
+            32.0 * torch.clamp(1.0 - cl_turn_phr / 0.16, min=0.0)
+            + 18.0 * torch.clamp(1.0 - cl_fills_phr / 2.20, min=0.0)
+            + 20.0 * torch.clamp(cl_turn_phr - 1.25, min=0.0) * torch.sigmoid(-cl_ev_v * 35.0)
         )
-        # Прямая премия за чистую долларовую доходность (cl_ev_v %) после всех комиссий на волнах 2.5%..8% и широком спреде!
-        profit_vol_bonus = 260.0 * torch.clamp(cl_ev_v, min=0.0, max=8.0) * torch.clamp(cl_turn_phr / 0.06, min=0.25, max=1.5)
+        # Прямая премия за сочетание чистой долларовой доходности (cl_ev_v %) И активного оборота в спреде/волнах!
+        profit_vol_bonus = 280.0 * torch.clamp(cl_ev_v, min=0.0, max=8.0) * torch.clamp(cl_turn_phr / 0.18, min=0.20, max=2.20)
     else:
         dead_mm_pen = torch.zeros(C, device=device)
         profit_vol_bonus = torch.zeros(C, device=device)
 
     if clean_idx and inv_idx:
-        active_mm_gate = torch.clamp(cl_turn_phr / 0.07, 0.0, 1.0) * torch.sigmoid((geo_clean + 10.0) / 4.0) * torch.sigmoid(cl_ev_v * 20.0)
+        active_mm_gate = torch.clamp(cl_turn_phr / 0.15, 0.0, 1.0) * torch.sigmoid((geo_clean + 10.0) / 4.0) * torch.sigmoid(cl_ev_v * 20.0)
         geo_v = 0.85 * (geo_clean + profit_vol_bonus - dead_mm_pen) + 0.15 * torch.where(geo_inv > 0.0, geo_inv * active_mm_gate, geo_inv)
     elif clean_idx:
         geo_v = geo_clean + profit_vol_bonus - dead_mm_pen

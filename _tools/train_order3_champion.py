@@ -575,7 +575,7 @@ def train_order3(
     val_span_starts = 4200
     avail_pre_oos = oos_start - purge_gap
     n_val_zones = 8
-    v_lo_grid = np.linspace(38000, min(599500, max(90000, avail_pre_oos - val_span_starts - 16000)), num=n_val_zones, dtype=int)
+    v_lo_grid = np.linspace(38000, max(90000, avail_pre_oos - val_span_starts - 12000), num=n_val_zones, dtype=int)
     val_zones = []
     tr_segments = []
     prev_tr_lo = 600
@@ -1034,18 +1034,75 @@ def train_order3(
         return fallback_st
 
     st_l66_soup = _load_gpu_seed(SAVE_DIR / "bak_l66" / "order3_soup_top3.pt", st_pw_l53)
+    st_l67_comp = _load_gpu_seed(SAVE_DIR / "bak_l67" / "l67_grand_compounder.pt", _load_gpu_seed(BASE_DIR / "models/prl/release_champion_v1.pt", st_l66_soup))
+    st_l67_soup = _load_gpu_seed(SAVE_DIR / "bak_l67" / "order3_soup_top3.pt", st_l66_soup)
     st_hyb_60pw_40l66 = _load_gpu_seed(SAVE_DIR / "bak_l66" / "hyb_60pw25_40l66.pt", st_pw_notkr)
     st_hyb_50_50 = _load_gpu_seed(SAVE_DIR / "bak_l66" / "hyb_50pw38_50pw25.pt", st_pw_notkr)
-    st_hyb_60l66_40pw = _load_gpu_seed(SAVE_DIR / "bak_l66" / "hyb_60l66_40pw25.pt", st_l66_soup)
-    st_ms_53i0_52i1 = st_hyb_60pw_40l66
-    st_ms_53i0_56i0 = st_hyb_50_50
+
+    def _build_l68_front_wave_seed(
+        st_base: dict,
+        st_shield: dict,
+        agg_modes: tuple[int, ...],
+        shield_modes: tuple[int, ...] = (4, 0),
+        exp_z: float = 2.7,
+        front_boost: float = 2.4,
+        inside_b_z: float = -0.5,
+        ret_b_z: float = -4.4,
+        span_b_z: float = -3.6,
+        edge_a_z: float = 1.08,
+        wave49_z: float = 0.28,
+        taker_buy_z: float = -0.35,
+        requote_bias: float = -8.7,
+    ) -> dict:
+        out_s = {k: st_base[k].detach().cpu().float().clone() for k in MultimodalMoEPolicyOrder3.PARAM_KEYS}
+        w2_s = out_s["w2_moe"].view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        b2_s = out_s["b2_moe"].view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        w2_sh = st_shield["w2_moe"].detach().cpu().float().view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        b2_sh = st_shield["b2_moe"].detach().cpu().float().view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        for m_sh in shield_modes:
+            w2_s[:, m_sh, :] = w2_sh[:, m_sh, :]
+            b2_s[0, m_sh, :] = b2_sh[0, m_sh, :]
+        for m_ag in agg_modes:
+            b2_s[0, m_ag, 0] = max(float(b2_s[0, m_ag, 0]), exp_z)
+            b2_s[0, m_ag, 1] += front_boost
+            b2_s[0, m_ag, 2] += front_boost * 0.80
+            b2_s[0, m_ag, 3] += front_boost * 0.55
+            b2_s[0, m_ag, 4] += front_boost * 0.25
+            b2_s[0, m_ag, 12] -= front_boost * 0.50
+            b2_s[0, m_ag, 37] = inside_b_z
+            b2_s[0, m_ag, 38] = ret_b_z
+            b2_s[0, m_ag, 39] = span_b_z
+            b2_s[0, m_ag, 41] = max(float(b2_s[0, m_ag, 41]), 4.8)
+            b2_s[0, m_ag, 42] = edge_a_z
+            b2_s[0, m_ag, 43] = min(float(b2_s[0, m_ag, 43]), -4.5)
+            b2_s[0, m_ag, 48] = 1.2 + taker_buy_z
+            b2_s[0, m_ag, 49] = wave49_z
+            w2_s[:, m_ag, 25] = 0.0
+            b2_s[0, m_ag, 25] = -7.2
+        w1_r, bb_r, _, _ = out_s["w_reg1"], out_s["b_reg1_b"], out_s["b_reg1_a"], out_s["w_reg2"]
+        u_idx = int(torch.argmax(w1_r[5, :] + w1_r[7, :]).item())
+        bb_r[0, u_idx] = requote_bias
+        out_s["w2_moe"] = w2_s.reshape(256, MOE_OUT_DIM_ORDER3)
+        out_s["b2_moe"] = b2_s.reshape(1, MOE_OUT_DIM_ORDER3)
+        st_nm = _normalize_weights_order3(out_s, policy.dtype)
+        return {k: v.to(device=device, dtype=policy.dtype) for k, v in st_nm.items()}
+
+    # Семейство агрессивных двухконтурных семян L68:
+    # Mode #4 = органический Crash-Shield L67 (68.8% времени на краше -25.9%!), моды (3, 2, 7, 6, 1) = Front-of-Book Spread & Wave Snipers!
+    st_l68_sel3_bal = _build_l68_front_wave_seed(st_l67_comp, st_l66_soup, agg_modes=(3, 2, 7), shield_modes=(4, 0), exp_z=2.6, front_boost=2.2, inside_b_z=-0.8, ret_b_z=-4.2, span_b_z=-3.4, edge_a_z=1.12, wave49_z=0.30, taker_buy_z=-0.45, requote_bias=-8.9)
+    st_l68_sel4_snp = _build_l68_front_wave_seed(st_l67_comp, st_l67_soup, agg_modes=(3, 2, 7, 6), shield_modes=(4, 0), exp_z=2.75, front_boost=2.5, inside_b_z=-0.4, ret_b_z=-4.5, span_b_z=-3.7, edge_a_z=1.05, wave49_z=0.28, taker_buy_z=-0.35, requote_bias=-8.7)
+    st_l68_sel5_assault = _build_l68_front_wave_seed(st_l67_comp, st_l66_soup, agg_modes=(3, 2, 7, 6, 1), shield_modes=(4,), exp_z=2.8, front_boost=2.4, inside_b_z=-0.5, ret_b_z=-4.4, span_b_z=-3.5, edge_a_z=1.08, wave49_z=0.25, taker_buy_z=-0.35, requote_bias=-8.8)
+    st_l68_sel2_trb = _build_l68_front_wave_seed(st_l67_comp, st_l67_soup, agg_modes=(3, 2), shield_modes=(4, 0), exp_z=3.0, front_boost=2.8, inside_b_z=+0.1, ret_b_z=-4.8, span_b_z=-4.0, edge_a_z=1.00, wave49_z=0.25, taker_buy_z=-0.25, requote_bias=-8.5)
+    st_l68_wide_bal = _build_l68_front_wave_seed(st_l67_comp, st_l66_soup, agg_modes=(0, 1, 2, 3, 5, 6), shield_modes=(4, 7), exp_z=2.5, front_boost=2.1, inside_b_z=-0.9, ret_b_z=-4.2, span_b_z=-3.4, edge_a_z=1.08, wave49_z=0.25, taker_buy_z=-0.50, requote_bias=-8.9)
+
+    st_ms_53i0_52i1 = st_l68_sel3_bal
+    st_ms_53i0_56i0 = st_l68_sel4_snp
     is_warm_l43 = True
 
-    # L67 Grand Kelly Realized Compounder: объединение +$312 (+24.22% за 7 сут = $44.57/сут!) и щита L66_Soup (DD 3.57%-8.11%)!
     seed_pool = (
-        [st_hyb_60pw_40l66, st_hyb_50_50, st_hyb_60l66_40pw, st_l66_soup, st_pw_l53, st_pw_notkr]
+        [st_l68_sel3_bal, st_l68_sel4_snp, st_l68_sel5_assault, st_l68_wide_bal, st_l67_comp, st_hyb_50_50]
         if island_id == 0
-        else [st_hyb_50_50, st_hyb_60pw_40l66, st_pw_notkr, st_hyb_60l66_40pw, st_l66_soup, st_pw_l61_38]
+        else [st_l68_sel4_snp, st_l68_sel5_assault, st_l68_sel2_trb, st_l68_wide_bal, st_l68_sel3_bal, st_l67_comp]
     )
     resume_iter = 0
     for res_p in [SAVE_DIR / "islands" / f"island_{island_id}_best.pt", SAVE_DIR / "global_best.pt", RESUME_CHAMP_PATH]:
