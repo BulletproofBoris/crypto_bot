@@ -46,6 +46,7 @@ from _tools.fused_order3_clean_tick import (
     MOE_OUT_DIM_ORDER3,
     ROUTER_IN_DIM_ORDER3,
     ROUTER_H_DIM_ORDER3,
+    ROUTER_OUT_DIM_ORDER3,
     REG_IN_DIM_ORDER3,
     REG_H_DIM_ORDER3,
     TOKEN_REFILL_PER_SEC_ORDER3,
@@ -79,8 +80,22 @@ def _normalize_weights_order3(state: dict, dtype: torch.dtype) -> dict:
     w1_mkt = w1_f[..., :MKT_DIM_ORDER3, :].clone()
     w1_ag = w1_f[..., MKT_DIM_ORDER3:, :]
 
-    # Блок 3 L70: Раздельная поблочная нормировка 4 групп рынка (сырой LOB не подавляет нормой модели Order-1 и Wave Stack!)
-    if MKT_DIM_ORDER3 >= 72:
+    # Блок 3 L70/L71: Раздельная поблочная нормировка 5 групп рынка (84D Signal Stack v4):
+    if MKT_DIM_ORDER3 >= 84:
+        grp_specs = (
+            ([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 40, 41, 42, 43, 56, 57, 58, 59, 66, 67, 68, 69, 70, 71], 5.8),
+            ([29, 30, 31, 32, 33, 44, 45, 46, 47, 48, 49], 6.8),
+            ([34, 35, 36, 37, 38, 39, 50, 51, 52, 53, 54, 55], 7.8),
+            ([60, 61, 62, 63, 64, 65], 8.2),
+            ([72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83], 8.0),
+        )
+        w1_mkt_norm = w1_mkt.clone()
+        for idxs_g, mult_g in grp_specs:
+            sub_g = w1_mkt[..., idxs_g, :]
+            cap_g = mult_g * math.sqrt(float(len(idxs_g)))
+            nb_g = torch.linalg.vector_norm(sub_g, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+            w1_mkt_norm[..., idxs_g, :] = sub_g * torch.clamp(cap_g / nb_g, max=1.0)
+    elif MKT_DIM_ORDER3 >= 72:
         grp_specs = (
             ([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 40, 41, 42, 43, 56, 57, 58, 59, 66, 67, 68, 69, 70, 71], 5.8),
             ([29, 30, 31, 32, 33, 44, 45, 46, 47, 48, 49], 6.8),
@@ -111,31 +126,40 @@ def _normalize_weights_order3(state: dict, dtype: torch.dtype) -> dict:
         s_k, e_k = k_i * EXPERT_OUT_DIM_ORDER3, (k_i + 1) * EXPERT_OUT_DIM_ORDER3
         wk = w2m_f[..., s_k:e_k]
         nk = torch.linalg.vector_norm(wk, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
-        w2m_parts.append(wk * torch.clamp(62.0 / nk, max=1.0))
+        w2m_parts.append(wk * torch.clamp(64.0 / nk, max=1.0))
     out["w2_moe"] = torch.cat(w2m_parts, dim=-1).to(dtype)
     out["b2_moe"] = torch.clamp(state["b2_moe"].float(), -7.5, 6.5).to(dtype)
 
-    # Раздельная нормировка прямого роутера w_gate1, выделяющая собственный бюджет каналам Wave Stack [320:326]:
+    # Раздельная нормировка прямого роутера w_gate1 (358D -> 128):
     wg1_f = state["w_gate1"].float()
-    if wg1_f.shape[-2] >= 326:
-        wg1_base = wg1_f[..., :320, :]
-        wg1_wave = wg1_f[..., 320:, :]
+    if wg1_f.shape[-2] >= 358:
+        wg1_base = wg1_f[..., :336, :]
+        wg1_wave_ext = wg1_f[..., 336:350, :]
+        wg1_rec_m = wg1_f[..., 350:358, :]
         nb_gb = torch.linalg.vector_norm(wg1_base, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
-        nb_gw = torch.linalg.vector_norm(wg1_wave, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+        nb_gw = torch.linalg.vector_norm(wg1_wave_ext, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+        nb_gr = torch.linalg.vector_norm(wg1_rec_m, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
         out["w_gate1"] = torch.cat(
-            [wg1_base * torch.clamp(27.0 / nb_gb, max=1.0), wg1_wave * torch.clamp(9.5 / nb_gw, max=1.0)],
+            [
+                wg1_base * torch.clamp(32.0 / nb_gb, max=1.0),
+                wg1_wave_ext * torch.clamp(14.0 / nb_gw, max=1.0),
+                wg1_rec_m * torch.clamp(8.5 / nb_gr, max=1.0),
+            ],
             dim=-2,
         ).to(dtype)
     else:
         nw_g1 = torch.linalg.vector_norm(wg1_f, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
-        out["w_gate1"] = (wg1_f * torch.clamp(28.0 / nw_g1, max=1.0)).to(dtype)
+        out["w_gate1"] = (wg1_f * torch.clamp(30.0 / nw_g1, max=1.0)).to(dtype)
 
     for k, cap in (
         ("w_res1", 65.0),
         ("w_res2", 40.0),
-        ("w_gate2", 14.0),
-        ("w_rec", 30.0),
+        ("w_gate2", 18.0),
+        ("w_rec", 36.0),
+        ("w_mem2h", 16.0),
         ("w_reg1", 26.0),
+        ("w_reg_res1", 24.0),
+        ("w_reg_res2", 18.0),
         ("w_reg2", 14.0),
     ):
         wf = state[k].float()
@@ -144,10 +168,21 @@ def _normalize_weights_order3(state: dict, dtype: torch.dtype) -> dict:
 
     out["b_res1"] = torch.clamp(state["b_res1"].float(), -2.0, 2.0).to(dtype)
     out["b_gate1"] = torch.clamp(state["b_gate1"].float(), -2.5, 2.5).to(dtype)
-    out["b_gate2"] = torch.clamp(state["b_gate2"].float(), -2.8, 2.8).to(dtype)
+    bg2_f = state["b_gate2"].float()
+    if bg2_f.shape[-1] >= 2 * K_MODES_ORDER3:
+        out["b_gate2"] = torch.cat(
+            [
+                torch.clamp(bg2_f[..., :K_MODES_ORDER3], -2.8, 2.8),
+                torch.clamp(bg2_f[..., K_MODES_ORDER3:], -4.5, 4.5),
+            ],
+            dim=-1,
+        ).to(dtype)
+    else:
+        out["b_gate2"] = torch.clamp(bg2_f, -2.8, 2.8).to(dtype)
     out["b_rec"] = torch.clamp(state["b_rec"].float(), -2.5, 2.5).to(dtype)
     out["b_reg1_b"] = torch.clamp(state["b_reg1_b"].float(), -3.0, 3.0).to(dtype)
     out["b_reg1_a"] = torch.clamp(state["b_reg1_a"].float(), -3.0, 3.0).to(dtype)
+    out["b_reg_res"] = torch.clamp(state["b_reg_res"].float(), -2.5, 2.5).to(dtype)
     out["b_reg2_b"] = torch.clamp(state["b_reg2_b"].float(), -6.0, 3.0).to(dtype)
     out["b_reg2_a"] = torch.clamp(state["b_reg2_a"].float(), -6.0, 3.0).to(dtype)
     return out
@@ -158,8 +193,10 @@ class MultimodalMoEPolicyOrder3:
         "w1", "b1", "w_res1", "b_res1", "w_res2",
         "w2_moe", "b2_moe",
         "w_gate1", "b_gate1", "w_gate2", "b_gate2",
-        "w_rec", "b_rec",
-        "w_reg1", "b_reg1_b", "b_reg1_a", "w_reg2", "b_reg2_b", "b_reg2_a",
+        "w_rec", "b_rec", "w_mem2h",
+        "w_reg1", "b_reg1_b", "b_reg1_a",
+        "w_reg_res1", "b_reg_res", "w_reg_res2",
+        "w_reg2", "b_reg2_b", "b_reg2_a",
     )
 
     def __init__(self, n_groups: int = 256, n_budgets: int = 6, device: torch.device = torch.device("cuda:0")):
@@ -167,7 +204,6 @@ class MultimodalMoEPolicyOrder3:
         self.n_budgets = n_budgets
         self.pop_size = n_groups * n_budgets
         self.device = device
-        # Храним мастер-популяцию мутаций и OpenAI-ES строго в fp32 (предотвращает обнуление мелких шагов квантованием bf16!)
         self.dtype = torch.float32
 
         self.w1 = torch.empty((n_groups, TOTAL_DIM_ORDER3, 384), dtype=self.dtype, device=device)
@@ -180,15 +216,19 @@ class MultimodalMoEPolicyOrder3:
         self.b2_moe = torch.empty((n_groups, 1, MOE_OUT_DIM_ORDER3), dtype=self.dtype, device=device)
         self.w_gate1 = torch.empty((n_groups, ROUTER_IN_DIM_ORDER3, ROUTER_H_DIM_ORDER3), dtype=self.dtype, device=device)
         self.b_gate1 = torch.empty((n_groups, 1, ROUTER_H_DIM_ORDER3), dtype=self.dtype, device=device)
-        self.w_gate2 = torch.empty((n_groups, ROUTER_H_DIM_ORDER3, K_MODES_ORDER3), dtype=self.dtype, device=device)
-        self.b_gate2 = torch.empty((n_groups, 1, K_MODES_ORDER3), dtype=self.dtype, device=device)
+        self.w_gate2 = torch.empty((n_groups, ROUTER_H_DIM_ORDER3, ROUTER_OUT_DIM_ORDER3), dtype=self.dtype, device=device)
+        self.b_gate2 = torch.empty((n_groups, 1, ROUTER_OUT_DIM_ORDER3), dtype=self.dtype, device=device)
 
         self.w_rec = torch.empty((n_groups, 256, 2 * MEM_DIM_ORDER3), dtype=self.dtype, device=device)
         self.b_rec = torch.empty((n_groups, 1, 2 * MEM_DIM_ORDER3), dtype=self.dtype, device=device)
+        self.w_mem2h = torch.empty((n_groups, MEM_DIM_ORDER3, 256), dtype=self.dtype, device=device)
 
         self.w_reg1 = torch.empty((n_groups, REG_IN_DIM_ORDER3, REG_H_DIM_ORDER3), dtype=self.dtype, device=device)
         self.b_reg1_b = torch.empty((n_groups, 1, REG_H_DIM_ORDER3), dtype=self.dtype, device=device)
         self.b_reg1_a = torch.empty((n_groups, 1, REG_H_DIM_ORDER3), dtype=self.dtype, device=device)
+        self.w_reg_res1 = torch.empty((n_groups, REG_H_DIM_ORDER3, 64), dtype=self.dtype, device=device)
+        self.b_reg_res = torch.empty((n_groups, 1, 64), dtype=self.dtype, device=device)
+        self.w_reg_res2 = torch.empty((n_groups, 32, REG_H_DIM_ORDER3), dtype=self.dtype, device=device)
         self.w_reg2 = torch.empty((n_groups, REG_H_DIM_ORDER3, 2), dtype=self.dtype, device=device)
         self.b_reg2_b = torch.empty((n_groups, 1, 2), dtype=self.dtype, device=device)
         self.b_reg2_a = torch.empty((n_groups, 1, 2), dtype=self.dtype, device=device)
@@ -231,76 +271,97 @@ class MultimodalMoEPolicyOrder3:
         if (
             is_order3
             and ck["w1"].shape[0] == TOTAL_DIM_ORDER3
-            and ck["w_gate1"].shape[0] == ROUTER_IN_DIM_ORDER3
+            and ck["w_gate1"].shape == (ROUTER_IN_DIM_ORDER3, ROUTER_H_DIM_ORDER3)
             and ck["w_reg1"].shape == (REG_IN_DIM_ORDER3, REG_H_DIM_ORDER3)
             and ck["b2_moe"].numel() == MOE_OUT_DIM_ORDER3
             and ck["b_rec"].numel() == 2 * MEM_DIM_ORDER3
-            and ck["b_gate2"].numel() == K_MODES_ORDER3
+            and ck["b_gate2"].numel() == ROUTER_OUT_DIM_ORDER3
+            and "w_mem2h" in ck
+            and "w_reg_res1" in ck
         ):
             state = {k: ck[k].to(dtype=self.dtype, device=self.device) for k in self.PARAM_KEYS}
         else:
-            # Хирургический перенос L46/L45 -> L48 (32D память, 48D эксперты, 311D роутер, 36->64->2 регулятор FIFO-очереди):
-            gen = torch.Generator().manual_seed(20261148)
-            w1_mkt = torch.randn((MKT_DIM_ORDER3, 384), generator=gen) * 0.005
+            # Хирургический Function-Preserving Net2Net перенос L70 -> L71 Liquid Gated v2 (0 потерь альфы на старте!):
+            gen = torch.Generator().manual_seed(20261171)
+            w1_mkt = torch.zeros((MKT_DIM_ORDER3, 384), dtype=torch.float32)
             b1_vec = ck["b1"].view(1, 384).float().clone()
             if is_order3:
                 old_mkt_d = max(0, min(MKT_DIM_ORDER3, int(ck["w1"].shape[0]) - AG_DIM_ORDER3))
                 if old_mkt_d > 0:
                     w1_mkt[:old_mkt_d, :] = ck["w1"][:old_mkt_d, :].float()
                 w1_ag = ck["w1"][ck["w1"].shape[0] - AG_DIM_ORDER3 :, :].float().clone()
-                if old_mkt_d < 60:
-                    w1_mkt[12, :] = w1_mkt[12, :] / 25.0
-                    b1_vec = b1_vec + 0.0020 * w1_mkt[13:14, :]
-                    w1_mkt[13, :] = w1_mkt[13, :] / 150.0
-                    w1_mkt[22:29, :] = w1_mkt[22:29, :] / 25.0
+                if old_mkt_d < 84 and old_mkt_d >= 72:
+                    # Деликатная тёплая распайка 12 новых каналов [72..83] без сдвига рабочих порогов h1:
+                    bull_dir = 0.35 * w1_mkt[38] + 0.35 * w1_mkt[39] + 0.30 * w1_mkt[61]
+                    crash_dir = 0.45 * w1_mkt[31] + 0.30 * w1_mkt[30] + 0.25 * w1_mkt[65]
+                    exec_dir = 0.55 * w1_mkt[48] + 0.45 * w1_mkt[46]
+                    for c_b, g_b in ((72, 0.04), (73, 0.05), (74, 0.05), (75, 0.06), (78, 0.04)):
+                        w1_mkt[c_b] = g_b * bull_dir
+                    for c_r, g_r in ((79, 0.05), (80, 0.06), (81, 0.07)):
+                        w1_mkt[c_r] = g_r * crash_dir
+                    w1_mkt[82] = 0.04 * exec_dir
+                    w1_mkt[83] = 0.05 * exec_dir
             else:
                 w1_ag = ck["w1"][370:, :].float().clone()
             w1_full = torch.cat([w1_mkt, w1_ag], dim=0)
 
             wg1_old = ck["w_gate1"].float()
-            if wg1_old.shape[0] != ROUTER_IN_DIM_ORDER3:
-                wg1_new = torch.zeros((ROUTER_IN_DIM_ORDER3, ROUTER_H_DIM_ORDER3), dtype=torch.float32)
-                if wg1_old.shape[0] == 295 and ROUTER_IN_DIM_ORDER3 >= 311:
-                    wg1_new[:288, :] = wg1_old[:288, :]
-                    wg1_new[304:311, :] = wg1_old[288:295, :]
-                else:
-                    cr = min(ROUTER_IN_DIM_ORDER3, wg1_old.shape[0])
-                    wg1_new[:cr, :] = wg1_old[:cr, :]
+            bg1_old = ck["b_gate1"].float().view(1, -1)
+            wg1_new = torch.zeros((ROUTER_IN_DIM_ORDER3, ROUTER_H_DIM_ORDER3), dtype=torch.float32)
+            wg1_new[:, min(wg1_old.shape[1], ROUTER_H_DIM_ORDER3) :] = torch.randn((ROUTER_IN_DIM_ORDER3, max(0, ROUTER_H_DIM_ORDER3 - wg1_old.shape[1])), generator=gen) * 0.012
+            bg1_new = torch.zeros((1, ROUTER_H_DIM_ORDER3), dtype=torch.float32)
+            old_rin, old_rh = wg1_old.shape
+            ch_r = min(old_rh, ROUTER_H_DIM_ORDER3)
+            bg1_new[:, :ch_r] = bg1_old[:, :ch_r]
+            if old_rin == 326 and ROUTER_IN_DIM_ORDER3 == 358:
+                wg1_new[:304, :ch_r] = wg1_old[:304, :ch_r]
+                wg1_new[320:342, :ch_r] = wg1_old[304:326, :ch_r]
+                bull_rg = 0.50 * wg1_old[317, :ch_r] + 0.50 * wg1_old[321, :ch_r]
+                crash_rg = 0.60 * wg1_old[313, :ch_r] + 0.40 * wg1_old[325, :ch_r]
+                for rr_i in (342, 343, 344, 345):
+                    wg1_new[rr_i, :ch_r] = 0.05 * bull_rg
+                for rr_c in (346, 347, 348):
+                    wg1_new[rr_c, :ch_r] = 0.06 * crash_rg
+                wg1_new[349, :ch_r] = 0.04 * wg1_old[310, :ch_r]
             else:
-                wg1_new = wg1_old
+                cr = min(ROUTER_IN_DIM_ORDER3, old_rin)
+                wg1_new[:cr, :ch_r] = wg1_old[:cr, :ch_r]
 
-            old_k = int(ck["b_gate2"].numel())
+            bg2_raw = ck["b_gate2"].float().view(1, -1)
+            old_k = int(ck.get("k_modes", K_MODES_ORDER3 if bg2_raw.numel() in (K_MODES_ORDER3, 2 * K_MODES_ORDER3) else bg2_raw.numel()))
             old_exp_d = int(ck["b2_moe"].numel()) // old_k
             w2m_old = ck["w2_moe"].float().view(256, old_k, old_exp_d)
             b2m_old = ck["b2_moe"].float().view(1, old_k, old_exp_d)
             wg2_old = ck["w_gate2"].float()
-            bg2_old = ck["b_gate2"].float().view(1, old_k)
 
             w2m_new = torch.zeros((256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3), dtype=torch.float32)
             b2m_new = torch.zeros((1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3), dtype=torch.float32)
-            wg2_new = torch.randn((ROUTER_H_DIM_ORDER3, K_MODES_ORDER3), generator=gen) * 0.03
-            bg2_new = torch.zeros((1, K_MODES_ORDER3), dtype=torch.float32)
+            wg2_new = torch.zeros((ROUTER_H_DIM_ORDER3, ROUTER_OUT_DIM_ORDER3), dtype=torch.float32)
+            bg2_new = torch.zeros((1, ROUTER_OUT_DIM_ORDER3), dtype=torch.float32)
 
             ck_copy = min(old_k, K_MODES_ORDER3)
             ed_copy = min(old_exp_d, EXPERT_OUT_DIM_ORDER3)
             w2m_new[:, :ck_copy, :ed_copy] = w2m_old[:, :ck_copy, :ed_copy]
             b2m_new[:, :ck_copy, :ed_copy] = b2m_old[:, :ck_copy, :ed_copy]
-            wg2_new[:, :ck_copy] = wg2_old[:, :ck_copy]
-            bg2_new[:, :ck_copy] = bg2_old[:, :ck_copy]
+            wg2_new[:min(wg2_old.shape[0], ROUTER_H_DIM_ORDER3), :min(wg2_old.shape[1], ROUTER_OUT_DIM_ORDER3)] = wg2_old[:min(wg2_old.shape[0], ROUTER_H_DIM_ORDER3), :min(wg2_old.shape[1], ROUTER_OUT_DIM_ORDER3)]
+            bg2_new[:, :min(bg2_raw.numel(), ROUTER_OUT_DIM_ORDER3)] = bg2_raw[:, :min(bg2_raw.numel(), ROUTER_OUT_DIM_ORDER3)]
+
+            if wg2_old.shape[1] <= K_MODES_ORDER3:
+                # Net2Net старт Liquid-вентилей роутера [8:16]: отзывчивый старт beta0=sigmoid(+1.6)~0.83 с живой связью к h_router!
+                wg2_new[:, K_MODES_ORDER3:] = torch.randn((ROUTER_H_DIM_ORDER3, K_MODES_ORDER3), generator=gen) * 0.020
+                bg2_new[:, K_MODES_ORDER3:] = +1.60
+            if ROUTER_H_DIM_ORDER3 > ch_r:
+                wg2_new[ch_r:, :K_MODES_ORDER3] = 0.0
 
             if old_exp_d <= 45 and EXPERT_OUT_DIM_ORDER3 >= 48:
-                # Инициализация [47] renorm_blend = +4.5 -> 98.9% стартовый паритет с L46 с открытым градиентом для каскадного резерва!
                 b2m_new[:, :, 47] = 4.50
             if old_exp_d <= 48 and EXPERT_OUT_DIM_ORDER3 >= 50:
                 b2m_new[:, :, 48:50] = -7.0
-
-            if old_k < K_MODES_ORDER3:
-                ref_m = min(1, old_k - 1)
-                for km in range(ck_copy, K_MODES_ORDER3):
-                    w2m_new[:, km, :ed_copy] = w2m_old[:, ref_m, :ed_copy] + torch.randn((256, ed_copy), generator=gen) * 0.025
-                    b2m_new[:, km, :ed_copy] = b2m_old[:, ref_m, :ed_copy]
-                    wg2_new[:, km] = wg2_old[:, km % old_k] + torch.randn((ROUTER_H_DIM_ORDER3,), generator=gen) * 0.06
-                bg2_new[0, ck_copy:] = float(bg2_old.mean().item()) - 0.65
+            if old_exp_d <= 50 and EXPERT_OUT_DIM_ORDER3 >= 52:
+                # Net2Net старт демпфера плана Bid [50] и Ask [51]: не замораживает окна входа (alpha~0.85..0.90), но открыт для ES!
+                w2m_new[:, :, 50:52] = torch.randn((256, K_MODES_ORDER3, 2), generator=gen) * 0.015
+                b2m_new[:, :, 50] = +1.75
+                b2m_new[:, :, 51] = +2.10
 
             w2m_flat = w2m_new.reshape(256, MOE_OUT_DIM_ORDER3)
             b2m_flat = b2m_new.reshape(1, MOE_OUT_DIM_ORDER3)
@@ -308,16 +369,20 @@ class MultimodalMoEPolicyOrder3:
             wrec_old = ck["w_rec"].float()
             brec_old = ck["b_rec"].float().view(1, -1)
             if brec_old.numel() != 2 * MEM_DIM_ORDER3:
+                old_m = brec_old.numel() // 2
                 wrec_new = torch.zeros((256, 2 * MEM_DIM_ORDER3), dtype=torch.float32)
                 brec_new = torch.zeros((1, 2 * MEM_DIM_ORDER3), dtype=torch.float32)
-                wrec_new[:, :16] = wrec_old[:, :16]
-                wrec_new[:, 32:48] = wrec_old[:, 16:32]
-                brec_new[:, :16] = brec_old[:, :16]
-                brec_new[:, 32:48] = brec_old[:, 16:32]
-                # Мягкая инициализация 3-минутной [16..24] и 12-минутной [24..32] макро-памяти:
-                wrec_new[:, 16:32] = torch.randn((256, 16), generator=gen) * 0.020
+                cm_r = min(old_m, MEM_DIM_ORDER3)
+                wrec_new[:, :cm_r] = wrec_old[:, :cm_r]
+                wrec_new[:, MEM_DIM_ORDER3 : MEM_DIM_ORDER3 + cm_r] = wrec_old[:, old_m : old_m + cm_r]
+                brec_new[:, :cm_r] = brec_old[:, :cm_r]
+                brec_new[:, MEM_DIM_ORDER3 : MEM_DIM_ORDER3 + cm_r] = brec_old[:, old_m : old_m + cm_r]
+                if MEM_DIM_ORDER3 > cm_r:
+                    wrec_new[:, cm_r:MEM_DIM_ORDER3] = torch.randn((256, MEM_DIM_ORDER3 - cm_r), generator=gen) * 0.025
             else:
                 wrec_new, brec_new = wrec_old, brec_old
+
+            wmem2h_new = ck["w_mem2h"].float() if ("w_mem2h" in ck and ck["w_mem2h"].shape == (MEM_DIM_ORDER3, 256)) else torch.zeros((MEM_DIM_ORDER3, 256), dtype=torch.float32)
 
             wreg1_old = ck["w_reg1"].float()
             breg1b_old = ck["b_reg1_b"].float().view(1, -1)
@@ -330,22 +395,22 @@ class MultimodalMoEPolicyOrder3:
                 breg1a_new = torch.zeros((1, REG_H_DIM_ORDER3), dtype=torch.float32)
                 wreg2_new = torch.zeros((REG_H_DIM_ORDER3, 2), dtype=torch.float32)
                 cr_h = min(old_rh, REG_H_DIM_ORDER3)
-                if old_ri == 32 and REG_IN_DIM_ORDER3 == 36:
-                    wreg1_new[:24, :cr_h] = wreg1_old[:24, :cr_h]
-                    wreg1_new[28:36, :cr_h] = wreg1_old[24:32, :cr_h]
-                elif old_ri == 26:
-                    wreg1_new[:22, :cr_h] = wreg1_old[:22, :cr_h]
-                    wreg1_new[28:32, :cr_h] = wreg1_old[22:26, :cr_h]
-                else:
-                    cr_i = min(old_ri, REG_IN_DIM_ORDER3)
-                    wreg1_new[:cr_i, :cr_h] = wreg1_old[:cr_i, :cr_h]
+                cr_i = min(old_ri, REG_IN_DIM_ORDER3)
+                wreg1_new[:cr_i, :cr_h] = wreg1_old[:cr_i, :cr_h]
                 breg1b_new[:, :cr_h] = breg1b_old[:, :cr_h]
                 breg1a_new[:, :cr_h] = breg1a_old[:, :cr_h]
                 wreg2_new[:cr_h, :] = wreg2_old[:cr_h, :]
-                if REG_H_DIM_ORDER3 > cr_h:
-                    wreg1_new[:, cr_h:] = torch.randn((REG_IN_DIM_ORDER3, REG_H_DIM_ORDER3 - cr_h), generator=gen) * 0.015
             else:
                 wreg1_new, breg1b_new, breg1a_new, wreg2_new = wreg1_old, breg1b_old, breg1a_old, wreg2_old
+
+            if "w_reg_res1" in ck and ck["w_reg_res1"].shape == (REG_H_DIM_ORDER3, 64):
+                wregr1_new = ck["w_reg_res1"].float()
+                bregr_new = ck["b_reg_res"].float().view(1, 64)
+                wregr2_new = ck["w_reg_res2"].float()
+            else:
+                wregr1_new = torch.randn((REG_H_DIM_ORDER3, 64), generator=gen) * 0.045
+                bregr_new = torch.zeros((1, 64), dtype=torch.float32)
+                wregr2_new = torch.zeros((32, REG_H_DIM_ORDER3), dtype=torch.float32)  # чистый Net2Net identity старт!
 
             state = {
                 "w1": w1_full.to(dtype=self.dtype, device=self.device),
@@ -356,14 +421,18 @@ class MultimodalMoEPolicyOrder3:
                 "w2_moe": w2m_flat.to(dtype=self.dtype, device=self.device),
                 "b2_moe": b2m_flat.to(dtype=self.dtype, device=self.device),
                 "w_gate1": wg1_new.to(dtype=self.dtype, device=self.device),
-                "b_gate1": ck["b_gate1"].view(1, ROUTER_H_DIM_ORDER3).to(dtype=self.dtype, device=self.device),
+                "b_gate1": bg1_new.to(dtype=self.dtype, device=self.device),
                 "w_gate2": wg2_new.to(dtype=self.dtype, device=self.device),
                 "b_gate2": bg2_new.to(dtype=self.dtype, device=self.device),
                 "w_rec": wrec_new.to(dtype=self.dtype, device=self.device),
                 "b_rec": brec_new.to(dtype=self.dtype, device=self.device),
+                "w_mem2h": wmem2h_new.to(dtype=self.dtype, device=self.device),
                 "w_reg1": wreg1_new.to(dtype=self.dtype, device=self.device),
                 "b_reg1_b": breg1b_new.to(dtype=self.dtype, device=self.device),
                 "b_reg1_a": breg1a_new.to(dtype=self.dtype, device=self.device),
+                "w_reg_res1": wregr1_new.to(dtype=self.dtype, device=self.device),
+                "b_reg_res": bregr_new.to(dtype=self.dtype, device=self.device),
+                "w_reg_res2": wregr2_new.to(dtype=self.dtype, device=self.device),
                 "w_reg2": wreg2_new.to(dtype=self.dtype, device=self.device),
                 "b_reg2_b": ck["b_reg2_b"].view(1, 2).to(dtype=self.dtype, device=self.device),
                 "b_reg2_a": ck["b_reg2_a"].view(1, 2).to(dtype=self.dtype, device=self.device),
@@ -430,41 +499,47 @@ class MultimodalMoEPolicyOrder3:
         if EXPERT_OUT_DIM_ORDER3 >= 50:
             dw2m_v = dw2m.view(-1, 256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
             db2m_v = db2m.view(-1, 1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
-            dw2m_v[:, :, :7, 25] *= 0.15  # защита рабочих волновых мод 0..6 от случайного включения тайм-стопа u_taker!
+            dw2m_v[:, :, :7, 25] *= 0.15
             db2m_v[:, :, :7, 25] *= 0.15
             dw2m_v[:, :, :, 48] *= 0.35
             db2m_v[:, :, :, 48] *= 0.35
-            dw2m_v[:, :, :, 49] *= 3.40   # активная калибровка гладкого wave_hold_pct [0..+10%] по модам!
+            dw2m_v[:, :, :, 49] *= 3.40
             db2m_v[:, :, :, 49] *= 3.80
             dw2m_v[:, :, :, 0] *= 1.80
             db2m_v[:, :, :, 0] *= 2.00
+            if EXPERT_OUT_DIM_ORDER3 >= 52:
+                dw2m_v[:, :, :, 50:52] *= 2.80  # активный поиск оптимального нелинейного демпфирования плана!
+                db2m_v[:, :, :, 50:52] *= 3.20
         self.w2_moe[2 : 2 + 2 * half].copy_(base_gpu["w2_moe"].unsqueeze(0) + dw2m.to(self.dtype))
         self.b2_moe[2 : 2 + 2 * half].copy_(base_gpu["b2_moe"].unsqueeze(0) + db2m.to(self.dtype))
 
         dw_g1 = _anti_ring((ROUTER_IN_DIM_ORDER3, ROUTER_H_DIM_ORDER3), moe_sig * 1.85, low_rank=12).to(self.dtype)
-        dw_g1[:, 272:311, :] *= 2.40  # активный фокус на 32D многомасштабной памяти и макро/карусельных каналах!
-        if ROUTER_IN_DIM_ORDER3 > 311:
-            dw_g1[:, 311:min(320, ROUTER_IN_DIM_ORDER3), :] *= 2.80
-        if ROUTER_IN_DIM_ORDER3 > 320:
-            dw_g1[:, 320:, :] *= 4.50  # прямое подключение 6D Wave Radar [w_5m..p_top_15m] в роутер мод K=8!
+        dw_g1[:, 272:320, :] *= 2.60  # 48D многомасштабная память в роутере
+        dw_g1[:, 320:, :] *= 4.20     # 30D прямых сигналов (Wave + 12H O1 + 16D O2) + 8D prev_g_mode рекуррентность!
         self.w_gate1[2 : 2 + 2 * half].copy_(base_gpu["w_gate1"].unsqueeze(0) + dw_g1)
         self.b_gate1[2 : 2 + 2 * half].copy_(base_gpu["b_gate1"].unsqueeze(0) + _anti_ring((1, ROUTER_H_DIM_ORDER3), moe_sig * 1.35).to(self.dtype))
-        dw_g2 = _anti_ring((ROUTER_H_DIM_ORDER3, K_MODES_ORDER3), moe_sig * 2.00)
-        db_g2 = _anti_ring((1, K_MODES_ORDER3), moe_sig * 1.40)
+        dw_g2 = _anti_ring((ROUTER_H_DIM_ORDER3, ROUTER_OUT_DIM_ORDER3), moe_sig * 2.00)
+        db_g2 = _anti_ring((1, ROUTER_OUT_DIM_ORDER3), moe_sig * 1.40)
+        dw_g2[:, :, K_MODES_ORDER3:] *= 2.20  # пластичность нелинейных Liquid-вентилей роутера!
+        db_g2[:, :, K_MODES_ORDER3:] *= 2.50
         self.w_gate2[2 : 2 + 2 * half].copy_(base_gpu["w_gate2"].unsqueeze(0) + dw_g2.to(self.dtype))
         self.b_gate2[2 : 2 + 2 * half].copy_(base_gpu["b_gate2"].unsqueeze(0) + db_g2.to(self.dtype))
 
         dw_rec = _anti_ring((256, 2 * MEM_DIM_ORDER3), sig_trunk * 1.10, low_rank=12)
-        dw_rec[:, 16:32] *= 2.20  # ускоряем обучение новых 3m/12m ячеек макро-памяти
+        dw_rec[:, 16:48] *= 2.40
         self.w_rec[2 : 2 + 2 * half].copy_(base_gpu["w_rec"].unsqueeze(0) + dw_rec.to(self.dtype))
         self.b_rec[2 : 2 + 2 * half].copy_(base_gpu["b_rec"].unsqueeze(0) + _anti_ring((1, 2 * MEM_DIM_ORDER3), sig_trunk * 0.5).to(self.dtype))
+        self.w_mem2h[2 : 2 + 2 * half].copy_(base_gpu["w_mem2h"].unsqueeze(0) + _anti_ring((MEM_DIM_ORDER3, 256), sig_trunk * 2.50, low_rank=10).to(self.dtype))
 
         bias_reg_sig = 0.040 * float(sigma_scale)
         dw_reg1 = _anti_ring((REG_IN_DIM_ORDER3, REG_H_DIM_ORDER3), sig_trunk * 1.75)
-        dw_reg1[:, 24:28, :] *= 2.80  # повышенная пластичность 4D каналов реальной FIFO-очереди (qprog, qa_eta, wall, hold_long)!
+        dw_reg1[:, 20:28, :] *= 2.80
         self.w_reg1[2 : 2 + 2 * half].copy_(base_gpu["w_reg1"].unsqueeze(0) + dw_reg1.to(self.dtype))
         self.b_reg1_b[2 : 2 + 2 * half].copy_(base_gpu["b_reg1_b"].unsqueeze(0) + _anti_ring((1, REG_H_DIM_ORDER3), sig_trunk * 1.10).to(self.dtype))
         self.b_reg1_a[2 : 2 + 2 * half].copy_(base_gpu["b_reg1_a"].unsqueeze(0) + _anti_ring((1, REG_H_DIM_ORDER3), sig_trunk * 1.10).to(self.dtype))
+        self.w_reg_res1[2 : 2 + 2 * half].copy_(base_gpu["w_reg_res1"].unsqueeze(0) + _anti_ring((REG_H_DIM_ORDER3, 64), sig_trunk * 2.20).to(self.dtype))
+        self.b_reg_res[2 : 2 + 2 * half].copy_(base_gpu["b_reg_res"].unsqueeze(0) + _anti_ring((1, 64), sig_trunk * 1.10).to(self.dtype))
+        self.w_reg_res2[2 : 2 + 2 * half].copy_(base_gpu["w_reg_res2"].unsqueeze(0) + _anti_ring((32, REG_H_DIM_ORDER3), sig_trunk * 2.20).to(self.dtype))
         self.w_reg2[2 : 2 + 2 * half].copy_(base_gpu["w_reg2"].unsqueeze(0) + _anti_ring((REG_H_DIM_ORDER3, 2), sig_trunk * 1.60).to(self.dtype))
         self.b_reg2_b[2 : 2 + 2 * half].copy_(base_gpu["b_reg2_b"].unsqueeze(0) + _anti_ring((1, 2), bias_reg_sig).to(self.dtype))
         self.b_reg2_a[2 : 2 + 2 * half].copy_(base_gpu["b_reg2_a"].unsqueeze(0) + _anti_ring((1, 2), bias_reg_sig).to(self.dtype))
@@ -564,9 +639,9 @@ def train_order3(
     log_msg(f"🚀 ORDER-3 WFv2 ISLAND #{island_id}/{num_islands} ({island_mode.upper()}) ON {device} | GROUPS={n_groups} (POP={n_groups * 6})")
     log_msg("=" * 90)
 
-    # 1. Загрузка строго каузальных 72D данных Signal Stack v3 (Wave Radar + Micro + Macro) на тике $0.0001
-    log_msg("📦 Загрузка каузальной 72D матрицы Signal Stack v3 (Wave Radar) и выделение эпохи суб-центового тика $0.0001...")
-    mkt_raw = np.load(BASE_DIR / "data/cache/rl_hybrid_market_obs_72d.npz", mmap_mode="r")
+    # 1. Загрузка строго каузальных 84D данных Signal Stack v4 (12H Order-1 + 16D Order-2 + Wave Radar) на тике $0.0001
+    log_msg("📦 Загрузка каузальной 84D матрицы Signal Stack v4 (12H Order-1 + 16D Order-2) и выделение эпохи тика $0.0001...")
+    mkt_raw = np.load(BASE_DIR / "data/cache/rl_hybrid_market_obs_84d.npz", mmap_mode="r")
     lob_raw = np.load(BASE_DIR / "data/cache/rl_guard_lob_cache_600h.npz", mmap_mode="r")
 
     b1_full = lob_raw["bid_p"][:, 0]
@@ -574,7 +649,7 @@ def train_order3(
     subcent_offset = int(subcent_hits[0]) if len(subcent_hits) > 0 else 0
     log_msg(f"🔍 Обнаружена граница перехода биржи на тик $0.0001: idx={subcent_offset:,} (отсечено {subcent_offset:,} старых $0.01 тиков!)")
 
-    mkt_sub = np.asarray(mkt_raw["market_obs_72d"][subcent_offset:], dtype=np.float32)
+    mkt_sub = np.asarray(mkt_raw["market_obs_84d"][subcent_offset:], dtype=np.float32)
     total_rows = len(mkt_sub)
     tick_sz = 0.0001
     if win_len > total_rows // 8:
@@ -1158,14 +1233,14 @@ def train_order3(
             w1[c_w, :] = w1[c_w, :] + (wave_gain * mult_w) * bull_dir_w1
         w1[65, :] = w1[65, :] + (wave_gain * 1.65) * crash_dir_w1
 
-        # 3) Тёплая распайка Wave Stack [320..325] в прямой роутер w_gate1:
-        # В r_extra_22d (строки 304..325): 316=ch36(20s), 317=ch39(160s), 318=ch55(skew20s), 313=ch31(crash300s), 312=ch30(bleed60s)
-        wg1[[316, 317, 318], :] = wg1[[316, 317, 318], :] * o1_boost
-        bull_dir_g = 0.40 * wg1[316, :] + 0.60 * wg1[317, :]
-        crash_dir_g = 0.65 * wg1[313, :] + 0.35 * wg1[312, :]
-        for r_w, mult_r in ((320, 0.50), (321, 0.65), (322, 0.80), (323, 0.75), (324, 0.90)):
+        # 3) В новой 358D схеме роутера r_extra_30d начинается со строки 320:
+        # 332=ch36(20s), 333=ch39(160s), 334=ch55(skew20s), 329=ch31(crash300s), 328=ch30(bleed60s), [336..341]=Wave6D, [342..349]=Ext8D!
+        wg1[[332, 333, 334], :] = wg1[[332, 333, 334], :] * o1_boost
+        bull_dir_g = 0.40 * wg1[332, :] + 0.60 * wg1[333, :]
+        crash_dir_g = 0.65 * wg1[329, :] + 0.35 * wg1[328, :]
+        for r_w, mult_r in ((336, 0.50), (337, 0.65), (338, 0.80), (339, 0.75), (340, 0.90)):
             wg1[r_w, :] = wg1[r_w, :] + (wave_gain * mult_r) * bull_dir_g
-        wg1[325, :] = wg1[325, :] + (wave_gain * 1.05) * crash_dir_g
+        wg1[341, :] = wg1[341, :] + (wave_gain * 1.05) * crash_dir_g
 
         d["w1"] = w1
         d["w_gate1"] = wg1
@@ -1173,7 +1248,6 @@ def train_order3(
         return {k: v.to(device=device, dtype=policy.dtype) for k, v in st_nm.items()}
 
     def _graft_wave_and_hft_l70(st_wave_base: dict, st_hft_base: dict, hft_modes: tuple[int, ...] = (1, 5), wave_gain: float = 0.70) -> dict:
-        """Соединяет волновое ядро L68_Ult_w30 (+$60 на ралли!) с высокооборотными модами L69_Isl0 ($23.4k/сут @ DD 11.5%!) + Warm-Wiring Order-1!"""
         m = {k: st_wave_base[k].detach().cpu().float().clone() for k in MultimodalMoEPolicyOrder3.PARAM_KEYS}
         w2 = m["w2_moe"].view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
         b2 = m["b2_moe"].view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
@@ -1186,20 +1260,65 @@ def train_order3(
         m["b2_moe"] = b2.reshape(1, MOE_OUT_DIM_ORDER3)
         return _warm_wire_l70_order1(m, wave_gain=wave_gain, o1_boost=1.28)
 
-    st_l70_ww_l69i0 = _warm_wire_l70_order1(st_l69_i0, wave_gain=0.75, o1_boost=1.30)
-    st_l70_ww_l68w30 = _warm_wire_l70_order1(st_l68_w30, wave_gain=0.75, o1_boost=1.30)
-    st_l70_graft_a = _graft_wave_and_hft_l70(st_l68_w30, st_l69_i0, hft_modes=(1, 5), wave_gain=0.75)
-    st_l70_graft_b = _graft_wave_and_hft_l70(st_l69_i0, st_l68_w30, hft_modes=(2, 3), wave_gain=0.80)
-    st_l70_ww_fc_snp = _warm_wire_l70_order1(st_l69_fc_snp, wave_gain=0.70, o1_boost=1.25)
+    def _tune_l71_liquid_seed(
+        st_in: dict,
+        gate_beta_z: float,
+        bid_latch_z: float,
+        ask_latch_z: float,
+        self_rec_gain: float = 0.35,
+        cnl_hyst_b: float = 0.0,
+        cnl_hyst_a: float = 0.0,
+    ) -> dict:
+        """
+        L71 Liquid Gated Seed (Function-Preserving + Endogenous Calmness):
+        - Настраивает стартовый баланс инерции роутера beta_gate = sigmoid(gate_beta_z) без заморозки быстрых окон входа,
+        - Настраивает нелинейный демпфер плана Bid/Ask (alpha_bid, alpha_ask),
+        - Включает мягкую самоподдержку текущей моды по диагонали prev_g_mode [350..357] -> w_gate2 и гистерезис отмены!
+        """
+        d = {k: st_in[k].detach().cpu().float().clone() for k in MultimodalMoEPolicyOrder3.PARAM_KEYS}
+        d["b_gate2"][0, K_MODES_ORDER3:] = gate_beta_z
+        b2 = d["b2_moe"].view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        b2[0, :, 50] = bid_latch_z
+        b2[0, :, 51] = ask_latch_z
+        # В краш-щите Mode #4 оставляем мгновенную реакцию Bid/Ask!
+        b2[0, 4, 50] = max(bid_latch_z + 1.5, 2.2)
+        b2[0, 4, 51] = max(ask_latch_z + 1.5, 2.4)
+        d["b2_moe"] = b2.reshape(1, MOE_OUT_DIM_ORDER3)
+        # Диагональная связь prev_g_mode [350..357] -> нейроны 64..71 роутера -> логиты мод 0..7:
+        for km in range(K_MODES_ORDER3):
+            h_slot = 64 + km
+            d["w_gate1"][350 + km, h_slot] = 1.35
+            d["b_gate1"][0, h_slot] = 0.15
+            d["w_gate2"][h_slot, km] = self_rec_gain
+            # При краш-угрозе ch[329=crash300s, 347=crash600s, 348=crash900s] мгновенно открываем вентиль beta_gate!
+            d["w_gate1"][[329, 347, 348], 72 + km] = 1.20
+            d["w_gate2"][72 + km, K_MODES_ORDER3 + km] = 1.60
+        if cnl_hyst_b != 0.0:
+            d["b_reg2_b"][0, 1] = d["b_reg2_b"][0, 1] + cnl_hyst_b
+        if cnl_hyst_a != 0.0:
+            d["b_reg2_a"][0, 1] = d["b_reg2_a"][0, 1] + cnl_hyst_a
+        st_n = _normalize_weights_order3(d, policy.dtype)
+        return {k: v.to(device=device, dtype=policy.dtype) for k, v in st_n.items()}
 
-    st_ms_53i0_52i1 = st_l70_graft_a
-    st_ms_53i0_56i0 = st_l70_graft_b
+    st_l70_champ = _load_gpu_seed(BASE_DIR / "models/prl/release_champion_v1.pt", st_l68_w30)
+    st_l70_e9 = _load_gpu_seed(SAVE_DIR / "bak_l70/l70_chim_e9.pt", st_l70_champ)
+    st_l70_ask45 = _load_gpu_seed(SAVE_DIR / "bak_l70/l70_chim_ask45.pt", st_l70_champ)
+    st_l70_soup = _load_gpu_seed(SAVE_DIR / "bak_l70/order3_soup_top3.pt", st_l70_champ)
+
+    st_l71_liq_champ = _tune_l71_liquid_seed(st_l70_champ, gate_beta_z=+0.85, bid_latch_z=+1.15, ask_latch_z=+1.45, self_rec_gain=0.35, cnl_hyst_b=-0.28, cnl_hyst_a=-0.22)
+    st_l71_liq_smooth = _tune_l71_liquid_seed(st_l70_champ, gate_beta_z=+0.30, bid_latch_z=+0.75, ask_latch_z=+1.05, self_rec_gain=0.50, cnl_hyst_b=-0.45, cnl_hyst_a=-0.35)
+    st_l71_liq_e9 = _tune_l71_liquid_seed(st_l70_e9, gate_beta_z=+0.75, bid_latch_z=+1.05, ask_latch_z=+1.35, self_rec_gain=0.40, cnl_hyst_b=-0.30, cnl_hyst_a=-0.25)
+    st_l71_liq_ask45 = _tune_l71_liquid_seed(st_l70_ask45, gate_beta_z=+0.80, bid_latch_z=+1.10, ask_latch_z=+1.35, self_rec_gain=0.40, cnl_hyst_b=-0.28, cnl_hyst_a=-0.22)
+    st_l71_liq_soup = _tune_l71_liquid_seed(st_l70_soup, gate_beta_z=+0.65, bid_latch_z=+0.95, ask_latch_z=+1.25, self_rec_gain=0.45, cnl_hyst_b=-0.35, cnl_hyst_a=-0.25)
+
+    st_ms_53i0_52i1 = st_l71_liq_champ
+    st_ms_53i0_56i0 = st_l71_liq_e9
     is_warm_l43 = True
 
     seed_pool = (
-        [st_l70_graft_a, st_l70_graft_b, st_l70_ww_l69i0, st_l70_ww_l68w30, st_l70_ww_fc_snp, st_l69_i1]
+        [st_l71_liq_champ, st_l71_liq_smooth, st_l71_liq_e9, st_l71_liq_ask45, st_l71_liq_soup, st_l70_champ]
         if island_id == 0
-        else [st_l70_ww_l69i0, st_l70_graft_b, st_l70_graft_a, st_l70_ww_fc_snp, st_l70_ww_l68w30, st_l69_fc_bal]
+        else [st_l71_liq_e9, st_l71_liq_ask45, st_l71_liq_smooth, st_l71_liq_soup, st_l71_liq_champ, st_l70_e9]
     )
     resume_iter = 0
     for res_p in [SAVE_DIR / "islands" / f"island_{island_id}_best.pt", SAVE_DIR / "global_best.pt", RESUME_CHAMP_PATH]:
@@ -1536,7 +1655,12 @@ def train_order3(
             if k == "w_gate1":
                 g0 = uniq_elites[0][1][k].detach().to(device=device, dtype=torch.float32).clone()
                 g1 = uniq_elites[1][1][k].detach().to(device=device, dtype=torch.float32)
-                g0[320:326] = 0.75 * g0[320:326] + 0.25 * g1[320:326]
+                g0[336:358] = 0.75 * g0[336:358] + 0.25 * g1[336:358]
+                soup_state[k] = g0.to(dtype=policy.dtype)
+            elif k in ("w_gate2", "b_gate2"):
+                g0 = uniq_elites[0][1][k].detach().to(device=device, dtype=torch.float32).clone()
+                g1 = uniq_elites[1][1][k].detach().to(device=device, dtype=torch.float32)
+                g0[:, K_MODES_ORDER3:] = 0.75 * g0[:, K_MODES_ORDER3:] + 0.25 * g1[:, K_MODES_ORDER3:]
                 soup_state[k] = g0.to(dtype=policy.dtype)
             elif k in gate_keys:
                 soup_state[k] = uniq_elites[0][1][k].detach().to(device=device, dtype=policy.dtype).clone()

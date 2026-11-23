@@ -21,6 +21,8 @@ import subprocess
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
 OUTPUT_DIR = BASE_DIR / "models" / "prl" / "order2_wf"
 LOGS_DIR = BASE_DIR / "scratch" / "wf_order2_logs"
 LOGS_DIR.mkdir(parents=True, exist_ok=True)

@@ -34,21 +34,21 @@ from _tools.fused_order3_clean_tick import (
     _scale_mkt_44d,
 )
 
-MKT_PATH = BASE_DIR / "data/cache/rl_hybrid_market_obs_72d.npz"
+MKT_PATH = BASE_DIR / "data/cache/rl_hybrid_market_obs_84d.npz"
 LOB_PATH = BASE_DIR / "data/cache/rl_guard_lob_cache_600h.npz"
 CHAMP_PATH = BASE_DIR / "models/prl/release_champion_v1.pt"
 
 
 def main():
     print("=" * 80)
-    print("🧪 ORDER-3 TRUE BITWISE SIM / LIVE PARITY & LATENCY VERIFICATION (SIGNAL STACK V3 72D)")
+    print("🧪 ORDER-3 TRUE BITWISE SIM / LIVE PARITY & LATENCY VERIFICATION (SIGNAL STACK V4 84D)")
     print("=" * 80)
 
     # Используем CPU, как на боевом VPS, для честного замера латентности без 14с холодного старта CUDA
     engine = Order3LiveInferenceEngine(checkpoint_path=CHAMP_PATH, device="cpu")
     print("  ✅ Order3LiveInferenceEngine (CPU) инициализирован.")
 
-    mkt_raw = np.load(MKT_PATH, mmap_mode="r")["market_obs_72d"]
+    mkt_raw = np.load(MKT_PATH, mmap_mode="r")["market_obs_84d"]
     lob_raw = np.load(LOB_PATH, mmap_mode="r")
     assert mkt_raw.shape[1] == MKT_DIM_ORDER3, f"Expected {MKT_DIM_ORDER3}D market matrix, got {mkt_raw.shape}"
     col_stds = np.std(np.asarray(mkt_raw[3016277::100], dtype=np.float32), axis=0)
@@ -68,8 +68,12 @@ def main():
         trader_entry=1.8380,
     )
     engine.mem_h.zero_()
+    engine.gate_state.zero_()
+    engine.strat_state.zero_()
 
     ref_mem_h = torch.zeros((1, MEM_DIM_ORDER3), dtype=torch.float32)
+    ref_gate_st = torch.zeros((1, engine.k_modes), dtype=torch.float32)
+    ref_strat_st = torch.zeros((1, EXPERT_OUT_DIM_ORDER3), dtype=torch.float32)
     latencies_ms = []
     max_pi_err = 0.0
     max_px_err = 0.0
@@ -105,26 +109,46 @@ def main():
             rr = h2 @ engine.w_rec + engine.b_rec
             rg = torch.cat(
                 [
-                    torch.sigmoid(rr[:, 32:40] + 1.0),
-                    torch.sigmoid(rr[:, 40:48] + 3.8),
-                    torch.sigmoid(rr[:, 48:56] + 5.2),
-                    torch.sigmoid(rr[:, 56:64] + 6.6),
+                    torch.sigmoid(rr[:, 48:56] + 1.0),
+                    torch.sigmoid(rr[:, 56:64] + 3.8),
+                    torch.sigmoid(rr[:, 64:72] + 5.2),
+                    torch.sigmoid(rr[:, 72:80] + 6.6),
+                    torch.sigmoid(rr[:, 80:88] + 2.2),
+                    torch.sigmoid(rr[:, 88:96] + 4.5),
                 ],
                 dim=-1,
             )
             ref_mem_h = rg * ref_mem_h + (1.0 - rg) * torch.tanh(rr[:, :MEM_DIM_ORDER3])
+            h2_ctx = h2 + ref_mem_h @ engine.w_mem2h
             r_extra = torch.cat(
                 [
                     zm[:, 0:1], zm[:, 40:44], zm[:, 44:45], zm[:, 48:49],
                     zm[:, 29:34], zm[:, 36:37], zm[:, 39:40], zm[:, 55:56], zm[:, 12:13],
-                    zm[:, 60:66],
+                    zm[:, 60:66], zm[:, 72:76], zm[:, 79:82], zm[:, 83:84],
                 ],
                 dim=-1,
             )
-            rin = torch.cat([h2, za_raw[:, 54:62], za_raw[:, 62:70], ref_mem_h, r_extra], dim=-1)
-            gm = torch.softmax(F.silu(rin @ engine.w_gate1 + engine.b_gate1) @ engine.w_gate2 + engine.b_gate2, dim=-1)
-            moe = (h2 @ engine.w2_moe + engine.b2_moe).view(1, engine.k_modes, EXPERT_OUT_DIM_ORDER3)
-            sr = (gm.unsqueeze(-1) * moe).sum(dim=1).squeeze(0)
+            prev_gm = torch.softmax(ref_gate_st, dim=-1)
+            rin = torch.cat([h2_ctx, za_raw[:, 54:62], za_raw[:, 62:70], ref_mem_h, r_extra, prev_gm], dim=-1)
+            go = F.silu(rin @ engine.w_gate1 + engine.b_gate1) @ engine.w_gate2 + engine.b_gate2
+            beta_g = torch.sigmoid(go[:, engine.k_modes : 2 * engine.k_modes])
+            ref_gate_st = (1.0 - beta_g) * ref_gate_st + beta_g * go[:, :engine.k_modes]
+            gm = torch.softmax(ref_gate_st, dim=-1)
+            moe = (h2_ctx @ engine.w2_moe + engine.b2_moe).view(1, engine.k_modes, EXPERT_OUT_DIM_ORDER3)
+            si = (gm.unsqueeze(-1) * moe).sum(dim=1)
+            ab = torch.sigmoid(si[:, 50:51])
+            aa = torch.sigmoid(si[:, 51:52])
+            bb = (1.0 - ab) * ref_strat_st + ab * si
+            ak = (1.0 - aa) * ref_strat_st + aa * si
+            ref_strat_st = torch.cat(
+                [
+                    bb[:, 0:13], ak[:, 13:25], si[:, 25:26], bb[:, 26:35], ak[:, 35:36], si[:, 36:37],
+                    bb[:, 37:41], ak[:, 41:44], bb[:, 44:45], ak[:, 45:47], bb[:, 47:48], si[:, 48:49],
+                    ak[:, 49:50], si[:, 50:52],
+                ],
+                dim=-1,
+            )
+            sr = ref_strat_st.squeeze(0)
             ref_pi_b = _fanned_slot_softmax(sr[1:13].unsqueeze(0), 0.08 + 2.42 * torch.sigmoid(sr[34:35]), 0.08 + 0.92 * torch.sigmoid(sr[44:45]), floor=0.005).squeeze(0).numpy()
             ref_pi_a = _fanned_slot_softmax(sr[13:25].unsqueeze(0), 0.08 + 2.42 * torch.sigmoid(sr[35:36]), 0.08 + 0.92 * torch.sigmoid(sr[44:45] + 0.25), floor=0.005).squeeze(0).numpy()
             echelon_k01 = torch.linspace(0.0, 1.0, 12, dtype=torch.float32)

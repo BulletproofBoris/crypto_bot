@@ -28,8 +28,10 @@ from _tools.fused_order3_clean_tick import (
     K_MODES_ORDER3,
     EXPERT_OUT_DIM_ORDER3,
     MOE_OUT_DIM_ORDER3,
+    ROUTER_EXTRA_DIM_ORDER3,
     ROUTER_IN_DIM_ORDER3,
     ROUTER_H_DIM_ORDER3,
+    ROUTER_OUT_DIM_ORDER3,
     REG_IN_DIM_ORDER3,
     REG_H_DIM_ORDER3,
     TOKEN_REFILL_PER_SEC_ORDER3,
@@ -87,42 +89,68 @@ class Order3LiveInferenceEngine:
         self.b_res1 = ck["b_res1"].view(1, 128).to(device=self.device, dtype=torch.float32)
         self.w_res2 = ck["w_res2"].to(device=self.device, dtype=torch.float32)
 
-        # Латентная многомасштабная память (16D -> 32D с бесшовной совместимостью L46/L48)
+        # Латентная многомасштабная память (16D / 32D -> 48D + прямая связь в ствол/экспертов w_mem2h)
         wrec_raw = ck["w_rec"].to(dtype=torch.float32)
         brec_raw = ck["b_rec"].to(dtype=torch.float32).view(1, -1)
         if brec_raw.numel() != 2 * MEM_DIM_ORDER3:
+            old_m = brec_raw.numel() // 2
             wrec_pad = torch.zeros((256, 2 * MEM_DIM_ORDER3), dtype=torch.float32)
             brec_pad = torch.zeros((1, 2 * MEM_DIM_ORDER3), dtype=torch.float32)
-            wrec_pad[:, :16] = wrec_raw[:, :16]
-            wrec_pad[:, 32:48] = wrec_raw[:, 16:32]
-            brec_pad[:, :16] = brec_raw[:, :16]
-            brec_pad[:, 32:48] = brec_raw[:, 16:32]
+            cm_r = min(old_m, MEM_DIM_ORDER3)
+            wrec_pad[:, :cm_r] = wrec_raw[:, :cm_r]
+            wrec_pad[:, MEM_DIM_ORDER3 : MEM_DIM_ORDER3 + cm_r] = wrec_raw[:, old_m : old_m + cm_r]
+            brec_pad[:, :cm_r] = brec_raw[:, :cm_r]
+            brec_pad[:, MEM_DIM_ORDER3 : MEM_DIM_ORDER3 + cm_r] = brec_raw[:, old_m : old_m + cm_r]
             wrec_raw, brec_raw = wrec_pad, brec_pad
         self.w_rec = wrec_raw.to(device=self.device)
         self.b_rec = brec_raw.view(1, 2 * MEM_DIM_ORDER3).to(device=self.device)
+        if "w_mem2h" in ck and ck["w_mem2h"].shape == (MEM_DIM_ORDER3, 256):
+            self.w_mem2h = ck["w_mem2h"].to(device=self.device, dtype=torch.float32)
+        else:
+            self.w_mem2h = torch.zeros((MEM_DIM_ORDER3, 256), dtype=torch.float32, device=self.device)
 
-        # Авто-определение числа мод K (поддержка как K=4, так и расширенных K=8 чекпоинтов!)
-        self.k_modes = int(ck["b_gate2"].numel())
+        # Авто-определение числа мод K (поддержка как K=8 с 16D Liquid-выходами, так и старых 8D выходов!)
+        bg2_numel = int(ck["b_gate2"].numel())
+        self.k_modes = int(ck.get("k_modes", K_MODES_ORDER3 if bg2_numel in (K_MODES_ORDER3, 2 * K_MODES_ORDER3) else bg2_numel))
         self.moe_out_dim = self.k_modes * EXPERT_OUT_DIM_ORDER3
         self.reg_in_dim = 28 + self.k_modes
 
-        # Контекстный маршрутизатор (с бесшовной обратной совместимостью 288D / 295D -> 311D)
+        # Вентильный рекуррентный маршрутизатор (358D -> 128 -> 16, с бесшовной обратной совместимостью 326D->64->8!)
         wg1_raw = ck["w_gate1"].to(dtype=torch.float32)
-        if wg1_raw.shape[0] != ROUTER_IN_DIM_ORDER3:
+        bg1_raw = ck["b_gate1"].to(dtype=torch.float32).view(1, -1)
+        wg2_raw = ck["w_gate2"].to(dtype=torch.float32)
+        bg2_raw = ck["b_gate2"].to(dtype=torch.float32).view(1, -1)
+        if wg1_raw.shape != (ROUTER_IN_DIM_ORDER3, ROUTER_H_DIM_ORDER3):
+            old_rin, old_rh = wg1_raw.shape
             wg1_adap = torch.zeros((ROUTER_IN_DIM_ORDER3, ROUTER_H_DIM_ORDER3), dtype=torch.float32)
-            if wg1_raw.shape[0] == 295 and ROUTER_IN_DIM_ORDER3 >= 311:
-                wg1_adap[:288, :] = wg1_raw[:288, :]
-                wg1_adap[304:311, :] = wg1_raw[288:295, :]
+            bg1_adap = torch.zeros((1, ROUTER_H_DIM_ORDER3), dtype=torch.float32)
+            ch_r = min(old_rh, ROUTER_H_DIM_ORDER3)
+            bg1_adap[:, :ch_r] = bg1_raw[:, :ch_r]
+            if old_rin == 326 and ROUTER_IN_DIM_ORDER3 == 358:
+                wg1_adap[:304, :ch_r] = wg1_raw[:304, :ch_r]
+                wg1_adap[320:342, :ch_r] = wg1_raw[304:326, :ch_r]
+            elif old_rin == 295:
+                wg1_adap[:288, :ch_r] = wg1_raw[:288, :ch_r]
+                wg1_adap[320:327, :ch_r] = wg1_raw[288:295, :ch_r]
             else:
-                copy_r = min(ROUTER_IN_DIM_ORDER3, wg1_raw.shape[0])
-                wg1_adap[:copy_r, :] = wg1_raw[:copy_r, :]
-            wg1_raw = wg1_adap
+                copy_r = min(ROUTER_IN_DIM_ORDER3, old_rin)
+                wg1_adap[:copy_r, :ch_r] = wg1_raw[:copy_r, :ch_r]
+            wg1_raw, bg1_raw = wg1_adap, bg1_adap
+        if wg2_raw.shape != (ROUTER_H_DIM_ORDER3, 2 * self.k_modes):
+            old_rh2, old_ro = wg2_raw.shape
+            wg2_adap = torch.zeros((ROUTER_H_DIM_ORDER3, 2 * self.k_modes), dtype=torch.float32)
+            bg2_adap = torch.zeros((1, 2 * self.k_modes), dtype=torch.float32)
+            wg2_adap[:min(old_rh2, ROUTER_H_DIM_ORDER3), :min(old_ro, 2 * self.k_modes)] = wg2_raw[:min(old_rh2, ROUTER_H_DIM_ORDER3), :min(old_ro, 2 * self.k_modes)]
+            bg2_adap[:, :min(old_ro, 2 * self.k_modes)] = bg2_raw[:, :min(old_ro, 2 * self.k_modes)]
+            if old_ro <= self.k_modes:
+                bg2_adap[:, self.k_modes:] = 12.0  # beta_gate=1.0 для 0.00e+00 паритета старых чекпоинтов!
+            wg2_raw, bg2_raw = wg2_adap, bg2_adap
         self.w_gate1 = wg1_raw.to(device=self.device)
-        self.b_gate1 = ck["b_gate1"].view(1, ROUTER_H_DIM_ORDER3).to(device=self.device, dtype=torch.float32)
-        self.w_gate2 = ck["w_gate2"].to(device=self.device, dtype=torch.float32)
-        self.b_gate2 = ck["b_gate2"].view(1, self.k_modes).to(device=self.device, dtype=torch.float32)
+        self.b_gate1 = bg1_raw.view(1, ROUTER_H_DIM_ORDER3).to(device=self.device)
+        self.w_gate2 = wg2_raw.to(device=self.device)
+        self.b_gate2 = bg2_raw.view(1, 2 * self.k_modes).to(device=self.device)
 
-        # MoE эксперты (с бесшовной обратной совместимостью 45D -> 48D на моду)
+        # MoE эксперты (с бесшовной обратной совместимостью 45D / 48D / 50D -> 52D на моду)
         w2m_raw = ck["w2_moe"].to(dtype=torch.float32)
         b2m_raw = ck["b2_moe"].to(dtype=torch.float32).view(1, -1)
         if b2m_raw.numel() != self.moe_out_dim:
@@ -138,12 +166,14 @@ class Order3LiveInferenceEngine:
                 b2m_pad[:, :, 47] = 6.0
             if old_ed <= 48 and EXPERT_OUT_DIM_ORDER3 >= 50:
                 b2m_pad[:, :, 48:50] = -12.0
+            if old_ed <= 50 and EXPERT_OUT_DIM_ORDER3 >= 52:
+                b2m_pad[:, :, 50:52] = 12.0
             w2m_raw = w2m_pad.reshape(256, self.moe_out_dim)
             b2m_raw = b2m_pad.reshape(1, self.moe_out_dim)
         self.w2_moe = w2m_raw.to(device=self.device)
         self.b2_moe = b2m_raw.view(1, self.moe_out_dim).to(device=self.device)
 
-        # Регулятор слотов (с бесшовной обратной совместимостью 26D / 32D->48 -> 36D->64)
+        # Двухкаскадный ResSwiGLU регулятор слотов (36D -> 64 -> ResSwiGLU -> 2)
         wreg1_raw = ck["w_reg1"].to(dtype=torch.float32)
         breg1b_raw = ck["b_reg1_b"].to(dtype=torch.float32).view(1, -1)
         breg1a_raw = ck["b_reg1_a"].to(dtype=torch.float32).view(1, -1)
@@ -171,12 +201,22 @@ class Order3LiveInferenceEngine:
         self.w_reg1 = wreg1_raw.to(device=self.device)
         self.b_reg1_b = breg1b_raw.view(1, REG_H_DIM_ORDER3).to(device=self.device)
         self.b_reg1_a = breg1a_raw.view(1, REG_H_DIM_ORDER3).to(device=self.device)
+        if "w_reg_res1" in ck and ck["w_reg_res1"].shape == (REG_H_DIM_ORDER3, 64):
+            self.w_reg_res1 = ck["w_reg_res1"].to(device=self.device, dtype=torch.float32)
+            self.b_reg_res = ck["b_reg_res"].view(1, 64).to(device=self.device, dtype=torch.float32)
+            self.w_reg_res2 = ck["w_reg_res2"].to(device=self.device, dtype=torch.float32)
+        else:
+            self.w_reg_res1 = torch.zeros((REG_H_DIM_ORDER3, 64), dtype=torch.float32, device=self.device)
+            self.b_reg_res = torch.zeros((1, 64), dtype=torch.float32, device=self.device)
+            self.w_reg_res2 = torch.zeros((32, REG_H_DIM_ORDER3), dtype=torch.float32, device=self.device)
         self.w_reg2 = wreg2_raw.to(device=self.device)
         self.b_reg2_b = ck["b_reg2_b"].view(1, 2).to(device=self.device, dtype=torch.float32)
         self.b_reg2_a = ck["b_reg2_a"].view(1, 2).to(device=self.device, dtype=torch.float32)
 
-        # Внутреннее состояние
+        # Внутреннее состояние (48D память + Liquid-вентили роутера и плана!)
         self.mem_h = torch.zeros((1, MEM_DIM_ORDER3), dtype=torch.float32, device=self.device)
+        self.gate_state = torch.zeros((1, self.k_modes), dtype=torch.float32, device=self.device)
+        self.strat_state = torch.zeros((1, EXPERT_OUT_DIM_ORDER3), dtype=torch.float32, device=self.device)
         self.api_tokens = float(LIVE_TOKEN_BUCKET_CAP)
         self.last_ts = time.time()
         self.echelon_k01 = torch.linspace(0.0, 1.0, 12, dtype=torch.float32, device=self.device)
@@ -223,11 +263,14 @@ class Order3LiveInferenceEngine:
         Полный шаг инференса Order-3 (L46/L48 100% паритет с fused_order3_clean_tick.py).
         """
         # Тензоры
-        zm = _scale_mkt_44d(torch.from_numpy(z_mkt_39d).to(device=self.device, dtype=torch.float32).view(1, MKT_DIM_ORDER3), torch.float32)
+        zm_in = torch.from_numpy(z_mkt_39d).to(device=self.device, dtype=torch.float32).view(1, -1)
+        if zm_in.shape[-1] < MKT_DIM_ORDER3:
+            zm_in = torch.cat([zm_in, torch.zeros((1, MKT_DIM_ORDER3 - zm_in.shape[-1]), dtype=torch.float32, device=self.device)], dim=-1)
+        zm = _scale_mkt_44d(zm_in[:, :MKT_DIM_ORDER3], torch.float32)
         za = torch.from_numpy(z_ag_110d).to(device=self.device, dtype=torch.float32).view(1, AG_DIM_ORDER3)
         za_norm = _normalize_agent_z110_per_block(za, torch.float32)
 
-        # 1. 170D -> 384
+        # 1. 194D -> 384
         pre_all = (zm @ self.w1_mkt + self.b1) + (za_norm @ self.w1_ag)
         h_base = torch.relu(pre_all[:, :256])
         h_gate = (2.0 * torch.sigmoid(pre_all[:, 256:384])).repeat_interleave(2, dim=-1)
@@ -238,38 +281,63 @@ class Order3LiveInferenceEngine:
         res_mid = torch.relu(res_pre[:, :64]) * (2.0 * torch.sigmoid(res_pre[:, 64:128]))
         h2 = h1 + res_mid @ self.w_res2
 
-        # 4-горизонтная латентная память 32D (~3.7s, ~45s, ~180s, ~735s)
+        # 6-горизонтная латентная память 48D + обратная проекция в экспертов и роутер h2_ctx
         rec_raw = h2 @ self.w_rec + self.b_rec
         rec_u = torch.tanh(rec_raw[:, :MEM_DIM_ORDER3])
         rec_gate = torch.cat(
             [
-                torch.sigmoid(rec_raw[:, 32:40] + 1.0),
-                torch.sigmoid(rec_raw[:, 40:48] + 3.8),
-                torch.sigmoid(rec_raw[:, 48:56] + 5.2),
-                torch.sigmoid(rec_raw[:, 56:64] + 6.6),
+                torch.sigmoid(rec_raw[:, 48:56] + 1.0),
+                torch.sigmoid(rec_raw[:, 56:64] + 3.8),
+                torch.sigmoid(rec_raw[:, 64:72] + 5.2),
+                torch.sigmoid(rec_raw[:, 72:80] + 6.6),
+                torch.sigmoid(rec_raw[:, 80:88] + 2.2),
+                torch.sigmoid(rec_raw[:, 88:96] + 4.5),
             ],
             dim=-1,
         )
         self.mem_h = rec_gate * self.mem_h + (1.0 - rec_gate) * rec_u
+        h2_ctx = h2 + self.mem_h @ self.w_mem2h
 
-        # Контекстный маршрутизатор (326D -> 64 -> K, с бесшовной обратной совместимостью 288D / 295D / 320D -> 326D)
+        # Вентильный рекуррентный маршрутизатор (358D -> 128 -> 16: 8 логитов мод + 8 нелинейных Liquid-вентилей инерции!)
         acct_8d = za[:, 54:62]
         queue_8d = za[:, 62:70]
-        r_extra_22d = torch.cat(
+        r_extra_30d = torch.cat(
             [
                 zm[:, 0:1], zm[:, 40:44], zm[:, 44:45], zm[:, 48:49],
                 zm[:, 29:34], zm[:, 36:37], zm[:, 39:40], zm[:, 55:56], zm[:, 12:13],
                 zm[:, 60:66],
+                zm[:, 72:76], zm[:, 79:82], zm[:, 83:84],
             ],
             dim=-1,
         )
-        router_in = torch.cat([h2, acct_8d, queue_8d, self.mem_h, r_extra_22d], dim=-1)
+        prev_g_mode = torch.softmax(self.gate_state, dim=-1)
+        router_in = torch.cat([h2_ctx, acct_8d, queue_8d, self.mem_h, r_extra_30d, prev_g_mode], dim=-1)
         r_hid = F.silu(router_in @ self.w_gate1 + self.b_gate1)
-        g_mode = torch.softmax((r_hid @ self.w_gate2 + self.b_gate2).float(), dim=-1)
+        gate_out = (r_hid @ self.w_gate2 + self.b_gate2).float()
+        raw_logits = gate_out[:, :self.k_modes]
+        beta_gate = torch.sigmoid(gate_out[:, self.k_modes : 2 * self.k_modes])
+        self.gate_state = (1.0 - beta_gate) * self.gate_state + beta_gate * raw_logits
+        g_mode = torch.softmax(self.gate_state, dim=-1)
 
-        # K Латентных экспертов (EXPERT_OUT_DIM_ORDER3 = 50)
-        moe_all = (h2 @ self.w2_moe + self.b2_moe).float().view(1, self.k_modes, EXPERT_OUT_DIM_ORDER3)
-        strat_raw = (g_mode.unsqueeze(-1) * moe_all).sum(dim=1).squeeze(0)  # [50]
+        # K Латентных экспертов (EXPERT_OUT_DIM_ORDER3 = 52) + Адаптивный нелинейный демпфер плана котирования!
+        moe_all = (h2_ctx @ self.w2_moe + self.b2_moe).float().view(1, self.k_modes, EXPERT_OUT_DIM_ORDER3)
+        strat_inst = (g_mode.unsqueeze(-1) * moe_all).sum(dim=1)  # [1, 52]
+        alpha_bid = torch.sigmoid(strat_inst[:, 50:51])
+        alpha_ask = torch.sigmoid(strat_inst[:, 51:52])
+        bid_blend = (1.0 - alpha_bid) * self.strat_state + alpha_bid * strat_inst
+        ask_blend = (1.0 - alpha_ask) * self.strat_state + alpha_ask * strat_inst
+        strat_merged = torch.cat(
+            [
+                bid_blend[:, 0:13], ask_blend[:, 13:25], strat_inst[:, 25:26],
+                bid_blend[:, 26:35], ask_blend[:, 35:36], strat_inst[:, 36:37],
+                bid_blend[:, 37:41], ask_blend[:, 41:44], bid_blend[:, 44:45],
+                ask_blend[:, 45:47], bid_blend[:, 47:48], strat_inst[:, 48:49],
+                ask_blend[:, 49:50], strat_inst[:, 50:52],
+            ],
+            dim=-1,
+        )
+        self.strat_state = strat_merged
+        strat_raw = strat_merged.squeeze(0)  # [52]
 
         # 1C. 100% Эндогенная экспозиция [0..1], распределение долей и резерв каскадной постановки renorm_blend:
         exp_bid_frac = float(torch.sigmoid(strat_raw[0]).item())
@@ -402,14 +470,18 @@ class Order3LiveInferenceEngine:
         spread = max(tick_sz, a1 - b1)
         sp_rel_2d = torch.full((12,), float(min(3.0, (spread / b1) * 40.0)), device=self.device)
         g_mode_12 = g_mode.expand(12, self.k_modes)
-        o1_slot_imp = torch.tanh(0.35 * (zm[:, 34:35] + zm[:, 36:37]) + 0.40 * (zm[:, 61:62] + zm[:, 62:63])).squeeze(0)
+        o1_slot_imp = torch.tanh(
+            0.30 * (zm[:, 34:35] + zm[:, 36:37])
+            + 0.35 * (zm[:, 61:62] + zm[:, 62:63])
+            + 0.25 * (zm[:, 72:73] + zm[:, 74:75])
+        ).squeeze(0)
         slot_edge_b = torch.clamp((((a1 - t_bid_px) / torch.clamp(t_bid_px, min=tick_sz)) - 2.0 * maker_fee) * 40.0, -2.0, 3.0)
-        slot_exec_b = (0.65 * zm[:, 48:49].squeeze(0) + 0.55 * o1_slot_imp).expand(12)
+        slot_exec_b = (0.50 * zm[:, 48:49].squeeze(0) + 0.25 * zm[:, 82:83].squeeze(0) + 0.25 * zm[:, 83:84].squeeze(0) + 0.55 * o1_slot_imp).expand(12)
         if pos_qty >= 2.0 and trader_entry > 1e-4:
             slot_edge_a = torch.clamp((((t_ask_px - float(trader_entry)) / max(tick_sz, float(trader_entry))) - 2.0 * maker_fee) * 40.0, -2.5, 3.0)
         else:
             slot_edge_a = torch.zeros_like(t_ask_px)
-        slot_exec_a = (0.65 * zm[:, 45:46].squeeze(0) - 0.55 * o1_slot_imp).expand(12)
+        slot_exec_a = (0.55 * zm[:, 45:46].squeeze(0) + 0.25 * zm[:, 80:81].squeeze(0) - 0.55 * o1_slot_imp).expand(12)
 
         # 4D датчики реальной FIFO-очереди и долгого удержания (1-в-1 с fused_order3_clean_tick.py):
         bqa_t = torch.from_numpy(bid_qa_12).to(device=self.device, dtype=torch.float32) if bid_qa_12 is not None else torch.zeros_like(cur_b_qty)
@@ -473,8 +545,12 @@ class Order3LiveInferenceEngine:
             dim=-1,
         )
 
-        rb_h = F.silu(feat_b_36 @ self.w_reg1 + self.b_reg1_b)
-        ra_h = F.silu(feat_a_36 @ self.w_reg1 + self.b_reg1_a)
+        rb_h0 = F.silu(feat_b_36 @ self.w_reg1 + self.b_reg1_b)
+        ra_h0 = F.silu(feat_a_36 @ self.w_reg1 + self.b_reg1_a)
+        rb_rp = rb_h0 @ self.w_reg_res1 + self.b_reg_res
+        ra_rp = ra_h0 @ self.w_reg_res1 + self.b_reg_res
+        rb_h = rb_h0 + (torch.relu(rb_rp[:, :32]) * (2.0 * torch.sigmoid(rb_rp[:, 32:64]))) @ self.w_reg_res2
+        ra_h = ra_h0 + (torch.relu(ra_rp[:, :32]) * (2.0 * torch.sigmoid(ra_rp[:, 32:64]))) @ self.w_reg_res2
         rb_out = rb_h @ self.w_reg2 + self.b_reg2_b  # [12, 2]
         ra_out = ra_h @ self.w_reg2 + self.b_reg2_a
 
@@ -543,11 +619,24 @@ def _eval_latest_wf_ubj_live(trader, b1: float, a1: float) -> Tuple[Optional[np.
                 bst.feature_names = None
                 bst.set_param({"nthread": 1})
                 o1_models.append(bst)
+            o1_ext_models = []
+            for h_ext in (320, 600, 900, 1800):
+                mfe = w1_latest / f"xgb_h{h_ext}s.ubj"
+                if mfe.exists():
+                    bste = xgb.Booster()
+                    bste.load_model(str(mfe))
+                    bste.feature_names = None
+                    bste.set_param({"nthread": 1})
+                    o1_ext_models.append(bste)
             o2_names = [
                 "adverse_selection_5s", "wave_exhaustion_10s", "ask_sweep_5s",
                 "guard_sweep_12s", "guard_bleed_60s", "guard_crash_300s",
                 "guard_exit_30s", "exec_fill_30s", "exec_frontrun_30s",
                 "carousel_success", "carousel_capacity",
+            ]
+            o2_ext_names = [
+                "guard_bleed_180s", "guard_crash_600s", "guard_crash_900s",
+                "exec_fill_120s", "carousel_success_240s",
             ]
             o2_models = []
             for nm in o2_names:
@@ -557,6 +646,15 @@ def _eval_latest_wf_ubj_live(trader, b1: float, a1: float) -> Tuple[Optional[np.
                 bst2.feature_names = None
                 bst2.set_param({"nthread": 1})
                 o2_models.append(bst2)
+            o2_ext_models = []
+            for nme in o2_ext_names:
+                mf2e = w2_latest / f"{nme}.ubj"
+                if mf2e.exists():
+                    bst2e = xgb.Booster()
+                    bst2e.load_model(str(mf2e))
+                    bst2e.feature_names = None
+                    bst2e.set_param({"nthread": 1})
+                    o2_ext_models.append(bst2e)
             ow_dir = BASE_DIR / "models/prl/order1_wave_wf"
             ow_models = []
             if ow_dir.exists():
@@ -577,7 +675,9 @@ def _eval_latest_wf_ubj_live(trader, b1: float, a1: float) -> Tuple[Optional[np.
                 "num_cols": num_cols,
                 "x_buf": np.zeros((1, len(num_cols)), dtype=np.float32),
                 "o1_models": o1_models,
+                "o1_ext_models": o1_ext_models,
                 "o2_models": o2_models,
+                "o2_ext_models": o2_ext_models,
                 "ow_models": ow_models,
                 "c_vals": np.array([-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0], dtype=np.float32),
             })
@@ -661,6 +761,18 @@ def _eval_latest_wf_ubj_live(trader, b1: float, a1: float) -> Tuple[Optional[np.
         r11 = np.array([float(m.inplace_predict(x66)[0]) for m in _LIVE_WF_CACHE["o2_models"]], dtype=np.float32)
         _LIVE_WF_CACHE["last_conf8"] = conf8
         _LIVE_WF_CACHE["last_tail_skew_20s"] = tail_skew_20s
+        o1_ext_m = _LIVE_WF_CACHE.get("o1_ext_models") or []
+        if len(o1_ext_m) == 4:
+            ez_e, cf_e, bi_e = [], [], []
+            for bste in o1_ext_m:
+                pe = bste.inplace_predict(x_row)[0]
+                ez_e.append(float(np.dot(pe, c_vals)))
+                cf_e.append(float(1.0 - pe[3]))
+                bi_e.append(float(np.sum(pe[4:]) - np.sum(pe[:3])))
+            _LIVE_WF_CACHE["last_o1_ext7"] = np.array([ez_e[0], ez_e[1], ez_e[2], ez_e[3], cf_e[1], cf_e[3], bi_e[2]], dtype=np.float32)
+        o2_ext_m = _LIVE_WF_CACHE.get("o2_ext_models") or []
+        if len(o2_ext_m) == 5:
+            _LIVE_WF_CACHE["last_o2_ext5"] = np.array([float(m.inplace_predict(x66)[0]) for m in o2_ext_m], dtype=np.float32)
         ow_mods = _LIVE_WF_CACHE.get("ow_models") or []
         if len(ow_mods) == 6:
             _LIVE_WF_CACHE["last_wave6"] = np.array([float(m.inplace_predict(x_row)[0]) for m in ow_mods], dtype=np.float32)
@@ -862,6 +974,21 @@ def build_live_hybrid_market_obs_40d(trader, b1: float, a1: float) -> np.ndarray
         z[70] = float(math.tanh(((st_mid - mn_1800) / st_mid) * 25.0))
         z[71] = float(math.tanh(((mx_1800 - st_mid) / st_mid) * 25.0))
 
+    if MKT_DIM_ORDER3 >= 84:
+        o1_e7 = _LIVE_WF_CACHE.get("last_o1_ext7")
+        if o1_e7 is not None and len(o1_e7) == 7:
+            z[72:76] = np.clip(o1_e7[0:4], -3.0, 3.0)
+            z[76] = float(np.clip(o1_e7[4], 0.0, 1.0))
+            z[77] = float(np.clip(o1_e7[5], 0.0, 1.0))
+            z[78] = float(np.clip(o1_e7[6], -1.0, 1.0))
+        else:
+            z[76:78] = 0.95
+        o2_e5 = _LIVE_WF_CACHE.get("last_o2_ext5")
+        if o2_e5 is not None and len(o2_e5) == 5:
+            z[79:84] = np.clip(o2_e5, 0.0, 1.0)
+        else:
+            z[79:84] = 0.40
+
     return z
 
 
@@ -878,7 +1005,7 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
     now_ts = time.time()
     trader.order3_engine.refill_tokens(now_ts)
 
-    # 1. Извлечение 39D вектора рынка и 110D вектора агента из трейдера
+    # 1. Извлечение 84D вектора рынка и 110D вектора агента из трейдера
     tot_eq = max(float(getattr(trader, "initial_budget_usd", 1022.54)), float(getattr(trader, "bot_cash_usd", 0.0)) + float(getattr(trader, "pos_qty", 0.0)) * b1)
 
     # Подготовка текущих массивов слотов
@@ -898,6 +1025,24 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
             h2w = h1w + (torch.relu(rpw[:, :64]) * (2.0 * torch.sigmoid(rpw[:, 64:128]))) @ eng_w.w_res2
             rrw = h2w @ eng_w.w_rec + eng_w.b_rec
             eng_w.mem_h.copy_(torch.tanh(rrw[:, :MEM_DIM_ORDER3]))
+            h2w_ctx = h2w + eng_w.mem_h @ eng_w.w_mem2h
+            rex_w = torch.cat(
+                [
+                    zm_w[:, 0:1], zm_w[:, 40:44], zm_w[:, 44:45], zm_w[:, 48:49],
+                    zm_w[:, 29:34], zm_w[:, 36:37], zm_w[:, 39:40], zm_w[:, 55:56], zm_w[:, 12:13],
+                    zm_w[:, 60:66], zm_w[:, 72:76], zm_w[:, 79:82], zm_w[:, 83:84],
+                ],
+                dim=-1,
+            )
+            z16_w = torch.zeros((1, 16), dtype=torch.float32, device=eng_w.device)
+            p0_m = torch.full((1, eng_w.k_modes), 1.0 / float(eng_w.k_modes), dtype=torch.float32, device=eng_w.device)
+            rin_w = torch.cat([h2w_ctx, z16_w, eng_w.mem_h, rex_w, p0_m], dim=-1)
+            rh_w = F.silu(rin_w @ eng_w.w_gate1 + eng_w.b_gate1)
+            go_w = (rh_w @ eng_w.w_gate2 + eng_w.b_gate2)[:, :eng_w.k_modes]
+            gm_w = torch.softmax(go_w, dim=-1)
+            moe_w = (h2w_ctx @ eng_w.w2_moe + eng_w.b2_moe).view(1, eng_w.k_modes, EXPERT_OUT_DIM_ORDER3)
+            eng_w.gate_state.copy_(go_w)
+            eng_w.strat_state.copy_((gm_w.unsqueeze(-1) * moe_w).sum(dim=1))
             eng_w._mem_warmed = True
 
     z_ag = getattr(trader, "last_order3_ag_110d", None)
