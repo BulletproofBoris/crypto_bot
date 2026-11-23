@@ -362,6 +362,10 @@ class MultimodalMoEPolicyOrder3:
                 w2m_new[:, :, 50:52] = torch.randn((256, K_MODES_ORDER3, 2), generator=gen) * 0.015
                 b2m_new[:, :, 50] = +1.75
                 b2m_new[:, :, 51] = +2.10
+            if old_exp_d <= 52 and EXPERT_OUT_DIM_ORDER3 >= 54:
+                # Net2Net старт L72 Tranche Carousel [52] и Spread Sniper [53] (-6.5 -> ~0.0015 на старте, с живым откликом к h2_ctx!):
+                w2m_new[:, :, 52:54] = torch.randn((256, K_MODES_ORDER3, 2), generator=gen) * 0.020
+                b2m_new[:, :, 52:54] = -6.50
 
             w2m_flat = w2m_new.reshape(256, MOE_OUT_DIM_ORDER3)
             b2m_flat = b2m_new.reshape(1, MOE_OUT_DIM_ORDER3)
@@ -501,15 +505,18 @@ class MultimodalMoEPolicyOrder3:
             db2m_v = db2m.view(-1, 1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
             dw2m_v[:, :, :7, 25] *= 0.15
             db2m_v[:, :, :7, 25] *= 0.15
-            dw2m_v[:, :, :, 48] *= 0.35
-            db2m_v[:, :, :, 48] *= 0.35
+            dw2m_v[:, :, :, 48] *= 2.40  # разморозка импульсного снайперского u_taker_buy [48] в L72!
+            db2m_v[:, :, :, 48] *= 2.80
             dw2m_v[:, :, :, 49] *= 3.40
             db2m_v[:, :, :, 49] *= 3.80
-            dw2m_v[:, :, :, 0] *= 1.80
-            db2m_v[:, :, :, 0] *= 2.00
+            dw2m_v[:, :, :, 0] *= 2.20
+            db2m_v[:, :, :, 0] *= 2.50
             if EXPERT_OUT_DIM_ORDER3 >= 52:
-                dw2m_v[:, :, :, 50:52] *= 2.80  # активный поиск оптимального нелинейного демпфирования плана!
-                db2m_v[:, :, :, 50:52] *= 3.20
+                dw2m_v[:, :, :, 50:52] *= 2.60  # активный поиск оптимального нелинейного демпфирования плана!
+                db2m_v[:, :, :, 50:52] *= 3.00
+            if EXPERT_OUT_DIM_ORDER3 >= 54:
+                dw2m_v[:, :, :, 52:54] *= 3.80  # ускоренный поиск Tranche Carousel [52] и Spread Sniper [53]!
+                db2m_v[:, :, :, 52:54] *= 4.20
         self.w2_moe[2 : 2 + 2 * half].copy_(base_gpu["w2_moe"].unsqueeze(0) + dw2m.to(self.dtype))
         self.b2_moe[2 : 2 + 2 * half].copy_(base_gpu["b2_moe"].unsqueeze(0) + db2m.to(self.dtype))
 
@@ -663,9 +670,9 @@ def train_order3(
     sv_gpu = torch.from_numpy(np.asarray(lob_raw["sell_vol"][subcent_offset:], dtype=np.float32)).to(device=device)
     bv_gpu = torch.from_numpy(np.asarray(lob_raw["buy_vol"][subcent_offset:], dtype=np.float32)).to(device=device)
 
-    # 2. Автоматическое Purged Multi-Regime волновое разбиение (Macro = 5401с = 90м волновой цикл, Micro = 1801с = 30м свинг!):
+    # 2. Автоматическое Purged Multi-Regime волновое разбиение (Macro = 5401с = 90м волновой цикл, Micro/Sprint = 1351с = 22.5м быстрый оборот!):
     macro_win_len = min(win_len, 5401)
-    micro_win_len = 1801
+    micro_win_len = 1351
     n_bask_w = max(24, n_val_windows)
     oos_ticks = max(macro_win_len + 7200, int(round(oos_hours * 3600.0)))
     oos_start = max(360000, total_rows - oos_ticks) if total_rows >= 480000 else int(total_rows * 0.80)
@@ -1300,25 +1307,62 @@ def train_order3(
         st_n = _normalize_weights_order3(d, policy.dtype)
         return {k: v.to(device=device, dtype=policy.dtype) for k, v in st_n.items()}
 
-    st_l70_champ = _load_gpu_seed(BASE_DIR / "models/prl/release_champion_v1.pt", st_l68_w30)
-    st_l70_e9 = _load_gpu_seed(SAVE_DIR / "bak_l70/l70_chim_e9.pt", st_l70_champ)
-    st_l70_ask45 = _load_gpu_seed(SAVE_DIR / "bak_l70/l70_chim_ask45.pt", st_l70_champ)
-    st_l70_soup = _load_gpu_seed(SAVE_DIR / "bak_l70/order3_soup_top3.pt", st_l70_champ)
+    def _build_l72_bold_seed(
+        st_in: dict,
+        tranche_z: float,
+        sniper_z: float,
+        exp_boost: float = 0.25,
+        taker_buy_z: float = -0.35,
+    ) -> dict:
+        """
+        L72 Bold Sniper & Tranche Carousel Seed:
+        - Активирует независимую карусель нижнего транша [52] (ближние Ask #00..#05 крутятся от min_buy_px!),
+        - Активирует снайпер переднего тика [53] (снимает отступ трусости retreat_b у Bid1 в рабочих модах!),
+        - Размораживает импульсный u_taker_buy [48] с привязкой к бычьему направлению ствола, сохраняя краш-щит Mode #4!
+        """
+        d = {k: st_in[k].detach().cpu().float().clone() for k in MultimodalMoEPolicyOrder3.PARAM_KEYS}
+        w2 = d["w2_moe"].view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        b2 = d["b2_moe"].view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        # Направление бычьей экспозиции эксперта 1 переносим с мягким коэффициентом в снайпер [53] и карусель [52]:
+        bull_exp_dir = w2[:, 1, 0].clone()
+        for m in (0, 1, 2, 3, 5, 6, 7):
+            b2[0, m, 0] = b2[0, m, 0] + exp_boost
+            b2[0, m, 52] = tranche_z
+            b2[0, m, 53] = sniper_z if m in (0, 1, 2, 5, 6) else (sniper_z - 1.0)
+            w2[:, m, 52] = w2[:, m, 52] + 0.12 * bull_exp_dir
+            w2[:, m, 53] = w2[:, m, 53] + 0.18 * bull_exp_dir
+        # В импульсных модах #1 и #6 размораживаем снайперский пробой u_taker_buy [48] (требуется > +1.2 для старта):
+        for m_imp in (1, 6):
+            b2[0, m_imp, 48] = taker_buy_z
+            w2[:, m_imp, 48] = 0.35 * bull_exp_dir
+        # Mode #4 остаётся неприкосновенным краш-щитом (-25.9% Crash MaxDD 12.19%!):
+        b2[0, 4, 52] = -4.0
+        b2[0, 4, 53] = -6.0
+        b2[0, 4, 48] = -8.0
+        d["w2_moe"] = w2.reshape(256, MOE_OUT_DIM_ORDER3)
+        d["b2_moe"] = b2.reshape(1, MOE_OUT_DIM_ORDER3)
+        st_n = _normalize_weights_order3(d, policy.dtype)
+        return {k: v.to(device=device, dtype=policy.dtype) for k, v in st_n.items()}
 
-    st_l71_liq_champ = _tune_l71_liquid_seed(st_l70_champ, gate_beta_z=+0.85, bid_latch_z=+1.15, ask_latch_z=+1.45, self_rec_gain=0.35, cnl_hyst_b=-0.28, cnl_hyst_a=-0.22)
-    st_l71_liq_smooth = _tune_l71_liquid_seed(st_l70_champ, gate_beta_z=+0.30, bid_latch_z=+0.75, ask_latch_z=+1.05, self_rec_gain=0.50, cnl_hyst_b=-0.45, cnl_hyst_a=-0.35)
-    st_l71_liq_e9 = _tune_l71_liquid_seed(st_l70_e9, gate_beta_z=+0.75, bid_latch_z=+1.05, ask_latch_z=+1.35, self_rec_gain=0.40, cnl_hyst_b=-0.30, cnl_hyst_a=-0.25)
-    st_l71_liq_ask45 = _tune_l71_liquid_seed(st_l70_ask45, gate_beta_z=+0.80, bid_latch_z=+1.10, ask_latch_z=+1.35, self_rec_gain=0.40, cnl_hyst_b=-0.28, cnl_hyst_a=-0.22)
-    st_l71_liq_soup = _tune_l71_liquid_seed(st_l70_soup, gate_beta_z=+0.65, bid_latch_z=+0.95, ask_latch_z=+1.25, self_rec_gain=0.45, cnl_hyst_b=-0.35, cnl_hyst_a=-0.25)
+    st_l71_champ = _load_gpu_seed(BASE_DIR / "models/prl/release_champion_v1.pt", st_l68_w30)
+    st_l71_i0 = _load_gpu_seed(SAVE_DIR / "bak_l71/island_0_best.pt", st_l71_champ)
+    st_l71_i1 = _load_gpu_seed(SAVE_DIR / "bak_l71/island_1_best.pt", st_l71_champ)
+    st_l71_ask40 = _load_gpu_seed(SAVE_DIR / "bak_l71/l71_chim_ask40.pt", st_l71_champ)
 
-    st_ms_53i0_52i1 = st_l71_liq_champ
-    st_ms_53i0_56i0 = st_l71_liq_e9
+    st_l72_bold_bal = _build_l72_bold_seed(st_l71_champ, tranche_z=+1.10, sniper_z=+0.85, exp_boost=0.25, taker_buy_z=-0.40)
+    st_l72_bold_aggr = _build_l72_bold_seed(st_l71_champ, tranche_z=+1.85, sniper_z=+1.65, exp_boost=0.45, taker_buy_z=+0.15)
+    st_l72_i0_sniper = _build_l72_bold_seed(st_l71_i0, tranche_z=+1.40, sniper_z=+1.20, exp_boost=0.30, taker_buy_z=-0.20)
+    st_l72_i1_sniper = _build_l72_bold_seed(st_l71_i1, tranche_z=+1.35, sniper_z=+1.15, exp_boost=0.30, taker_buy_z=-0.25)
+    st_l72_ask40_car = _build_l72_bold_seed(st_l71_ask40, tranche_z=+1.60, sniper_z=+1.10, exp_boost=0.25, taker_buy_z=-0.30)
+
+    st_ms_53i0_52i1 = st_l72_bold_bal
+    st_ms_53i0_56i0 = st_l72_i0_sniper
     is_warm_l43 = True
 
     seed_pool = (
-        [st_l71_liq_champ, st_l71_liq_smooth, st_l71_liq_e9, st_l71_liq_ask45, st_l71_liq_soup, st_l70_champ]
+        [st_l72_bold_bal, st_l72_bold_aggr, st_l72_i0_sniper, st_l72_ask40_car, st_l72_i1_sniper, st_l71_champ]
         if island_id == 0
-        else [st_l71_liq_e9, st_l71_liq_ask45, st_l71_liq_smooth, st_l71_liq_soup, st_l71_liq_champ, st_l70_e9]
+        else [st_l72_bold_aggr, st_l72_i0_sniper, st_l72_bold_bal, st_l72_i1_sniper, st_l72_ask40_car, st_l71_i0]
     )
     resume_iter = 0
     for res_p in [SAVE_DIR / "islands" / f"island_{island_id}_best.pt", SAVE_DIR / "global_best.pt", RESUME_CHAMP_PATH]:

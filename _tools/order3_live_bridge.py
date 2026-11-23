@@ -168,6 +168,8 @@ class Order3LiveInferenceEngine:
                 b2m_pad[:, :, 48:50] = -12.0
             if old_ed <= 50 and EXPERT_OUT_DIM_ORDER3 >= 52:
                 b2m_pad[:, :, 50:52] = 12.0
+            if old_ed <= 52 and EXPERT_OUT_DIM_ORDER3 >= 54:
+                b2m_pad[:, :, 52:54] = -12.0
             w2m_raw = w2m_pad.reshape(256, self.moe_out_dim)
             b2m_raw = b2m_pad.reshape(1, self.moe_out_dim)
         self.w2_moe = w2m_raw.to(device=self.device)
@@ -258,6 +260,8 @@ class Order3LiveInferenceEngine:
         roll_sell_1s: float = 10.0,
         roll_buy_1s: float = 10.0,
         hold_sec: float = 0.0,
+        min_buy_px: float = 0.0,
+        low_tranche_qty: float = 0.0,
     ) -> Dict[str, Any]:
         """
         Полный шаг инференса Order-3 (L46/L48 100% паритет с fused_order3_clean_tick.py).
@@ -319,9 +323,9 @@ class Order3LiveInferenceEngine:
         self.gate_state = (1.0 - beta_gate) * self.gate_state + beta_gate * raw_logits
         g_mode = torch.softmax(self.gate_state, dim=-1)
 
-        # K Латентных экспертов (EXPERT_OUT_DIM_ORDER3 = 52) + Адаптивный нелинейный демпфер плана котирования!
+        # K Латентных экспертов (EXPERT_OUT_DIM_ORDER3 = 54) + Адаптивный нелинейный демпфер плана котирования!
         moe_all = (h2_ctx @ self.w2_moe + self.b2_moe).float().view(1, self.k_modes, EXPERT_OUT_DIM_ORDER3)
-        strat_inst = (g_mode.unsqueeze(-1) * moe_all).sum(dim=1)  # [1, 52]
+        strat_inst = (g_mode.unsqueeze(-1) * moe_all).sum(dim=1)  # [1, 54]
         alpha_bid = torch.sigmoid(strat_inst[:, 50:51])
         alpha_ask = torch.sigmoid(strat_inst[:, 51:52])
         bid_blend = (1.0 - alpha_bid) * self.strat_state + alpha_bid * strat_inst
@@ -333,11 +337,12 @@ class Order3LiveInferenceEngine:
                 bid_blend[:, 37:41], ask_blend[:, 41:44], bid_blend[:, 44:45],
                 ask_blend[:, 45:47], bid_blend[:, 47:48], strat_inst[:, 48:49],
                 ask_blend[:, 49:50], strat_inst[:, 50:52],
+                ask_blend[:, 52:53], bid_blend[:, 53:54],
             ],
             dim=-1,
         )
         self.strat_state = strat_merged
-        strat_raw = strat_merged.squeeze(0)  # [52]
+        strat_raw = strat_merged.squeeze(0)  # [54]
 
         # 1C. 100% Эндогенная экспозиция [0..1], распределение долей и резерв каскадной постановки renorm_blend:
         exp_bid_frac = float(torch.sigmoid(strat_raw[0]).item())
@@ -356,10 +361,11 @@ class Order3LiveInferenceEngine:
         u_taker_buy = float(torch.tanh(F.relu(strat_raw[48] - 1.2)).item())
         max_slip_pct = 0.005 + 0.145 * float(torch.sigmoid(strat_raw[36]).item())
 
-        # 3. Независимая полно-спредовая геометрия 24 слотов + гладкий дифференцируемый Wave-Hold Ask Target (+0..+10%, ch 49):
+        # 3. Полно-спредовая геометрия 24 слотов + L72 Tranche Carousel [52] & Spread Sniper [53] (1-в-1 с fused_order3_clean_tick.py):
         spread_room = max(0.0, a1 - b1 - tick_sz)
         inside_b = spread_room * float(torch.sigmoid(strat_raw[37]).item())
-        retreat_b = b1 * 0.04 * float(torch.sigmoid(strat_raw[38]).item())
+        sniper_front = float(torch.sigmoid(strat_raw[53]).item())
+        retreat_b = b1 * 0.04 * float(torch.sigmoid(strat_raw[38]).item()) * (1.0 - sniper_front)
         span_b_usd = b1 * (0.0005 + 0.2495 * float(torch.sigmoid(strat_raw[39]).item()))
         gamma_b = 0.40 + 2.10 * float(torch.sigmoid(strat_raw[40]).item())
 
@@ -368,7 +374,14 @@ class Order3LiveInferenceEngine:
         max_maker_bid = max(tick_sz, a1 - tick_sz)
         t_bid_px = torch.clamp(torch.round(torch.clamp(raw_t_bid, max=max_maker_bid) / tick_sz) * tick_sz, min=tick_sz)
 
-        ref_entry = float(trader_entry) * (1.0 + 2.0 * maker_fee) if (pos_qty >= 2.0 and trader_entry > 1e-4) else a1
+        hp_now_b = pos_qty >= 2.0
+        ref_entry = float(trader_entry) * (1.0 + 2.0 * maker_fee) if (hp_now_b and trader_entry > 1e-4) else a1
+        has_low_tr = hp_now_b and (float(low_tranche_qty) >= 2.0) and (float(min_buy_px) > 1e-4)
+        low_ref_entry = (float(min_buy_px) * (1.0 + 2.0 * maker_fee)) if has_low_tr else ref_entry
+        tranche_s = float(torch.sigmoid(strat_raw[52]).item()) if has_low_tr else 0.0
+        tranche_w_k = tranche_s * torch.pow(1.0 - self.echelon_k01, 2.0)
+        ref_entry_k = ref_entry * (1.0 - tranche_w_k) + low_ref_entry * tranche_w_k
+
         skew_blend = float(torch.sigmoid(strat_raw[41]).item())
         z42_t = strat_raw[42]
         t42_s = float(torch.tanh(z42_t * 0.25).item())
@@ -378,10 +391,10 @@ class Order3LiveInferenceEngine:
         gamma_a = 0.40 + 2.10 * float(torch.sigmoid(strat_raw[40] + strat_raw[46]).item())
 
         inside_a = spread_room * float(torch.sigmoid(strat_raw[43]).item())
-        anchor_base_a = a1 + skew_blend * (ref_entry - a1) + a1 * ask_edge_pct - inside_a
+        anchor_base_a_k = a1 + skew_blend * (ref_entry_k - a1) + (a1 * ask_edge_pct - inside_a)
         min_maker_ask = b1 + tick_sz
         curve_a = torch.pow(self.echelon_k01, gamma_a)
-        raw_t_ask = anchor_base_a + span_a_usd * curve_a
+        raw_t_ask = anchor_base_a_k + span_a_usd * curve_a
         t_ask_px = torch.maximum(torch.full_like(raw_t_ask, min_maker_ask), torch.round(raw_t_ask / tick_sz) * tick_sz)
 
         tot_bud_eff = max(budget, cash + pos_qty * b1)
@@ -1201,6 +1214,8 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
         roll_sell_1s=rs_1s,
         roll_buy_1s=rb_1s,
         hold_sec=float(getattr(trader, "hold_sec", 0.0)),
+        min_buy_px=float(getattr(trader, "tr_low_px", getattr(trader, "min_buy_px", 0.0))),
+        low_tranche_qty=float(getattr(trader, "tr_low_qty", getattr(trader, "low_tranche_qty", 0.0))),
     )
 
     p_prec = int(getattr(trader, "price_precision", 4))

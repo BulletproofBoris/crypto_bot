@@ -24,8 +24,8 @@ TOTAL_DIM_ORDER3 = 194
 
 MEM_DIM_ORDER3 = 48
 K_MODES_ORDER3 = 8
-EXPERT_OUT_DIM_ORDER3 = 52
-MOE_OUT_DIM_ORDER3 = K_MODES_ORDER3 * EXPERT_OUT_DIM_ORDER3  # 416
+EXPERT_OUT_DIM_ORDER3 = 54
+MOE_OUT_DIM_ORDER3 = K_MODES_ORDER3 * EXPERT_OUT_DIM_ORDER3  # 432
 ROUTER_EXTRA_DIM_ORDER3 = 30
 ROUTER_IN_DIM_ORDER3 = 256 + 8 + 8 + MEM_DIM_ORDER3 + ROUTER_EXTRA_DIM_ORDER3 + K_MODES_ORDER3  # 358
 ROUTER_H_DIM_ORDER3 = 128
@@ -419,6 +419,8 @@ def _order3_clean_tick_step(
             strat_inst[:, 48:49],   # [48] u_taker_buy (мгновенный!)
             ask_blend[:, 49:50],    # [49] wave_hold_pct
             strat_inst[:, 50:52],   # [50..51] сами вентили
+            ask_blend[:, 52:53],    # [52] tranche_carousel_z (независимая карусель нижнего транша!)
+            bid_blend[:, 53:54],    # [53] sniper_front_z (подавление отступа трусости у Bid1!)
         ],
         dim=-1,
     )
@@ -519,10 +521,11 @@ def _order3_clean_tick_step(
     api_tokens = torch.where(exec_tb, torch.clamp(api_tokens - 1.0, min=0.0), api_tokens)
     n_fills = torch.clamp(n_fills.long() + exec_tb.long(), max=2000000).to(torch.int32)
 
-    # 3. 100% Эндогенная полно-спредовая + волновая геометрия 24 слотов (раскрытие цели Ask до +12% в волне [ch 49]!):
+    # 3. 100% Эндогенная полно-спредовая + волновая геометрия 24 слотов + L72 Tranche Carousel [52] & Spread Sniper [53]:
     spread_room = torch.clamp(a1 - b1 - tick_size, min=0.0)
     inside_b = spread_room * torch.sigmoid(strat_raw[:, 37])
-    retreat_b = b1 * 0.04 * torch.sigmoid(strat_raw[:, 38])
+    sniper_front = torch.sigmoid(strat_raw[:, 53])
+    retreat_b = b1 * 0.04 * torch.sigmoid(strat_raw[:, 38]) * (1.0 - sniper_front)
     span_b_usd = b1 * (0.0005 + 0.2495 * torch.sigmoid(strat_raw[:, 39]))
     gamma_b = 0.40 + 2.10 * torch.sigmoid(strat_raw[:, 40])
 
@@ -534,6 +537,12 @@ def _order3_clean_tick_step(
     hp_now = pos_qty >= 2.0
     hp_now_mask = hp_now.unsqueeze(1)
     ref_entry = torch.where(hp_now & (avg_entry > 1e-4), avg_entry * (1.0 + 2.0 * maker_fee), a1)
+    has_low_tr = hp_now & (low_tranche_qty >= 2.0) & (min_buy_px > 1e-4)
+    low_ref_entry = torch.where(has_low_tr, min_buy_px * (1.0 + 2.0 * maker_fee), ref_entry)
+    ech_front_sq = torch.pow(1.0 - echelon_k01, 2.0).unsqueeze(0)  # [1, 12]: 1.00 на #00 -> 0.30 на #05 -> 0.00 на #11
+    tranche_w_k = (torch.sigmoid(strat_raw[:, 52]) * has_low_tr.float()).unsqueeze(1) * ech_front_sq
+    ref_entry_k = ref_entry.unsqueeze(1) * (1.0 - tranche_w_k) + low_ref_entry.unsqueeze(1) * tranche_w_k
+
     skew_blend = torch.sigmoid(strat_raw[:, 41])
     z42 = strat_raw[:, 42]
     t42_slow = torch.tanh(z42 * 0.25)
@@ -543,10 +552,10 @@ def _order3_clean_tick_step(
     gamma_a = 0.40 + 2.10 * torch.sigmoid(strat_raw[:, 40] + strat_raw[:, 46])
 
     inside_a = spread_room * torch.sigmoid(strat_raw[:, 43])
-    anchor_base_a = a1 + skew_blend * (ref_entry - a1) + a1 * ask_edge_pct - inside_a
+    anchor_base_a_k = a1.unsqueeze(1) + skew_blend.unsqueeze(1) * (ref_entry_k - a1.unsqueeze(1)) + (a1 * ask_edge_pct - inside_a).unsqueeze(1)
     min_maker_ask = (b1 + tick_size).unsqueeze(1)
     curve_a = torch.pow(echelon_k01.unsqueeze(0), gamma_a.unsqueeze(1))
-    raw_t_ask = anchor_base_a.unsqueeze(1) + span_a_usd.unsqueeze(1) * curve_a
+    raw_t_ask = anchor_base_a_k + span_a_usd.unsqueeze(1) * curve_a
     t_ask_px = torch.maximum(min_maker_ask, torch.round(raw_t_ask / tick_size) * tick_size)
 
     val_pred_now = torch.zeros_like(b1)
@@ -1270,6 +1279,8 @@ def evaluate_order3_basket(
                 b2m_pad[:, :, 48:50] = -12.0
             if old_exp_d <= 50 and EXPERT_OUT_DIM_ORDER3 >= 52:
                 b2m_pad[:, :, 50:52] = 12.0  # sigmoid(12)=1.0 -> 0.00e+00 паритет старых чекпоинтов L70!
+            if old_exp_d <= 52 and EXPERT_OUT_DIM_ORDER3 >= 54:
+                b2m_pad[:, :, 52:54] = -12.0  # sigmoid(-12)=0.0 -> 0.00e+00 паритет чекпоинтов L70/L71!
             w2m_t = w2m_pad.reshape(256, MOE_OUT_DIM_ORDER3)
             b2m_t = b2m_pad.reshape(1, MOE_OUT_DIM_ORDER3)
         w2m_l.append(w2m_t.to(dtype=dt))
@@ -1848,14 +1859,19 @@ def evaluate_order3_basket(
     cl_turn_phr = cl_turn_v / win_hrs
     if enforce_activity_floor and len(clean_idx) >= 8:
         idle_cap_pen = 42.0 * torch.clamp(0.80 - cl_work_v, min=0.0)
+        # L72 Quality-Gated High-Velocity Engine: снимает потолок 2.80 и вознаграждает смелый оборот при высокой чистой марже сделки!
+        edge_per_turn_bp = 100.0 * cl_ev_v / torch.clamp(cl_turn_v, min=0.04)
+        qual_gate = torch.sigmoid((edge_per_turn_bp - 4.0) / 4.5) * torch.sigmoid(cl_ev_v * 18.0)
+        vel_mult = 0.45 * torch.clamp(cl_turn_phr / 0.35, min=0.25, max=3.80) + 0.55 * torch.sqrt(torch.clamp(cl_turn_phr / 0.28, min=0.10, max=20.0))
         dead_mm_pen = (
             idle_cap_pen
-            + 36.0 * torch.clamp(1.0 - cl_turn_phr / 0.45, min=0.0)
-            + 20.0 * torch.clamp(1.0 - cl_fills_phr / 3.50, min=0.0)
-            + 18.0 * torch.clamp(cl_turn_phr - 2.20, min=0.0) * torch.sigmoid(-cl_ev_v * 35.0)
+            + 42.0 * torch.clamp(1.0 - cl_turn_phr / 0.65, min=0.0)
+            + 26.0 * torch.clamp(1.0 - cl_fills_phr / 5.20, min=0.0)
+            + 22.0 * torch.clamp(cl_turn_phr - 2.00, min=0.0) * torch.sigmoid(-cl_ev_v * 35.0)
         )
         profit_vol_bonus = (
-            300.0 * torch.clamp(cl_ev_v, min=0.0, max=10.0) * torch.clamp(cl_turn_phr / 0.35, min=0.25, max=2.80)
+            325.0 * torch.clamp(cl_ev_v, min=0.0, max=12.0) * vel_mult
+            + 30.0 * torch.clamp(cl_fills_phr / 5.5, min=0.0, max=3.2) * qual_gate
             + 22.0 * torch.clamp(cl_work_v - 0.55, min=0.0) * torch.sigmoid(cl_ev_v * 15.0)
         )
     else:

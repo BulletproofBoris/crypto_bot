@@ -144,7 +144,7 @@ def main():
                 [
                     bb[:, 0:13], ak[:, 13:25], si[:, 25:26], bb[:, 26:35], ak[:, 35:36], si[:, 36:37],
                     bb[:, 37:41], ak[:, 41:44], bb[:, 44:45], ak[:, 45:47], bb[:, 47:48], si[:, 48:49],
-                    ak[:, 49:50], si[:, 50:52],
+                    ak[:, 49:50], si[:, 50:52], ak[:, 52:53], bb[:, 53:54],
                 ],
                 dim=-1,
             )
@@ -154,11 +154,18 @@ def main():
             echelon_k01 = torch.linspace(0.0, 1.0, 12, dtype=torch.float32)
             spread_room = max(0.0, a1 - b1 - 0.0001)
             inside_b = spread_room * float(torch.sigmoid(sr[37]).item())
-            retreat_b = b1 * 0.04 * float(torch.sigmoid(sr[38]).item())
+            sniper_front = float(torch.sigmoid(sr[53]).item())
+            retreat_b = b1 * 0.04 * float(torch.sigmoid(sr[38]).item()) * (1.0 - sniper_front)
             span_b_usd = b1 * (0.0005 + 0.2495 * float(torch.sigmoid(sr[39]).item()))
             gamma_b = 0.40 + 2.10 * float(torch.sigmoid(sr[40]).item())
             raw_t_bid = (b1 + inside_b - retreat_b) - span_b_usd * torch.pow(echelon_k01, gamma_b)
             ref_t_bid = torch.clamp(torch.round(torch.clamp(raw_t_bid, max=max(0.0001, a1 - 0.0001)) / 0.0001) * 0.0001, min=0.0001).numpy()
+
+            min_bp_test, low_tq_test = b1 * 0.994, 45.0
+            ref_e = entry_px * 1.0020
+            low_ref_e = min_bp_test * 1.0020
+            tr_w_k = float(torch.sigmoid(sr[52]).item()) * torch.pow(1.0 - echelon_k01, 2.0)
+            ref_e_k = ref_e * (1.0 - tr_w_k) + low_ref_e * tr_w_k
 
             skew_blend = float(torch.sigmoid(sr[41]).item())
             t42_s = float(torch.tanh(sr[42] * 0.25).item())
@@ -167,8 +174,8 @@ def main():
             span_a_usd = a1 * (0.0005 + 0.2495 * float(torch.sigmoid(sr[39] + 0.5 * sr[42] + sr[45]).item()))
             gamma_a = 0.40 + 2.10 * float(torch.sigmoid(sr[40] + sr[46]).item())
             inside_a = spread_room * float(torch.sigmoid(sr[43]).item())
-            anchor_base_a = a1 + skew_blend * (entry_px * 1.0020 - a1) + a1 * ask_edge_pct - inside_a
-            raw_t_ask = anchor_base_a + span_a_usd * torch.pow(echelon_k01, gamma_a)
+            anchor_base_a_k = a1 + skew_blend * (ref_e_k - a1) + (a1 * ask_edge_pct - inside_a)
+            raw_t_ask = anchor_base_a_k + span_a_usd * torch.pow(echelon_k01, gamma_a)
             ref_t_ask = np.maximum(b1 + 0.0001, (torch.round(raw_t_ask / 0.0001) * 0.0001).numpy())
 
         t0 = time.perf_counter()
@@ -176,7 +183,7 @@ def main():
             z_mkt_39d=z_mkt, z_ag_110d=z_ag, b1=b1, a1=a1,
             budget=budget, pos_qty=pos_qty, cash=cash,
             bid_px_12=bid_px, bid_qty_12=bid_qty, ask_px_12=ask_px, ask_qty_12=ask_qty,
-            trader_entry=entry_px,
+            trader_entry=entry_px, min_buy_px=min_bp_test, low_tranche_qty=low_tq_test,
         )
         latencies_ms.append((time.perf_counter() - t0) * 1000.0)
 
