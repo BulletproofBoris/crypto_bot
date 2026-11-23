@@ -756,7 +756,7 @@ class LiveTriadRLTrader:
                 return
             import torch
             rel_ck = torch.load(ckpt_p, map_location="cpu", weights_only=False)
-            if rel_ck.get("arch_version") == "order3_v1":
+            if str(rel_ck.get("arch_version", "")).startswith("order3"):
                 from _tools.order3_live_bridge import Order3LiveInferenceEngine
                 if not getattr(self, "bo_swarm_routers", None) and (BASE_DIR / "models" / "prl_bo").exists():
                     try:
@@ -769,7 +769,8 @@ class LiveTriadRLTrader:
                 self.order3_mode = True
                 self.order3_engine = Order3LiveInferenceEngine(checkpoint_path=ckpt_p, device="cpu")
                 self.rel_ckpt_mtime = cur_mtime
-                print(f"🔥 [HOT-RELOAD ORDER-3 CHAMPION] Загружен непрерывный {rel_ck.get('in_dim', 150)}D Order-3 Чемпион v1 из {ckpt_p.name} (Geo={rel_ck.get('geo_score_bp', 0):+.2f} bp)!")
+                in_d = int(rel_ck["w1"].shape[0]) if "w1" in rel_ck else int(rel_ck.get("in_dim", 194))
+                print(f"🔥 [HOT-RELOAD ORDER-3 CHAMPION] Загружен непрерывный {in_d}D Order-3 Чемпион ({rel_ck.get('arch_version')}, tag={rel_ck.get('champ_tag', 'v1')}) из {ckpt_p.name} (Geo={rel_ck.get('geo_score_bp', 0):+.2f} bp)!")
                 return
             if "w1" in rel_ck and ("w2" in rel_ck or "w2_moe" in rel_ck):
                 self.l7_w1 = rel_ck["w1"].float()
