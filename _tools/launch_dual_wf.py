@@ -32,23 +32,14 @@ def main():
     parser.add_argument("--force", action="store_true", help="Force re-training completed windows")
     args = parser.parse_args()
 
-    summary_path = OUTPUT_DIR / "walkforward_summary.json"
+    from _tools.walkforward_trainer import HORIZONS
     completed = set()
     if not args.force:
-        if summary_path.exists():
-            try:
-                with open(summary_path) as f:
-                    d = json.load(f)
-                for k, v in d.items():
-                    if v.get("completed", False):
-                        completed.add(v.get("win_idx"))
-            except Exception:
-                pass
-
-        # Check disk for completed windows
+        # Окно считается полностью готовым только при наличии всех 12 горизонтов (1s..1800s):
         for w in range(args.start_win, args.end_win + 1):
-            mf = OUTPUT_DIR / f"win_{w:02d}" / f"meta_win_{w:02d}.json"
-            if mf.exists():
+            w_dir = OUTPUT_DIR / f"win_{w:02d}"
+            mf = w_dir / f"meta_win_{w:02d}.json"
+            if mf.exists() and all((w_dir / f"xgb_h{H}s.ubj").exists() for H in HORIZONS):
                 try:
                     with open(mf) as f:
                         if json.load(f).get("completed", False):

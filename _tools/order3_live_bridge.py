@@ -402,13 +402,14 @@ class Order3LiveInferenceEngine:
         spread = max(tick_sz, a1 - b1)
         sp_rel_2d = torch.full((12,), float(min(3.0, (spread / b1) * 40.0)), device=self.device)
         g_mode_12 = g_mode.expand(12, self.k_modes)
+        o1_slot_imp = torch.tanh(0.35 * (zm[:, 34:35] + zm[:, 36:37]) + 0.40 * (zm[:, 61:62] + zm[:, 62:63])).squeeze(0)
         slot_edge_b = torch.clamp((((a1 - t_bid_px) / torch.clamp(t_bid_px, min=tick_sz)) - 2.0 * maker_fee) * 40.0, -2.0, 3.0)
-        slot_exec_b = zm[:, 48:49].squeeze(0).expand(12)
+        slot_exec_b = (0.65 * zm[:, 48:49].squeeze(0) + 0.55 * o1_slot_imp).expand(12)
         if pos_qty >= 2.0 and trader_entry > 1e-4:
             slot_edge_a = torch.clamp((((t_ask_px - float(trader_entry)) / max(tick_sz, float(trader_entry))) - 2.0 * maker_fee) * 40.0, -2.5, 3.0)
         else:
             slot_edge_a = torch.zeros_like(t_ask_px)
-        slot_exec_a = zm[:, 45:46].squeeze(0).expand(12)
+        slot_exec_a = (0.65 * zm[:, 45:46].squeeze(0) - 0.55 * o1_slot_imp).expand(12)
 
         # 4D датчики реальной FIFO-очереди и долгого удержания (1-в-1 с fused_order3_clean_tick.py):
         bqa_t = torch.from_numpy(bid_qa_12).to(device=self.device, dtype=torch.float32) if bid_qa_12 is not None else torch.zeros_like(cur_b_qty)
@@ -887,6 +888,17 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
     a_qty = np.array([float(s.get("qty", 0.0)) for s in trader.ask_slots], dtype=np.float32)
 
     z_mkt = build_live_hybrid_market_obs_40d(trader, b1, a1)
+    if not getattr(trader.order3_engine, "_mem_warmed", False):
+        with torch.no_grad():
+            eng_w = trader.order3_engine
+            zm_w = _scale_mkt_44d(torch.from_numpy(z_mkt).to(device=eng_w.device, dtype=torch.float32).view(1, MKT_DIM_ORDER3), torch.float32)
+            pw = zm_w @ eng_w.w1_mkt + eng_w.b1
+            h1w = torch.relu(pw[:, :256]) * (2.0 * torch.sigmoid(pw[:, 256:384])).repeat_interleave(2, dim=-1)
+            rpw = h1w @ eng_w.w_res1 + eng_w.b_res1
+            h2w = h1w + (torch.relu(rpw[:, :64]) * (2.0 * torch.sigmoid(rpw[:, 64:128]))) @ eng_w.w_res2
+            rrw = h2w @ eng_w.w_rec + eng_w.b_rec
+            eng_w.mem_h.copy_(torch.tanh(rrw[:, :MEM_DIM_ORDER3]))
+            eng_w._mem_warmed = True
 
     z_ag = getattr(trader, "last_order3_ag_110d", None)
     if z_ag is None or len(z_ag) != AG_DIM_ORDER3:

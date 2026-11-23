@@ -76,13 +76,27 @@ def log_msg(msg: str) -> None:
 def _normalize_weights_order3(state: dict, dtype: torch.dtype) -> dict:
     out = {}
     w1_f = state["w1"].float()
-    w1_mkt = w1_f[..., :MKT_DIM_ORDER3, :]
+    w1_mkt = w1_f[..., :MKT_DIM_ORDER3, :].clone()
     w1_ag = w1_f[..., MKT_DIM_ORDER3:, :]
 
-    # Нормировка блока рынка и блока агента раздельно
-    cap_mkt = 6.5 * math.sqrt(float(MKT_DIM_ORDER3))
-    nb_mkt = torch.linalg.vector_norm(w1_mkt, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
-    w1_mkt_norm = w1_mkt * torch.clamp(cap_mkt / nb_mkt, max=1.0)
+    # Блок 3 L70: Раздельная поблочная нормировка 4 групп рынка (сырой LOB не подавляет нормой модели Order-1 и Wave Stack!)
+    if MKT_DIM_ORDER3 >= 72:
+        grp_specs = (
+            ([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 40, 41, 42, 43, 56, 57, 58, 59, 66, 67, 68, 69, 70, 71], 5.8),
+            ([29, 30, 31, 32, 33, 44, 45, 46, 47, 48, 49], 6.8),
+            ([34, 35, 36, 37, 38, 39, 50, 51, 52, 53, 54, 55], 7.8),
+            ([60, 61, 62, 63, 64, 65], 8.2),
+        )
+        w1_mkt_norm = w1_mkt.clone()
+        for idxs_g, mult_g in grp_specs:
+            sub_g = w1_mkt[..., idxs_g, :]
+            cap_g = mult_g * math.sqrt(float(len(idxs_g)))
+            nb_g = torch.linalg.vector_norm(sub_g, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+            w1_mkt_norm[..., idxs_g, :] = sub_g * torch.clamp(cap_g / nb_g, max=1.0)
+    else:
+        cap_mkt = 6.5 * math.sqrt(float(MKT_DIM_ORDER3))
+        nb_mkt = torch.linalg.vector_norm(w1_mkt, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+        w1_mkt_norm = w1_mkt * torch.clamp(cap_mkt / nb_mkt, max=1.0)
 
     cap_ag = 6.5 * math.sqrt(float(AG_DIM_ORDER3))
     nb_ag = torch.linalg.vector_norm(w1_ag, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
@@ -101,10 +115,24 @@ def _normalize_weights_order3(state: dict, dtype: torch.dtype) -> dict:
     out["w2_moe"] = torch.cat(w2m_parts, dim=-1).to(dtype)
     out["b2_moe"] = torch.clamp(state["b2_moe"].float(), -7.5, 6.5).to(dtype)
 
+    # Раздельная нормировка прямого роутера w_gate1, выделяющая собственный бюджет каналам Wave Stack [320:326]:
+    wg1_f = state["w_gate1"].float()
+    if wg1_f.shape[-2] >= 326:
+        wg1_base = wg1_f[..., :320, :]
+        wg1_wave = wg1_f[..., 320:, :]
+        nb_gb = torch.linalg.vector_norm(wg1_base, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+        nb_gw = torch.linalg.vector_norm(wg1_wave, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+        out["w_gate1"] = torch.cat(
+            [wg1_base * torch.clamp(27.0 / nb_gb, max=1.0), wg1_wave * torch.clamp(9.5 / nb_gw, max=1.0)],
+            dim=-2,
+        ).to(dtype)
+    else:
+        nw_g1 = torch.linalg.vector_norm(wg1_f, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+        out["w_gate1"] = (wg1_f * torch.clamp(28.0 / nw_g1, max=1.0)).to(dtype)
+
     for k, cap in (
         ("w_res1", 65.0),
         ("w_res2", 40.0),
-        ("w_gate1", 28.0),
         ("w_gate2", 14.0),
         ("w_rec", 30.0),
         ("w_reg1", 26.0),
@@ -382,7 +410,8 @@ class MultimodalMoEPolicyOrder3:
 
         dw1 = _anti_ring((TOTAL_DIM_ORDER3, 384), sig_trunk, low_rank=16).to(self.dtype)
         dw1[:, 0:1, :] *= 2.40
-        dw1[:, 1:40, :] *= 1.50
+        dw1[:, 1:32, :] *= 1.35
+        dw1[:, 32:40, :] *= 3.00  # ускоренное обучение Order-1 (1s..160s) на фоне 15% anti-spoof LOB Dropout!
         dw1[:, 40:60, :] *= 2.20
         if MKT_DIM_ORDER3 > 60:
             dw1[:, 60:MKT_DIM_ORDER3, :] *= 4.20  # ускоренное подключение 12D Wave Radar + 30m/60m структуры волн!
@@ -578,7 +607,7 @@ def train_order3(
     v_lo_grid = np.linspace(38000, max(90000, avail_pre_oos - val_span_starts - 12000), num=n_val_zones, dtype=int)
     val_zones = []
     tr_segments = []
-    prev_tr_lo = 600
+    prev_tr_lo = 1850  # гарантирует полные 1,800s (30m) левого разогрева mem_h перед каждым окном!
     for z_i in range(n_val_zones):
         v_lo = max(prev_tr_lo + 2500 + purge_gap, int(v_lo_grid[z_i]))
         v_hi = v_lo + val_span_starts
@@ -732,6 +761,7 @@ def train_order3(
                 "mode_probs": mp_join,
                 "mode_mi_bits": round(mi_join, 4),
                 "turn_mult": round(float(a.get("turn_mult", 0.0)) + float(b.get("turn_mult", 0.0)), 4),
+                "work_frac": round(0.5 * float(a.get("work_frac", 0.0)) + 0.5 * float(b.get("work_frac", 0.0)), 4),
             })
         return merged
 
@@ -1034,25 +1064,25 @@ def train_order3(
         return fallback_st
 
     st_l66_soup = _load_gpu_seed(SAVE_DIR / "bak_l66" / "order3_soup_top3.pt", st_pw_l53)
-    st_l67_comp = _load_gpu_seed(SAVE_DIR / "bak_l67" / "l67_grand_compounder.pt", _load_gpu_seed(BASE_DIR / "models/prl/release_champion_v1.pt", st_l66_soup))
-    st_l67_soup = _load_gpu_seed(SAVE_DIR / "bak_l67" / "order3_soup_top3.pt", st_l66_soup)
-    st_hyb_60pw_40l66 = _load_gpu_seed(SAVE_DIR / "bak_l66" / "hyb_60pw25_40l66.pt", st_pw_notkr)
-    st_hyb_50_50 = _load_gpu_seed(SAVE_DIR / "bak_l66" / "hyb_50pw38_50pw25.pt", st_pw_notkr)
+    st_l68_w30 = _load_gpu_seed(SAVE_DIR / "bak_l68" / "l68_ult_w30.pt", _load_gpu_seed(BASE_DIR / "models/prl/release_champion_v1.pt", st_l66_soup))
+    st_l68_w36 = _load_gpu_seed(SAVE_DIR / "bak_l68" / "l68_ult_w36.pt", st_l68_w30)
+    st_l68_isl1 = _load_gpu_seed(SAVE_DIR / "bak_l68" / "island_1_best.pt", st_l68_w36)
 
-    def _build_l68_front_wave_seed(
+    def _build_l69_full_cap_seed(
         st_base: dict,
         st_shield: dict,
         agg_modes: tuple[int, ...],
         shield_modes: tuple[int, ...] = (4, 0),
-        exp_z: float = 2.7,
-        front_boost: float = 2.4,
-        inside_b_z: float = -0.5,
-        ret_b_z: float = -4.4,
-        span_b_z: float = -3.6,
-        edge_a_z: float = 1.08,
-        wave49_z: float = 0.28,
-        taker_buy_z: float = -0.35,
-        requote_bias: float = -8.7,
+        exp_z: float = 4.0,
+        front_boost: float = 2.6,
+        inside_b_z: float = -0.2,
+        ret_b_z: float = -4.7,
+        span_b_z: float = -3.9,
+        edge_a_z: float = 1.00,
+        wave49_z: float = 0.22,
+        taker_buy_z: float = -0.25,
+        requote_bias: float = -8.3,
+        flex_exit_in_shield: bool = True,
     ) -> dict:
         out_s = {k: st_base[k].detach().cpu().float().clone() for k in MultimodalMoEPolicyOrder3.PARAM_KEYS}
         w2_s = out_s["w2_moe"].view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
@@ -1062,13 +1092,22 @@ def train_order3(
         for m_sh in shield_modes:
             w2_s[:, m_sh, :] = w2_sh[:, m_sh, :]
             b2_s[0, m_sh, :] = b2_sh[0, m_sh, :]
+            b2_s[0, m_sh, 0] = min(float(b2_s[0, m_sh, 0]), -2.0)
+            if flex_exit_in_shield:
+                # В краш-модах разрешаем быструю разгрузку убыточной позы у спреда (0 заморозки мешка на -25%!):
+                b2_s[0, m_sh, 41] = -1.2   # skew_blend ~ 23% -> Ask прижимается к текущему Ask1, освобождая USDT!
+                b2_s[0, m_sh, 42] = -0.2
+                b2_s[0, m_sh, 25] = max(float(b2_s[0, m_sh, 25]), -0.4)
         for m_ag in agg_modes:
-            b2_s[0, m_ag, 0] = max(float(b2_s[0, m_ag, 0]), exp_z)
+            w2_s[:, m_ag, 0] *= 0.25
+            b2_s[0, m_ag, 0] = exp_z
             b2_s[0, m_ag, 1] += front_boost
-            b2_s[0, m_ag, 2] += front_boost * 0.80
+            b2_s[0, m_ag, 2] += front_boost * 0.85
             b2_s[0, m_ag, 3] += front_boost * 0.55
-            b2_s[0, m_ag, 4] += front_boost * 0.25
-            b2_s[0, m_ag, 12] -= front_boost * 0.50
+            b2_s[0, m_ag, 12] -= front_boost * 0.70
+            b2_s[0, m_ag, 34] = -1.6   # tau_b ~ 0.48 (концентрация в 2-3 крупных слота!)
+            b2_s[0, m_ag, 44] = +2.4   # max_share_b ~ 92%
+            b2_s[0, m_ag, 47] = +4.0   # renorm_blend ~ 98.2%
             b2_s[0, m_ag, 37] = inside_b_z
             b2_s[0, m_ag, 38] = ret_b_z
             b2_s[0, m_ag, 39] = span_b_z
@@ -1082,27 +1121,85 @@ def train_order3(
         w1_r, bb_r, _, _ = out_s["w_reg1"], out_s["b_reg1_b"], out_s["b_reg1_a"], out_s["w_reg2"]
         u_idx = int(torch.argmax(w1_r[5, :] + w1_r[7, :]).item())
         bb_r[0, u_idx] = requote_bias
+        out_s["b_reg2_b"][0, 0] = max(float(out_s["b_reg2_b"][0, 0]), 2.0)
+        out_s["b_reg2_a"][0, 0] = max(float(out_s["b_reg2_a"][0, 0]), 2.0)
         out_s["w2_moe"] = w2_s.reshape(256, MOE_OUT_DIM_ORDER3)
         out_s["b2_moe"] = b2_s.reshape(1, MOE_OUT_DIM_ORDER3)
         st_nm = _normalize_weights_order3(out_s, policy.dtype)
         return {k: v.to(device=device, dtype=policy.dtype) for k, v in st_nm.items()}
 
-    # Семейство агрессивных двухконтурных семян L68:
-    # Mode #4 = органический Crash-Shield L67 (68.8% времени на краше -25.9%!), моды (3, 2, 7, 6, 1) = Front-of-Book Spread & Wave Snipers!
-    st_l68_sel3_bal = _build_l68_front_wave_seed(st_l67_comp, st_l66_soup, agg_modes=(3, 2, 7), shield_modes=(4, 0), exp_z=2.6, front_boost=2.2, inside_b_z=-0.8, ret_b_z=-4.2, span_b_z=-3.4, edge_a_z=1.12, wave49_z=0.30, taker_buy_z=-0.45, requote_bias=-8.9)
-    st_l68_sel4_snp = _build_l68_front_wave_seed(st_l67_comp, st_l67_soup, agg_modes=(3, 2, 7, 6), shield_modes=(4, 0), exp_z=2.75, front_boost=2.5, inside_b_z=-0.4, ret_b_z=-4.5, span_b_z=-3.7, edge_a_z=1.05, wave49_z=0.28, taker_buy_z=-0.35, requote_bias=-8.7)
-    st_l68_sel5_assault = _build_l68_front_wave_seed(st_l67_comp, st_l66_soup, agg_modes=(3, 2, 7, 6, 1), shield_modes=(4,), exp_z=2.8, front_boost=2.4, inside_b_z=-0.5, ret_b_z=-4.4, span_b_z=-3.5, edge_a_z=1.08, wave49_z=0.25, taker_buy_z=-0.35, requote_bias=-8.8)
-    st_l68_sel2_trb = _build_l68_front_wave_seed(st_l67_comp, st_l67_soup, agg_modes=(3, 2), shield_modes=(4, 0), exp_z=3.0, front_boost=2.8, inside_b_z=+0.1, ret_b_z=-4.8, span_b_z=-4.0, edge_a_z=1.00, wave49_z=0.25, taker_buy_z=-0.25, requote_bias=-8.5)
-    st_l68_wide_bal = _build_l68_front_wave_seed(st_l67_comp, st_l66_soup, agg_modes=(0, 1, 2, 3, 5, 6), shield_modes=(4, 7), exp_z=2.5, front_boost=2.1, inside_b_z=-0.9, ret_b_z=-4.2, span_b_z=-3.4, edge_a_z=1.08, wave49_z=0.25, taker_buy_z=-0.50, requote_bias=-8.9)
+    st_l69_fc_snp = _build_l69_full_cap_seed(st_l68_w30, st_l68_isl1, agg_modes=(1, 2, 3, 5, 6, 7), shield_modes=(4, 0), exp_z=4.1, front_boost=2.7, inside_b_z=+0.05, ret_b_z=-4.9, span_b_z=-4.1, edge_a_z=0.95, wave49_z=0.20, taker_buy_z=-0.20, requote_bias=-8.2, flex_exit_in_shield=True)
+    st_l69_fc_bal = _build_l69_full_cap_seed(st_l68_w30, st_l68_w36, agg_modes=(2, 3, 6, 7), shield_modes=(4, 0), exp_z=3.9, front_boost=2.5, inside_b_z=-0.25, ret_b_z=-4.7, span_b_z=-3.9, edge_a_z=1.08, wave49_z=0.30, taker_buy_z=-0.28, requote_bias=-8.4, flex_exit_in_shield=True)
+    st_l69_fc_hft = _build_l69_full_cap_seed(st_l68_isl1, st_l68_isl1, agg_modes=(1, 2, 3, 5, 6, 7), shield_modes=(4, 0), exp_z=4.4, front_boost=3.0, inside_b_z=+0.35, ret_b_z=-5.2, span_b_z=-4.4, edge_a_z=0.80, wave49_z=-0.25, taker_buy_z=-0.15, requote_bias=-7.9, flex_exit_in_shield=True)
+    st_l69_fc_wav = _build_l69_full_cap_seed(st_l68_w36, st_l68_isl1, agg_modes=(1, 2, 3, 6, 7), shield_modes=(4, 0), exp_z=4.0, front_boost=2.6, inside_b_z=-0.15, ret_b_z=-4.8, span_b_z=-4.0, edge_a_z=1.12, wave49_z=0.35, taker_buy_z=-0.22, requote_bias=-8.3, flex_exit_in_shield=True)
 
-    st_ms_53i0_52i1 = st_l68_sel3_bal
-    st_ms_53i0_56i0 = st_l68_sel4_snp
+    st_l69_i0 = _load_gpu_seed(SAVE_DIR / "bak_l69" / "island_0_best.pt", st_l68_w30)
+    st_l69_i1 = _load_gpu_seed(SAVE_DIR / "bak_l69" / "island_1_best.pt", st_l68_w36)
+
+    def _warm_wire_l70_order1(st_src: dict, wave_gain: float = 0.65, o1_boost: float = 1.25) -> dict:
+        """
+        Блок 2 L70: Семантический Warm-Wiring моделей Order-1 (1s..160s + Wave Stack 5m..60m):
+        - Усиливает рабочий блок Order-1 [34..39, 50..55] в стволе и роутере,
+        - Распаивает бычьи каналы Wave Stack [60..64] по выученному вектору Order-1 80s/160s [38, 39],
+          а разворотный канал вершины wave_top_15m [65] — по выученному вектору guard_crash_300s [31]!
+        """
+        d = {k: st_src[k].detach().cpu().float().clone() for k in MultimodalMoEPolicyOrder3.PARAM_KEYS}
+        w1 = d["w1"]
+        wg1 = d["w_gate1"]
+
+        # 1) Усиление существующего короткого/среднего Order-1
+        o1_idx = [34, 35, 36, 37, 38, 39, 50, 51, 52, 53, 54, 55]
+        w1[o1_idx, :] = w1[o1_idx, :] * o1_boost
+
+        # 2) Тёплая распайка Wave Stack [60..65] в ствол w1_mkt:
+        bull_dir_w1 = 0.45 * w1[38, :] + 0.55 * w1[39, :]
+        crash_dir_w1 = 0.60 * w1[31, :] + 0.40 * w1[30, :]
+        for c_w, mult_w in ((60, 0.90), (61, 1.15), (62, 1.35), (63, 1.25), (64, 1.45)):
+            w1[c_w, :] = w1[c_w, :] + (wave_gain * mult_w) * bull_dir_w1
+        w1[65, :] = w1[65, :] + (wave_gain * 1.65) * crash_dir_w1
+
+        # 3) Тёплая распайка Wave Stack [320..325] в прямой роутер w_gate1:
+        # В r_extra_22d (строки 304..325): 316=ch36(20s), 317=ch39(160s), 318=ch55(skew20s), 313=ch31(crash300s), 312=ch30(bleed60s)
+        wg1[[316, 317, 318], :] = wg1[[316, 317, 318], :] * o1_boost
+        bull_dir_g = 0.40 * wg1[316, :] + 0.60 * wg1[317, :]
+        crash_dir_g = 0.65 * wg1[313, :] + 0.35 * wg1[312, :]
+        for r_w, mult_r in ((320, 0.50), (321, 0.65), (322, 0.80), (323, 0.75), (324, 0.90)):
+            wg1[r_w, :] = wg1[r_w, :] + (wave_gain * mult_r) * bull_dir_g
+        wg1[325, :] = wg1[325, :] + (wave_gain * 1.05) * crash_dir_g
+
+        d["w1"] = w1
+        d["w_gate1"] = wg1
+        st_nm = _normalize_weights_order3(d, policy.dtype)
+        return {k: v.to(device=device, dtype=policy.dtype) for k, v in st_nm.items()}
+
+    def _graft_wave_and_hft_l70(st_wave_base: dict, st_hft_base: dict, hft_modes: tuple[int, ...] = (1, 5), wave_gain: float = 0.70) -> dict:
+        """Соединяет волновое ядро L68_Ult_w30 (+$60 на ралли!) с высокооборотными модами L69_Isl0 ($23.4k/сут @ DD 11.5%!) + Warm-Wiring Order-1!"""
+        m = {k: st_wave_base[k].detach().cpu().float().clone() for k in MultimodalMoEPolicyOrder3.PARAM_KEYS}
+        w2 = m["w2_moe"].view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        b2 = m["b2_moe"].view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        w2_h = st_hft_base["w2_moe"].detach().cpu().float().view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        b2_h = st_hft_base["b2_moe"].detach().cpu().float().view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        for hm in hft_modes:
+            w2[:, hm, :] = w2_h[:, hm, :]
+            b2[0, hm, :] = b2_h[0, hm, :]
+        m["w2_moe"] = w2.reshape(256, MOE_OUT_DIM_ORDER3)
+        m["b2_moe"] = b2.reshape(1, MOE_OUT_DIM_ORDER3)
+        return _warm_wire_l70_order1(m, wave_gain=wave_gain, o1_boost=1.28)
+
+    st_l70_ww_l69i0 = _warm_wire_l70_order1(st_l69_i0, wave_gain=0.75, o1_boost=1.30)
+    st_l70_ww_l68w30 = _warm_wire_l70_order1(st_l68_w30, wave_gain=0.75, o1_boost=1.30)
+    st_l70_graft_a = _graft_wave_and_hft_l70(st_l68_w30, st_l69_i0, hft_modes=(1, 5), wave_gain=0.75)
+    st_l70_graft_b = _graft_wave_and_hft_l70(st_l69_i0, st_l68_w30, hft_modes=(2, 3), wave_gain=0.80)
+    st_l70_ww_fc_snp = _warm_wire_l70_order1(st_l69_fc_snp, wave_gain=0.70, o1_boost=1.25)
+
+    st_ms_53i0_52i1 = st_l70_graft_a
+    st_ms_53i0_56i0 = st_l70_graft_b
     is_warm_l43 = True
 
     seed_pool = (
-        [st_l68_sel3_bal, st_l68_sel4_snp, st_l68_sel5_assault, st_l68_wide_bal, st_l67_comp, st_hyb_50_50]
+        [st_l70_graft_a, st_l70_graft_b, st_l70_ww_l69i0, st_l70_ww_l68w30, st_l70_ww_fc_snp, st_l69_i1]
         if island_id == 0
-        else [st_l68_sel4_snp, st_l68_sel5_assault, st_l68_sel2_trb, st_l68_wide_bal, st_l68_sel3_bal, st_l67_comp]
+        else [st_l70_ww_l69i0, st_l70_graft_b, st_l70_graft_a, st_l70_ww_fc_snp, st_l70_ww_l68w30, st_l69_fc_bal]
     )
     resume_iter = 0
     for res_p in [SAVE_DIR / "islands" / f"island_{island_id}_best.pt", SAVE_DIR / "global_best.pt", RESUME_CHAMP_PATH]:
@@ -1376,7 +1473,7 @@ def train_order3(
             log_msg(
                 f"⭐ [It {it:03d} | +{delta_bp:.2f} bp | {src_tag}] NEW K=8 CHAMPION! "
                 f"JointGeo={best_geo_bp:+.2f} bp (Mac={best_metrics['macro_geo_bp']:+.2f}, Mic={best_metrics['micro_geo_bp']:+.2f}) | "
-                f"CleanEV={best_clean_ev:+.4f}% | InvEV={best_metrics.get('inv_delta_ev_pct', 0.0):+.4f}% | Turn={best_metrics.get('turn_mult', 0.0):.2f}x | "
+                f"CleanEV={best_clean_ev:+.4f}% | Work={best_metrics.get('work_frac', 0.0)*100:.1f}% | Turn={best_metrics.get('turn_mult', 0.0):.2f}x | "
                 f"Fills/w={best_metrics['fills']/w_cnt_f:.1f} | MI={best_metrics['mode_mi_bits']:.2f}b | Time={time.time() - t_it:.1f}s"
             )
         else:
@@ -1436,7 +1533,12 @@ def train_order3(
         gate_keys = {"w_gate1", "b_gate1", "w_gate2", "b_gate2"}
         soup_state = {}
         for k in MultimodalMoEPolicyOrder3.PARAM_KEYS:
-            if k in gate_keys:
+            if k == "w_gate1":
+                g0 = uniq_elites[0][1][k].detach().to(device=device, dtype=torch.float32).clone()
+                g1 = uniq_elites[1][1][k].detach().to(device=device, dtype=torch.float32)
+                g0[320:326] = 0.75 * g0[320:326] + 0.25 * g1[320:326]
+                soup_state[k] = g0.to(dtype=policy.dtype)
+            elif k in gate_keys:
                 soup_state[k] = uniq_elites[0][1][k].detach().to(device=device, dtype=policy.dtype).clone()
             else:
                 t0_w = uniq_elites[0][1][k].detach().to(device=device, dtype=torch.float32)

@@ -558,14 +558,15 @@ def _order3_clean_tick_step(
     sp_rel_2d = torch.clamp(((a1 - b1) / b1) * 40.0, 0.0, 3.0).unsqueeze(1).expand(N, S)
     g_mode_s = g_mode.unsqueeze(1).expand(N, S, K_MODES_ORDER3)
 
+    o1_slot_imp = torch.tanh(0.35 * (mkt_w[:, 34:35].float() + mkt_w[:, 36:37].float()) + 0.40 * (mkt_w[:, 61:62].float() + mkt_w[:, 62:63].float())).to(dt)
     slot_edge_b = torch.clamp((((a1.unsqueeze(1) - t_bid_px) / torch.clamp(t_bid_px, min=tick_size)) - 2.0 * maker_fee) * 40.0, -2.0, 3.0)
-    slot_exec_b = mkt_w[:, 48:49].expand(N, S)
+    slot_exec_b = (0.65 * mkt_w[:, 48:49] + 0.55 * o1_slot_imp).expand(N, S)
     slot_edge_a = torch.where(
         hp_now_mask & (avg_entry.unsqueeze(1) > 1e-4),
         torch.clamp((((t_ask_px - avg_entry.unsqueeze(1)) / torch.clamp(avg_entry.unsqueeze(1), min=tick_size)) - 2.0 * maker_fee) * 40.0, -2.5, 3.0),
         torch.zeros_like(t_ask_px),
     )
-    slot_exec_a = mkt_w[:, 45:46].expand(N, S)
+    slot_exec_a = (0.65 * mkt_w[:, 45:46] - 0.55 * o1_slot_imp).expand(N, S)
 
     # 4D датчики реальной FIFO-очереди и долгого горизонта удержания (снимает слепоту регулятора к qprog и стенам L2!):
     qprog_b = torch.where(had_b_pre, torch.clamp(1.0 - bid_qa / (bid_qa0.float() + 10.0), 0.0, 1.0), torch.zeros_like(bid_qty))
@@ -904,7 +905,14 @@ def _order3_clean_tick_step(
     dd_pct = 100.0 * torch.clamp(peak_mtm_eq - mtm_eq, min=0.0) / budget
     max_mtm_dd_pct = torch.maximum(max_mtm_dd_pct, dd_pct)
 
-    sum_val_err = sum_val_err
+    na1_1d = na1.squeeze(1)
+    near_b_usd = torch.where((bid_qty > 1e-6) & (bid_px >= nb1_1d.unsqueeze(1) * 0.9945), bid_qty * bid_px, torch.zeros_like(bid_qty)).sum(dim=1)
+    near_a_q = torch.where((ask_qty > 1e-6) & (ask_px <= na1_1d.unsqueeze(1) * 1.0085), ask_qty, torch.zeros_like(ask_qty)).sum(dim=1)
+    healthy_wave_pos = (pos_qty > 1e-6) & (avg_entry > 1e-4) & (nb1_1d >= avg_entry * 0.990)
+    working_pos_usd = torch.where(healthy_wave_pos, pos_qty * nb1_1d, torch.minimum(pos_qty, near_a_q) * nb1_1d)
+    raw_work_frac = torch.clamp((working_pos_usd + near_b_usd) / torch.clamp(mtm_eq, min=25.0), 0.0, 1.0)
+    is_danger_mkt = (mkt_w[:, 31] > 0.36) | (mkt_w[:, 30] > 0.44) | (mkt_w[:, 65] > 0.34)
+    sum_val_err = sum_val_err + torch.where(is_danger_mkt, torch.ones_like(raw_work_frac), raw_work_frac)
     prev_val_pred = val_pred_now
     prev_mtm_eq = mtm_eq
 
@@ -1282,22 +1290,18 @@ def evaluate_order3_basket(
     # Потоковый расчет z_mkt_w (pre_mkt считается блоками по 240 шагов: 10x экономия VRAM, 0 OOM на C=192!)
     raw_mkt_slice = mkt_39d_all[t_steps_cl[:win_len - 1]]
     if calib_jitter_std > 0.0 and raw_mkt_slice.shape[-1] >= 56:
-        # Оконно-постоянная прививка против дрейфа калибровки при смене каузальных окон Order-1/2 (win_k -> win_{k+1}), ТОЛЬКО на Train!
+        # L70 Anti-Spoof LOB Dropout (15% маскировка сырого BBO дисбаланса ch[1..4] на Train -> принуждает опираться на Order-1 / Wave Stack!)
         raw_mkt_slice = raw_mkt_slice.float().clone()
-        s_o2a = 1.0 + torch.randn((1, W, 5), device=device) * calib_jitter_std
-        b_o2a = torch.randn((1, W, 5), device=device) * (0.35 * calib_jitter_std)
-        raw_mkt_slice[..., 29:34] = torch.clamp(raw_mkt_slice[..., 29:34] * s_o2a + b_o2a, 0.0, 1.0)
-        s_o2b = 1.0 + torch.randn((1, W, 6), device=device) * calib_jitter_std
-        b_o2b = torch.randn((1, W, 6), device=device) * (0.35 * calib_jitter_std)
-        raw_mkt_slice[..., 44:50] = torch.clamp(raw_mkt_slice[..., 44:50] * s_o2b + b_o2b, 0.0, 1.0)
-        s_o1 = 1.0 + torch.randn((1, W, 6), device=device) * calib_jitter_std
-        b_o1 = torch.randn((1, W, 6), device=device) * (0.45 * calib_jitter_std)
-        raw_mkt_slice[..., 34:40] = torch.clamp(raw_mkt_slice[..., 34:40] * s_o1 + b_o1, -3.0, 3.0)
-        s_o1f = 1.0 + torch.randn((1, W, 6), device=device) * calib_jitter_std
-        b_o1f = torch.randn((1, W, 6), device=device) * (0.30 * calib_jitter_std)
-        raw_mkt_slice[..., 50:56] = raw_mkt_slice[..., 50:56] * s_o1f + b_o1f
-        raw_mkt_slice[..., 52:55] = torch.clamp(raw_mkt_slice[..., 52:55], 0.0, 1.0)
-    z_mkt_w = _scale_mkt_44d(raw_mkt_slice, dt).contiguous()  # [win_len - 1, W, 60]
+        lob_drop_mask = (torch.rand((raw_mkt_slice.shape[0], W, 1), device=device) > 0.15).float()
+        lob_noise = torch.randn((raw_mkt_slice.shape[0], W, 4), device=device) * (1.25 * calib_jitter_std)
+        raw_mkt_slice[..., 1:5] = torch.clamp(raw_mkt_slice[..., 1:5] * lob_drop_mask + lob_noise, -1.0, 1.0)
+        # Легкая прививка калибровки моделей (в 3 раза мягче прежней, чтобы не подавлять доверие к Order-1!):
+        cj_m = 0.30 * calib_jitter_std
+        s_o2a = 1.0 + torch.randn((1, W, 5), device=device) * cj_m
+        raw_mkt_slice[..., 29:34] = torch.clamp(raw_mkt_slice[..., 29:34] * s_o2a, 0.0, 1.0)
+        s_o1 = 1.0 + torch.randn((1, W, 6), device=device) * cj_m
+        raw_mkt_slice[..., 34:40] = torch.clamp(raw_mkt_slice[..., 34:40] * s_o1, -3.0, 3.0)
+    z_mkt_w = _scale_mkt_44d(raw_mkt_slice, dt).contiguous()  # [win_len - 1, W, 72]
 
     b10_w_all = b10_all[t_steps_cl].contiguous()
     a10_w_all = a10_all[t_steps_cl].contiguous()
@@ -1317,7 +1321,34 @@ def evaluate_order3_basket(
     env_budgets_e = budget_tiers.unsqueeze(0).expand(C, B_bud).reshape(E)
     budget = env_budgets_e.unsqueeze(0).expand(W, E).reshape(N).contiguous()
 
-    mem_h = torch.zeros((N, MEM_DIM_ORDER3), dtype=dt, device=device)
+    # Блок 1 L70: Честное каузальное дополнение окна слева [ws - 1800 .. ws) для 100% разогрева 32D памяти mem_h (0 холодного нуля на s=0!):
+    warm_stride = 10
+    n_warm_steps = 180  # 180 * 10s = 1,800s (30 минут реальной прошлой истории слева, строго < purge_gap=5651s!)
+    w_offs = torch.arange(-n_warm_steps * warm_stride, 0, warm_stride, dtype=torch.long, device=device).unsqueeze(1)
+    t_warm_idx = torch.clamp(w_starts.unsqueeze(0) + w_offs, min=0, max=total_max_t)  # [180, W]
+    z_warm = _scale_mkt_44d(mkt_39d_all[t_warm_idx], dt).contiguous()  # [180, W, 72]
+    z_warm_in = z_warm.view(n_warm_steps * W, MKT_DIM_ORDER3).unsqueeze(0).expand(C, -1, -1)
+    pre_warm = (torch.bmm(z_warm_in, w1_mkt_c) + b1_c).view(C, n_warm_steps, W, 384)
+    mem_cw = torch.zeros((C, W, MEM_DIM_ORDER3), dtype=dt, device=device)
+    for uw in range(n_warm_steps):
+        pw_u = pre_warm[:, uw]  # [C, W, 384]
+        h1_w = torch.relu(pw_u[:, :, :256]) * (2.0 * torch.sigmoid(pw_u[:, :, 256:384])).repeat_interleave(2, dim=-1)
+        rp_w = torch.bmm(h1_w, wr1_c) + br1_c
+        h2_w = h1_w + torch.bmm(torch.relu(rp_w[:, :, :64]) * (2.0 * torch.sigmoid(rp_w[:, :, 64:128])), wr2_c)
+        rr_w = torch.bmm(h2_w, wrec_c) + brec_c
+        ru_w = torch.tanh(rr_w[:, :, :MEM_DIM_ORDER3])
+        rg_1s = torch.cat(
+            [
+                torch.sigmoid(rr_w[:, :, 32:40].float() + 1.0),
+                torch.sigmoid(rr_w[:, :, 40:48].float() + 3.8),
+                torch.sigmoid(rr_w[:, :, 48:56].float() + 5.2),
+                torch.sigmoid(rr_w[:, :, 56:64].float() + 6.6),
+            ],
+            dim=-1,
+        )
+        rg_step = torch.pow(rg_1s, float(warm_stride)).to(dt)
+        mem_cw = rg_step * mem_cw + (1.0 - rg_step) * ru_w
+    mem_h = mem_cw.permute(1, 0, 2).unsqueeze(2).expand(W, C, B_bud, MEM_DIM_ORDER3).reshape(N, MEM_DIM_ORDER3).contiguous()
     cash = budget.clone()
     pos_qty = torch.zeros(N, dtype=torch.float32, device=device)
     pos_cost_usd = torch.zeros(N, dtype=torch.float32, device=device)
@@ -1506,8 +1537,8 @@ def evaluate_order3_basket(
     tail_px = torch.clamp(end_b10[:, -1] * 0.985, min=tick_sz)
     strict_l2_carry = (liq_10_q * end_b10).sum(dim=1) * (1.0 - maker_fee) + excess_end_q * tail_px * (1.0 - taker_fee)
     if enforce_activity_floor:
-        work_cap_q = (0.45 * budget) / torch.clamp(end_mid, min=tick_sz)
-        healthy_mm = (init_pos_0 <= 1e-6) & (avg_entry > 1e-4) & (end_mid >= avg_entry * 0.988)
+        work_cap_q = (0.96 * budget) / torch.clamp(end_mid, min=tick_sz)
+        healthy_mm = (init_pos_0 <= 1e-6) & (avg_entry > 1e-4) & (end_mid >= avg_entry * 0.985)
         maker_q = torch.where(healthy_mm, torch.minimum(pos_qty, work_cap_q), torch.zeros_like(pos_qty))
         rem_l2_q = torch.clamp(pos_qty - maker_q, min=0.0)
         rem_liq_10 = torch.clamp(torch.minimum(rem_l2_q.unsqueeze(1) - prev_end_bq, end_bq10), min=0.0)
@@ -1590,11 +1621,11 @@ def evaluate_order3_basket(
         cl_cvar05_v = torch.topk(cl_g_mat, max(1, cl_g_mat.shape[1] // 20), dim=1, largest=False).values.mean(dim=1)
         cl_min_g_v = cl_g_mat.min(dim=1).values
         cl_down_v = torch.sqrt(torch.mean(torch.clamp(-cl_g_mat, min=0.0) ** 2, dim=1))
-        # Трехслойный Cliff-Breaker для многочасовых волн: режет глубокие катастрофы (> -45..-120 bp), разрешая рабочие стопы на ложных пробоях!
+        # Трехслойный Cliff-Breaker для 85%-95% загрузки капитала: не штрафует рабочее дыхание волны (-1.0%..-1.5%), жестко отсекая реальные обвалы!
         cl_tail_pen = (
-            0.38 * torch.clamp(-45.0 - cl_cvar15_v, min=0.0)
-            + 0.35 * torch.clamp(-80.0 - cl_cvar10_v, min=0.0)
-            + 0.42 * torch.clamp(-135.0 - cl_cvar05_v, min=0.0)
+            0.35 * torch.clamp(-110.0 - cl_cvar15_v, min=0.0)
+            + 0.35 * torch.clamp(-185.0 - cl_cvar10_v, min=0.0)
+            + 0.45 * torch.clamp(-265.0 - cl_cvar05_v, min=0.0)
         )
         # Сняты микроскальперские потолки 0.45% / 50 bp: полный сложный рост капитала на волнах до +8.0% / +800 bp!
         cl_mtm_sub = mtm_wcb[clean_idx]
@@ -1662,35 +1693,42 @@ def evaluate_order3_basket(
     h_cond_v = mode_ent_mat.view(W, C, B_bud).mean(dim=(0, 2))
     mi_bits_v = torch.clamp((h_marg_v - h_cond_v) / ln2, min=0.0)
 
-    # Волновой + широкоспредовый фильтр БЕЗ штрафа за удержание многочасовой волны (0 штрафа q50_turn_phr, фильтр против холостого комиссионного churn!):
+    work_wcb = (sum_val_err / n_steps_f).view(W, C, B_bud)
+    cl_work_v = work_wcb[clean_idx].mean(dim=(0, 2)) if clean_idx else work_wcb.mean(dim=(0, 2))
+
+    # L69 Full-Capital High-Velocity Engine: прямой стимул работы всем депозитом (work_frac >= 80%) + высокооборотный сбор спреда/волн!
     win_hrs = max(0.25, float(win_len - 1) / 3600.0)
     cl_fills_phr = cl_fills_pw / win_hrs
     cl_turn_phr = cl_turn_v / win_hrs
     if enforce_activity_floor and len(clean_idx) >= 8:
+        idle_cap_pen = 42.0 * torch.clamp(0.80 - cl_work_v, min=0.0)
         dead_mm_pen = (
-            32.0 * torch.clamp(1.0 - cl_turn_phr / 0.16, min=0.0)
-            + 18.0 * torch.clamp(1.0 - cl_fills_phr / 2.20, min=0.0)
-            + 20.0 * torch.clamp(cl_turn_phr - 1.25, min=0.0) * torch.sigmoid(-cl_ev_v * 35.0)
+            idle_cap_pen
+            + 36.0 * torch.clamp(1.0 - cl_turn_phr / 0.45, min=0.0)
+            + 20.0 * torch.clamp(1.0 - cl_fills_phr / 3.50, min=0.0)
+            + 18.0 * torch.clamp(cl_turn_phr - 2.20, min=0.0) * torch.sigmoid(-cl_ev_v * 35.0)
         )
-        # Прямая премия за сочетание чистой долларовой доходности (cl_ev_v %) И активного оборота в спреде/волнах!
-        profit_vol_bonus = 280.0 * torch.clamp(cl_ev_v, min=0.0, max=8.0) * torch.clamp(cl_turn_phr / 0.18, min=0.20, max=2.20)
+        profit_vol_bonus = (
+            300.0 * torch.clamp(cl_ev_v, min=0.0, max=10.0) * torch.clamp(cl_turn_phr / 0.35, min=0.25, max=2.80)
+            + 22.0 * torch.clamp(cl_work_v - 0.55, min=0.0) * torch.sigmoid(cl_ev_v * 15.0)
+        )
     else:
         dead_mm_pen = torch.zeros(C, device=device)
         profit_vol_bonus = torch.zeros(C, device=device)
 
     if clean_idx and inv_idx:
-        active_mm_gate = torch.clamp(cl_turn_phr / 0.15, 0.0, 1.0) * torch.sigmoid((geo_clean + 10.0) / 4.0) * torch.sigmoid(cl_ev_v * 20.0)
+        active_mm_gate = torch.clamp(cl_turn_phr / 0.25, 0.0, 1.0) * torch.clamp(cl_work_v / 0.65, 0.0, 1.0) * torch.sigmoid((geo_clean + 10.0) / 4.0) * torch.sigmoid(cl_ev_v * 20.0)
         geo_v = 0.85 * (geo_clean + profit_vol_bonus - dead_mm_pen) + 0.15 * torch.where(geo_inv > 0.0, geo_inv * active_mm_gate, geo_inv)
     elif clean_idx:
         geo_v = geo_clean + profit_vol_bonus - dead_mm_pen
     else:
         geo_v = geo_inv
 
-    # Единый перенос компактной матрицы метрик [C, 16] на CPU!
+    # Единый перенос компактной матрицы метрик [C, 17] на CPU!
     stats_cpu = torch.stack(
         [
             geo_v, ent_bp_v, cvar25_v, q_mat[0], q_mat[2], q_mat[4],
-            full_ev_v, cl_ev_v, inv_ev_v, dd_v, fills_v, cancels_v, requeues_v, fqp_v, mi_bits_v, cl_turn_v,
+            full_ev_v, cl_ev_v, inv_ev_v, dd_v, fills_v, cancels_v, requeues_v, fqp_v, mi_bits_v, cl_turn_v, cl_work_v,
         ],
         dim=1,
     ).cpu().tolist()
@@ -1721,5 +1759,6 @@ def evaluate_order3_basket(
             'mode_probs': [round(float(x), 4) for x in mp_cpu[ci]],
             'mode_mi_bits': round(float(st[14]), 4),
             'turn_mult': round(float(st[15]), 4),
+            'work_frac': round(float(st[16]), 4),
         })
     return results[:orig_c]

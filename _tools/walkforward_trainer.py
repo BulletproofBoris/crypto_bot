@@ -43,9 +43,14 @@ from order1_research_lab import (
 )
 from data_labeler import compute_single_horizon_labels
 
-# ─── Configuration ───
-HORIZONS = [1, 2, 5, 10, 20, 40, 80, 160]
-K_STAR = {1: 3.0, 2: 3.0, 5: 3.0, 10: 3.0, 20: 3.0, 40: 5.0, 80: 2.5, 160: 2.0}
+# ─── Configuration (Expanded up to 48h Statistical Ceiling H = 1800s / 30m) ───
+CORE_HORIZONS = [1, 2, 5, 10, 20, 40, 80, 160]
+EXTENDED_HORIZONS = [320, 600, 900, 1800]
+HORIZONS = CORE_HORIZONS + EXTENDED_HORIZONS  # 12 horizons: 1s .. 30m (N_eff >= 95 on 48h window)
+K_STAR = {
+    1: 3.0, 2: 3.0, 5: 3.0, 10: 3.0, 20: 3.0, 40: 5.0, 80: 2.5, 160: 2.0,
+    320: 2.0, 600: 2.0, 900: 2.0, 1800: 1.5,
+}
 TICK_SIZE = 0.0001
 VENUE = "ST"
 
@@ -139,19 +144,34 @@ def load_window_data(pf: pq.ParquetFile, num_cols: list[str],
 
 def train_xgboost_gpu_model(X_tr: np.ndarray, y_tr: np.ndarray,
                             X_val: np.ndarray, y_val: np.ndarray,
-                            save_path: Path, device: torch.device) -> tuple[np.ndarray, dict]:
+                            save_path: Path, device: torch.device,
+                            horizon_sec: int = 10) -> tuple[np.ndarray, dict]:
     dev_str = str(device)
-    dtrain = xgb.DMatrix(X_tr, label=y_tr)
-    dval = xgb.DMatrix(X_val, label=y_val)
+    # Адаптивная ёмкость дерева под N_eff = (48h - H) / H, исключающая переобучение на 5m..30m:
+    if horizon_sec >= 900:
+        max_depth, reg_lam, min_cw, sub_s = 4, 6.0, 64.0, 0.70
+    elif horizon_sec >= 320:
+        max_depth, reg_lam, min_cw, sub_s = 5, 3.0, 32.0, 0.75
+    else:
+        max_depth, reg_lam, min_cw, sub_s = 6, 1.0, 1.0, 0.80
+
+    # Каузальный purge хвоста H секунд на Train + отсечение неполного хвоста H секунд на Val:
+    tr_cut = max(1000, len(X_tr) - int(horizon_sec)) if horizon_sec >= 60 else len(X_tr)
+    val_cut = max(500, len(X_val) - int(horizon_sec)) if horizon_sec >= 60 else len(X_val)
+
+    dtrain = xgb.DMatrix(X_tr[:tr_cut], label=y_tr[:tr_cut])
+    dval = xgb.DMatrix(X_val[:val_cut], label=y_val[:val_cut])
     params = {
-        'max_depth': 6,
+        'max_depth': max_depth,
         'learning_rate': 0.05,
         'objective': 'multi:softprob',
         'num_class': NUM_CLASSES,
         'tree_method': 'hist',
         'device': dev_str,
-        'subsample': 0.8,
+        'subsample': sub_s,
         'colsample_bytree': 0.8,
+        'reg_lambda': reg_lam,
+        'min_child_weight': min_cw,
         'verbosity': 0,
         'seed': 42
     }
@@ -163,7 +183,7 @@ def train_xgboost_gpu_model(X_tr: np.ndarray, y_tr: np.ndarray,
     )
     model.save_model(str(save_path))
     probs = model.predict(dval)
-    metrics = compute_evaluation_metrics(y_val, probs)
+    metrics = compute_evaluation_metrics(y_val[:val_cut], probs)
     del model, dtrain, dval
     gc.collect()
     return probs, metrics
@@ -176,20 +196,24 @@ def train_single_window(win_idx: int, num_cols: list[str],
     win_dir.mkdir(parents=True, exist_ok=True)
     meta_path = win_dir / f"meta_win_{win_idx:02d}.json"
 
-    if meta_path.exists() and not force:
+    existing_meta = {}
+    if meta_path.exists():
         try:
             with open(meta_path) as f:
                 existing_meta = json.load(f)
-            if existing_meta.get("completed", False):
-                print(f"  ⏭ Window {win_idx:02d} already completed. Skipping.", flush=True)
-                return existing_meta
         except Exception:
-            pass
+            existing_meta = {}
 
+    all_files_exist = all((win_dir / f"xgb_h{H}s.ubj").exists() for H in HORIZONS)
+    if existing_meta.get("completed", False) and all_files_exist and not force:
+        print(f"  ⏭ Window {win_idx:02d} already has all {len(HORIZONS)} horizons. Skipping.", flush=True)
+        return existing_meta
+
+    missing_horizons = HORIZONS if force else [H for H in HORIZONS if not (win_dir / f"xgb_h{H}s.ubj").exists()]
     t_start = time.time()
     t_s, t_e, v_s, v_e = get_window_bounds(total_rows, win_idx)
     dev_str = str(assigned_device)
-    print(f"\n{'='*70}\n  🚀 [{dev_str}] Processing Window {win_idx:02d}/68: Train [{t_s:,}..{t_e:,}], Val [{v_s:,}..{v_e:,}]\n{'='*70}", flush=True)
+    print(f"\n{'='*70}\n  🚀 [{dev_str}] Processing Window {win_idx:02d}: Train [{t_s:,}..{t_e:,}], Val [{v_s:,}..{v_e:,}] | ToTrain={missing_horizons}\n{'='*70}", flush=True)
 
     pf = pq.ParquetFile(str(PARQUET_PATH))
     X_tr, X_val, df_tr_lbl, df_val_lbl, tr_mask, val_mask = load_window_data(
@@ -198,7 +222,7 @@ def train_single_window(win_idx: int, num_cols: list[str],
     print(f"  [{dev_str} | Win {win_idx:02d}] Valid Rows: Train {len(X_tr):,} | Val {len(X_val):,}", flush=True)
 
     labels_tr, labels_val = {}, {}
-    for H in HORIZONS:
+    for H in missing_horizons:
         K = K_STAR[H]
         l_tr = compute_single_horizon_labels(df_tr_lbl, "prl", H, K, min_vol=0, tick_size=TICK_SIZE, venue=VENUE)
         l_val = compute_single_horizon_labels(df_val_lbl, "prl", H, K, min_vol=0, tick_size=TICK_SIZE, venue=VENUE)
@@ -208,20 +232,20 @@ def train_single_window(win_idx: int, num_cols: list[str],
     del df_tr_lbl, df_val_lbl
     gc.collect()
 
-    horizon_results = {}
+    horizon_results = dict(existing_meta.get("horizons", {}))
 
-    # Concurrent XGBoost GPU for all 8 horizons (2 parallel workers on assigned_device)
+    # Concurrent XGBoost GPU for missing horizons (2 parallel workers on assigned_device)
     from concurrent.futures import ThreadPoolExecutor
 
     def _train_single_xgb_h(H):
         t0 = time.time()
         y_tr, y_val = labels_tr[H], labels_val[H]
         xgb_file = win_dir / f"xgb_h{H}s.ubj"
-        probs, metrics = train_xgboost_gpu_model(X_tr, y_tr, X_val, y_val, xgb_file, assigned_device)
+        probs, metrics = train_xgboost_gpu_model(X_tr, y_tr, X_val, y_val, xgb_file, assigned_device, horizon_sec=H)
         return H, probs, metrics, time.time() - t0
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(_train_single_xgb_h, H) for H in HORIZONS]
+        futures = [executor.submit(_train_single_xgb_h, H) for H in missing_horizons]
         for f in futures:
             H, probs, metrics, elapsed = f.result()
             horizon_results[f"H{H}s"] = {

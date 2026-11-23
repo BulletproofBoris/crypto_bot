@@ -42,7 +42,7 @@ WF_SUMMARY_PATH = BASE_DIR / "models" / "prl" / "variant_a_order1" / "walkforwar
 OUTPUT_DIR = BASE_DIR / "models" / "prl" / "order2_wf"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-TARGET_NAMES = [
+CORE_TARGET_NAMES = [
     "adverse_selection_5s",
     "wave_exhaustion_10s",
     "ask_sweep_5s",
@@ -55,6 +55,35 @@ TARGET_NAMES = [
     "carousel_success",
     "carousel_capacity",
 ]
+
+EXTENDED_TARGET_NAMES = [
+    "guard_bleed_180s",      # 3m slow bleed <= -50 bp without +20 bp bounce
+    "guard_crash_600s",      # 10m cascade crash <= -120 bp
+    "guard_crash_900s",      # 15m structural crash ceiling <= -180 bp
+    "exec_fill_120s",        # 2m deep-queue large order fill probability
+    "carousel_success_240s", # 4m full maker-maker round-trip cycle (>= +24 bp)
+]
+
+TARGET_NAMES = CORE_TARGET_NAMES + EXTENDED_TARGET_NAMES  # 16 physical risk & execution models
+
+TARGET_HORIZONS_SEC = {
+    "adverse_selection_5s": 5,
+    "wave_exhaustion_10s": 10,
+    "ask_sweep_5s": 5,
+    "guard_sweep_12s": 12,
+    "guard_bleed_60s": 60,
+    "guard_crash_300s": 300,
+    "guard_exit_30s": 30,
+    "exec_fill_30s": 30,
+    "exec_frontrun_30s": 30,
+    "carousel_success": 90,
+    "carousel_capacity": 90,
+    "guard_bleed_180s": 180,
+    "guard_crash_600s": 600,
+    "guard_crash_900s": 900,
+    "exec_fill_120s": 120,
+    "carousel_success_240s": 240,
+}
 
 
 # ─── Numba Parallel Target Computation ───
@@ -71,8 +100,13 @@ def compute_numba_targets(bid_p, ask_p, bid_q1, ask_q1, sell_v, buy_v, bps_15, b
     y_front = np.zeros(n, dtype=np.float32)
     y_car_succ = np.zeros(n, dtype=np.float32)
     y_car_cap = np.zeros(n, dtype=np.float32)
+    y_bleed180 = np.zeros(n, dtype=np.float32)
+    y_crash600 = np.zeros(n, dtype=np.float32)
+    y_crash900 = np.zeros(n, dtype=np.float32)
+    y_fill120 = np.zeros(n, dtype=np.float32)
+    y_car240 = np.zeros(n, dtype=np.float32)
 
-    for t in prange(30, n - 95):
+    for t in prange(30, n - 905):
         b0 = bid_p[t]
         a0 = ask_p[t]
         th15 = bps_15[t]
@@ -197,9 +231,82 @@ def compute_numba_targets(bid_p, ask_p, bid_q1, ask_q1, sell_v, buy_v, bps_15, b
                         cap_val = s90_vol if s90_vol < b90_vol else b90_vol
                         y_car_cap[t] = cap_val if cap_val < 1000.0 else 1000.0
 
+        # 10. Extended Bleed 180s (<= -50 bp without +20 bp bounce)
+        th20 = b0 * 0.0020
+        th50 = b0 * 0.0050
+        min_b180 = bid_p[t + 2]
+        max_b180 = bid_p[t + 2]
+        for k in range(4, 181, 2):
+            if bid_p[t + k] < min_b180:
+                min_b180 = bid_p[t + k]
+            if bid_p[t + k] > max_b180:
+                max_b180 = bid_p[t + k]
+        if (b0 - min_b180) >= th50 and (max_b180 - b0) < th20:
+            y_bleed180[t] = 1.0
+
+        # 11. Extended Crash 600s (<= -120 bp) & Crash 900s (<= -180 bp — 15m statistical ceiling)
+        th120 = b0 * 0.0120
+        th180 = b0 * 0.0180
+        min_b600 = bid_p[t + 5]
+        for k in range(10, 601, 5):
+            if bid_p[t + k] < min_b600:
+                min_b600 = bid_p[t + k]
+        if (b0 - min_b600) >= th120:
+            y_crash600[t] = 1.0
+
+        min_b900 = min_b600
+        for k in range(605, 901, 5):
+            if bid_p[t + k] < min_b900:
+                min_b900 = bid_p[t + k]
+        if (b0 - min_b900) >= th180:
+            y_crash900[t] = 1.0
+
+        # 12. Extended Deep-Queue Execution Fill 120s (2m orderbook memory limit)
+        s120_vol = s30_vol
+        min_a120 = min_a30
+        for k in range(31, 121):
+            s120_vol += sell_v[t + k]
+            if ask_p[t + k] < min_a120:
+                min_a120 = ask_p[t + k]
+        if s120_vol >= (0.60 * bid_q1[t] + 80.0) or min_a120 <= b0:
+            y_fill120[t] = 1.0
+
+        # 13. Extended Full-Cycle Carousel 240s (4m maker-maker round-trip >= +24 bp, stop -25 bp)
+        th25 = b0 * 0.0025
+        s240_vol = 0.0
+        q_ahead_b2 = 0.55 * bid_q1[t] + 25.0
+        t_fill2 = -1
+        for k in range(1, 241):
+            s240_vol += sell_v[t + k]
+            if s240_vol >= q_ahead_b2:
+                t_fill2 = k
+                break
+        if t_fill2 > 0:
+            min_b_dur2 = bid_p[t + 1]
+            for k in range(2, t_fill2 + 1):
+                if bid_p[t + k] < min_b_dur2:
+                    min_b_dur2 = bid_p[t + k]
+            if min_b_dur2 >= (b0 - th25):
+                b240_vol = 0.0
+                q_ahead_a2 = 0.55 * ask_q1[t + t_fill2] + 25.0
+                t_sell2 = -1
+                for k in range(t_fill2 + 1, 241):
+                    b240_vol += buy_v[t + k]
+                    if b240_vol >= q_ahead_a2:
+                        t_sell2 = k
+                        break
+                if t_sell2 > 0 and (ask_p[t + t_fill2] - b0) >= (b0 * 0.0024):
+                    min_b_cyc2 = bid_p[t + t_fill2 + 1]
+                    for k in range(t_fill2 + 2, t_sell2 + 1):
+                        if bid_p[t + k] < min_b_cyc2:
+                            min_b_cyc2 = bid_p[t + k]
+                    if min_b_cyc2 >= (b0 - th25):
+                        y_car240[t] = 1.0
+
     return (
         y_adv, y_exh, y_swp, y_sw12, y_bleed, y_crash,
-        y_exit, y_fill, y_front, y_car_succ, y_car_cap
+        y_exit, y_fill, y_front, y_car_succ, y_car_cap,
+        y_bleed180, y_crash600, y_crash900, y_fill120, y_car240
     )
 
 
@@ -316,49 +423,64 @@ def train_window_order2(
     win_dir.mkdir(parents=True, exist_ok=True)
     meta_path = win_dir / f"meta_order2_win_{win_idx:02d}.json"
 
-    if meta_path.exists() and not force:
+    existing_meta = {}
+    if meta_path.exists():
         try:
             with open(meta_path) as f:
-                d = json.load(f)
-            if d.get("completed", False):
-                return d
+                existing_meta = json.load(f)
         except Exception:
-            pass
+            existing_meta = {}
 
+    all_ubj_exist = all((win_dir / f"{nm}.ubj").exists() for nm in TARGET_NAMES)
+    if existing_meta.get("completed", False) and all_ubj_exist and not force:
+        return existing_meta
+
+    missing_targets = TARGET_NAMES if force else [nm for nm in TARGET_NAMES if not (win_dir / f"{nm}.ubj").exists()]
     t0_win = time.time()
     X_tr = X_all[train_start:train_end]
     X_val = X_all[val_start:val_end]
     n_tr = len(X_tr)
     n_val = len(X_val)
 
-    dval = xgb.DMatrix(X_val, feature_names=feature_names)
-    win_metrics = {}
+    win_metrics = dict(existing_meta.get("models", {}))
 
-    for name in TARGET_NAMES:
+    for name in missing_targets:
         t0_m = time.time()
+        h_sec = int(TARGET_HORIZONS_SEC.get(name, 60))
+        tr_cut = max(2000, n_tr - h_sec)
+        val_cut = max(1000, n_val - h_sec)
+
         y_all = targets_dict[name]
-        y_tr = y_all[train_start:train_end]
-        y_val = y_all[val_start:val_end]
+        y_tr = y_all[train_start : train_start + tr_cut]
+        y_val = y_all[val_start : val_start + val_cut]
 
         is_reg = (name == "carousel_capacity")
-        dtr = xgb.DMatrix(X_tr, label=y_tr, feature_names=feature_names)
-        dval.set_info(label=y_val)
+        dtr = xgb.DMatrix(X_tr[:tr_cut], label=y_tr, feature_names=feature_names)
+        dval = xgb.DMatrix(X_val[:val_cut], label=y_val, feature_names=feature_names)
+
+        # Регуляризация глубины дерева для дальнобойных щитов 600s..900s (защита от малого N_pos_eff):
+        if h_sec >= 600:
+            m_depth, r_lam, sub_s = 5, 6.0, 0.75
+        elif h_sec >= 180:
+            m_depth, r_lam, sub_s = 6, 4.0, 0.80
+        else:
+            m_depth, r_lam, sub_s = 8, 3.0, 0.85
 
         if not is_reg:
             n_pos = int(np.sum(y_tr > 0.5))
-            n_neg = n_tr - n_pos
+            n_neg = len(y_tr) - n_pos
             scale_pos = max(1.0, min(25.0, float(n_neg) / max(1.0, float(n_pos))))
             params = {
                 "tree_method": "hist",
                 "device": device_str,
                 "objective": "binary:logistic",
                 "eval_metric": "auc",
-                "max_depth": 8,            # Capacity upgrade: depth 8
-                "learning_rate": 0.035,     # Smooth shrinkage
-                "subsample": 0.85,
+                "max_depth": m_depth,
+                "learning_rate": 0.035,
+                "subsample": sub_s,
                 "colsample_bytree": 0.85,
                 "scale_pos_weight": scale_pos,
-                "reg_lambda": 3.0,
+                "reg_lambda": r_lam,
                 "reg_alpha": 1.0,
             }
         else:
@@ -367,17 +489,17 @@ def train_window_order2(
                 "device": device_str,
                 "objective": "reg:pseudohubererror",
                 "eval_metric": "mae",
-                "max_depth": 8,
+                "max_depth": m_depth,
                 "learning_rate": 0.035,
-                "subsample": 0.85,
+                "subsample": sub_s,
                 "colsample_bytree": 0.85,
-                "reg_lambda": 3.0,
+                "reg_lambda": r_lam,
             }
 
         bst = xgb.train(
             params,
             dtr,
-            num_boost_round=600,            # Capacity upgrade: 600 trees
+            num_boost_round=600,
             evals=[(dval, "val")],
             early_stopping_rounds=30,
             verbose_eval=False,
@@ -403,11 +525,8 @@ def train_window_order2(
             "size_kb": round(sz_kb, 1),
             "time_sec": round(el_m, 1),
         }
-        del dtr, bst
+        del dtr, dval, bst
         gc.collect()
-
-    del dval
-    gc.collect()
 
     elapsed_win = time.time() - t0_win
     mean_auc = np.mean([v["score"] for k, v in win_metrics.items() if k != "carousel_capacity"])

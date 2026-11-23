@@ -36,7 +36,14 @@ def compile_continuous_oos_matrix():
     import sys
     from pathlib import Path
     sys.path.append(str(Path(__file__).resolve().parent.parent))
-    from _tools.walkforward_order2_trainer import TARGET_NAMES, build_66d_features, GUARD_LOB_PATH, ALPHA_PATH, WF_SUMMARY_PATH
+    from _tools.walkforward_order2_trainer import (
+        CORE_TARGET_NAMES,
+        TARGET_NAMES,
+        build_66d_features,
+        GUARD_LOB_PATH,
+        ALPHA_PATH,
+        WF_SUMMARY_PATH,
+    )
 
     lob = np.load(GUARD_LOB_PATH, allow_pickle=True)
     alpha = np.load(ALPHA_PATH, allow_pickle=True)
@@ -46,7 +53,7 @@ def compile_continuous_oos_matrix():
         summary_order1 = json.load(f)
 
     X_all, feature_names = build_66d_features(lob, alpha)
-    oos_matrix_11d = np.zeros((total_rows, 11), dtype=np.float32)
+    oos_matrix_16d = np.zeros((total_rows, len(TARGET_NAMES)), dtype=np.float32)
 
     # Compile OOS slices dynamically from all available Walk-Forward windows!
     win_keys = sorted([k for k in summary_order1.keys() if k.startswith("win_")], key=lambda x: int(x.split("_")[1]))
@@ -73,19 +80,31 @@ def compile_continuous_oos_matrix():
             if model_file.exists():
                 bst = xgb.Booster()
                 bst.load_model(str(model_file))
-                oos_matrix_11d[s_idx:e_idx, col_idx] = bst.predict(d_slice)
+                oos_matrix_16d[s_idx:e_idx, col_idx] = bst.predict(d_slice)
 
     out_npz = BASE_DIR / "data" / "cache" / "order2_risk_matrix_11d.npz"
     tmp_npz = out_npz.with_suffix(".tmp.npz")
     np.savez_compressed(
         tmp_npz,
-        risk_matrix_11d=oos_matrix_11d,
-        target_names=np.array(TARGET_NAMES),
+        risk_matrix_11d=oos_matrix_16d[:, :len(CORE_TARGET_NAMES)],
+        target_names=np.array(CORE_TARGET_NAMES),
         total_rows=total_rows,
     )
     tmp_npz.replace(out_npz)
+
+    out_ext_npz = BASE_DIR / "data" / "cache" / "order2_risk_matrix_16d.npz"
+    tmp_ext_npz = out_ext_npz.with_suffix(".tmp.npz")
+    np.savez_compressed(
+        tmp_ext_npz,
+        risk_matrix_16d=oos_matrix_16d,
+        target_names=np.array(TARGET_NAMES),
+        total_rows=total_rows,
+    )
+    tmp_ext_npz.replace(out_ext_npz)
     sz_mb = out_npz.stat().st_size / (1024 * 1024)
-    print(f"✅ Continuous 11D OOS Risk Matrix saved: {out_npz} ({sz_mb:.1f} MB, {total_rows:,} rows)")
+    sz_ext = out_ext_npz.stat().st_size / (1024 * 1024)
+    print(f"✅ Continuous 11D Core OOS Risk Matrix saved: {out_npz} ({sz_mb:.1f} MB)")
+    print(f"✅ Continuous 16D Extended OOS Risk Matrix saved: {out_ext_npz} ({sz_ext:.1f} MB, {total_rows:,} rows)")
 
 
 def main():
@@ -95,11 +114,13 @@ def main():
     parser.add_argument("--force", action="store_true", help="Force re-training")
     args = parser.parse_args()
 
+    from _tools.walkforward_order2_trainer import TARGET_NAMES
     completed = set()
     if not args.force:
         for w in range(args.start_win, args.end_win + 1):
-            mf = OUTPUT_DIR / f"win_{w:02d}" / f"meta_order2_win_{w:02d}.json"
-            if mf.exists():
+            w_dir = OUTPUT_DIR / f"win_{w:02d}"
+            mf = w_dir / f"meta_order2_win_{w:02d}.json"
+            if mf.exists() and all((w_dir / f"{nm}.ubj").exists() for nm in TARGET_NAMES):
                 try:
                     with open(mf) as f:
                         if json.load(f).get("completed", False):
