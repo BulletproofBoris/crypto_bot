@@ -45,6 +45,7 @@ CODE_FILES = (
     "_tools/fused_l26_endogenous_tick.py",
     "_tools/fused_l25_regulator_tick.py",
     "_tools/build_bo_swarm_36d_cache.py",
+    "_tools/microstructure_features.py",
     "_tools/live_feature_updater.py",
     "_tools/vectorized_free_multi_order_env.py",
     "_tools/swarm_router.py",
