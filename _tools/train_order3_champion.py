@@ -681,6 +681,7 @@ def train_order3(
     wf_version: str = "pure_wf_v19_l49_cvar_shield",
     oos_hours: float = 17.0,
     inv_stress_frac: float = 0.35,
+    world_mode: str = "dec",
 ) -> None:
     t_start = time.time()
     device = torch.device(device_str if torch.cuda.is_available() else "cpu")
@@ -691,13 +692,20 @@ def train_order3(
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     log_msg("=" * 90)
-    log_msg(f"🚀 ORDER-3 WFv2 ISLAND #{island_id}/{num_islands} ({island_mode.upper()}) ON {device} | GROUPS={n_groups} (POP={n_groups * 6})")
+    log_msg(f"🚀 ORDER-3 WFv2 ISLAND #{island_id}/{num_islands} ({island_mode.upper()} | WORLD={world_mode.upper()}) ON {device} | GROUPS={n_groups} (POP={n_groups * 6})")
     log_msg("=" * 90)
 
-    # 1. Загрузка строго каузальных 88D данных Signal Stack v5 (12H Order-1 + 16D Order-2 + Wave + 4D Order-2.5 Live Impact/Regret) на очищенном стакане $0.0001
-    log_msg("📦 Загрузка каузальной 88D матрицы Signal Stack v5 (Order-2.5 + Decontaminated LOB) и выделение эпохи тика $0.0001...")
-    mkt_raw = np.load(BASE_DIR / "data/cache/rl_hybrid_market_obs_88d.npz", mmap_mode="r")
-    lob_raw = np.load(BASE_DIR / "data/cache/rl_guard_lob_cache_600h.npz", mmap_mode="r")
+    # 1. Загрузка строго каузальных 88D данных Signal Stack v5 (поддержка как RAW мира без вырезанных ордеров, так и DEC интерактивного мира!)
+    if world_mode == "raw":
+        mkt_p = BASE_DIR / "data/cache/rl_hybrid_market_obs_88d_raw_with_self.npz"
+        lob_p = BASE_DIR / "data/cache/rl_guard_lob_cache_600h_raw_with_self.npz"
+        log_msg("📦 Загрузка каузальной 88D матрицы Signal Stack v5 [WORLD=RAW UNTOUCHED BOOK] и выделение эпохи тика $0.0001...")
+    else:
+        mkt_p = BASE_DIR / "data/cache/rl_hybrid_market_obs_88d.npz"
+        lob_p = BASE_DIR / "data/cache/rl_guard_lob_cache_600h.npz"
+        log_msg("📦 Загрузка каузальной 88D матрицы Signal Stack v5 [WORLD=DEC INTERACTIVE BOOK] и выделение эпохи тика $0.0001...")
+    mkt_raw = np.load(mkt_p, mmap_mode="r")
+    lob_raw = np.load(lob_p, mmap_mode="r")
 
     b1_full = lob_raw["bid_p"][:, 0]
     subcent_hits = np.where(np.abs(b1_full * 100.0 - np.round(b1_full * 100.0)) > 1e-3)[0]
@@ -718,9 +726,9 @@ def train_order3(
     sv_gpu = torch.from_numpy(np.asarray(lob_raw["sell_vol"][subcent_offset:], dtype=np.float32)).to(device=device)
     bv_gpu = torch.from_numpy(np.asarray(lob_raw["buy_vol"][subcent_offset:], dtype=np.float32)).to(device=device)
 
-    # 2. Автоматическое Purged Multi-Regime волновое разбиение (Macro = 5401с = 90м волновой цикл, Micro/Sprint = 1351с = 22.5м быстрый оборот!):
-    macro_win_len = min(win_len, 5401)
-    micro_win_len = 1351
+    # 2. Автоматическое Purged Multi-Regime волновое разбиение (L77 Long-Horizon Macro до 21,601с = 6.0ч полного цикла + Micro = 1,801с = 30м спринт!):
+    macro_win_len = min(win_len, 21601)
+    micro_win_len = 1801 if macro_win_len >= 10801 else 1351
     n_bask_w = max(24, n_val_windows)
     oos_ticks = max(macro_win_len + 7200, int(round(oos_hours * 3600.0)))
     oos_start = max(360000, total_rows - oos_ticks) if total_rows >= 480000 else int(total_rows * 0.80)
@@ -1393,86 +1401,28 @@ def train_order3(
         st_n = _normalize_weights_order3(d, policy.dtype)
         return {k: v.to(device=device, dtype=policy.dtype) for k, v in st_n.items()}
 
-    st_live_l74 = _load_gpu_seed(BASE_DIR / "models/prl/release_champion_v1.pt", st_l68_w30)
-    st_l74_g = _load_gpu_seed(SAVE_DIR / "bak_l74/global_best.pt", st_live_l74)
-    st_l74_soup = _load_gpu_seed(SAVE_DIR / "bak_l74/order3_soup_top3.pt", st_l74_g)
-    st_l74_i1 = _load_gpu_seed(SAVE_DIR / "bak_l74/island_1_best.pt", st_l74_g)
-    st_l73_g = _load_gpu_seed(SAVE_DIR / "bak_l73/global_best.pt", st_live_l74)
-    st_l73_soup = _load_gpu_seed(SAVE_DIR / "bak_l73/order3_soup_top3.pt", st_l73_g)
+    st_live_l75 = _load_gpu_seed(BASE_DIR / "models/prl/release_champion_v1.pt", st_l68_w30)
+    st_l74_prev = _load_gpu_seed(BASE_DIR / "models/prl/release_champion_v1_bak_l74_pre_l75.pt", st_live_l75)
+    st_l75_soup = _load_gpu_seed(SAVE_DIR / "bak_l75/order3_soup_top3.pt", st_live_l75)
+    st_l75_i0 = _load_gpu_seed(SAVE_DIR / "bak_l75/island_0_best.pt", st_live_l75)
+    st_l75_i1 = _load_gpu_seed(SAVE_DIR / "bak_l75/island_1_best.pt", st_live_l75)
+    dw_p = SAVE_DIR / "bak_l75/dual_world_candidates.pt"
+    if dw_p.exists():
+        dw_d = torch.load(dw_p, map_location="cpu", weights_only=False)
+        st_dw_c06 = {k: v.to(device=device, dtype=policy.dtype) for k, v in dw_d["06) L75_Soup50 + Live50"].items()}
+        st_dw_c09 = {k: v.to(device=device, dtype=policy.dtype) for k, v in dw_d["09) Tri(Soup+Hyb)+Live35"].items()}
+    else:
+        st_dw_c06 = st_live_l75
+        st_dw_c09 = st_l75_soup
 
-    def _build_l75_order25_seed(
-        st_in: dict,
-        st_clean54: dict,
-        o25_gain: float = 1.0,
-        restore_52_54: bool = False,
-        sniper_bump: float = 0.0,
-        hold_bump: float = 0.0,
-    ) -> dict:
-        """
-        L75 Interactive Order-2.5 Seed:
-        1) При restore_52_54=True восстанавливает чистые неразмытые веса b2[:, :, 52:54] (без -12.0 примеси от L71!),
-        2) Усиливает тёплую распайку Order-2.5 [84..87] в ствол w1 и роутер w_gate1 [350..353]:
-           - ch[86] p_live_buy_trap (r_in[352]) -> активирует краш-щит Mode #4 и гасит падающий нож!
-           - ch[87] p_live_sell_regret (r_in[353]) -> усиливает бычью моду и удержание волны wave_hold [49]!
-           - ch[85] p_penny_jump_whale (r_in[351]) -> стимулирует шаг внутрь спреда sniper_front [53] и дробление!
-        """
-        d = {k: st_in[k].detach().cpu().float().clone() for k in MultimodalMoEPolicyOrder3.PARAM_KEYS}
-        w1 = d["w1"]
-        wg1 = d["w_gate1"]
-        w2 = d["w2_moe"].view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
-        b2 = d["b2_moe"].view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
-
-        if restore_52_54:
-            w2_c = st_clean54["w2_moe"].detach().cpu().float().view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
-            b2_c = st_clean54["b2_moe"].detach().cpu().float().view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
-            w2[:, :, 52:54] = w2_c[:, :, 52:54]
-            b2[:, :, 52:54] = b2_c[:, :, 52:54]
-
-        bull_w1 = 0.35 * w1[38, :] + 0.35 * w1[39, :] + 0.30 * w1[61, :]
-        crash_w1 = 0.45 * w1[31, :] + 0.30 * w1[30, :] + 0.25 * w1[65, :]
-        fr_w1 = 0.65 * w1[47, :] + 0.35 * w1[44, :]
-        w1[84, :] = w1[84, :] + (0.12 * o25_gain) * fr_w1
-        w1[85, :] = w1[85, :] + (0.18 * o25_gain) * fr_w1
-        w1[86, :] = w1[86, :] + (0.28 * o25_gain) * crash_w1
-        w1[87, :] = w1[87, :] + (0.24 * o25_gain) * bull_w1
-
-        bull_rg = 0.50 * wg1[333, :] + 0.50 * wg1[338, :]
-        crash_rg = 0.55 * wg1[329, :] + 0.45 * wg1[347, :]
-        wg1[350, :] = wg1[350, :] + (0.10 * o25_gain) * wg1[327, :]
-        wg1[351, :] = wg1[351, :] + (0.16 * o25_gain) * wg1[327, :]
-        wg1[352, :] = wg1[352, :] + (0.30 * o25_gain) * crash_rg
-        wg1[353, :] = wg1[353, :] + (0.25 * o25_gain) * bull_rg
-
-        if sniper_bump != 0.0 or hold_bump != 0.0:
-            for m in (0, 1, 2, 3, 5, 6, 7):
-                b2[0, m, 53] = b2[0, m, 53] + sniper_bump
-                b2[0, m, 49] = b2[0, m, 49] + hold_bump
-
-        d["w1"] = w1
-        d["w_gate1"] = wg1
-        d["w2_moe"] = w2.reshape(256, MOE_OUT_DIM_ORDER3)
-        d["b2_moe"] = b2.reshape(1, MOE_OUT_DIM_ORDER3)
-        st_n = _normalize_weights_order3(d, policy.dtype)
-        return {k: v.to(device=device, dtype=policy.dtype) for k, v in st_n.items()}
-
-    st_l75_live_clean = _build_l75_order25_seed(st_live_l74, st_l74_soup, o25_gain=1.0, restore_52_54=True)
-    st_l75_l74_wired = _build_l75_order25_seed(st_l74_soup, st_l74_soup, o25_gain=1.15, restore_52_54=False, sniper_bump=0.20, hold_bump=0.15)
-    st_l75_l73_wired = _build_l75_order25_seed(st_l73_soup, st_l73_soup, o25_gain=1.15, restore_52_54=False, sniper_bump=0.20, hold_bump=0.20)
-    st_l75_50_50 = {
-        k: (0.50 * st_l75_l74_wired[k].float() + 0.50 * st_l75_l73_wired[k].float()).to(dtype=policy.dtype)
-        for k in MultimodalMoEPolicyOrder3.PARAM_KEYS
-    }
-    st_l75_50_50 = {k: v.to(device=device, dtype=policy.dtype) for k, v in _normalize_weights_order3(st_l75_50_50, policy.dtype).items()}
-    st_l75_sniper_hold = _build_l75_order25_seed(st_l74_i1, st_l74_i1, o25_gain=1.35, restore_52_54=False, sniper_bump=0.45, hold_bump=0.35)
-
-    st_ms_53i0_52i1 = st_l75_50_50
-    st_ms_53i0_56i0 = st_l75_l73_wired
+    st_ms_53i0_52i1 = st_dw_c06
+    st_ms_53i0_56i0 = st_dw_c09
     is_warm_l43 = True
 
     seed_pool = (
-        [st_live_l74, st_l75_live_clean, st_l75_50_50, st_l75_l74_wired, st_l75_l73_wired, st_l75_sniper_hold]
+        [st_live_l75, st_dw_c06, st_dw_c09, st_l75_soup, st_l75_i0, st_l74_prev]
         if island_id == 0
-        else [st_l75_50_50, st_l75_sniper_hold, st_l75_l73_wired, st_l75_l74_wired, st_l75_live_clean, st_live_l74]
+        else [st_live_l75, st_dw_c09, st_dw_c06, st_l75_soup, st_l75_i1, st_l74_prev]
     )
     resume_iter = 0
     for res_p in [SAVE_DIR / "islands" / f"island_{island_id}_best.pt", SAVE_DIR / "global_best.pt", RESUME_CHAMP_PATH]:
@@ -1558,51 +1508,36 @@ def train_order3(
     for it in range(start_it, max_iters + 1):
         t_it = time.time()
 
-        # 🧬 Асинхронная кросс-островная миграция элиты
-        if it % 10 == 0:
-            immigrant_cand = None
-            immigrant_geo = -999.0
-            immigrant_source = ""
+        # 🧬 Честная межмировая миграция элиты (с обязательной переоценкой соседа в локальном мире RAW / DEC!):
+        if it % 8 == 0:
             islands_dir = SAVE_DIR / "islands"
             islands_dir.mkdir(parents=True, exist_ok=True)
-
             neighbor_id = (island_id - 1) % max(1, num_islands)
             neighbor_p = islands_dir / f"island_{neighbor_id}_best.pt"
             if neighbor_id != island_id and neighbor_p.exists():
                 try:
                     n_ck = torch.load(neighbor_p, map_location="cpu", weights_only=False)
                     if "w1" in n_ck and n_ck["w1"].shape[0] == TOTAL_DIM_ORDER3 and n_ck.get("wf_version") == wf_version:
-                        n_geo = float(n_ck.get("geo_score_bp", -999.0))
-                        if n_geo > best_geo_bp + 0.08:
-                            immigrant_cand = n_ck
-                            immigrant_geo = n_geo
-                            immigrant_source = f"Сосед #{neighbor_id}"
+                        nb_st = {k: n_ck[k].to(device=device, dtype=policy.dtype) for k in MultimodalMoEPolicyOrder3.PARAM_KEYS if k in n_ck}
+                        if len(nb_st) == len(MultimodalMoEPolicyOrder3.PARAM_KEYS):
+                            nb_local_res = eval_dual_scale([nb_st], val_macro_basket, val_micro_basket, enforce_mi=True)[0]
+                            nb_local_geo = float(nb_local_res["geo_score_bp"])
+                            elite_archive.append((nb_local_geo, {k: v.clone() for k, v in nb_st.items()}))
+                            if len(elite_archive) > 8:
+                                elite_archive.sort(key=lambda x: x[0], reverse=True)
+                                elite_archive = elite_archive[:8]
+                            if nb_local_geo > best_geo_bp + 0.08:
+                                log_msg(f"🧬 [Island #{island_id} | {world_mode.upper()}] Межмировая миграция Соседа #{neighbor_id} ПРОШЛА локальный фильтр: LocalValGeo={nb_local_geo:+.2f} bp > {best_geo_bp:+.2f} bp!")
+                                prev_best_state = {k: v.clone() for k, v in best_state.items()}
+                                best_geo_bp = nb_local_geo
+                                best_clean_ev = float(nb_local_res["clean_ev_pct"])
+                                best_state = {k: v.clone() for k, v in nb_st.items()}
+                                best_metrics = dict(nb_local_res)
+                                policy.update_momentum(prev_best_state, best_state)
+                                patience = 0
+                                last_improve_ts = time.time()
                 except Exception:
                     pass
-
-            if sync_path.exists():
-                try:
-                    g_ck = torch.load(sync_path, map_location="cpu", weights_only=False)
-                    if "w1" in g_ck and g_ck["w1"].shape[0] == TOTAL_DIM_ORDER3 and g_ck.get("wf_version") == wf_version:
-                        g_geo = float(g_ck.get("geo_score_bp", -999.0))
-                        if g_geo > max(best_geo_bp + 0.08, immigrant_geo):
-                            immigrant_cand = g_ck
-                            immigrant_geo = g_geo
-                            immigrant_source = "Абсолютный лидер"
-                except Exception:
-                    pass
-
-            if immigrant_cand is not None:
-                log_msg(f"🧬 [Island #{island_id}] Миграция элиты ({immigrant_source}): ValGeo={immigrant_geo:+.2f} bp vs локального {best_geo_bp:+.2f} bp!")
-                prev_best_state = {k: v.clone() for k, v in best_state.items()}
-                best_geo_bp = immigrant_geo
-                best_clean_ev = float(immigrant_cand.get("clean_ev_pct", 0.0))
-                for k in MultimodalMoEPolicyOrder3.PARAM_KEYS:
-                    if k in immigrant_cand:
-                        best_state[k] = immigrant_cand[k].to(device=device, dtype=policy.dtype).clone()
-                policy.update_momentum(prev_best_state, best_state)
-                patience = 0
-                last_improve_ts = time.time()
 
         elapsed_hours = (prior_elapsed_sec + (time.time() - t_start)) / 3600.0
         stagnant_min = (time.time() - last_improve_ts) / 60.0
@@ -1865,6 +1800,7 @@ def main():
     parser.add_argument("--wf-version", type=str, default="pure_wf_v35_l65_wave_rider", help="Lesson / WF version tag")
     parser.add_argument("--oos-hours", type=float, default=22.0, help="Blind OOS tail hours reserved at end of dataset")
     parser.add_argument("--inv-stress", type=float, default=0.35, help="Fraction of windows with pre-loaded inventory stress")
+    parser.add_argument("--world-mode", type=str, default="dec", choices=["dec", "raw"], help="Orderbook world mode: dec (decontaminated+interactive) or raw (untouched)")
     args = parser.parse_args()
 
     train_order3(
@@ -1882,6 +1818,7 @@ def main():
         wf_version=args.wf_version,
         oos_hours=args.oos_hours,
         inv_stress_frac=args.inv_stress,
+        world_mode=args.world_mode,
     )
 
 

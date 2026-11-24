@@ -69,12 +69,16 @@ def main():
     print("🧹 STEP 2: HISTORICAL ORDERBOOK SELF-DECONTAMINATION (MATCHING LIVE SELF-STRIPPING)")
     print("=" * 96, flush=True)
 
-    if not LOB_RAW_BAK.exists():
+    cur_lob_n = len(np.load(LOB_PATH, mmap_mode="r")["ts"])
+    bak_lob_n = len(np.load(LOB_RAW_BAK, mmap_mode="r")["ts"]) if LOB_RAW_BAK.exists() else -1
+    if not LOB_RAW_BAK.exists() or cur_lob_n > bak_lob_n:
         shutil.copy2(LOB_PATH, LOB_RAW_BAK)
-        print(f"Backed up raw LOB cache -> {LOB_RAW_BAK.name}")
-    if not OBS84_RAW_BAK.exists():
+        print(f"Backed up fresh raw LOB cache ({cur_lob_n:,} rows) -> {LOB_RAW_BAK.name}")
+    cur_o84_n = len(np.load(OBS84_PATH, mmap_mode="r")["market_obs_84d"])
+    bak_o84_n = len(np.load(OBS84_RAW_BAK, mmap_mode="r")["market_obs_84d"]) if OBS84_RAW_BAK.exists() else -1
+    if not OBS84_RAW_BAK.exists() or cur_o84_n > bak_o84_n:
         shutil.copy2(OBS84_PATH, OBS84_RAW_BAK)
-        print(f"Backed up raw 84D cache -> {OBS84_RAW_BAK.name}")
+        print(f"Backed up fresh raw 84D cache ({cur_o84_n:,} rows) -> {OBS84_RAW_BAK.name}")
 
     # Always read from the clean untouched raw backup so operation is 100% idempotent!
     raw_lob = np.load(LOB_RAW_BAK)
