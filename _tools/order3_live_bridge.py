@@ -126,7 +126,10 @@ class Order3LiveInferenceEngine:
             bg1_adap = torch.zeros((1, ROUTER_H_DIM_ORDER3), dtype=torch.float32)
             ch_r = min(old_rh, ROUTER_H_DIM_ORDER3)
             bg1_adap[:, :ch_r] = bg1_raw[:, :ch_r]
-            if old_rin == 326 and ROUTER_IN_DIM_ORDER3 == 358:
+            if old_rin == 358 and ROUTER_IN_DIM_ORDER3 == 362:
+                wg1_adap[:350, :ch_r] = wg1_raw[:350, :ch_r]
+                wg1_adap[354:362, :ch_r] = wg1_raw[350:358, :ch_r]
+            elif old_rin == 326 and ROUTER_IN_DIM_ORDER3 >= 358:
                 wg1_adap[:304, :ch_r] = wg1_raw[:304, :ch_r]
                 wg1_adap[320:342, :ch_r] = wg1_raw[304:326, :ch_r]
             elif old_rin == 295:
@@ -311,6 +314,7 @@ class Order3LiveInferenceEngine:
                 zm[:, 29:34], zm[:, 36:37], zm[:, 39:40], zm[:, 55:56], zm[:, 12:13],
                 zm[:, 60:66],
                 zm[:, 72:76], zm[:, 79:82], zm[:, 83:84],
+                zm[:, 84:88],
             ],
             dim=-1,
         )
@@ -682,6 +686,17 @@ def _eval_latest_wf_ubj_live(trader, b1: float, a1: float) -> Tuple[Optional[np.
                             bstw.feature_names = None
                             bstw.set_param({"nthread": 1})
                             ow_models.append(bstw)
+            o25_dir = BASE_DIR / "models/prl/order25_live"
+            o25_models = {}
+            if o25_dir.exists():
+                for o25_nm in ("order25_bot_impact", "order25_buy_trap_3m", "order25_sell_regret_3m"):
+                    mf25 = o25_dir / f"{o25_nm}.ubj"
+                    if mf25.exists():
+                        bst25 = xgb.Booster()
+                        bst25.load_model(str(mf25))
+                        bst25.feature_names = None
+                        bst25.set_param({"nthread": 1})
+                        o25_models[o25_nm] = bst25
             _LIVE_WF_CACHE.update({
                 "ready": "ok",
                 "xgb": xgb,
@@ -692,6 +707,7 @@ def _eval_latest_wf_ubj_live(trader, b1: float, a1: float) -> Tuple[Optional[np.
                 "o2_models": o2_models,
                 "o2_ext_models": o2_ext_models,
                 "ow_models": ow_models,
+                "o25_models": o25_models,
                 "c_vals": np.array([-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0], dtype=np.float32),
             })
         if _LIVE_WF_CACHE.get("ready") != "ok":
@@ -1002,6 +1018,41 @@ def build_live_hybrid_market_obs_40d(trader, b1: float, a1: float) -> np.ndarray
         else:
             z[79:84] = 0.40
 
+    if MKT_DIM_ORDER3 >= 88:
+        o25_m = _LIVE_WF_CACHE.get("o25_models") or {}
+        xgb_mod = _LIVE_WF_CACHE.get("xgb")
+        if xgb_mod is not None and len(o25_m) == 3:
+            try:
+                bp10_l = np.asarray(getattr(trader, "last_clean_bp_10", [b1] * 10), dtype=np.float32)[:5]
+                bq10_l = np.asarray(getattr(trader, "last_clean_bq_10", np.zeros(10, dtype=np.float32)), dtype=np.float32)[:5]
+                b1_c = max(0.0001, float(b1))
+                a1_c = max(b1_c + 0.0001, float(a1))
+                l1_u = max(20.0, float(bq10_l[0]) * b1_c if len(bq10_l) > 0 else 20.0)
+                t5_u = max(50.0, float(np.sum(bq10_l * bp10_l)) if len(bq10_l) == len(bp10_l) else l1_u)
+                sp_s = float(np.clip(((a1_c - b1_c) / b1_c * 10000.0) / 30.0, 0.0, 4.0))
+                z84_row = z[:84].reshape(1, 84)
+                q_2row = np.zeros((2, 90), dtype=np.float32)
+                q_2row[0, :84] = z[:84]
+                q_2row[0, 86] = math.log1p(40.0) / 6.0
+                q_2row[0, 87] = min(10.0, 40.0 / l1_u) / 3.0
+                q_2row[0, 88] = min(5.0, 40.0 / t5_u)
+                q_2row[0, 89] = sp_s
+                q_2row[1, :84] = z[:84]
+                q_2row[1, 86] = math.log1p(250.0) / 6.0
+                q_2row[1, 87] = min(10.0, 250.0 / l1_u) / 3.0
+                q_2row[1, 88] = min(5.0, 250.0 / t5_u)
+                q_2row[1, 89] = sp_s
+                p_imp2 = o25_m["order25_bot_impact"].predict(xgb_mod.DMatrix(q_2row))
+                dm84 = xgb_mod.DMatrix(z84_row)
+                z[84] = float(np.clip(p_imp2[0], 0.0, 1.0))
+                z[85] = float(np.clip(p_imp2[1], 0.0, 1.0))
+                z[86] = float(np.clip(o25_m["order25_buy_trap_3m"].predict(dm84)[0], 0.0, 1.0))
+                z[87] = float(np.clip(o25_m["order25_sell_regret_3m"].predict(dm84)[0], 0.0, 1.0))
+            except Exception:
+                z[84], z[85], z[86], z[87] = 0.35, 0.36, 0.15, 0.33
+        else:
+            z[84], z[85], z[86], z[87] = 0.35, 0.36, 0.15, 0.33
+
     return z
 
 
@@ -1044,6 +1095,7 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
                     zm_w[:, 0:1], zm_w[:, 40:44], zm_w[:, 44:45], zm_w[:, 48:49],
                     zm_w[:, 29:34], zm_w[:, 36:37], zm_w[:, 39:40], zm_w[:, 55:56], zm_w[:, 12:13],
                     zm_w[:, 60:66], zm_w[:, 72:76], zm_w[:, 79:82], zm_w[:, 83:84],
+                    zm_w[:, 84:88],
                 ],
                 dim=-1,
             )

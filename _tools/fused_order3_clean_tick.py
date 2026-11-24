@@ -18,16 +18,16 @@ os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
 import torch
 import torch.nn.functional as F
 
-MKT_DIM_ORDER3 = 84
+MKT_DIM_ORDER3 = 88
 AG_DIM_ORDER3 = 110
-TOTAL_DIM_ORDER3 = 194
+TOTAL_DIM_ORDER3 = 198
 
 MEM_DIM_ORDER3 = 48
 K_MODES_ORDER3 = 8
 EXPERT_OUT_DIM_ORDER3 = 54
 MOE_OUT_DIM_ORDER3 = K_MODES_ORDER3 * EXPERT_OUT_DIM_ORDER3  # 432
-ROUTER_EXTRA_DIM_ORDER3 = 30
-ROUTER_IN_DIM_ORDER3 = 256 + 8 + 8 + MEM_DIM_ORDER3 + ROUTER_EXTRA_DIM_ORDER3 + K_MODES_ORDER3  # 358
+ROUTER_EXTRA_DIM_ORDER3 = 34
+ROUTER_IN_DIM_ORDER3 = 256 + 8 + 8 + MEM_DIM_ORDER3 + ROUTER_EXTRA_DIM_ORDER3 + K_MODES_ORDER3  # 362
 ROUTER_H_DIM_ORDER3 = 128
 ROUTER_OUT_DIM_ORDER3 = 2 * K_MODES_ORDER3  # 16: 8 mode logits + 8 liquid update gates!
 REG_IN_DIM_ORDER3 = 28 + K_MODES_ORDER3     # 36D per-slot features
@@ -99,6 +99,9 @@ def _scale_mkt_44d(z_mkt: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
         zm[..., 76:78] = (zm[..., 76:78] - 0.95) * 8.0
         zm[..., 78] = zm[..., 78] * 3.0
         zm[..., 79:84] = (zm[..., 79:84] - 0.40) * 2.5
+    if zm.shape[-1] >= 88:
+        # Signal Stack v5 (L75 Order-2.5: Penny-Jump Small/Whale + Real Live Buy Trap & Sell Regret):
+        zm[..., 84:88] = (zm[..., 84:88] - 0.30) * 2.5
     return zm.to(dt)
 
 
@@ -377,6 +380,7 @@ def _order3_clean_tick_step(
             mkt_w[:, 29:34], mkt_w[:, 36:37], mkt_w[:, 39:40], mkt_w[:, 55:56], mkt_w[:, 12:13],
             mkt_w[:, 60:66],
             mkt_w[:, 72:76], mkt_w[:, 79:82], mkt_w[:, 83:84],
+            mkt_w[:, 84:88],
         ],
         dim=-1,
     ).to(dt)
@@ -751,9 +755,22 @@ def _order3_clean_tick_step(
     api_tokens = torch.clamp(api_tokens - valid_b.float().sum(dim=1), min=0.0)
     n_req_b_step = (clear_b & valid_b).long().sum(dim=1)
 
-    # Честная физическая FIFO-очередь биржи L2 (0 искусственных штрафов за объем > $50!):
+    # Интерактивная Order-2.5 физика очереди L2: rival penny-jumping на пассивных BBO-плитах (0 штрафа при шаге внутрь спреда inside_sp!):
+    p_pj_s = torch.clamp(mkt_w[:, 84:85].float() * 0.40 + 0.30, 0.0, 1.0)
+    p_pj_w = torch.clamp(mkt_w[:, 85:86].float() * 0.40 + 0.30, 0.0, 1.0)
+
     inside_sp_b = t_bid_px > (b1.unsqueeze(1) + 0.1 * tick_size)
-    base_b_qa = torch.where(inside_sp_b, torch.zeros_like(t_vis_bq), t_vis_bq)
+    at_bbo_b = (~inside_sp_b) & (t_bid_px >= (b1.unsqueeze(1) - 12.0 * tick_size))
+    slot_usd_b = plc_b_qty * t_bid_px
+    w_frac_b = torch.clamp((slot_usd_b - 35.0) / 215.0, 0.0, 1.0)
+    eff_pj_b = p_pj_s + w_frac_b * (p_pj_w - p_pj_s)
+    # Эмпирический rival front-run в долях очереди, когда пассивно стоим на BBO в режиме высокого penny-jump (Audit 1A/1B: 54.9% at BBO vs 21.5% inside spread!):
+    rival_qa_b = torch.where(
+        at_bbo_b,
+        torch.clamp(eff_pj_b - 0.25, min=0.0) * (15.0 + 0.65 * plc_b_qty * (0.35 + 0.65 * w_frac_b)),
+        torch.zeros_like(t_vis_bq),
+    )
+    base_b_qa = torch.where(inside_sp_b, torch.zeros_like(t_vis_bq), t_vis_bq + rival_qa_b)
 
     bid_px = torch.where(valid_b, t_bid_px, bid_px)
     bid_qty = torch.where(valid_b, plc_b_qty, bid_qty)
@@ -783,7 +800,16 @@ def _order3_clean_tick_step(
     n_req_a_step = (clear_a & valid_a).long().sum(dim=1)
 
     inside_sp_a = t_ask_px < (a1.unsqueeze(1) - 0.1 * tick_size)
-    base_a_qa = torch.where(inside_sp_a, torch.zeros_like(t_vis_aq), t_vis_aq)
+    at_bbo_a = (~inside_sp_a) & (t_ask_px <= (a1.unsqueeze(1) + 12.0 * tick_size))
+    slot_usd_a = plc_a_qty * t_ask_px
+    w_frac_a = torch.clamp((slot_usd_a - 35.0) / 215.0, 0.0, 1.0)
+    eff_pj_a = p_pj_s + w_frac_a * (p_pj_w - p_pj_s)
+    rival_qa_a = torch.where(
+        at_bbo_a,
+        torch.clamp(eff_pj_a - 0.25, min=0.0) * (15.0 + 0.65 * plc_a_qty * (0.35 + 0.65 * w_frac_a)),
+        torch.zeros_like(t_vis_aq),
+    )
+    base_a_qa = torch.where(inside_sp_a, torch.zeros_like(t_vis_aq), t_vis_aq + rival_qa_a)
 
     ask_px = torch.where(valid_a, t_ask_px, ask_px)
     ask_qty = torch.where(valid_a, plc_a_qty, ask_qty)
@@ -1296,8 +1322,11 @@ def evaluate_order3_basket(
             bg1_pad = torch.zeros((1, ROUTER_H_DIM_ORDER3), dtype=torch.float32, device=device)
             ch_r = min(old_rh, ROUTER_H_DIM_ORDER3)
             bg1_pad[:, :ch_r] = bg1_t[:, :ch_r]
-            if old_rin == 326 and ROUTER_IN_DIM_ORDER3 == 358:
-                # 272 (h2+acct+queue) + 32 (old mem) -> [304:320] new mem -> [320:342] old 22D r_extra!
+            if old_rin == 358 and ROUTER_IN_DIM_ORDER3 == 362:
+                # 256+8+8+48+30 = 350 -> [350:354] 4D Order-2.5 -> [354:362] 8D prev_g_mode!
+                wg1_pad[:350, :ch_r] = wg1_t[:350, :ch_r]
+                wg1_pad[354:362, :ch_r] = wg1_t[350:358, :ch_r]
+            elif old_rin == 326 and ROUTER_IN_DIM_ORDER3 >= 358:
                 wg1_pad[:304, :ch_r] = wg1_t[:304, :ch_r]
                 wg1_pad[320:342, :ch_r] = wg1_t[304:326, :ch_r]
             elif old_rin == 295:
@@ -1428,7 +1457,10 @@ def evaluate_order3_basket(
             raw_mkt_slice[..., 72:76] = torch.clamp(raw_mkt_slice[..., 72:76] * s_o1e, -3.0, 3.0)
             s_o2e = 1.0 + torch.randn((1, W, 5), device=device) * cj_m
             raw_mkt_slice[..., 79:84] = torch.clamp(raw_mkt_slice[..., 79:84] * s_o2e, 0.0, 1.0)
-    z_mkt_w = _scale_mkt_44d(raw_mkt_slice, dt).contiguous()  # [win_len - 1, W, 84]
+        if raw_mkt_slice.shape[-1] >= 88:
+            s_o25 = 1.0 + torch.randn((1, W, 4), device=device) * cj_m
+            raw_mkt_slice[..., 84:88] = torch.clamp(raw_mkt_slice[..., 84:88] * s_o25, 0.0, 1.0)
+    z_mkt_w = _scale_mkt_44d(raw_mkt_slice, dt).contiguous()  # [win_len - 1, W, 88]
 
     b10_w_all = b10_all[t_steps_cl].contiguous()
     a10_w_all = a10_all[t_steps_cl].contiguous()
@@ -1456,7 +1488,7 @@ def evaluate_order3_basket(
     raw_warm = mkt_39d_all[t_warm_idx]
     if raw_warm.shape[-1] < MKT_DIM_ORDER3:
         raw_warm = torch.cat([raw_warm, torch.zeros((*raw_warm.shape[:-1], MKT_DIM_ORDER3 - raw_warm.shape[-1]), dtype=raw_warm.dtype, device=device)], dim=-1)
-    z_warm = _scale_mkt_44d(raw_warm, dt).contiguous()  # [180, W, 84]
+    z_warm = _scale_mkt_44d(raw_warm, dt).contiguous()  # [180, W, 88]
     z_warm_in = z_warm.view(n_warm_steps * W, MKT_DIM_ORDER3).unsqueeze(0).expand(C, -1, -1)
     pre_warm = (torch.bmm(z_warm_in, w1_mkt_c) + b1_c).view(C, n_warm_steps, W, 384)
     mem_cw = torch.zeros((C, W, MEM_DIM_ORDER3), dtype=dt, device=device)
@@ -1483,13 +1515,14 @@ def evaluate_order3_basket(
 
     # Равновесный прогрев начальных состояний gate_state и strat_state на последнем шаге перед ws:
     h2_w_ctx = h2_w + torch.bmm(mem_cw, wmem2h_c)
-    zw_last = z_warm[-1]  # [W, 84]
+    zw_last = z_warm[-1]  # [W, 88]
     rex_w = torch.cat(
         [
             zw_last[:, 0:1], zw_last[:, 40:44], zw_last[:, 44:45], zw_last[:, 48:49],
             zw_last[:, 29:34], zw_last[:, 36:37], zw_last[:, 39:40], zw_last[:, 55:56], zw_last[:, 12:13],
             zw_last[:, 60:66],
             zw_last[:, 72:76], zw_last[:, 79:82], zw_last[:, 83:84],
+            zw_last[:, 84:88],
         ],
         dim=-1,
     ).to(dt).unsqueeze(0).expand(C, W, ROUTER_EXTRA_DIM_ORDER3)

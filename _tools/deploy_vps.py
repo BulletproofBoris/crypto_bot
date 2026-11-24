@@ -81,6 +81,10 @@ def _discover_latest_wf_ubj_files() -> list[str]:
         for w_dir in wins[-2:]:
             for f in sorted(w_dir.glob("*.ubj")):
                 rels.append(str(f.relative_to(BASE_DIR)))
+    o25_root = BASE_DIR / "models/prl/order25_live"
+    if o25_root.exists():
+        for f25 in sorted(o25_root.glob("*.ubj")):
+            rels.append(str(f25.relative_to(BASE_DIR)))
     return rels
 
 

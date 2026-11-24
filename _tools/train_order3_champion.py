@@ -80,8 +80,23 @@ def _normalize_weights_order3(state: dict, dtype: torch.dtype) -> dict:
     w1_mkt = w1_f[..., :MKT_DIM_ORDER3, :].clone()
     w1_ag = w1_f[..., MKT_DIM_ORDER3:, :]
 
-    # Блок 3 L70/L71: Раздельная поблочная нормировка 5 групп рынка (84D Signal Stack v4):
-    if MKT_DIM_ORDER3 >= 84:
+    # Блок 3 L70..L75: Раздельная поблочная нормировка 6 групп рынка (88D Signal Stack v5 с Order-2.5):
+    if MKT_DIM_ORDER3 >= 88:
+        grp_specs = (
+            ([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 40, 41, 42, 43, 56, 57, 58, 59, 66, 67, 68, 69, 70, 71], 5.8),
+            ([29, 30, 31, 32, 33, 44, 45, 46, 47, 48, 49], 6.8),
+            ([34, 35, 36, 37, 38, 39, 50, 51, 52, 53, 54, 55], 7.8),
+            ([60, 61, 62, 63, 64, 65], 8.2),
+            ([72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83], 8.0),
+            ([84, 85, 86, 87], 7.5),
+        )
+        w1_mkt_norm = w1_mkt.clone()
+        for idxs_g, mult_g in grp_specs:
+            sub_g = w1_mkt[..., idxs_g, :]
+            cap_g = mult_g * math.sqrt(float(len(idxs_g)))
+            nb_g = torch.linalg.vector_norm(sub_g, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+            w1_mkt_norm[..., idxs_g, :] = sub_g * torch.clamp(cap_g / nb_g, max=1.0)
+    elif MKT_DIM_ORDER3 >= 84:
         grp_specs = (
             ([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 40, 41, 42, 43, 56, 57, 58, 59, 66, 67, 68, 69, 70, 71], 5.8),
             ([29, 30, 31, 32, 33, 44, 45, 46, 47, 48, 49], 6.8),
@@ -130,9 +145,24 @@ def _normalize_weights_order3(state: dict, dtype: torch.dtype) -> dict:
     out["w2_moe"] = torch.cat(w2m_parts, dim=-1).to(dtype)
     out["b2_moe"] = torch.clamp(state["b2_moe"].float(), -7.5, 6.5).to(dtype)
 
-    # Раздельная нормировка прямого роутера w_gate1 (358D -> 128):
+    # Раздельная нормировка прямого роутера w_gate1 (362D -> 128):
     wg1_f = state["w_gate1"].float()
-    if wg1_f.shape[-2] >= 358:
+    if wg1_f.shape[-2] >= 362:
+        wg1_base = wg1_f[..., :336, :]
+        wg1_wave_ext = wg1_f[..., 336:354, :]
+        wg1_rec_m = wg1_f[..., 354:362, :]
+        nb_gb = torch.linalg.vector_norm(wg1_base, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+        nb_gw = torch.linalg.vector_norm(wg1_wave_ext, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+        nb_gr = torch.linalg.vector_norm(wg1_rec_m, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+        out["w_gate1"] = torch.cat(
+            [
+                wg1_base * torch.clamp(32.0 / nb_gb, max=1.0),
+                wg1_wave_ext * torch.clamp(15.5 / nb_gw, max=1.0),
+                wg1_rec_m * torch.clamp(8.5 / nb_gr, max=1.0),
+            ],
+            dim=-2,
+        ).to(dtype)
+    elif wg1_f.shape[-2] >= 358:
         wg1_base = wg1_f[..., :336, :]
         wg1_wave_ext = wg1_f[..., 336:350, :]
         wg1_rec_m = wg1_f[..., 350:358, :]
@@ -301,6 +331,15 @@ class MultimodalMoEPolicyOrder3:
                         w1_mkt[c_r] = g_r * crash_dir
                     w1_mkt[82] = 0.04 * exec_dir
                     w1_mkt[83] = 0.05 * exec_dir
+                if old_mkt_d < 88 and MKT_DIM_ORDER3 >= 88 and old_mkt_d >= 72:
+                    # Тёплая распайка Order-2.5 [84..87]: penny_jump [84,85] -> frontrun_dir [47], buy_trap [86] -> crash_dir, sell_regret [87] -> bull_dir!
+                    bull_dir88 = 0.35 * w1_mkt[38] + 0.35 * w1_mkt[39] + 0.30 * w1_mkt[61]
+                    crash_dir88 = 0.45 * w1_mkt[31] + 0.30 * w1_mkt[30] + 0.25 * w1_mkt[65]
+                    fr_dir88 = 0.65 * w1_mkt[47] + 0.35 * w1_mkt[44]
+                    w1_mkt[84] = 0.05 * fr_dir88
+                    w1_mkt[85] = 0.07 * fr_dir88
+                    w1_mkt[86] = 0.09 * crash_dir88
+                    w1_mkt[87] = 0.08 * bull_dir88
             else:
                 w1_ag = ck["w1"][370:, :].float().clone()
             w1_full = torch.cat([w1_mkt, w1_ag], dim=0)
@@ -313,7 +352,16 @@ class MultimodalMoEPolicyOrder3:
             old_rin, old_rh = wg1_old.shape
             ch_r = min(old_rh, ROUTER_H_DIM_ORDER3)
             bg1_new[:, :ch_r] = bg1_old[:, :ch_r]
-            if old_rin == 326 and ROUTER_IN_DIM_ORDER3 == 358:
+            if old_rin == 358 and ROUTER_IN_DIM_ORDER3 == 362:
+                wg1_new[:350, :ch_r] = wg1_old[:350, :ch_r]
+                wg1_new[354:362, :ch_r] = wg1_old[350:358, :ch_r]
+                bull_rg88 = 0.50 * wg1_old[333, :ch_r] + 0.50 * wg1_old[338, :ch_r]
+                crash_rg88 = 0.55 * wg1_old[329, :ch_r] + 0.45 * wg1_old[347, :ch_r]
+                wg1_new[350, :ch_r] = 0.04 * wg1_old[327, :ch_r]
+                wg1_new[351, :ch_r] = 0.06 * wg1_old[327, :ch_r]
+                wg1_new[352, :ch_r] = 0.09 * crash_rg88
+                wg1_new[353, :ch_r] = 0.08 * bull_rg88
+            elif old_rin == 326 and ROUTER_IN_DIM_ORDER3 >= 358:
                 wg1_new[:304, :ch_r] = wg1_old[:304, :ch_r]
                 wg1_new[320:342, :ch_r] = wg1_old[304:326, :ch_r]
                 bull_rg = 0.50 * wg1_old[317, :ch_r] + 0.50 * wg1_old[321, :ch_r]
@@ -646,9 +694,9 @@ def train_order3(
     log_msg(f"🚀 ORDER-3 WFv2 ISLAND #{island_id}/{num_islands} ({island_mode.upper()}) ON {device} | GROUPS={n_groups} (POP={n_groups * 6})")
     log_msg("=" * 90)
 
-    # 1. Загрузка строго каузальных 84D данных Signal Stack v4 (12H Order-1 + 16D Order-2 + Wave Radar) на тике $0.0001
-    log_msg("📦 Загрузка каузальной 84D матрицы Signal Stack v4 (12H Order-1 + 16D Order-2) и выделение эпохи тика $0.0001...")
-    mkt_raw = np.load(BASE_DIR / "data/cache/rl_hybrid_market_obs_84d.npz", mmap_mode="r")
+    # 1. Загрузка строго каузальных 88D данных Signal Stack v5 (12H Order-1 + 16D Order-2 + Wave + 4D Order-2.5 Live Impact/Regret) на очищенном стакане $0.0001
+    log_msg("📦 Загрузка каузальной 88D матрицы Signal Stack v5 (Order-2.5 + Decontaminated LOB) и выделение эпохи тика $0.0001...")
+    mkt_raw = np.load(BASE_DIR / "data/cache/rl_hybrid_market_obs_88d.npz", mmap_mode="r")
     lob_raw = np.load(BASE_DIR / "data/cache/rl_guard_lob_cache_600h.npz", mmap_mode="r")
 
     b1_full = lob_raw["bid_p"][:, 0]
@@ -656,7 +704,7 @@ def train_order3(
     subcent_offset = int(subcent_hits[0]) if len(subcent_hits) > 0 else 0
     log_msg(f"🔍 Обнаружена граница перехода биржи на тик $0.0001: idx={subcent_offset:,} (отсечено {subcent_offset:,} старых $0.01 тиков!)")
 
-    mkt_sub = np.asarray(mkt_raw["market_obs_84d"][subcent_offset:], dtype=np.float32)
+    mkt_sub = np.asarray(mkt_raw["market_obs_88d"][subcent_offset:], dtype=np.float32)
     total_rows = len(mkt_sub)
     tick_sz = 0.0001
     if win_len > total_rows // 8:
@@ -1291,10 +1339,11 @@ def train_order3(
         b2[0, 4, 50] = max(bid_latch_z + 1.5, 2.2)
         b2[0, 4, 51] = max(ask_latch_z + 1.5, 2.4)
         d["b2_moe"] = b2.reshape(1, MOE_OUT_DIM_ORDER3)
-        # Диагональная связь prev_g_mode [350..357] -> нейроны 64..71 роутера -> логиты мод 0..7:
+        # Диагональная связь prev_g_mode [354..361] -> нейроны 64..71 роутера -> логиты мод 0..7:
+        rec_off = ROUTER_IN_DIM_ORDER3 - K_MODES_ORDER3
         for km in range(K_MODES_ORDER3):
             h_slot = 64 + km
-            d["w_gate1"][350 + km, h_slot] = 1.35
+            d["w_gate1"][rec_off + km, h_slot] = 1.35
             d["b_gate1"][0, h_slot] = 0.15
             d["w_gate2"][h_slot, km] = self_rec_gain
             # При краш-угрозе ch[329=crash300s, 347=crash600s, 348=crash900s] мгновенно открываем вентиль beta_gate!
@@ -1344,25 +1393,86 @@ def train_order3(
         st_n = _normalize_weights_order3(d, policy.dtype)
         return {k: v.to(device=device, dtype=policy.dtype) for k, v in st_n.items()}
 
-    st_l71_champ = _load_gpu_seed(BASE_DIR / "models/prl/release_champion_v1.pt", st_l68_w30)
-    st_l71_i0 = _load_gpu_seed(SAVE_DIR / "bak_l71/island_0_best.pt", st_l71_champ)
-    st_l71_i1 = _load_gpu_seed(SAVE_DIR / "bak_l71/island_1_best.pt", st_l71_champ)
-    st_l71_ask40 = _load_gpu_seed(SAVE_DIR / "bak_l71/l71_chim_ask40.pt", st_l71_champ)
+    st_live_l74 = _load_gpu_seed(BASE_DIR / "models/prl/release_champion_v1.pt", st_l68_w30)
+    st_l74_g = _load_gpu_seed(SAVE_DIR / "bak_l74/global_best.pt", st_live_l74)
+    st_l74_soup = _load_gpu_seed(SAVE_DIR / "bak_l74/order3_soup_top3.pt", st_l74_g)
+    st_l74_i1 = _load_gpu_seed(SAVE_DIR / "bak_l74/island_1_best.pt", st_l74_g)
+    st_l73_g = _load_gpu_seed(SAVE_DIR / "bak_l73/global_best.pt", st_live_l74)
+    st_l73_soup = _load_gpu_seed(SAVE_DIR / "bak_l73/order3_soup_top3.pt", st_l73_g)
 
-    st_l72_bold_bal = _build_l72_bold_seed(st_l71_champ, tranche_z=+1.10, sniper_z=+0.85, exp_boost=0.25, taker_buy_z=-0.40)
-    st_l72_bold_aggr = _build_l72_bold_seed(st_l71_champ, tranche_z=+1.85, sniper_z=+1.65, exp_boost=0.45, taker_buy_z=+0.15)
-    st_l72_i0_sniper = _build_l72_bold_seed(st_l71_i0, tranche_z=+1.40, sniper_z=+1.20, exp_boost=0.30, taker_buy_z=-0.20)
-    st_l72_i1_sniper = _build_l72_bold_seed(st_l71_i1, tranche_z=+1.35, sniper_z=+1.15, exp_boost=0.30, taker_buy_z=-0.25)
-    st_l72_ask40_car = _build_l72_bold_seed(st_l71_ask40, tranche_z=+1.60, sniper_z=+1.10, exp_boost=0.25, taker_buy_z=-0.30)
+    def _build_l75_order25_seed(
+        st_in: dict,
+        st_clean54: dict,
+        o25_gain: float = 1.0,
+        restore_52_54: bool = False,
+        sniper_bump: float = 0.0,
+        hold_bump: float = 0.0,
+    ) -> dict:
+        """
+        L75 Interactive Order-2.5 Seed:
+        1) При restore_52_54=True восстанавливает чистые неразмытые веса b2[:, :, 52:54] (без -12.0 примеси от L71!),
+        2) Усиливает тёплую распайку Order-2.5 [84..87] в ствол w1 и роутер w_gate1 [350..353]:
+           - ch[86] p_live_buy_trap (r_in[352]) -> активирует краш-щит Mode #4 и гасит падающий нож!
+           - ch[87] p_live_sell_regret (r_in[353]) -> усиливает бычью моду и удержание волны wave_hold [49]!
+           - ch[85] p_penny_jump_whale (r_in[351]) -> стимулирует шаг внутрь спреда sniper_front [53] и дробление!
+        """
+        d = {k: st_in[k].detach().cpu().float().clone() for k in MultimodalMoEPolicyOrder3.PARAM_KEYS}
+        w1 = d["w1"]
+        wg1 = d["w_gate1"]
+        w2 = d["w2_moe"].view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        b2 = d["b2_moe"].view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
 
-    st_ms_53i0_52i1 = st_l72_bold_bal
-    st_ms_53i0_56i0 = st_l72_i0_sniper
+        if restore_52_54:
+            w2_c = st_clean54["w2_moe"].detach().cpu().float().view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+            b2_c = st_clean54["b2_moe"].detach().cpu().float().view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+            w2[:, :, 52:54] = w2_c[:, :, 52:54]
+            b2[:, :, 52:54] = b2_c[:, :, 52:54]
+
+        bull_w1 = 0.35 * w1[38, :] + 0.35 * w1[39, :] + 0.30 * w1[61, :]
+        crash_w1 = 0.45 * w1[31, :] + 0.30 * w1[30, :] + 0.25 * w1[65, :]
+        fr_w1 = 0.65 * w1[47, :] + 0.35 * w1[44, :]
+        w1[84, :] = w1[84, :] + (0.12 * o25_gain) * fr_w1
+        w1[85, :] = w1[85, :] + (0.18 * o25_gain) * fr_w1
+        w1[86, :] = w1[86, :] + (0.28 * o25_gain) * crash_w1
+        w1[87, :] = w1[87, :] + (0.24 * o25_gain) * bull_w1
+
+        bull_rg = 0.50 * wg1[333, :] + 0.50 * wg1[338, :]
+        crash_rg = 0.55 * wg1[329, :] + 0.45 * wg1[347, :]
+        wg1[350, :] = wg1[350, :] + (0.10 * o25_gain) * wg1[327, :]
+        wg1[351, :] = wg1[351, :] + (0.16 * o25_gain) * wg1[327, :]
+        wg1[352, :] = wg1[352, :] + (0.30 * o25_gain) * crash_rg
+        wg1[353, :] = wg1[353, :] + (0.25 * o25_gain) * bull_rg
+
+        if sniper_bump != 0.0 or hold_bump != 0.0:
+            for m in (0, 1, 2, 3, 5, 6, 7):
+                b2[0, m, 53] = b2[0, m, 53] + sniper_bump
+                b2[0, m, 49] = b2[0, m, 49] + hold_bump
+
+        d["w1"] = w1
+        d["w_gate1"] = wg1
+        d["w2_moe"] = w2.reshape(256, MOE_OUT_DIM_ORDER3)
+        d["b2_moe"] = b2.reshape(1, MOE_OUT_DIM_ORDER3)
+        st_n = _normalize_weights_order3(d, policy.dtype)
+        return {k: v.to(device=device, dtype=policy.dtype) for k, v in st_n.items()}
+
+    st_l75_live_clean = _build_l75_order25_seed(st_live_l74, st_l74_soup, o25_gain=1.0, restore_52_54=True)
+    st_l75_l74_wired = _build_l75_order25_seed(st_l74_soup, st_l74_soup, o25_gain=1.15, restore_52_54=False, sniper_bump=0.20, hold_bump=0.15)
+    st_l75_l73_wired = _build_l75_order25_seed(st_l73_soup, st_l73_soup, o25_gain=1.15, restore_52_54=False, sniper_bump=0.20, hold_bump=0.20)
+    st_l75_50_50 = {
+        k: (0.50 * st_l75_l74_wired[k].float() + 0.50 * st_l75_l73_wired[k].float()).to(dtype=policy.dtype)
+        for k in MultimodalMoEPolicyOrder3.PARAM_KEYS
+    }
+    st_l75_50_50 = {k: v.to(device=device, dtype=policy.dtype) for k, v in _normalize_weights_order3(st_l75_50_50, policy.dtype).items()}
+    st_l75_sniper_hold = _build_l75_order25_seed(st_l74_i1, st_l74_i1, o25_gain=1.35, restore_52_54=False, sniper_bump=0.45, hold_bump=0.35)
+
+    st_ms_53i0_52i1 = st_l75_50_50
+    st_ms_53i0_56i0 = st_l75_l73_wired
     is_warm_l43 = True
 
     seed_pool = (
-        [st_l72_bold_bal, st_l72_bold_aggr, st_l72_i0_sniper, st_l72_ask40_car, st_l72_i1_sniper, st_l71_champ]
+        [st_live_l74, st_l75_live_clean, st_l75_50_50, st_l75_l74_wired, st_l75_l73_wired, st_l75_sniper_hold]
         if island_id == 0
-        else [st_l72_bold_aggr, st_l72_i0_sniper, st_l72_bold_bal, st_l72_i1_sniper, st_l72_ask40_car, st_l71_i0]
+        else [st_l75_50_50, st_l75_sniper_hold, st_l75_l73_wired, st_l75_l74_wired, st_l75_live_clean, st_live_l74]
     )
     resume_iter = 0
     for res_p in [SAVE_DIR / "islands" / f"island_{island_id}_best.pt", SAVE_DIR / "global_best.pt", RESUME_CHAMP_PATH]:
@@ -1699,7 +1809,7 @@ def train_order3(
             if k == "w_gate1":
                 g0 = uniq_elites[0][1][k].detach().to(device=device, dtype=torch.float32).clone()
                 g1 = uniq_elites[1][1][k].detach().to(device=device, dtype=torch.float32)
-                g0[336:358] = 0.75 * g0[336:358] + 0.25 * g1[336:358]
+                g0[336:ROUTER_IN_DIM_ORDER3] = 0.75 * g0[336:ROUTER_IN_DIM_ORDER3] + 0.25 * g1[336:ROUTER_IN_DIM_ORDER3]
                 soup_state[k] = g0.to(dtype=policy.dtype)
             elif k in ("w_gate2", "b_gate2"):
                 g0 = uniq_elites[0][1][k].detach().to(device=device, dtype=torch.float32).clone()

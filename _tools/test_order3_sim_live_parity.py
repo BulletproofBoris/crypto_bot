@@ -34,21 +34,21 @@ from _tools.fused_order3_clean_tick import (
     _scale_mkt_44d,
 )
 
-MKT_PATH = BASE_DIR / "data/cache/rl_hybrid_market_obs_84d.npz"
+MKT_PATH = BASE_DIR / "data/cache/rl_hybrid_market_obs_88d.npz"
 LOB_PATH = BASE_DIR / "data/cache/rl_guard_lob_cache_600h.npz"
 CHAMP_PATH = BASE_DIR / "models/prl/release_champion_v1.pt"
 
 
 def main():
     print("=" * 80)
-    print("🧪 ORDER-3 TRUE BITWISE SIM / LIVE PARITY & LATENCY VERIFICATION (SIGNAL STACK V4 84D)")
+    print("🧪 ORDER-3 TRUE BITWISE SIM / LIVE PARITY & LATENCY VERIFICATION (SIGNAL STACK V5 88D)")
     print("=" * 80)
 
     # Используем CPU, как на боевом VPS, для честного замера латентности без 14с холодного старта CUDA
     engine = Order3LiveInferenceEngine(checkpoint_path=CHAMP_PATH, device="cpu")
     print("  ✅ Order3LiveInferenceEngine (CPU) инициализирован.")
 
-    mkt_raw = np.load(MKT_PATH, mmap_mode="r")["market_obs_84d"]
+    mkt_raw = np.load(MKT_PATH, mmap_mode="r")["market_obs_88d"]
     lob_raw = np.load(LOB_PATH, mmap_mode="r")
     assert mkt_raw.shape[1] == MKT_DIM_ORDER3, f"Expected {MKT_DIM_ORDER3}D market matrix, got {mkt_raw.shape}"
     col_stds = np.std(np.asarray(mkt_raw[3016277::100], dtype=np.float32), axis=0)
@@ -125,6 +125,7 @@ def main():
                     zm[:, 0:1], zm[:, 40:44], zm[:, 44:45], zm[:, 48:49],
                     zm[:, 29:34], zm[:, 36:37], zm[:, 39:40], zm[:, 55:56], zm[:, 12:13],
                     zm[:, 60:66], zm[:, 72:76], zm[:, 79:82], zm[:, 83:84],
+                    zm[:, 84:88],
                 ],
                 dim=-1,
             )
