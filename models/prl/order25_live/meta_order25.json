@@ -1,0 +1,22 @@
+{
+  "models": {
+    "order25_bot_impact": {
+      "oos_auc": 0.7565,
+      "rounds": 45
+    },
+    "order25_buy_trap_3m": {
+      "oos_auc": 0.6181,
+      "rounds": 120
+    },
+    "order25_sell_regret_3m": {
+      "oos_auc": 0.5429,
+      "rounds": 45
+    }
+  },
+  "channels_88d": {
+    "84": "p_penny_jump_small ($40 at BBO)",
+    "85": "p_penny_jump_whale ($250 at BBO)",
+    "86": "p_live_buy_trap_3m (real live adverse fill markout <= -35bp)",
+    "87": "p_live_sell_regret_3m (real live premature ask fill rally >= +35bp)"
+  }
+}
