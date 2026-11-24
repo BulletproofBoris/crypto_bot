@@ -34,21 +34,21 @@ from _tools.fused_order3_clean_tick import (
     _scale_mkt_44d,
 )
 
-MKT_PATH = BASE_DIR / "data/cache/rl_hybrid_market_obs_88d.npz"
+MKT_PATH = BASE_DIR / "data/cache/rl_hybrid_market_obs_94d.npz"
 LOB_PATH = BASE_DIR / "data/cache/rl_guard_lob_cache_600h.npz"
 CHAMP_PATH = BASE_DIR / "models/prl/release_champion_v1.pt"
 
 
 def main():
     print("=" * 80)
-    print("🧪 ORDER-3 TRUE BITWISE SIM / LIVE PARITY & LATENCY VERIFICATION (SIGNAL STACK V5 88D)")
+    print("🧪 ORDER-3 TRUE BITWISE SIM / LIVE PARITY & LATENCY VERIFICATION (SIGNAL STACK V6 94D)")
     print("=" * 80)
 
     # Используем CPU, как на боевом VPS, для честного замера латентности без 14с холодного старта CUDA
     engine = Order3LiveInferenceEngine(checkpoint_path=CHAMP_PATH, device="cpu")
     print("  ✅ Order3LiveInferenceEngine (CPU) инициализирован.")
 
-    mkt_raw = np.load(MKT_PATH, mmap_mode="r")["market_obs_88d"]
+    mkt_raw = np.load(MKT_PATH, mmap_mode="r")["market_obs_94d"]
     lob_raw = np.load(LOB_PATH, mmap_mode="r")
     assert mkt_raw.shape[1] == MKT_DIM_ORDER3, f"Expected {MKT_DIM_ORDER3}D market matrix, got {mkt_raw.shape}"
     col_stds = np.std(np.asarray(mkt_raw[3016277::100], dtype=np.float32), axis=0)
@@ -125,7 +125,7 @@ def main():
                     zm[:, 0:1], zm[:, 40:44], zm[:, 44:45], zm[:, 48:49],
                     zm[:, 29:34], zm[:, 36:37], zm[:, 39:40], zm[:, 55:56], zm[:, 12:13],
                     zm[:, 60:66], zm[:, 72:76], zm[:, 79:82], zm[:, 83:84],
-                    zm[:, 84:88],
+                    zm[:, 84:88], zm[:, 88:94],
                 ],
                 dim=-1,
             )
@@ -145,7 +145,7 @@ def main():
                 [
                     bb[:, 0:13], ak[:, 13:25], si[:, 25:26], bb[:, 26:35], ak[:, 35:36], si[:, 36:37],
                     bb[:, 37:41], ak[:, 41:44], bb[:, 44:45], ak[:, 45:47], bb[:, 47:48], si[:, 48:49],
-                    ak[:, 49:50], si[:, 50:52], ak[:, 52:53], bb[:, 53:54],
+                    ak[:, 49:50], si[:, 50:52], ak[:, 52:53], bb[:, 53:54], ak[:, 54:55],
                 ],
                 dim=-1,
             )
@@ -165,8 +165,11 @@ def main():
             min_bp_test, low_tq_test = b1 * 0.994, 45.0
             ref_e = entry_px * 1.0020
             low_ref_e = min_bp_test * 1.0020
-            tr_w_k = float(torch.sigmoid(sr[52]).item()) * torch.pow(1.0 - echelon_k01, 2.0)
+            ech_f_sq = torch.pow(1.0 - echelon_k01, 2.0)
+            tr_w_k = float(torch.sigmoid(sr[52]).item()) * ech_f_sq
             ref_e_k = ref_e * (1.0 - tr_w_k) + low_ref_e * tr_w_k
+            unw_w_k = (float(torch.sigmoid(sr[54]).item()) * ech_f_sq) * (ref_e_k > a1).float()
+            eff_ref_e_k = ref_e_k * (1.0 - unw_w_k) + a1 * unw_w_k
 
             skew_blend = float(torch.sigmoid(sr[41]).item())
             t42_s = float(torch.tanh(sr[42] * 0.25).item())
@@ -175,7 +178,7 @@ def main():
             span_a_usd = a1 * (0.0005 + 0.2495 * float(torch.sigmoid(sr[39] + 0.5 * sr[42] + sr[45]).item()))
             gamma_a = 0.40 + 2.10 * float(torch.sigmoid(sr[40] + sr[46]).item())
             inside_a = spread_room * float(torch.sigmoid(sr[43]).item())
-            anchor_base_a_k = a1 + skew_blend * (ref_e_k - a1) + (a1 * ask_edge_pct - inside_a)
+            anchor_base_a_k = a1 + skew_blend * (eff_ref_e_k - a1) + (a1 * ask_edge_pct - inside_a)
             raw_t_ask = anchor_base_a_k + span_a_usd * torch.pow(echelon_k01, gamma_a)
             ref_t_ask = np.maximum(b1 + 0.0001, (torch.round(raw_t_ask / 0.0001) * 0.0001).numpy())
 

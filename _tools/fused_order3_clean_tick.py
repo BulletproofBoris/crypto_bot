@@ -18,16 +18,16 @@ os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
 import torch
 import torch.nn.functional as F
 
-MKT_DIM_ORDER3 = 88
+MKT_DIM_ORDER3 = 94
 AG_DIM_ORDER3 = 110
-TOTAL_DIM_ORDER3 = 198
+TOTAL_DIM_ORDER3 = 204
 
 MEM_DIM_ORDER3 = 48
 K_MODES_ORDER3 = 8
-EXPERT_OUT_DIM_ORDER3 = 54
-MOE_OUT_DIM_ORDER3 = K_MODES_ORDER3 * EXPERT_OUT_DIM_ORDER3  # 432
-ROUTER_EXTRA_DIM_ORDER3 = 34
-ROUTER_IN_DIM_ORDER3 = 256 + 8 + 8 + MEM_DIM_ORDER3 + ROUTER_EXTRA_DIM_ORDER3 + K_MODES_ORDER3  # 362
+EXPERT_OUT_DIM_ORDER3 = 55
+MOE_OUT_DIM_ORDER3 = K_MODES_ORDER3 * EXPERT_OUT_DIM_ORDER3  # 440
+ROUTER_EXTRA_DIM_ORDER3 = 40
+ROUTER_IN_DIM_ORDER3 = 256 + 8 + 8 + MEM_DIM_ORDER3 + ROUTER_EXTRA_DIM_ORDER3 + K_MODES_ORDER3  # 368
 ROUTER_H_DIM_ORDER3 = 128
 ROUTER_OUT_DIM_ORDER3 = 2 * K_MODES_ORDER3  # 16: 8 mode logits + 8 liquid update gates!
 REG_IN_DIM_ORDER3 = 28 + K_MODES_ORDER3     # 36D per-slot features
@@ -102,6 +102,10 @@ def _scale_mkt_44d(z_mkt: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
     if zm.shape[-1] >= 88:
         # Signal Stack v5 (L75 Order-2.5: Penny-Jump Small/Whale + Real Live Buy Trap & Sell Regret):
         zm[..., 84:88] = (zm[..., 84:88] - 0.30) * 2.5
+    if zm.shape[-1] >= 94:
+        # Signal Stack v6 (L78 Medium-Term 5m..30m Structure & Tape CVD):
+        zm[..., 88:91] = zm[..., 88:91] * 2.5
+        zm[..., 91:94] = zm[..., 91:94] * 2.0
     return zm.to(dt)
 
 
@@ -381,6 +385,7 @@ def _order3_clean_tick_step(
             mkt_w[:, 60:66],
             mkt_w[:, 72:76], mkt_w[:, 79:82], mkt_w[:, 83:84],
             mkt_w[:, 84:88],
+            mkt_w[:, 88:94],
         ],
         dim=-1,
     ).to(dt)
@@ -388,7 +393,7 @@ def _order3_clean_tick_step(
     gate_prev_g = gate_state.view(W, G, B, K_MODES_ORDER3).permute(1, 0, 2, 3).reshape(G, M, K_MODES_ORDER3)
     prev_g_mode_g = torch.softmax(gate_prev_g, dim=-1).to(dt)
 
-    router_in_g = torch.cat([h2_ctx, acct_g, queue_g, mem_next_g, r_extra_g, prev_g_mode_g], dim=-1)  # [G, M, 358]
+    router_in_g = torch.cat([h2_ctx, acct_g, queue_g, mem_next_g, r_extra_g, prev_g_mode_g], dim=-1)  # [G, M, 368]
     r_hid_g = F.silu(torch.bmm(router_in_g, w_gate1_g) + b_gate1_g)  # [G, M, 128]
 
     gate_out_g = torch.bmm(r_hid_g, w_gate2_g).float() + b_gate2_g.float()  # [G, M, 16]
@@ -399,7 +404,7 @@ def _order3_clean_tick_step(
     gate_state = gate_next_g.view(G, W, B, K_MODES_ORDER3).permute(1, 0, 2, 3).reshape(N, K_MODES_ORDER3)
 
     moe_all_g = (torch.bmm(h2_ctx, w2_moe_g).float() + b2_moe_g.float()).view(G, M, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
-    strat_inst_g = (g_mode_g.unsqueeze(-1) * moe_all_g).sum(dim=2)  # [G, M, 52]
+    strat_inst_g = (g_mode_g.unsqueeze(-1) * moe_all_g).sum(dim=2)  # [G, M, 55]
     strat_inst = strat_inst_g.view(G, W, B, EXPERT_OUT_DIM_ORDER3).permute(1, 0, 2, 3).reshape(N, EXPERT_OUT_DIM_ORDER3)
 
     # Адаптивный нелинейный демпфер плана котирования (разрывает петлю PLACE -> free_cash -> CANCEL, оставляя Taker мгновенным!):
@@ -425,6 +430,7 @@ def _order3_clean_tick_step(
             strat_inst[:, 50:52],   # [50..51] сами вентили
             ask_blend[:, 52:53],    # [52] tranche_carousel_z (независимая карусель нижнего транша!)
             bid_blend[:, 53:54],    # [53] sniper_front_z (подавление отступа трусости у Bid1!)
+            ask_blend[:, 54:55],    # [54] unwind_front_z (L78 ранний мейкер-сброс передних эшелонов при сломе тренда!)
         ],
         dim=-1,
     )
@@ -546,6 +552,9 @@ def _order3_clean_tick_step(
     ech_front_sq = torch.pow(1.0 - echelon_k01, 2.0).unsqueeze(0)  # [1, 12]: 1.00 на #00 -> 0.30 на #05 -> 0.00 на #11
     tranche_w_k = (torch.sigmoid(strat_raw[:, 52]) * has_low_tr.float()).unsqueeze(1) * ech_front_sq
     ref_entry_k = ref_entry.unsqueeze(1) * (1.0 - tranche_w_k) + low_ref_entry.unsqueeze(1) * tranche_w_k
+    # L78 Controlled Maker Stop-Unwind [54]: плавно подтягивает передние Ask-эшелоны к a1 ТОЛЬКО при просадке (ref_entry_k > a1)!
+    unwind_w_k = (torch.sigmoid(strat_raw[:, 54]).unsqueeze(1) * ech_front_sq) * (ref_entry_k > a1.unsqueeze(1)).float()
+    eff_ref_entry_k = ref_entry_k * (1.0 - unwind_w_k) + a1.unsqueeze(1) * unwind_w_k
 
     skew_blend = torch.sigmoid(strat_raw[:, 41])
     z42 = strat_raw[:, 42]
@@ -556,7 +565,7 @@ def _order3_clean_tick_step(
     gamma_a = 0.40 + 2.10 * torch.sigmoid(strat_raw[:, 40] + strat_raw[:, 46])
 
     inside_a = spread_room * torch.sigmoid(strat_raw[:, 43])
-    anchor_base_a_k = a1.unsqueeze(1) + skew_blend.unsqueeze(1) * (ref_entry_k - a1.unsqueeze(1)) + (a1 * ask_edge_pct - inside_a).unsqueeze(1)
+    anchor_base_a_k = a1.unsqueeze(1) + skew_blend.unsqueeze(1) * (eff_ref_entry_k - a1.unsqueeze(1)) + (a1 * ask_edge_pct - inside_a).unsqueeze(1)
     min_maker_ask = (b1 + tick_size).unsqueeze(1)
     curve_a = torch.pow(echelon_k01.unsqueeze(0), gamma_a.unsqueeze(1))
     raw_t_ask = anchor_base_a_k + span_a_usd.unsqueeze(1) * curve_a
@@ -1008,7 +1017,14 @@ def _order3_clean_tick_step(
     healthy_wave_pos = (pos_qty > 1e-6) & (avg_entry > 1e-4) & (nb1_1d >= avg_entry * 0.990)
     working_pos_usd = torch.where(healthy_wave_pos, pos_qty * nb1_1d, torch.minimum(pos_qty, near_a_q) * nb1_1d)
     raw_work_frac = torch.clamp((working_pos_usd + near_b_usd) / torch.clamp(mtm_eq, min=25.0), 0.0, 1.0)
-    is_danger_mkt = (mkt_w[:, 31] > 0.36) | (mkt_w[:, 30] > 0.44) | (mkt_w[:, 65] > 0.34) | (mkt_w[:, 80] > 0.38) | (mkt_w[:, 81] > 0.38)
+    is_spike_danger = (mkt_w[:, 31] > 0.36) | (mkt_w[:, 30] > 0.44) | (mkt_w[:, 65] > 0.34) | (mkt_w[:, 80] > 0.38) | (mkt_w[:, 81] > 0.38)
+    # L78 Smart Bear-Trend Cash Immunity: освобождает сидение в 100% USDT на ступенчатых даунтрендах (Wave Down / Lower Highs / BuyTrap+CVD<0)!
+    is_macro_bear = (
+        ((mkt_w[:, 61] < -0.16) & (mkt_w[:, 62] < -0.14))
+        | ((mkt_w[:, 89] < -0.16) & (mkt_w[:, 90] > 0.10))
+        | ((mkt_w[:, 86] > 0.30) & (mkt_w[:, 92] < -0.14))
+    )
+    is_danger_mkt = is_spike_danger | is_macro_bear
     sum_val_err = sum_val_err + torch.where(is_danger_mkt, torch.ones_like(raw_work_frac), raw_work_frac)
     prev_val_pred = val_pred_now
     prev_mtm_eq = mtm_eq
@@ -1515,7 +1531,7 @@ def evaluate_order3_basket(
 
     # Равновесный прогрев начальных состояний gate_state и strat_state на последнем шаге перед ws:
     h2_w_ctx = h2_w + torch.bmm(mem_cw, wmem2h_c)
-    zw_last = z_warm[-1]  # [W, 88]
+    zw_last = z_warm[-1]  # [W, 94]
     rex_w = torch.cat(
         [
             zw_last[:, 0:1], zw_last[:, 40:44], zw_last[:, 44:45], zw_last[:, 48:49],
@@ -1523,6 +1539,7 @@ def evaluate_order3_basket(
             zw_last[:, 60:66],
             zw_last[:, 72:76], zw_last[:, 79:82], zw_last[:, 83:84],
             zw_last[:, 84:88],
+            zw_last[:, 88:94],
         ],
         dim=-1,
     ).to(dt).unsqueeze(0).expand(C, W, ROUTER_EXTRA_DIM_ORDER3)

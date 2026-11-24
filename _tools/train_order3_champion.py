@@ -80,8 +80,24 @@ def _normalize_weights_order3(state: dict, dtype: torch.dtype) -> dict:
     w1_mkt = w1_f[..., :MKT_DIM_ORDER3, :].clone()
     w1_ag = w1_f[..., MKT_DIM_ORDER3:, :]
 
-    # Блок 3 L70..L75: Раздельная поблочная нормировка 6 групп рынка (88D Signal Stack v5 с Order-2.5):
-    if MKT_DIM_ORDER3 >= 88:
+    # Блок 3 L70..L78: Раздельная поблочная нормировка 7 групп рынка (94D Signal Stack v6 с Order-2.5 + 5m..30m Structure/CVD):
+    if MKT_DIM_ORDER3 >= 94:
+        grp_specs = (
+            ([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 40, 41, 42, 43, 56, 57, 58, 59, 66, 67, 68, 69, 70, 71], 5.8),
+            ([29, 30, 31, 32, 33, 44, 45, 46, 47, 48, 49], 6.8),
+            ([34, 35, 36, 37, 38, 39, 50, 51, 52, 53, 54, 55], 7.8),
+            ([60, 61, 62, 63, 64, 65], 8.2),
+            ([72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83], 8.0),
+            ([84, 85, 86, 87], 7.5),
+            ([88, 89, 90, 91, 92, 93], 7.8),
+        )
+        w1_mkt_norm = w1_mkt.clone()
+        for idxs_g, mult_g in grp_specs:
+            sub_g = w1_mkt[..., idxs_g, :]
+            cap_g = mult_g * math.sqrt(float(len(idxs_g)))
+            nb_g = torch.linalg.vector_norm(sub_g, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+            w1_mkt_norm[..., idxs_g, :] = sub_g * torch.clamp(cap_g / nb_g, max=1.0)
+    elif MKT_DIM_ORDER3 >= 88:
         grp_specs = (
             ([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 40, 41, 42, 43, 56, 57, 58, 59, 66, 67, 68, 69, 70, 71], 5.8),
             ([29, 30, 31, 32, 33, 44, 45, 46, 47, 48, 49], 6.8),
@@ -145,9 +161,24 @@ def _normalize_weights_order3(state: dict, dtype: torch.dtype) -> dict:
     out["w2_moe"] = torch.cat(w2m_parts, dim=-1).to(dtype)
     out["b2_moe"] = torch.clamp(state["b2_moe"].float(), -7.5, 6.5).to(dtype)
 
-    # Раздельная нормировка прямого роутера w_gate1 (362D -> 128):
+    # Раздельная нормировка прямого роутера w_gate1 (368D -> 128):
     wg1_f = state["w_gate1"].float()
-    if wg1_f.shape[-2] >= 362:
+    if wg1_f.shape[-2] >= 368:
+        wg1_base = wg1_f[..., :336, :]
+        wg1_wave_ext = wg1_f[..., 336:360, :]
+        wg1_rec_m = wg1_f[..., 360:368, :]
+        nb_gb = torch.linalg.vector_norm(wg1_base, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+        nb_gw = torch.linalg.vector_norm(wg1_wave_ext, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+        nb_gr = torch.linalg.vector_norm(wg1_rec_m, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+        out["w_gate1"] = torch.cat(
+            [
+                wg1_base * torch.clamp(32.0 / nb_gb, max=1.0),
+                wg1_wave_ext * torch.clamp(17.5 / nb_gw, max=1.0),
+                wg1_rec_m * torch.clamp(8.5 / nb_gr, max=1.0),
+            ],
+            dim=-2,
+        ).to(dtype)
+    elif wg1_f.shape[-2] >= 362:
         wg1_base = wg1_f[..., :336, :]
         wg1_wave_ext = wg1_f[..., 336:354, :]
         wg1_rec_m = wg1_f[..., 354:362, :]
@@ -340,6 +371,16 @@ class MultimodalMoEPolicyOrder3:
                     w1_mkt[85] = 0.07 * fr_dir88
                     w1_mkt[86] = 0.09 * crash_dir88
                     w1_mkt[87] = 0.08 * bull_dir88
+                if old_mkt_d < 94 and MKT_DIM_ORDER3 >= 94 and old_mkt_d >= 88:
+                    # L78 Тёплая распайка 5m..30m Structure & Tape CVD [88..93]: ret_30m/twap_dev/CVD -> bull_dir, lower_highs [90] -> crash_dir!
+                    bull_dir94 = 0.40 * w1_mkt[61] + 0.30 * w1_mkt[62] + 0.30 * w1_mkt[87]
+                    crash_dir94 = 0.45 * w1_mkt[31] + 0.30 * w1_mkt[65] + 0.25 * w1_mkt[86]
+                    w1_mkt[88] = 0.06 * bull_dir94
+                    w1_mkt[89] = 0.07 * bull_dir94
+                    w1_mkt[90] = 0.09 * crash_dir94
+                    w1_mkt[91] = 0.05 * bull_dir94
+                    w1_mkt[92] = 0.07 * bull_dir94
+                    w1_mkt[93] = 0.06 * bull_dir94
             else:
                 w1_ag = ck["w1"][370:, :].float().clone()
             w1_full = torch.cat([w1_mkt, w1_ag], dim=0)
@@ -352,7 +393,18 @@ class MultimodalMoEPolicyOrder3:
             old_rin, old_rh = wg1_old.shape
             ch_r = min(old_rh, ROUTER_H_DIM_ORDER3)
             bg1_new[:, :ch_r] = bg1_old[:, :ch_r]
-            if old_rin == 358 and ROUTER_IN_DIM_ORDER3 == 362:
+            if old_rin == 362 and ROUTER_IN_DIM_ORDER3 == 368:
+                wg1_new[:354, :ch_r] = wg1_old[:354, :ch_r]
+                wg1_new[360:368, :ch_r] = wg1_old[354:362, :ch_r]
+                bull_rg94 = 0.50 * wg1_old[337, :ch_r] + 0.50 * wg1_old[353, :ch_r]
+                crash_rg94 = 0.50 * wg1_old[329, :ch_r] + 0.50 * wg1_old[352, :ch_r]
+                wg1_new[354, :ch_r] = 0.05 * bull_rg94
+                wg1_new[355, :ch_r] = 0.06 * bull_rg94
+                wg1_new[356, :ch_r] = 0.09 * crash_rg94
+                wg1_new[357, :ch_r] = 0.05 * bull_rg94
+                wg1_new[358, :ch_r] = 0.07 * bull_rg94
+                wg1_new[359, :ch_r] = 0.06 * bull_rg94
+            elif old_rin == 358 and ROUTER_IN_DIM_ORDER3 == 362:
                 wg1_new[:350, :ch_r] = wg1_old[:350, :ch_r]
                 wg1_new[354:362, :ch_r] = wg1_old[350:358, :ch_r]
                 bull_rg88 = 0.50 * wg1_old[333, :ch_r] + 0.50 * wg1_old[338, :ch_r]
@@ -414,6 +466,11 @@ class MultimodalMoEPolicyOrder3:
                 # Net2Net старт L72 Tranche Carousel [52] и Spread Sniper [53] (-6.5 -> ~0.0015 на старте, с живым откликом к h2_ctx!):
                 w2m_new[:, :, 52:54] = torch.randn((256, K_MODES_ORDER3, 2), generator=gen) * 0.020
                 b2m_new[:, :, 52:54] = -6.50
+            if old_exp_d <= 54 and EXPERT_OUT_DIM_ORDER3 >= 55:
+                # L78 Controlled Maker Stop-Unwind [54]: тихий старт (-5.50 -> ~0.004, в Mode #4 Crash Shield -3.50 -> ~0.029) с живым градиентом ES!
+                w2m_new[:, :, 54] = torch.randn((256, K_MODES_ORDER3), generator=gen) * 0.022
+                b2m_new[:, :, 54] = -5.50
+                b2m_new[:, 4, 54] = -3.50
 
             w2m_flat = w2m_new.reshape(256, MOE_OUT_DIM_ORDER3)
             b2m_flat = b2m_new.reshape(1, MOE_OUT_DIM_ORDER3)
@@ -565,6 +622,9 @@ class MultimodalMoEPolicyOrder3:
             if EXPERT_OUT_DIM_ORDER3 >= 54:
                 dw2m_v[:, :, :, 52:54] *= 3.80  # ускоренный поиск Tranche Carousel [52] и Spread Sniper [53]!
                 db2m_v[:, :, :, 52:54] *= 4.20
+            if EXPERT_OUT_DIM_ORDER3 >= 55:
+                dw2m_v[:, :, :, 54] *= 4.20     # ускоренное обучение Controlled Maker Stop-Unwind [54]!
+                db2m_v[:, :, :, 54] *= 4.80
         self.w2_moe[2 : 2 + 2 * half].copy_(base_gpu["w2_moe"].unsqueeze(0) + dw2m.to(self.dtype))
         self.b2_moe[2 : 2 + 2 * half].copy_(base_gpu["b2_moe"].unsqueeze(0) + db2m.to(self.dtype))
 
@@ -695,15 +755,15 @@ def train_order3(
     log_msg(f"🚀 ORDER-3 WFv2 ISLAND #{island_id}/{num_islands} ({island_mode.upper()} | WORLD={world_mode.upper()}) ON {device} | GROUPS={n_groups} (POP={n_groups * 6})")
     log_msg("=" * 90)
 
-    # 1. Загрузка строго каузальных 88D данных Signal Stack v5 (поддержка как RAW мира без вырезанных ордеров, так и DEC интерактивного мира!)
+    # 1. Загрузка строго каузальных 94D данных Signal Stack v6 (поддержка как RAW мира без вырезанных ордеров, так и DEC интерактивного мира!)
     if world_mode == "raw":
-        mkt_p = BASE_DIR / "data/cache/rl_hybrid_market_obs_88d_raw_with_self.npz"
+        mkt_p = BASE_DIR / "data/cache/rl_hybrid_market_obs_94d_raw_with_self.npz"
         lob_p = BASE_DIR / "data/cache/rl_guard_lob_cache_600h_raw_with_self.npz"
-        log_msg("📦 Загрузка каузальной 88D матрицы Signal Stack v5 [WORLD=RAW UNTOUCHED BOOK] и выделение эпохи тика $0.0001...")
+        log_msg("📦 Загрузка каузальной 94D матрицы Signal Stack v6 [WORLD=RAW UNTOUCHED BOOK] и выделение эпохи тика $0.0001...")
     else:
-        mkt_p = BASE_DIR / "data/cache/rl_hybrid_market_obs_88d.npz"
+        mkt_p = BASE_DIR / "data/cache/rl_hybrid_market_obs_94d.npz"
         lob_p = BASE_DIR / "data/cache/rl_guard_lob_cache_600h.npz"
-        log_msg("📦 Загрузка каузальной 88D матрицы Signal Stack v5 [WORLD=DEC INTERACTIVE BOOK] и выделение эпохи тика $0.0001...")
+        log_msg("📦 Загрузка каузальной 94D матрицы Signal Stack v6 [WORLD=DEC INTERACTIVE BOOK] и выделение эпохи тика $0.0001...")
     mkt_raw = np.load(mkt_p, mmap_mode="r")
     lob_raw = np.load(lob_p, mmap_mode="r")
 
@@ -712,7 +772,7 @@ def train_order3(
     subcent_offset = int(subcent_hits[0]) if len(subcent_hits) > 0 else 0
     log_msg(f"🔍 Обнаружена граница перехода биржи на тик $0.0001: idx={subcent_offset:,} (отсечено {subcent_offset:,} старых $0.01 тиков!)")
 
-    mkt_sub = np.asarray(mkt_raw["market_obs_88d"][subcent_offset:], dtype=np.float32)
+    mkt_sub = np.asarray(mkt_raw["market_obs_94d"][subcent_offset:], dtype=np.float32)
     total_rows = len(mkt_sub)
     tick_sz = 0.0001
     if win_len > total_rows // 8:

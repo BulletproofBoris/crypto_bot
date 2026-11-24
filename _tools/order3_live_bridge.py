@@ -126,9 +126,12 @@ class Order3LiveInferenceEngine:
             bg1_adap = torch.zeros((1, ROUTER_H_DIM_ORDER3), dtype=torch.float32)
             ch_r = min(old_rh, ROUTER_H_DIM_ORDER3)
             bg1_adap[:, :ch_r] = bg1_raw[:, :ch_r]
-            if old_rin == 358 and ROUTER_IN_DIM_ORDER3 == 362:
+            if old_rin == 362 and ROUTER_IN_DIM_ORDER3 == 368:
+                wg1_adap[:354, :ch_r] = wg1_raw[:354, :ch_r]
+                wg1_adap[360:368, :ch_r] = wg1_raw[354:362, :ch_r]
+            elif old_rin == 358 and ROUTER_IN_DIM_ORDER3 >= 362:
                 wg1_adap[:350, :ch_r] = wg1_raw[:350, :ch_r]
-                wg1_adap[354:362, :ch_r] = wg1_raw[350:358, :ch_r]
+                wg1_adap[ROUTER_IN_DIM_ORDER3 - 8 : ROUTER_IN_DIM_ORDER3, :ch_r] = wg1_raw[350:358, :ch_r]
             elif old_rin == 326 and ROUTER_IN_DIM_ORDER3 >= 358:
                 wg1_adap[:304, :ch_r] = wg1_raw[:304, :ch_r]
                 wg1_adap[320:342, :ch_r] = wg1_raw[304:326, :ch_r]
@@ -153,7 +156,7 @@ class Order3LiveInferenceEngine:
         self.w_gate2 = wg2_raw.to(device=self.device)
         self.b_gate2 = bg2_raw.view(1, 2 * self.k_modes).to(device=self.device)
 
-        # MoE эксперты (с бесшовной обратной совместимостью 45D / 48D / 50D -> 52D на моду)
+        # MoE эксперты (с бесшовной обратной совместимостью 45D / 48D / 50D / 54D -> 55D на моду)
         w2m_raw = ck["w2_moe"].to(dtype=torch.float32)
         b2m_raw = ck["b2_moe"].to(dtype=torch.float32).view(1, -1)
         if b2m_raw.numel() != self.moe_out_dim:
@@ -173,6 +176,8 @@ class Order3LiveInferenceEngine:
                 b2m_pad[:, :, 50:52] = 12.0
             if old_ed <= 52 and EXPERT_OUT_DIM_ORDER3 >= 54:
                 b2m_pad[:, :, 52:54] = -12.0
+            if old_ed <= 54 and EXPERT_OUT_DIM_ORDER3 >= 55:
+                b2m_pad[:, :, 54] = -12.0
             w2m_raw = w2m_pad.reshape(256, self.moe_out_dim)
             b2m_raw = b2m_pad.reshape(1, self.moe_out_dim)
         self.w2_moe = w2m_raw.to(device=self.device)
@@ -315,6 +320,7 @@ class Order3LiveInferenceEngine:
                 zm[:, 60:66],
                 zm[:, 72:76], zm[:, 79:82], zm[:, 83:84],
                 zm[:, 84:88],
+                zm[:, 88:94],
             ],
             dim=-1,
         )
@@ -327,9 +333,9 @@ class Order3LiveInferenceEngine:
         self.gate_state = (1.0 - beta_gate) * self.gate_state + beta_gate * raw_logits
         g_mode = torch.softmax(self.gate_state, dim=-1)
 
-        # K Латентных экспертов (EXPERT_OUT_DIM_ORDER3 = 54) + Адаптивный нелинейный демпфер плана котирования!
+        # K Латентных экспертов (EXPERT_OUT_DIM_ORDER3 = 55) + Адаптивный нелинейный демпфер плана котирования!
         moe_all = (h2_ctx @ self.w2_moe + self.b2_moe).float().view(1, self.k_modes, EXPERT_OUT_DIM_ORDER3)
-        strat_inst = (g_mode.unsqueeze(-1) * moe_all).sum(dim=1)  # [1, 54]
+        strat_inst = (g_mode.unsqueeze(-1) * moe_all).sum(dim=1)  # [1, 55]
         alpha_bid = torch.sigmoid(strat_inst[:, 50:51])
         alpha_ask = torch.sigmoid(strat_inst[:, 51:52])
         bid_blend = (1.0 - alpha_bid) * self.strat_state + alpha_bid * strat_inst
@@ -342,11 +348,12 @@ class Order3LiveInferenceEngine:
                 ask_blend[:, 45:47], bid_blend[:, 47:48], strat_inst[:, 48:49],
                 ask_blend[:, 49:50], strat_inst[:, 50:52],
                 ask_blend[:, 52:53], bid_blend[:, 53:54],
+                ask_blend[:, 54:55],
             ],
             dim=-1,
         )
         self.strat_state = strat_merged
-        strat_raw = strat_merged.squeeze(0)  # [54]
+        strat_raw = strat_merged.squeeze(0)  # [55]
 
         # 1C. 100% Эндогенная экспозиция [0..1], распределение долей и резерв каскадной постановки renorm_blend:
         exp_bid_frac = float(torch.sigmoid(strat_raw[0]).item())
@@ -383,8 +390,12 @@ class Order3LiveInferenceEngine:
         has_low_tr = hp_now_b and (float(low_tranche_qty) >= 2.0) and (float(min_buy_px) > 1e-4)
         low_ref_entry = (float(min_buy_px) * (1.0 + 2.0 * maker_fee)) if has_low_tr else ref_entry
         tranche_s = float(torch.sigmoid(strat_raw[52]).item()) if has_low_tr else 0.0
-        tranche_w_k = tranche_s * torch.pow(1.0 - self.echelon_k01, 2.0)
+        ech_front_sq = torch.pow(1.0 - self.echelon_k01, 2.0)
+        tranche_w_k = tranche_s * ech_front_sq
         ref_entry_k = ref_entry * (1.0 - tranche_w_k) + low_ref_entry * tranche_w_k
+        unwind_s = float(torch.sigmoid(strat_raw[54]).item())
+        unwind_w_k = (unwind_s * ech_front_sq) * (ref_entry_k > a1).float()
+        eff_ref_entry_k = ref_entry_k * (1.0 - unwind_w_k) + a1 * unwind_w_k
 
         skew_blend = float(torch.sigmoid(strat_raw[41]).item())
         z42_t = strat_raw[42]
@@ -395,7 +406,7 @@ class Order3LiveInferenceEngine:
         gamma_a = 0.40 + 2.10 * float(torch.sigmoid(strat_raw[40] + strat_raw[46]).item())
 
         inside_a = spread_room * float(torch.sigmoid(strat_raw[43]).item())
-        anchor_base_a_k = a1 + skew_blend * (ref_entry_k - a1) + (a1 * ask_edge_pct - inside_a)
+        anchor_base_a_k = a1 + skew_blend * (eff_ref_entry_k - a1) + (a1 * ask_edge_pct - inside_a)
         min_maker_ask = b1 + tick_sz
         curve_a = torch.pow(self.echelon_k01, gamma_a)
         raw_t_ask = anchor_base_a_k + span_a_usd * curve_a
@@ -1053,6 +1064,49 @@ def build_live_hybrid_market_obs_40d(trader, b1: float, a1: float) -> np.ndarray
         else:
             z[84], z[85], z[86], z[87] = 0.35, 0.36, 0.15, 0.33
 
+    if MKT_DIM_ORDER3 >= 94:
+        now_m94 = time.time()
+        mh94 = _LIVE_WF_CACHE.get("mid_hist_3600s") or [(now_m94, st_mid)]
+        m_30m = next((x[1] for x in reversed(mh94) if (now_m94 - x[0]) >= 1795.0), mh94[0][1])
+        vals_cur_15m = [x[1] for x in mh94 if (now_m94 - x[0]) <= 900.5] or [st_mid]
+        vals_prv_15m = [x[1] for x in mh94 if 900.5 < (now_m94 - x[0]) <= 1800.5] or vals_cur_15m
+        mean_15m = sum(vals_cur_15m) / float(len(vals_cur_15m))
+        mx_cur_15m = max(vals_cur_15m)
+        mx_prv_15m = max(vals_prv_15m)
+        z[88] = float(math.tanh((st_mid / max(m_30m, 1e-4) - 1.0) * 12.0))
+        z[89] = float(math.tanh(((st_mid - mean_15m) / st_mid) * 25.0))
+        z[90] = float(math.tanh(((mx_prv_15m - mx_cur_15m) / st_mid) * 25.0))
+
+        fh1800 = _LIVE_WF_CACHE.setdefault("flow_hist_1800s", [])
+        last_ts1800 = float(_LIVE_WF_CACHE.get("last_fh1800_ts", 0.0))
+        fh_ts_live = list(getattr(trader, "flow_ts_hist_30s", []))
+        fh_old_live = list(getattr(trader, "flow_hist_10s", []))
+        if fh_ts_live:
+            for it_f in fh_ts_live:
+                ts_v = float(it_f[0])
+                if ts_v > last_ts1800 + 1e-6:
+                    fh1800.append((ts_v, max(0.0, float(it_f[1])), max(0.0, float(it_f[2]))))
+                    last_ts1800 = ts_v
+            _LIVE_WF_CACHE["last_fh1800_ts"] = last_ts1800
+        elif fh_old_live:
+            for it_f in fh_old_live:
+                ts_v = float(it_f[0])
+                if ts_v > 1e9 and ts_v > last_ts1800 + 1e-6:
+                    fh1800.append((ts_v, max(0.0, float(it_f[2])), max(0.0, float(it_f[3]))))
+                    last_ts1800 = ts_v
+            _LIVE_WF_CACHE["last_fh1800_ts"] = last_ts1800
+        if len(fh1800) > 2000 or (fh1800 and (now_m94 - fh1800[0][0]) > 1830.0):
+            fh1800[:] = [x for x in fh1800 if (now_m94 - x[0]) <= 1800.5]
+        b5 = sum(x[1] for x in fh1800 if (now_m94 - x[0]) <= 300.5)
+        s5 = sum(x[2] for x in fh1800 if (now_m94 - x[0]) <= 300.5)
+        b15 = sum(x[1] for x in fh1800 if (now_m94 - x[0]) <= 900.5)
+        s15 = sum(x[2] for x in fh1800 if (now_m94 - x[0]) <= 900.5)
+        b30 = sum(x[1] for x in fh1800)
+        s30 = sum(x[2] for x in fh1800)
+        z[91] = float(np.clip((b5 - s5) / (b5 + s5 + 50.0), -1.0, 1.0))
+        z[92] = float(np.clip((b15 - s15) / (b15 + s15 + 150.0), -1.0, 1.0))
+        z[93] = float(np.clip((b30 - s30) / (b30 + s30 + 300.0), -1.0, 1.0))
+
     return z
 
 
@@ -1095,7 +1149,7 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
                     zm_w[:, 0:1], zm_w[:, 40:44], zm_w[:, 44:45], zm_w[:, 48:49],
                     zm_w[:, 29:34], zm_w[:, 36:37], zm_w[:, 39:40], zm_w[:, 55:56], zm_w[:, 12:13],
                     zm_w[:, 60:66], zm_w[:, 72:76], zm_w[:, 79:82], zm_w[:, 83:84],
-                    zm_w[:, 84:88],
+                    zm_w[:, 84:88], zm_w[:, 88:94],
                 ],
                 dim=-1,
             )
