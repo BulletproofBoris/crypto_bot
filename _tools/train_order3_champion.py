@@ -1155,9 +1155,9 @@ def train_order3(
     st_l79_unfr_i1 = _build_l79_unfrozen_seed(st_l78_i1, micro55_z=-1.05, carousel52_z=-2.35, unwind54_z=-2.20, struct_gain=0.16)
 
     seed_pool = (
-        [st_live_anchor, st_live_champ, st_l79_unfr_live, st_l79_unfr_i0, st_l78_i0, st_l78_soup, st_l77_prev]
+        [st_live_anchor, st_live_champ, st_l79_unfr_live, st_l79_unfr_i0, st_l78_i0, st_l78_soup]
         if island_id == 0
-        else [st_live_anchor, st_live_champ, st_l79_unfr_live, st_l79_unfr_i1, st_l78_i1, st_l78_soup, st_l77_i1]
+        else [st_live_anchor, st_live_champ, st_l79_unfr_live, st_l79_unfr_i1, st_l78_i1, st_l78_soup]
     )
     resume_iter = 0
     for res_p in [SAVE_DIR / "islands" / f"island_{island_id}_best.pt", SAVE_DIR / "global_best.pt", RESUME_CHAMP_PATH]:
