@@ -5470,7 +5470,7 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
             touched_b = any(s.get("id") is not None and float(s.get("px", 0.0)) >= b1 - 0.5 * exec_t_pre for s in trader.bid_slots)
             touched_a = any(s.get("id") is not None and float(s.get("px", 0.0)) <= a1 + 0.5 * exec_t_pre for s in trader.ask_slots)
             since_sync = time.time() - float(getattr(trader, "_last_pre_inf_sync_ts", 0.0))
-            if ((touched_b or touched_a) and since_sync >= 0.95) or (any(s.get("id") is not None for s in (trader.bid_slots + trader.ask_slots)) and since_sync >= 2.5):
+            if (touched_b or touched_a) and since_sync >= 0.95:
                 trader._last_pre_inf_sync_ts = time.time()
                 trader.sync_live_orders(b1, count_hold=False)
 
