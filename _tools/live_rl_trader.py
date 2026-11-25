@@ -21,9 +21,15 @@ import argparse
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from datetime import timedelta as _td_msk
 from pathlib import Path
 import numpy as np
 import pandas as pd
+
+
+def _msk_ms() -> str:
+    """Точная метка времени MSK с миллисекундами для строк исполнения/отмен (сверка live с симулятором по секундам)."""
+    return datetime.now(timezone(_td_msk(hours=3))).strftime("%H:%M:%S.%f")[:-3]
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
@@ -1162,9 +1168,11 @@ class LiveTriadRLTrader:
                         print(
                             f"  🟢 [24-SLOT FILL BID #{s_idx:02d}] +{net_d:.4f} PRL @ ${px:.2f} | "
                             f"Поз={self.pos_qty:.4f} PRL (avg=${self.avg_entry:.4f}, low_tr={self.tr_low_qty:.1f}@${self.tr_low_px:.2f}, mid_tr={self.tr_mid_qty:.1f}@${self.tr_mid_px:.2f}) | "
-                            f"Кэш=${self.bot_cash_usd:.2f}"
+                            f"Кэш=${self.bot_cash_usd:.2f} | px4={px:.4f} id={oid} t={_msk_ms()}"
                         )
                 if st in ("done", "cancel"):
+                    if st == "cancel" and d_fill <= 1e-4:
+                        print(f"  ✖️ [24-SLOT SYNC-CLEARED BID #{s_idx:02d}] id={oid} state=cancel filled={filled:.4f} | t={_msk_ms()}")
                     slot["id"] = None
                     slot["px"] = 0.0
                     slot["qty"] = 0.0
@@ -1249,9 +1257,11 @@ class LiveTriadRLTrader:
                     print(
                         f"  💰 [24-SLOT FILL ASK #{s_idx:02d}] -{d_fill:.4f} PRL @ ${px:.2f} | "
                         f"PnL={pnl:+.4f}$ | Остаток поз={self.pos_qty:.4f} PRL (avg=${self.avg_entry:.4f}, low_tr={self.tr_low_qty:.1f}@${self.tr_low_px:.2f}) | "
-                        f"Кэш=${self.bot_cash_usd:.2f}"
+                        f"Кэш=${self.bot_cash_usd:.2f} | px4={px:.4f} id={oid} t={_msk_ms()}"
                     )
                 if st in ("done", "cancel"):
+                    if st == "cancel" and d_fill <= 1e-4:
+                        print(f"  ✖️ [24-SLOT SYNC-CLEARED ASK #{s_idx:02d}] id={oid} state=cancel filled={filled:.4f} | t={_msk_ms()}")
                     slot["id"] = None
                     slot["px"] = 0.0
                     slot["qty"] = 0.0
@@ -5292,6 +5302,68 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
     from _tools.live_feature_updater import LiveFeatureStreamer
     streamer = LiveFeatureStreamer(df_sub, trader.feature_names, coin=coin)
     df_init = streamer.get_recent_window(180)
+    # Полный прогрев медленных каналов Order-3 при старте демона (0 холодного старта после деплоя):
+    # mid по секундам из depth.csv (60m окна [66..71, 88..90], EMA m5..m3600) и лента taker-объёмов из trades.csv (30m CVD [91..93], EMA b15..s60).
+    if getattr(trader, "order3_mode", False):
+        try:
+            from collections import defaultdict as _dd
+            from _tools.order3_live_bridge import _LIVE_WF_CACHE as _o3_cache
+            sec_mid = {}
+            for line in raw_d_lines:
+                p_d = line.split(",")
+                if len(p_d) > 101:
+                    try:
+                        tv_d = float(p_d[0])
+                        si_d = int(tv_d // 1000) if tv_d > 1e11 else int(tv_d)
+                        bp_d, ap_d = float(p_d[1]), float(p_d[101])
+                        if bp_d > 0 and ap_d > bp_d:
+                            sec_mid[si_d] = 0.5 * (bp_d + ap_d)
+                    except ValueError:
+                        pass
+            tr_path = Path("/opt/crypto_bot/data/realtime/prlusdt/trades.csv")
+            tr_lines = subprocess.run(["tail", "-n", "40000", str(tr_path)], capture_output=True, text=True).stdout.splitlines() if tr_path.exists() else []
+            sec_bv, sec_sv = _dd(float), _dd(float)
+            for line in tr_lines:
+                p_t = line.split(",")
+                if len(p_t) >= 5:
+                    try:
+                        amt_t, side_t, tv_t = float(p_t[2]), p_t[3].strip().lower(), float(p_t[4])
+                    except ValueError:
+                        continue
+                    si_t = int(tv_t // 1000) if tv_t > 1e11 else int(tv_t)
+                    if side_t == "buy":
+                        sec_bv[si_t] += max(0.0, amt_t)
+                    elif side_t == "sell":
+                        sec_sv[si_t] += max(0.0, amt_t)
+            if len(sec_mid) >= 600:
+                end_s = max(sec_mid)
+                start_s = end_s - 3600
+                cur_m = next(sec_mid[s] for s in sorted(sec_mid) if s >= start_s)
+                es_w = {"b15": 0.0, "s15": 0.0, "b30": 0.0, "s30": 0.0, "b60": 0.0, "s60": 0.0, "bo_b30": 0.0, "bo_s30": 0.0, "bo_m30": cur_m,
+                        "m5": cur_m, "m15": cur_m, "m30": cur_m, "m60": cur_m, "m120": cur_m, "m900": cur_m, "m3600": cur_m}
+                mh_w, fh_w = [], []
+                for s_w in range(start_s, end_s + 1):
+                    cur_m = sec_mid.get(s_w, cur_m)
+                    bv_w, sv_w = sec_bv.get(s_w, 0.0), sec_sv.get(s_w, 0.0)
+                    for k_w, a_w in (("15", 2.0 / 16.0), ("30", 2.0 / 31.0), ("60", 2.0 / 61.0)):
+                        es_w[f"b{k_w}"] = (1.0 - a_w) * es_w[f"b{k_w}"] + a_w * bv_w
+                        es_w[f"s{k_w}"] = (1.0 - a_w) * es_w[f"s{k_w}"] + a_w * sv_w
+                    for k_m, a_m in (("m5", 2.0 / 6.0), ("m15", 2.0 / 16.0), ("m30", 2.0 / 31.0), ("m60", 2.0 / 61.0), ("m120", 2.0 / 121.0), ("m900", 2.0 / 901.0), ("m3600", 2.0 / 3601.0)):
+                        es_w[k_m] = (1.0 - a_m) * es_w[k_m] + a_m * cur_m
+                    mh_w.append((float(s_w), cur_m))
+                    if s_w > end_s - 1800 and (bv_w > 0.0 or sv_w > 0.0):
+                        fh_w.append((float(s_w), bv_w, sv_w))
+                es_w["bo_m30"] = cur_m
+                trader._o3_ema_state = es_w
+                _o3_cache["mid_hist_3600s"] = mh_w
+                _o3_cache["flow_hist_1800s"] = fh_w
+                _o3_cache["last_fh1800_ts"] = float(end_s)
+                print(f"✅ [ORDER-3 WARMUP] Прогреты 60m mid ({len(mh_w)} сек) и 30m лента ({len(fh_w)} сек с объёмом, "
+                      f"buy={sum(x[1] for x in fh_w):.0f} / sell={sum(x[2] for x in fh_w):.0f} PRL) + EMA m5..m3600", flush=True)
+            else:
+                print(f"⚠️ [ORDER-3 WARMUP] Недостаточно истории depth.csv ({len(sec_mid)} сек) — холодный старт медленных каналов", flush=True)
+        except Exception as e_w:
+            print(f"⚠️ [ORDER-3 WARMUP WARN]: {e_w}", flush=True)
     X_tail = df_init.reindex(columns=trader.feature_names, fill_value=0.0).to_numpy(dtype=np.float32)
     X_buf = deque(X_tail, maxlen=180)
     last_row = df_init.iloc[-1:].copy()
@@ -5391,6 +5463,16 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
             trader.hold_sec += 1
             if b1 > 0:
                 trader.peak_bid = max(trader.peak_bid, trader.avg_entry, b1)
+
+        # Пред-инференсная синхронизация исполнений при касании спреда (убирает 2–5с слепоту нейросети после реального филла!):
+        if getattr(trader, "order3_mode", False) and is_24s and b1 > 0:
+            exec_t_pre = float(getattr(trader, "exec_tick_size", trader.tick_size))
+            touched_b = any(s.get("id") is not None and float(s.get("px", 0.0)) >= b1 - 0.5 * exec_t_pre for s in trader.bid_slots)
+            touched_a = any(s.get("id") is not None and float(s.get("px", 0.0)) <= a1 + 0.5 * exec_t_pre for s in trader.ask_slots)
+            since_sync = time.time() - float(getattr(trader, "_last_pre_inf_sync_ts", 0.0))
+            if ((touched_b or touched_a) and since_sync >= 0.95) or (any(s.get("id") is not None for s in (trader.bid_slots + trader.ask_slots)) and since_sync >= 2.5):
+                trader._last_pre_inf_sync_ts = time.time()
+                trader.sync_live_orders(b1, count_hold=False)
 
         if getattr(trader, "order3_mode", False):
             obs, mask = trader.compute_obs_and_mask(None, last_row)

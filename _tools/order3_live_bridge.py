@@ -178,6 +178,8 @@ class Order3LiveInferenceEngine:
                 b2m_pad[:, :, 52:54] = -12.0
             if old_ed <= 54 and EXPERT_OUT_DIM_ORDER3 >= 55:
                 b2m_pad[:, :, 54] = -12.0
+            if old_ed <= 55 and EXPERT_OUT_DIM_ORDER3 >= 56:
+                b2m_pad[:, :, 55] = -12.0
             w2m_raw = w2m_pad.reshape(256, self.moe_out_dim)
             b2m_raw = b2m_pad.reshape(1, self.moe_out_dim)
         self.w2_moe = w2m_raw.to(device=self.device)
@@ -333,9 +335,9 @@ class Order3LiveInferenceEngine:
         self.gate_state = (1.0 - beta_gate) * self.gate_state + beta_gate * raw_logits
         g_mode = torch.softmax(self.gate_state, dim=-1)
 
-        # K Латентных экспертов (EXPERT_OUT_DIM_ORDER3 = 55) + Адаптивный нелинейный демпфер плана котирования!
+        # K Латентных экспертов (EXPERT_OUT_DIM_ORDER3 = 56) + Адаптивный нелинейный демпфер плана котирования!
         moe_all = (h2_ctx @ self.w2_moe + self.b2_moe).float().view(1, self.k_modes, EXPERT_OUT_DIM_ORDER3)
-        strat_inst = (g_mode.unsqueeze(-1) * moe_all).sum(dim=1)  # [1, 55]
+        strat_inst = (g_mode.unsqueeze(-1) * moe_all).sum(dim=1)  # [1, 56]
         alpha_bid = torch.sigmoid(strat_inst[:, 50:51])
         alpha_ask = torch.sigmoid(strat_inst[:, 51:52])
         bid_blend = (1.0 - alpha_bid) * self.strat_state + alpha_bid * strat_inst
@@ -348,15 +350,18 @@ class Order3LiveInferenceEngine:
                 ask_blend[:, 45:47], bid_blend[:, 47:48], strat_inst[:, 48:49],
                 ask_blend[:, 49:50], strat_inst[:, 50:52],
                 ask_blend[:, 52:53], bid_blend[:, 53:54],
-                ask_blend[:, 54:55],
+                ask_blend[:, 54:55], bid_blend[:, 55:56],
             ],
             dim=-1,
         )
         self.strat_state = strat_merged
-        strat_raw = strat_merged.squeeze(0)  # [55]
+        strat_raw = strat_merged.squeeze(0)  # [56]
 
-        # 1C. 100% Эндогенная экспозиция [0..1], распределение долей и резерв каскадной постановки renorm_blend:
-        exp_bid_frac = float(torch.sigmoid(strat_raw[0]).item())
+        # 1C. 100% Эндогенная экспозиция [0..1] + L79 Wide-Spread Micro-Sniper [55]:
+        rel_sp_now = (a1 - b1) / max(tick_sz, float(b1))
+        wide_sp_gate = min(1.0, max(0.0, (rel_sp_now - 0.0035) / 0.0045))
+        eff_micro_s = float(torch.sigmoid(strat_raw[55]).item()) * wide_sp_gate
+        exp_bid_frac = max(float(torch.sigmoid(strat_raw[0]).item()), 0.065 * eff_micro_s)
         renorm_blend = float(torch.sigmoid(strat_raw[47]).item())
 
         tau_b_t = 0.08 + 2.42 * torch.sigmoid(strat_raw[34:35])
@@ -364,7 +369,9 @@ class Order3LiveInferenceEngine:
         max_share_b_t = 0.08 + 0.92 * torch.sigmoid(strat_raw[44:45])
         max_share_a_t = 0.08 + 0.92 * torch.sigmoid(strat_raw[44:45] + 0.25)
 
-        pi_b_t = _fanned_slot_softmax(strat_raw[1:13].unsqueeze(0), tau_b_t, max_share_b_t, floor=0.005).squeeze(0)
+        logits_b_12 = strat_raw[1:13].clone()
+        logits_b_12[0] = logits_b_12[0] + 5.0 * eff_micro_s
+        pi_b_t = _fanned_slot_softmax(logits_b_12.unsqueeze(0), tau_b_t, max_share_b_t, floor=0.005).squeeze(0)
         pi_a_t = _fanned_slot_softmax(strat_raw[13:25].unsqueeze(0), tau_a_t, max_share_a_t, floor=0.005).squeeze(0)
 
         # 2. Непрерывные эндогенные Taker-вентили (Exit ch 25 + Impulse Wave Buy ch 48):
@@ -372,7 +379,7 @@ class Order3LiveInferenceEngine:
         u_taker_buy = float(torch.tanh(F.relu(strat_raw[48] - 1.2)).item())
         max_slip_pct = 0.005 + 0.145 * float(torch.sigmoid(strat_raw[36]).item())
 
-        # 3. Полно-спредовая геометрия 24 слотов + L72 Tranche Carousel [52] & Spread Sniper [53] (1-в-1 с fused_order3_clean_tick.py):
+        # 3. Полно-спредовая геометрия 24 слотов + L72..L79 Micro-Sniper [55] (1-в-1 с fused_order3_clean_tick.py):
         spread_room = max(0.0, a1 - b1 - tick_sz)
         inside_b = spread_room * float(torch.sigmoid(strat_raw[37]).item())
         sniper_front = float(torch.sigmoid(strat_raw[53]).item())
@@ -381,7 +388,11 @@ class Order3LiveInferenceEngine:
         gamma_b = 0.40 + 2.10 * float(torch.sigmoid(strat_raw[40]).item())
 
         curve_b = torch.pow(self.echelon_k01, gamma_b)
-        raw_t_bid = (b1 + inside_b - retreat_b) - span_b_usd * curve_b
+        ech0_m = (self.echelon_k01 < 0.01).float()
+        eff_retreat_k = retreat_b * (1.0 - ech0_m * eff_micro_s)
+        micro_step_in = min(spread_room, 2.0 * tick_sz) * eff_micro_s
+        eff_inside_k = torch.clamp(inside_b + ech0_m * micro_step_in, max=spread_room)
+        raw_t_bid = (b1 + eff_inside_k - eff_retreat_k) - span_b_usd * curve_b
         max_maker_bid = max(tick_sz, a1 - tick_sz)
         t_bid_px = torch.clamp(torch.round(torch.clamp(raw_t_bid, max=max_maker_bid) / tick_sz) * tick_sz, min=tick_sz)
 
@@ -999,11 +1010,11 @@ def build_live_hybrid_market_obs_40d(trader, b1: float, a1: float) -> np.ndarray
         mh.append((now_m, st_mid))
         if len(mh) > 4000 or (mh and (now_m - mh[0][0]) > 3660.0):
             mh[:] = [x for x in mh if (now_m - x[0]) <= 3605.0]
-        m_5m = next((x[1] for x in reversed(mh) if (now_m - x[0]) >= 295.0), mh[0][1])
-        m_15m = next((x[1] for x in reversed(mh) if (now_m - x[0]) >= 895.0), mh[0][1])
-        m_60m = mh[0][1]
-        vals_30m = [x[1] for x in mh if (now_m - x[0]) <= 1805.0] or [st_mid]
-        vals_60m = [x[1] for x in mh] or [st_mid]
+        m_5m = next((x[1] for x in reversed(mh) if (now_m - x[0]) >= 299.5), mh[0][1])
+        m_15m = next((x[1] for x in reversed(mh) if (now_m - x[0]) >= 899.5), mh[0][1])
+        m_60m = next((x[1] for x in reversed(mh) if (now_m - x[0]) >= 3599.5), mh[0][1])
+        vals_30m = [x[1] for x in mh if (now_m - x[0]) <= 1799.5] or [st_mid]
+        vals_60m = [x[1] for x in mh if (now_m - x[0]) <= 3599.5] or [st_mid]
         mn_1800, mx_1800 = min(vals_30m), max(vals_30m)
         mn_3600, mx_3600 = min(vals_60m), max(vals_60m)
         rng_1h = max(mx_3600 - mn_3600, st_mid * 0.005)
@@ -1067,9 +1078,9 @@ def build_live_hybrid_market_obs_40d(trader, b1: float, a1: float) -> np.ndarray
     if MKT_DIM_ORDER3 >= 94:
         now_m94 = time.time()
         mh94 = _LIVE_WF_CACHE.get("mid_hist_3600s") or [(now_m94, st_mid)]
-        m_30m = next((x[1] for x in reversed(mh94) if (now_m94 - x[0]) >= 1795.0), mh94[0][1])
-        vals_cur_15m = [x[1] for x in mh94 if (now_m94 - x[0]) <= 900.5] or [st_mid]
-        vals_prv_15m = [x[1] for x in mh94 if 900.5 < (now_m94 - x[0]) <= 1800.5] or vals_cur_15m
+        m_30m = next((x[1] for x in reversed(mh94) if (now_m94 - x[0]) >= 1799.5), mh94[0][1])
+        vals_cur_15m = [x[1] for x in mh94 if (now_m94 - x[0]) <= 899.5] or [st_mid]
+        vals_prv_15m = [x[1] for x in mh94 if 899.5 < (now_m94 - x[0]) <= 1799.5] or vals_cur_15m
         mean_15m = sum(vals_cur_15m) / float(len(vals_cur_15m))
         mx_cur_15m = max(vals_cur_15m)
         mx_prv_15m = max(vals_prv_15m)
@@ -1077,7 +1088,7 @@ def build_live_hybrid_market_obs_40d(trader, b1: float, a1: float) -> np.ndarray
         z[89] = float(math.tanh(((st_mid - mean_15m) / st_mid) * 25.0))
         z[90] = float(math.tanh(((mx_prv_15m - mx_cur_15m) / st_mid) * 25.0))
 
-        fh1800 = _LIVE_WF_CACHE.setdefault("flow_hist_1800s", [])
+        fh1800 = _LIVE_WF_CACHE.setdefault("flow_hist_1800s", [])  # прогревается при старте демона из trades.csv (live_rl_trader.py)
         last_ts1800 = float(_LIVE_WF_CACHE.get("last_fh1800_ts", 0.0))
         fh_ts_live = list(getattr(trader, "flow_ts_hist_30s", []))
         fh_old_live = list(getattr(trader, "flow_hist_10s", []))
@@ -1096,18 +1107,24 @@ def build_live_hybrid_market_obs_40d(trader, b1: float, a1: float) -> np.ndarray
                     last_ts1800 = ts_v
             _LIVE_WF_CACHE["last_fh1800_ts"] = last_ts1800
         if len(fh1800) > 2000 or (fh1800 and (now_m94 - fh1800[0][0]) > 1830.0):
-            fh1800[:] = [x for x in fh1800 if (now_m94 - x[0]) <= 1800.5]
-        b5 = sum(x[1] for x in fh1800 if (now_m94 - x[0]) <= 300.5)
-        s5 = sum(x[2] for x in fh1800 if (now_m94 - x[0]) <= 300.5)
-        b15 = sum(x[1] for x in fh1800 if (now_m94 - x[0]) <= 900.5)
-        s15 = sum(x[2] for x in fh1800 if (now_m94 - x[0]) <= 900.5)
-        b30 = sum(x[1] for x in fh1800)
-        s30 = sum(x[2] for x in fh1800)
+            fh1800[:] = [x for x in fh1800 if (now_m94 - x[0]) <= 1802.0]
+        b5 = sum(x[1] for x in fh1800 if (now_m94 - x[0]) <= 299.5)
+        s5 = sum(x[2] for x in fh1800 if (now_m94 - x[0]) <= 299.5)
+        b15 = sum(x[1] for x in fh1800 if (now_m94 - x[0]) <= 899.5)
+        s15 = sum(x[2] for x in fh1800 if (now_m94 - x[0]) <= 899.5)
+        b30 = sum(x[1] for x in fh1800 if (now_m94 - x[0]) <= 1799.5)
+        s30 = sum(x[2] for x in fh1800 if (now_m94 - x[0]) <= 1799.5)
         z[91] = float(np.clip((b5 - s5) / (b5 + s5 + 50.0), -1.0, 1.0))
         z[92] = float(np.clip((b15 - s15) / (b15 + s15 + 150.0), -1.0, 1.0))
         z[93] = float(np.clip((b30 - s30) / (b30 + s30 + 300.0), -1.0, 1.0))
 
     return z
+
+
+def _msk_ms() -> str:
+    """Точная метка времени MSK с миллисекундами для строк постановки/отмены (сверка live с симулятором по секундам)."""
+    t_now = time.time()
+    return time.strftime("%H:%M:%S", time.gmtime(t_now + 3 * 3600)) + f".{int((t_now % 1) * 1000):03d}"
 
 
 def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
@@ -1485,6 +1502,18 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
                     if isinstance(rc_f, dict):
                         c_map[oid_f] = rc_f
 
+        # Peatio v2 асинхронная очередь отмен: если cancel вернул state="wait", даём движку 120 мс и проверяем исчезновение из open_orders!
+        has_wait_cnl = any(isinstance(v, dict) and str(v.get("state", "")).lower() == "wait" for v in c_map.values())
+        if has_wait_cnl:
+            time.sleep(0.12)
+            try:
+                still_open_ids = {o_it.get("id") for o_it in (trader.client.get_open_orders(trader.market) or []) if isinstance(o_it, dict)}
+                for oid_w, info_w in list(c_map.items()):
+                    if isinstance(info_w, dict) and str(info_w.get("state", "")).lower() == "wait" and oid_w not in still_open_ids:
+                        info_w["state"] = "cancel"
+            except Exception:
+                pass
+
         need_fill_sync = False
 
         for s, oid, is_cross in to_cnl_b:
@@ -1505,7 +1534,7 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
                     s_px = float(trader.bid_slots[s].get("px", 0.0))
                     trader.ex_usdt_free += float(trader.bid_slots[s].get("qty", 0.0)) * s_px
                     trader.bid_slots[s] = {"slot": s, "id": None, "px": 0.0, "qty": 0.0, "act_ts": 0.0, "acc_fill": 0.0}
-                    print(f"  ✖️ [NEURAL CANCEL BID #{s:02d} ({'crossed' if is_cross else 'reg'})] id={oid}")
+                    print(f"  ✖️ [NEURAL CANCEL BID #{s:02d} ({'crossed' if is_cross else 'reg'})] id={oid} | t={_msk_ms()}")
 
         for s, oid, is_cross in to_cnl_a:
             c_info = c_map.get(oid)
@@ -1524,7 +1553,7 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
                 elif st_c in ("cancel", "done", ""):
                     trader.ex_coin_free = float(getattr(trader, "ex_coin_free", 0.0)) + float(trader.ask_slots[s].get("qty", 0.0))
                     trader.ask_slots[s] = {"slot": s, "id": None, "px": 0.0, "qty": 0.0, "act_ts": 0.0, "acc_fill": 0.0}
-                    print(f"  ✖️ [NEURAL CANCEL ASK #{s:02d} ({'crossed' if is_cross else 'reg'})] id={oid}")
+                    print(f"  ✖️ [NEURAL CANCEL ASK #{s:02d} ({'crossed' if is_cross else 'reg'})] id={oid} | t={_msk_ms()}")
 
         if need_fill_sync:
             trader._sync_24slot_orders(b1, count_hold=False, pre_fetched_orders=c_map)
@@ -1546,10 +1575,15 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
             sel_b.append(s)
             trader.order3_engine.api_tokens -= 1.0
 
+    # "Легко в бою": транспортный 2-тиковый зазор от встречного BBO при широком спреде (>=3 тиков) защищает пассивный Maker от случайного Taker-перехлёста за 206 мс полёта HTTP!
+    flight_guard_ticks = 2.0 if (a1 - b1) >= 2.9 * t_sz else 1.0
+    max_safe_bid = max(t_sz, a1 - flight_guard_ticks * t_sz)
+    min_safe_ask = b1 + flight_guard_ticks * t_sz
+
     sum_pi_b = sum(float(plan["pi_bid"][s]) + 1e-5 for s in sel_b)
     b_tasks = []
     for s in sel_b:
-        px_s = round(float(plan["t_bid_px"][s]), p_prec)
+        px_s = round(min(max_safe_bid, float(plan["t_bid_px"][s])), p_prec)
         full_sh_b = (float(plan["pi_bid"][s]) + 1e-5) / max(1e-6, sum_pi_b)
         raw_sh_b = min(float(plan["pi_bid"][s]), full_sh_b)
         share_s = renorm_b * full_sh_b + (1.0 - renorm_b) * raw_sh_b
@@ -1576,7 +1610,7 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
     sum_pi_a = sum(float(plan["pi_ask"][s]) + 1e-5 for s in sel_a)
     a_tasks = []
     for s in sel_a:
-        px_s = round(max(b1 + t_sz, float(plan["t_ask_px"][s])), p_prec)
+        px_s = round(max(min_safe_ask, float(plan["t_ask_px"][s])), p_prec)
         full_sh_a = (float(plan["pi_ask"][s]) + 1e-5) / max(1e-6, sum_pi_a)
         raw_sh_a = min(float(plan["pi_ask"][s]), full_sh_a)
         share_a = renorm_b * full_sh_a + (1.0 - renorm_b) * raw_sh_a
@@ -1603,12 +1637,12 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
                     init_qa_b = 0.0 if p_act > (b1 + 0.1 * t_sz) else float(plan["t_vis_bq"][s])
                     trader.ex_usdt_free = max(0.0, trader.ex_usdt_free - q_act * p_act * 1.001)
                     trader.bid_slots[s] = {"slot": s, "id": oid_n, "px": p_act, "qty": q_act, "act_ts": now_ts, "acc_fill": 0.0, "qa": init_qa_b, "qa0": init_qa_b}
-                    print(f"  📥 [NEURAL PLACE BID #{s:02d}] id={oid_n} | {q_act:.4f} PRL @ ${p_act:.{p_prec}f} (Mode#{m_idx}={m_prob:.0%} | E={exp_b:.0%})")
+                    print(f"  📥 [NEURAL PLACE BID #{s:02d}] id={oid_n} | {q_act:.4f} PRL @ ${p_act:.{p_prec}f} (Mode#{m_idx}={m_prob:.0%} | E={exp_b:.0%}) | t={_msk_ms()}")
                 else:
                     init_qa_a = 0.0 if p_act < (a1 - 0.1 * t_sz) else float(plan["t_vis_aq"][s])
                     trader.ex_coin_free = max(0.0, float(getattr(trader, "ex_coin_free", 0.0)) - q_act)
                     trader.ask_slots[s] = {"slot": s, "id": oid_n, "px": p_act, "qty": q_act, "act_ts": now_ts, "acc_fill": 0.0, "qa": init_qa_a, "qa0": init_qa_a}
-                    print(f"  📤 [NEURAL PLACE ASK #{s:02d}] id={oid_n} | {q_act:.4f} PRL @ ${p_act:.{p_prec}f} (Mode#{m_idx}={m_prob:.0%})")
+                    print(f"  📤 [NEURAL PLACE ASK #{s:02d}] id={oid_n} | {q_act:.4f} PRL @ ${p_act:.{p_prec}f} (Mode#{m_idx}={m_prob:.0%}) | t={_msk_ms()}")
 
     if b_tasks or a_tasks or to_cnl_b or to_cnl_a:
         trader._save_wallet()

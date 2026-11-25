@@ -471,6 +471,11 @@ class MultimodalMoEPolicyOrder3:
                 w2m_new[:, :, 54] = torch.randn((256, K_MODES_ORDER3), generator=gen) * 0.022
                 b2m_new[:, :, 54] = -5.50
                 b2m_new[:, 4, 54] = -3.50
+            if old_exp_d <= 55 and EXPERT_OUT_DIM_ORDER3 >= 56:
+                # L79 Wide-Spread Micro-Sniper [55]: тихий старт (-4.50, в Mode #4 -1.50 -> ~18% от 6.5% = ~1.2% проба на спреде >80 bp) с живым градиентом ES!
+                w2m_new[:, :, 55] = torch.randn((256, K_MODES_ORDER3), generator=gen) * 0.025
+                b2m_new[:, :, 55] = -4.50
+                b2m_new[:, 4, 55] = -1.50
 
             w2m_flat = w2m_new.reshape(256, MOE_OUT_DIM_ORDER3)
             b2m_flat = b2m_new.reshape(1, MOE_OUT_DIM_ORDER3)
@@ -625,6 +630,9 @@ class MultimodalMoEPolicyOrder3:
             if EXPERT_OUT_DIM_ORDER3 >= 55:
                 dw2m_v[:, :, :, 54] *= 4.20     # ускоренное обучение Controlled Maker Stop-Unwind [54]!
                 db2m_v[:, :, :, 54] *= 4.80
+            if EXPERT_OUT_DIM_ORDER3 >= 56:
+                dw2m_v[:, :, :, 55] *= 4.50     # ускоренное обучение Wide-Spread Micro-Sniper [55]!
+                db2m_v[:, :, :, 55] *= 5.20
         self.w2_moe[2 : 2 + 2 * half].copy_(base_gpu["w2_moe"].unsqueeze(0) + dw2m.to(self.dtype))
         self.b2_moe[2 : 2 + 2 * half].copy_(base_gpu["b2_moe"].unsqueeze(0) + db2m.to(self.dtype))
 
@@ -742,6 +750,7 @@ def train_order3(
     oos_hours: float = 17.0,
     inv_stress_frac: float = 0.35,
     world_mode: str = "dec",
+    harsh_stress: bool = True,
 ) -> None:
     t_start = time.time()
     device = torch.device(device_str if torch.cuda.is_available() else "cpu")
@@ -881,6 +890,7 @@ def train_order3(
                 bq10_all=bq10_gpu, aq10_all=aq10_gpu, sv_all=sv_gpu, bv_all=bv_gpu,
                 cand_states=cands, val_windows=bask, win_len=w_len, tick_sz=tick_sz, device=device,
                 calib_jitter_std=calib_jitter_std, enforce_activity_floor=enforce_activity_floor,
+                harsh_stress=harsh_stress,
             )
         chunks_res = []
         weights = []
@@ -893,6 +903,7 @@ def train_order3(
                 bq10_all=bq10_gpu, aq10_all=aq10_gpu, sv_all=sv_gpu, bv_all=bv_gpu,
                 cand_states=cands, val_windows=sub_padded, win_len=w_len, tick_sz=tick_sz, device=device,
                 calib_jitter_std=calib_jitter_std, enforce_activity_floor=enforce_activity_floor,
+                harsh_stress=harsh_stress,
             )
             chunks_res.append(r_sub)
             weights.append(float(len(sub_b)))
@@ -1461,28 +1472,21 @@ def train_order3(
         st_n = _normalize_weights_order3(d, policy.dtype)
         return {k: v.to(device=device, dtype=policy.dtype) for k, v in st_n.items()}
 
-    st_live_l75 = _load_gpu_seed(BASE_DIR / "models/prl/release_champion_v1.pt", st_l68_w30)
-    st_l74_prev = _load_gpu_seed(BASE_DIR / "models/prl/release_champion_v1_bak_l74_pre_l75.pt", st_live_l75)
-    st_l75_soup = _load_gpu_seed(SAVE_DIR / "bak_l75/order3_soup_top3.pt", st_live_l75)
-    st_l75_i0 = _load_gpu_seed(SAVE_DIR / "bak_l75/island_0_best.pt", st_live_l75)
-    st_l75_i1 = _load_gpu_seed(SAVE_DIR / "bak_l75/island_1_best.pt", st_live_l75)
-    dw_p = SAVE_DIR / "bak_l75/dual_world_candidates.pt"
-    if dw_p.exists():
-        dw_d = torch.load(dw_p, map_location="cpu", weights_only=False)
-        st_dw_c06 = {k: v.to(device=device, dtype=policy.dtype) for k, v in dw_d["06) L75_Soup50 + Live50"].items()}
-        st_dw_c09 = {k: v.to(device=device, dtype=policy.dtype) for k, v in dw_d["09) Tri(Soup+Hyb)+Live35"].items()}
-    else:
-        st_dw_c06 = st_live_l75
-        st_dw_c09 = st_l75_soup
+    st_live_champ = _load_gpu_seed(BASE_DIR / "models/prl/release_champion_v1.pt", st_l68_w30)
+    st_l77_prev = _load_gpu_seed(BASE_DIR / "models/prl/release_champion_v1_bak_l77_pre_l78.pt", st_live_champ)
+    st_l78_i0 = _load_gpu_seed(SAVE_DIR / "bak_l78/island_0_raw_best.pt", st_live_champ)
+    st_l78_i1 = _load_gpu_seed(SAVE_DIR / "bak_l78/island_1_dec_best.pt", st_live_champ)
+    st_l78_soup = _load_gpu_seed(SAVE_DIR / "bak_l78/order3_soup_top3.pt", st_live_champ)
+    st_l77_i1 = _load_gpu_seed(SAVE_DIR / "bak_l77/island_1_dec_best.pt", st_live_champ)
 
-    st_ms_53i0_52i1 = st_dw_c06
-    st_ms_53i0_56i0 = st_dw_c09
+    st_ms_53i0_52i1 = st_l78_i0
+    st_ms_53i0_56i0 = st_l78_i1
     is_warm_l43 = True
 
     seed_pool = (
-        [st_live_l75, st_dw_c06, st_dw_c09, st_l75_soup, st_l75_i0, st_l74_prev]
+        [st_live_champ, st_l77_prev, st_l78_i0, st_l78_i1, st_l78_soup, st_l77_i1]
         if island_id == 0
-        else [st_live_l75, st_dw_c09, st_dw_c06, st_l75_soup, st_l75_i1, st_l74_prev]
+        else [st_live_champ, st_l77_prev, st_l78_i1, st_l78_i0, st_l78_soup, st_l77_i1]
     )
     resume_iter = 0
     for res_p in [SAVE_DIR / "islands" / f"island_{island_id}_best.pt", SAVE_DIR / "global_best.pt", RESUME_CHAMP_PATH]:
@@ -1861,6 +1865,7 @@ def main():
     parser.add_argument("--oos-hours", type=float, default=22.0, help="Blind OOS tail hours reserved at end of dataset")
     parser.add_argument("--inv-stress", type=float, default=0.35, help="Fraction of windows with pre-loaded inventory stress")
     parser.add_argument("--world-mode", type=str, default="dec", choices=["dec", "raw"], help="Orderbook world mode: dec (decontaminated+interactive) or raw (untouched)")
+    parser.add_argument("--no-harsh-stress", action="store_true", help="Disable harsh_stress execution physics (default: harsh_stress=True)")
     args = parser.parse_args()
 
     train_order3(
@@ -1879,6 +1884,7 @@ def main():
         oos_hours=args.oos_hours,
         inv_stress_frac=args.inv_stress,
         world_mode=args.world_mode,
+        harsh_stress=(not args.no_harsh_stress),
     )
 
 

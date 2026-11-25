@@ -145,12 +145,17 @@ def main():
                 [
                     bb[:, 0:13], ak[:, 13:25], si[:, 25:26], bb[:, 26:35], ak[:, 35:36], si[:, 36:37],
                     bb[:, 37:41], ak[:, 41:44], bb[:, 44:45], ak[:, 45:47], bb[:, 47:48], si[:, 48:49],
-                    ak[:, 49:50], si[:, 50:52], ak[:, 52:53], bb[:, 53:54], ak[:, 54:55],
+                    ak[:, 49:50], si[:, 50:52], ak[:, 52:53], bb[:, 53:54], ak[:, 54:55], bb[:, 55:56],
                 ],
                 dim=-1,
             )
             sr = ref_strat_st.squeeze(0)
-            ref_pi_b = _fanned_slot_softmax(sr[1:13].unsqueeze(0), 0.08 + 2.42 * torch.sigmoid(sr[34:35]), 0.08 + 0.92 * torch.sigmoid(sr[44:45]), floor=0.005).squeeze(0).numpy()
+            rel_sp_t = (a1 - b1) / max(0.0001, b1)
+            wide_sp_g = min(1.0, max(0.0, (rel_sp_t - 0.0035) / 0.0045))
+            eff_mic_s = float(torch.sigmoid(sr[55]).item()) * wide_sp_g
+            log_b12 = sr[1:13].clone()
+            log_b12[0] = log_b12[0] + 5.0 * eff_mic_s
+            ref_pi_b = _fanned_slot_softmax(log_b12.unsqueeze(0), 0.08 + 2.42 * torch.sigmoid(sr[34:35]), 0.08 + 0.92 * torch.sigmoid(sr[44:45]), floor=0.005).squeeze(0).numpy()
             ref_pi_a = _fanned_slot_softmax(sr[13:25].unsqueeze(0), 0.08 + 2.42 * torch.sigmoid(sr[35:36]), 0.08 + 0.92 * torch.sigmoid(sr[44:45] + 0.25), floor=0.005).squeeze(0).numpy()
             echelon_k01 = torch.linspace(0.0, 1.0, 12, dtype=torch.float32)
             spread_room = max(0.0, a1 - b1 - 0.0001)
@@ -159,7 +164,10 @@ def main():
             retreat_b = b1 * 0.04 * float(torch.sigmoid(sr[38]).item()) * (1.0 - sniper_front)
             span_b_usd = b1 * (0.0005 + 0.2495 * float(torch.sigmoid(sr[39]).item()))
             gamma_b = 0.40 + 2.10 * float(torch.sigmoid(sr[40]).item())
-            raw_t_bid = (b1 + inside_b - retreat_b) - span_b_usd * torch.pow(echelon_k01, gamma_b)
+            ech0_m = (echelon_k01 < 0.01).float()
+            eff_ret_k = retreat_b * (1.0 - ech0_m * eff_mic_s)
+            eff_ins_k = torch.clamp(inside_b + ech0_m * (min(spread_room, 0.0002) * eff_mic_s), max=spread_room)
+            raw_t_bid = (b1 + eff_ins_k - eff_ret_k) - span_b_usd * torch.pow(echelon_k01, gamma_b)
             ref_t_bid = torch.clamp(torch.round(torch.clamp(raw_t_bid, max=max(0.0001, a1 - 0.0001)) / 0.0001) * 0.0001, min=0.0001).numpy()
 
             min_bp_test, low_tq_test = b1 * 0.994, 45.0

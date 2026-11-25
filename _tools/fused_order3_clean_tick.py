@@ -24,8 +24,8 @@ TOTAL_DIM_ORDER3 = 204
 
 MEM_DIM_ORDER3 = 48
 K_MODES_ORDER3 = 8
-EXPERT_OUT_DIM_ORDER3 = 55
-MOE_OUT_DIM_ORDER3 = K_MODES_ORDER3 * EXPERT_OUT_DIM_ORDER3  # 440
+EXPERT_OUT_DIM_ORDER3 = 56
+MOE_OUT_DIM_ORDER3 = K_MODES_ORDER3 * EXPERT_OUT_DIM_ORDER3  # 448
 ROUTER_EXTRA_DIM_ORDER3 = 40
 ROUTER_IN_DIM_ORDER3 = 256 + 8 + 8 + MEM_DIM_ORDER3 + ROUTER_EXTRA_DIM_ORDER3 + K_MODES_ORDER3  # 368
 ROUTER_H_DIM_ORDER3 = 128
@@ -223,6 +223,7 @@ def _order3_clean_tick_step(
     maker_fee: float,
     taker_fee: float,
     true_latency: bool = True,
+    harsh_stress: bool = False,
 ):
     W = b1_w0.shape[0]
     G = w1_ag_g.shape[0]
@@ -431,6 +432,7 @@ def _order3_clean_tick_step(
             ask_blend[:, 52:53],    # [52] tranche_carousel_z (независимая карусель нижнего транша!)
             bid_blend[:, 53:54],    # [53] sniper_front_z (подавление отступа трусости у Bid1!)
             ask_blend[:, 54:55],    # [54] unwind_front_z (L78 ранний мейкер-сброс передних эшелонов при сломе тренда!)
+            bid_blend[:, 55:56],    # [55] micro_sniper_z (L79 изолированный микро-снайпер широкого спреда на слоте #00!)
         ],
         dim=-1,
     )
@@ -442,15 +444,19 @@ def _order3_clean_tick_step(
     mode_ent_step = -(g_mode * torch.log(torch.clamp(g_mode, min=1e-6))).sum(dim=-1)
     sum_mode_ent = sum_mode_ent + mode_ent_step
 
-    # 1C. 100% Эндогенная экспозиция [0..1], распределение долей и непрерывный резерв каскадной постановки renorm_blend:
-    exp_bid_frac = torch.sigmoid(strat_raw[:, 0])
+    # 1C. 100% Эндогенная экспозиция [0..1] + L79 Wide-Spread Micro-Sniper [55] (до 6.5% на слоте #00 при спреде >35..80 bp):
+    rel_sp_now = (a1 - b1) / torch.clamp(b1, min=tick_size)
+    wide_sp_gate = torch.clamp((rel_sp_now - 0.0035) / 0.0045, 0.0, 1.0)
+    eff_micro_s = torch.sigmoid(strat_raw[:, 55]) * wide_sp_gate
+    exp_bid_frac = torch.maximum(torch.sigmoid(strat_raw[:, 0]), 0.065 * eff_micro_s)
     renorm_blend = torch.sigmoid(strat_raw[:, 47:48])
 
     tau_b = 0.08 + 2.42 * torch.sigmoid(strat_raw[:, 34:35])
     tau_a = 0.08 + 2.42 * torch.sigmoid(strat_raw[:, 35:36])
     max_share_b = 0.08 + 0.92 * torch.sigmoid(strat_raw[:, 44:45])
     max_share_a = 0.08 + 0.92 * torch.sigmoid(strat_raw[:, 44:45] + 0.25)
-    pi_bid = _fanned_slot_softmax(strat_raw[:, 1:13], tau_b, max_share_b, floor=0.005)
+    logits_b_12 = torch.cat([strat_raw[:, 1:2] + (5.0 * eff_micro_s).unsqueeze(1), strat_raw[:, 2:13]], dim=-1)
+    pi_bid = _fanned_slot_softmax(logits_b_12, tau_b, max_share_b, floor=0.005)
     pi_ask = _fanned_slot_softmax(strat_raw[:, 13:25], tau_a, max_share_a, floor=0.005)
     # 2. Непрерывный эндогенный Taker-вентиль БЕЗ карательного сноса обеспеченных Ask-очередей при частичном хеджировании:
     u_taker = torch.tanh(F.relu(strat_raw[:, 25]))
@@ -540,7 +546,11 @@ def _order3_clean_tick_step(
     gamma_b = 0.40 + 2.10 * torch.sigmoid(strat_raw[:, 40])
 
     curve_b = torch.pow(echelon_k01.unsqueeze(0), gamma_b.unsqueeze(1))
-    raw_t_bid = (b1 + inside_b - retreat_b).unsqueeze(1) - span_b_usd.unsqueeze(1) * curve_b
+    ech0_m = (echelon_k01 < 0.01).float().unsqueeze(0)  # [1, 12]: 1.0 только на слоте #00!
+    eff_retreat_k = retreat_b.unsqueeze(1) * (1.0 - ech0_m * eff_micro_s.unsqueeze(1))
+    micro_step_in = torch.minimum(spread_room, torch.full_like(spread_room, 2.0 * tick_size)) * eff_micro_s
+    eff_inside_k = torch.minimum(spread_room.unsqueeze(1), inside_b.unsqueeze(1) + ech0_m * micro_step_in.unsqueeze(1))
+    raw_t_bid = (b1.unsqueeze(1) + eff_inside_k - eff_retreat_k) - span_b_usd.unsqueeze(1) * curve_b
     max_maker_bid = torch.clamp(a1 - tick_size, min=tick_size).unsqueeze(1)
     t_bid_px = torch.clamp(torch.round(torch.minimum(raw_t_bid, max_maker_bid) / tick_size) * tick_size, min=tick_size)
 
@@ -586,7 +596,8 @@ def _order3_clean_tick_step(
     ctx_4d_a = torch.tanh(strat_raw[:, 30:34])
     s_2d = s_cur_i16.view(1, 1)
     next_s_2d = s_nxt_i16.view(1, 1)
-    act_lat_2d = (next_s_2d + 1) if true_latency else next_s_2d
+    base_lat_ticks = 3 if harsh_stress else (2 if true_latency else 0)
+    act_lat_2d = next_s_2d + base_lat_ticks
 
     had_b_pre = bid_qty > 1e-6
     had_a_pre = ask_qty > 1e-6
@@ -705,9 +716,10 @@ def _order3_clean_tick_step(
     g_cnl_b = rb_out[:, :, 1] > 0.0
     g_plc_a = ra_out[:, :, 0] > 0.0
     g_cnl_a = ra_out[:, :, 1] > 0.0
-    # 5. Ранжированное по срочности снятие ордеров + Эндогенный резерв каскадной постановки renorm_blend:
+    # 5. Ранжированное по срочности снятие ордеров (в полёте HTTP до bid_act_s/ask_act_s ордер ещё не подтверждён движком Peatio -> рутинный cancel ждёт оседания в книге!):
+    settled_b = (s_2d >= bid_act_s) if true_latency else torch.ones_like(had_b_pre)
     crossed_b = bid_px >= (a1.unsqueeze(1) - 0.1 * tick_size)
-    want_cnl_b = had_b_pre & (crossed_b | g_cnl_b)
+    want_cnl_b = had_b_pre & (crossed_b | (settled_b & g_cnl_b))
     prio_cnl_b = torch.where(want_cnl_b, rb_out[:, :, 1] + crossed_b.float() * 100.0, torch.full_like(bid_qty, -1e4))
     ord_cb = torch.argsort(prio_cnl_b, dim=1, descending=True)
     inv_cb = torch.argsort(ord_cb, dim=1)
@@ -716,8 +728,9 @@ def _order3_clean_tick_step(
     clear_b = torch.gather(allow_cb_s, 1, inv_cb)
     api_tokens = torch.clamp(api_tokens - clear_b.float().sum(dim=1), min=0.0)
 
+    settled_a = (s_2d >= ask_act_s) if true_latency else torch.ones_like(had_a_pre)
     crossed_a = ask_px <= (b1.unsqueeze(1) + 0.1 * tick_size)
-    want_cnl_a = had_a_pre & ((~hp_now_mask) | crossed_a | g_cnl_a)
+    want_cnl_a = had_a_pre & ((~hp_now_mask) | crossed_a | (settled_a & g_cnl_a))
     prio_cnl_a = torch.where(want_cnl_a, ra_out[:, :, 1] + (crossed_a | (~hp_now_mask)).float() * 100.0, torch.full_like(ask_qty, -1e4))
     ord_ca = torch.argsort(prio_cnl_a, dim=1, descending=True)
     inv_ca = torch.argsort(ord_ca, dim=1)
@@ -729,6 +742,11 @@ def _order3_clean_tick_step(
     n_cnl_b_step = clear_b.long().sum(dim=1)
     n_cnl_a_step = clear_a.long().sum(dim=1) + had_ask_taker_cnt
 
+    # Peatio v2 Cancel-Lock Quarantine: при отмене на шаге s слот НЕ перезанимается в ту же миллисекунду, а часть locked-маржи ждёт async-воркера!
+    cnl_lock_frac = 1.00 if harsh_stress else (0.65 if true_latency else 0.0)
+    cnl_locked_b_usd = cnl_lock_frac * torch.where(clear_b, bid_qty * bid_px * (1.0 + maker_fee), torch.zeros_like(bid_qty)).sum(dim=1)
+    cnl_locked_a_qty = cnl_lock_frac * torch.where(clear_a, ask_qty, torch.zeros_like(ask_qty)).sum(dim=1)
+
     bid_qty = torch.where(clear_b, torch.zeros_like(bid_qty), bid_qty)
     bid_px = torch.where(clear_b, torch.zeros_like(bid_px), bid_px)
     bid_qa = torch.where(clear_b, torch.zeros_like(bid_qa), bid_qa)
@@ -739,12 +757,12 @@ def _order3_clean_tick_step(
     ask_qa = torch.where(clear_a, torch.zeros_like(ask_qa), ask_qa)
     ask_qa0 = torch.where(clear_a, torch.zeros_like(ask_qa0), ask_qa0)
 
-    res_cash_after_cnl = (bid_qty * bid_px * (1.0 + maker_fee)).sum(dim=1)
+    res_cash_after_cnl = (bid_qty * bid_px * (1.0 + maker_fee)).sum(dim=1) + cnl_locked_b_usd
     free_cash_for_b = torch.clamp(cash * 0.998 - res_cash_after_cnl, min=0.0)
     rem_exp_for_b = torch.clamp(tot_bud_eff * 0.996 * exp_bid_frac - pos_qty * b1 - res_cash_after_cnl, min=0.0)
     avail_b_usd = torch.minimum(free_cash_for_b, rem_exp_for_b)
 
-    empty_b_now = bid_qty <= 1e-6
+    empty_b_now = (bid_qty <= 1e-6) & ((~clear_b) if true_latency else torch.ones_like(clear_b))
     cand_plc_b = empty_b_now & g_plc_b & (pi_bid > 1e-4) & ((avail_b_usd.unsqueeze(1) / (t_bid_px * (1.0 + maker_fee))) >= 2.0)
     ord_b_idx = torch.argsort(torch.where(cand_plc_b, pi_bid, torch.full_like(pi_bid, -1.0)), dim=1, descending=True)
     inv_b_idx = torch.argsort(ord_b_idx, dim=1)
@@ -757,7 +775,7 @@ def _order3_clean_tick_step(
     full_share_b = torch.where(sum_pi_sel_b > 1e-6, pi_sel_b / torch.clamp(sum_pi_sel_b, min=1e-6), torch.zeros_like(pi_sel_b))
     raw_share_b = torch.where(want_place_b, torch.minimum(pi_bid, full_share_b), torch.zeros_like(pi_bid))
     share_sel_b = renorm_blend * full_share_b + (1.0 - renorm_blend) * raw_share_b
-    plc_b_qty = (avail_b_usd.unsqueeze(1) * share_sel_b) / (t_bid_px * (1.0 + maker_fee))
+    plc_b_qty = torch.floor(((avail_b_usd.unsqueeze(1) * share_sel_b * 0.999) / (t_bid_px * (1.0 + maker_fee))) * 10000.0) / 10000.0
     valid_b = want_place_b & (plc_b_qty >= 2.0)
     plc_b_qty = torch.where(valid_b, plc_b_qty, torch.zeros_like(plc_b_qty))
     n_plc_b_step = valid_b.long().sum(dim=1)
@@ -768,18 +786,23 @@ def _order3_clean_tick_step(
     p_pj_s = torch.clamp(mkt_w[:, 84:85].float() * 0.40 + 0.30, 0.0, 1.0)
     p_pj_w = torch.clamp(mkt_w[:, 85:86].float() * 0.40 + 0.30, 0.0, 1.0)
 
+    # Транспортный 2-тиковый зазор от встречного BBO при широком спреде (1-в-1 с execute_live_24slot_order3 в order3_live_bridge.py):
+    flight_guard = torch.where((a1 - b1) >= 2.9 * tick_size, torch.full_like(a1, 2.0), torch.ones_like(a1)).unsqueeze(1)
+    t_bid_px = torch.minimum(t_bid_px, torch.clamp(a1.unsqueeze(1) - flight_guard * tick_size, min=tick_size))
     inside_sp_b = t_bid_px > (b1.unsqueeze(1) + 0.1 * tick_size)
     at_bbo_b = (~inside_sp_b) & (t_bid_px >= (b1.unsqueeze(1) - 12.0 * tick_size))
     slot_usd_b = plc_b_qty * t_bid_px
     w_frac_b = torch.clamp((slot_usd_b - 35.0) / 215.0, 0.0, 1.0)
     eff_pj_b = p_pj_s + w_frac_b * (p_pj_w - p_pj_s)
-    # Эмпирический rival front-run в долях очереди, когда пассивно стоим на BBO в режиме высокого penny-jump (Audit 1A/1B: 54.9% at BBO vs 21.5% inside spread!):
+    pj_mult = 1.65 if harsh_stress else 1.0
+    # Audit 1A/1B: 56.5% penny-jump at BBO AND 23.0% inside spread (<0 bp) + whale book-push!
     rival_qa_b = torch.where(
         at_bbo_b,
-        torch.clamp(eff_pj_b - 0.25, min=0.0) * (15.0 + 0.65 * plc_b_qty * (0.35 + 0.65 * w_frac_b)),
+        pj_mult * torch.clamp(eff_pj_b - 0.22, min=0.0) * (18.0 + 0.85 * plc_b_qty * (0.35 + 0.65 * w_frac_b)),
         torch.zeros_like(t_vis_bq),
     )
-    base_b_qa = torch.where(inside_sp_b, torch.zeros_like(t_vis_bq), t_vis_bq + rival_qa_b)
+    rival_in_sp_b = pj_mult * torch.clamp(eff_pj_b - 0.28, min=0.0) * (8.0 + 0.45 * plc_b_qty * (0.25 + 0.75 * w_frac_b))
+    base_b_qa = torch.where(inside_sp_b, rival_in_sp_b, t_vis_bq + rival_qa_b)
 
     bid_px = torch.where(valid_b, t_bid_px, bid_px)
     bid_qty = torch.where(valid_b, plc_b_qty, bid_qty)
@@ -787,9 +810,11 @@ def _order3_clean_tick_step(
     bid_qa0 = torch.where(valid_b, base_b_qa.to(dt), bid_qa0)
     bid_act_s = torch.where(valid_b, act_lat_2d.expand_as(bid_act_s), bid_act_s)
 
-    unreserved_pos = torch.clamp(pos_qty - ask_qty.sum(dim=1), min=0.0).unsqueeze(1)
-    empty_a_now = ask_qty <= 1e-6
-    cand_plc_a = empty_a_now & hp_now_mask & g_plc_a & (pi_ask > 1e-4) & (unreserved_pos >= 2.0)
+    fill_sync_lag = 2 if harsh_stress else (1 if true_latency else 0)
+    fill_synced_mask = ((s_2d >= entry_s.unsqueeze(1) + fill_sync_lag) if fill_sync_lag > 0 else torch.ones_like(hp_now_mask))
+    unreserved_pos = torch.clamp(pos_qty - ask_qty.sum(dim=1) - cnl_locked_a_qty, min=0.0).unsqueeze(1)
+    empty_a_now = (ask_qty <= 1e-6) & ((~clear_a) if true_latency else torch.ones_like(clear_a))
+    cand_plc_a = empty_a_now & hp_now_mask & fill_synced_mask & g_plc_a & (pi_ask > 1e-4) & (unreserved_pos >= 2.0)
     ord_a_idx = torch.argsort(torch.where(cand_plc_a, pi_ask, torch.full_like(pi_ask, -1.0)), dim=1, descending=True)
     inv_a_idx = torch.argsort(ord_a_idx, dim=1)
     cand_a_sorted = torch.gather(cand_plc_a.float(), 1, ord_a_idx)
@@ -801,13 +826,14 @@ def _order3_clean_tick_step(
     full_share_a = torch.where(sum_pi_sel_a > 1e-6, pi_sel_a / torch.clamp(sum_pi_sel_a, min=1e-6), torch.zeros_like(pi_sel_a))
     raw_share_a = torch.where(want_place_a, torch.minimum(pi_ask, full_share_a), torch.zeros_like(pi_ask))
     share_sel_a = renorm_blend * full_share_a + (1.0 - renorm_blend) * raw_share_a
-    plc_a_qty = unreserved_pos * share_sel_a
+    plc_a_qty = torch.floor((unreserved_pos * share_sel_a) * 10000.0) / 10000.0
     valid_a = want_place_a & (plc_a_qty >= 2.0)
     plc_a_qty = torch.where(valid_a, plc_a_qty, torch.zeros_like(plc_a_qty))
     n_plc_a_step = valid_a.long().sum(dim=1)
     api_tokens = torch.clamp(api_tokens - valid_a.float().sum(dim=1), min=0.0)
     n_req_a_step = (clear_a & valid_a).long().sum(dim=1)
 
+    t_ask_px = torch.maximum(t_ask_px, b1.unsqueeze(1) + flight_guard * tick_size)
     inside_sp_a = t_ask_px < (a1.unsqueeze(1) - 0.1 * tick_size)
     at_bbo_a = (~inside_sp_a) & (t_ask_px <= (a1.unsqueeze(1) + 12.0 * tick_size))
     slot_usd_a = plc_a_qty * t_ask_px
@@ -815,10 +841,11 @@ def _order3_clean_tick_step(
     eff_pj_a = p_pj_s + w_frac_a * (p_pj_w - p_pj_s)
     rival_qa_a = torch.where(
         at_bbo_a,
-        torch.clamp(eff_pj_a - 0.25, min=0.0) * (15.0 + 0.65 * plc_a_qty * (0.35 + 0.65 * w_frac_a)),
+        pj_mult * torch.clamp(eff_pj_a - 0.22, min=0.0) * (18.0 + 0.85 * plc_a_qty * (0.35 + 0.65 * w_frac_a)),
         torch.zeros_like(t_vis_aq),
     )
-    base_a_qa = torch.where(inside_sp_a, torch.zeros_like(t_vis_aq), t_vis_aq + rival_qa_a)
+    rival_in_sp_a = pj_mult * torch.clamp(eff_pj_a - 0.28, min=0.0) * (8.0 + 0.45 * plc_a_qty * (0.25 + 0.75 * w_frac_a))
+    base_a_qa = torch.where(inside_sp_a, rival_in_sp_a, t_vis_aq + rival_qa_a)
 
     ask_px = torch.where(valid_a, t_ask_px, ask_px)
     ask_qty = torch.where(valid_a, plc_a_qty, ask_qty)
@@ -828,12 +855,21 @@ def _order3_clean_tick_step(
 
     n_mut_tot = n_cnl_b_step + n_cnl_a_step + n_plc_b_step + n_plc_a_step
     if true_latency:
-        burst_delay = ((n_mut_tot > 4) | (api_tokens < 2.0)).unsqueeze(1)
-        extra_s = torch.where((api_tokens < 1.0).unsqueeze(1), (next_s_2d + 3).expand_as(bid_act_s), (next_s_2d + 2).expand_as(bid_act_s))
+        burst_delay = ((n_mut_tot >= 2) | (api_tokens < 3.0)).unsqueeze(1)
+        lat_med = 5 if harsh_stress else 3
+        lat_hi = 6 if harsh_stress else 4
+        extra_s = torch.where((n_mut_tot >= 5).unsqueeze(1) | (api_tokens < 1.5).unsqueeze(1), (next_s_2d + lat_hi).expand_as(bid_act_s), (next_s_2d + lat_med).expand_as(bid_act_s))
         bid_act_s = torch.where(valid_b & burst_delay, extra_s, bid_act_s)
         ask_act_s = torch.where(valid_a & burst_delay, extra_s, ask_act_s)
 
-    # 6. Исполнение FIFO-очередей без фантомной ликвидности и с полной 12-слотовой дедупликацией цен:
+    # Непрерывный дрейф соперников вперёд нашей стоячей плиты у края стакана (penny-jump erosion):
+    rest_near_b = (bid_qty > 1e-6) & (~valid_b) & (bid_px >= b1.unsqueeze(1) - 6.0 * tick_size)
+    rest_near_a = (ask_qty > 1e-6) & (~valid_a) & (ask_px <= a1.unsqueeze(1) + 6.0 * tick_size)
+    drip_rate = 1.60 if harsh_stress else 0.75
+    bid_qa = torch.where(rest_near_b, bid_qa + drip_rate * torch.clamp(p_pj_s - 0.25, min=0.0), bid_qa)
+    ask_qa = torch.where(rest_near_a, ask_qa + drip_rate * torch.clamp(p_pj_s - 0.25, min=0.0), ask_qa)
+
+    # 6. Реалистичное и стрессовое ("Тяжело в учении") исполнение FIFO-очередей с асимметричным Adverse Selection:
     nb1_1w = torch.clamp(nb1_w0, min=tick_size)
     na1_1w = torch.clamp(na1_w0, min=nb1_1w + tick_size)
     nb1 = nb1_1w.unsqueeze(1).expand(W, E).reshape(N, 1)
@@ -846,18 +882,66 @@ def _order3_clean_tick_step(
     tril_s = torch.tril(torch.ones((S, S), dtype=torch.bool, device=bid_px.device), diagonal=-1).unsqueeze(0)
 
     act_b = (bid_qty > 1e-6) & (next_s_2d >= bid_act_s)
-    strict_cross_b = na1 <= (bid_px - 0.5 * tick_size)
-    hit_b = act_b & (strict_cross_b | ((nb1 <= bid_px + 1e-6) & (sv > 0.0)))
-    any_strict_b = (act_b & strict_cross_b).any(dim=1, keepdim=True)
-    # При строгом пересечении без ленты объем физически ограничен встречной заявкой na1_q (0 фантомных монет от b1_q!):
-    tot_flow_b = torch.where(any_strict_b, torch.maximum(sv, na1_q), sv)
+    b1_2d = b1.unsqueeze(1)
+    a1_2d = a1.unsqueeze(1)
+    b1_q_2d = b1_q.unsqueeze(1)
+    a1_q_2d = a1_q.unsqueeze(1)
+
+    # Закон сохранения массы стакана SafeTrade (отсечение 82.7% mid-spread self-wash объёма, где b1/b1_q и a1/a1_q не сдвинулись ни на йоту!):
+    b1_cleared = nb1 < (b1_2d - 0.1 * tick_size)
+    a1_cleared = na1 > (a1_2d + 0.1 * tick_size)
+    same_b1 = torch.abs(nb1 - b1_2d) <= 0.1 * tick_size
+    same_a1 = torch.abs(na1 - a1_2d) <= 0.1 * tick_size
+    depl_b1 = torch.where(same_b1, torch.clamp(b1_q_2d - nb1_q, min=0.0), torch.zeros_like(nb1_q))
+    depl_a1 = torch.where(same_a1, torch.clamp(a1_q_2d - na1_q, min=0.0), torch.zeros_like(na1_q))
+    pure_wash_tick = same_b1 & same_a1 & (torch.abs(nb1_q - b1_q_2d) < 1e-3) & (torch.abs(na1_q - a1_q_2d) < 1e-3)
+
+    in_sp_ord_b = bid_px > (b1_2d + 0.1 * tick_size)
+    price_through_b = nb1 < (bid_px - 0.5 * tick_size)
+    touch_only_b = (~price_through_b) & (nb1 <= bid_px + 1e-6)
+    deep_cross_b = na1 <= (bid_px - 2.5 * tick_size)
+    is_toxic_dump_b = b1_cleared | ((~pure_wash_tick) & (sv > 1.50 * bv + 15.0) & (depl_b1 > 5.0))
+
+    in_sp_org_frac = 0.010 if harsh_stress else 0.022
+    depl_real_frac = 0.12 if harsh_stress else 0.24
+    touch_frac_fav = 0.09 if harsh_stress else 0.18
+    touch_frac_tox = 1.00 if harsh_stress else 0.88
+    cross_q_cap = 0.05 if harsh_stress else 0.12
+    qa_evap_tox_b = 0.16 if harsh_stress else 0.42
+    qa_comp_fav = 1.50 if harsh_stress else 1.12
+
+    # При неизменном b1 падение b1_q (depl_b1) частично вызвано отменами, а объём сделки СТРОГО ограничен сверху реальной лентой sv!
+    clr_sv_cap = sv if harsh_stress else torch.minimum(sv, b1_q_2d + 0.35 * sv)
+    org_sv_at_book = torch.where(b1_cleared, clr_sv_cap, torch.minimum(sv, depl_real_frac * depl_b1))
+    org_sv_in_sp = torch.where(
+        b1_cleared,
+        clr_sv_cap,
+        torch.where(pure_wash_tick, torch.zeros_like(sv), torch.minimum(sv, torch.maximum(depl_real_frac * depl_b1, in_sp_org_frac * sv))),
+    )
+    org_sv_slot = torch.where(in_sp_ord_b, org_sv_in_sp, org_sv_at_book)
+
+    hit_b = act_b & (deep_cross_b | ((price_through_b | touch_only_b) & (org_sv_slot > 1e-5)))
+    eff_sv_slot_b = torch.where(
+        price_through_b & b1_cleared & is_toxic_dump_b,
+        org_sv_slot,
+        torch.where(is_toxic_dump_b, touch_frac_tox * org_sv_slot, touch_frac_fav * org_sv_slot),
+    )
+    tot_flow_b = torch.where(deep_cross_b, torch.maximum(eff_sv_slot_b, cross_q_cap * na1_q), eff_sv_slot_b)
+    # Sweep-through (проверено прогоном 27k реальных ордеров 23–25 ноября): если реальные продажи увели книгу (без нас) строго ниже нашей цены,
+    # весь объём ленты sv прошёл через уровни от b1 до nb1 -> поток к нашему уровню = sv (дальше вычитаются лучшие уровни и очередь).
+    # В harsh_stress требуется проход минимум на 2 тика.
+    sweep_b = act_b & price_through_b & b1_cleared & (sv > 1e-5) & (nb1 < bid_px - (1.5 if harsh_stress else 0.5) * tick_size)
+    hit_b = hit_b | sweep_b
+    tot_flow_b = torch.where(sweep_b, torch.maximum(tot_flow_b, sv), tot_flow_b)
 
     same_px_earlier_b = (
         (torch.abs(bid_px.unsqueeze(2) - bid_px.unsqueeze(1)) < 0.1 * tick_size)
         & act_b.unsqueeze(1)
         & tril_s
     ).any(dim=2)
-    inc_qa_b = torch.where(same_px_earlier_b, torch.zeros_like(bid_qa), bid_qa)
+    # Асимметрия спотового стакана: при токсичном сливе чужие биды снимаются (подставляя нас под нож), а на спокойном дне конкурируют за вход!
+    adj_bid_qa = torch.where(is_toxic_dump_b, bid_qa * qa_evap_tox_b, bid_qa * qa_comp_fav)
+    inc_qa_b = torch.where(same_px_earlier_b, torch.zeros_like(adj_bid_qa), adj_bid_qa)
     eff_qa_b = torch.where(hit_b, inc_qa_b, torch.zeros_like(bid_qa))
     eff_qty_b = torch.where(hit_b, bid_qty, torch.zeros_like(bid_qty))
 
@@ -875,23 +959,28 @@ def _order3_clean_tick_step(
     bid_qa = torch.where(hit_b, torch.clamp(bid_qa - qa_eaten_b, min=0.0), bid_qa)
 
     want_b = torch.minimum(eff_qty_b, torch.clamp(rem_flow_at_slot_b - eff_qa_b, min=0.0))
-    # Точный долларовый контроль платежеспособности по фактической цене слота bid_px (0 бесплатного плеча!):
-    unit_cost_b = torch.clamp(bid_px * (1.0 + maker_fee), min=tick_size)
-    want_cost_b = want_b * unit_cost_b
+    # Точная бухгалтерия SafeTrade (Peatio v2): при покупке списывается чистый USDT = f_q_gross * bid_px, а комиссия удерживается в монете PRL с округлением лота до 0.0001!
+    eff_m_fee = maker_fee * (1.30 if harsh_stress else 1.0)
+    near_opp_b = (next_s_2d == bid_act_s) & (bid_px >= a1.unsqueeze(1) - 2.1 * tick_size)
+    slot_fee_b = torch.where(near_opp_b, torch.full_like(bid_px, taker_fee if harsh_stress else 0.5 * (maker_fee + taker_fee)), torch.full_like(bid_px, eff_m_fee))
+    unit_px_b = torch.clamp(bid_px, min=tick_size)
+    want_b_q4 = torch.floor(want_b * 10000.0) / 10000.0
+    want_cost_b = want_b_q4 * unit_px_b
     cum_cost_b = torch.cumsum(want_cost_b, dim=1)
     avail_usd_slot_b = torch.clamp(cash.unsqueeze(1) * 0.999 - (cum_cost_b - want_cost_b), min=0.0)
-    f_q = torch.minimum(want_b, avail_usd_slot_b / unit_cost_b)
+    f_q = torch.floor(torch.minimum(want_b_q4, avail_usd_slot_b / unit_px_b) * 10000.0) / 10000.0
+    f_q_net = torch.floor(f_q * (1.0 - slot_fee_b) * 10000.0) / 10000.0
 
-    has_slot_b = f_q > 1e-5
-    tot_fq = f_q.sum(dim=1)
-    tot_cost_raw = (f_q * bid_px).sum(dim=1)
-    tot_cost = tot_cost_raw * (1.0 + maker_fee)
+    has_slot_b = f_q_net > 1e-5
+    tot_fq = f_q_net.sum(dim=1)
+    tot_cost_raw = (f_q_net * bid_px).sum(dim=1)
+    tot_cost = (f_q * bid_px).sum(dim=1)
     has_buy = tot_fq > 1e-5
     n_fills = torch.clamp(n_fills.long() + has_buy.long(), max=2000000).to(torch.int32)
-    fill_qp_b_step = torch.where(has_buy, (f_q * pre_fill_qp_b).sum(dim=1) / torch.clamp(tot_fq, min=1e-6), torch.zeros_like(tot_fq))
+    fill_qp_b_step = torch.where(has_buy, (f_q_net * pre_fill_qp_b).sum(dim=1) / torch.clamp(tot_fq, min=1e-6), torch.zeros_like(tot_fq))
     old_q = pos_qty
     pos_pre_buy = old_q
-    new_q = old_q + tot_fq
+    new_q = torch.floor((old_q + tot_fq) * 10000.0) / 10000.0
     avg_fill_b_px = tot_cost_raw / torch.clamp(tot_fq, min=1e-6)
     first_buy = has_buy & (old_q <= 1e-6)
     no_low_yet = has_buy & (old_q > 1e-6) & (low_tranche_qty <= 1e-6)
@@ -927,18 +1016,41 @@ def _order3_clean_tick_step(
     bid_qty = torch.where(has_slot_b, torch.where(rem_ord_b >= 2.0, rem_ord_b, torch.zeros_like(rem_ord_b)), bid_qty)
     # Ask может продавать ТОЛЬКО монеты pos_pre_buy, уже находившиеся на балансе до начала этой секунды (0 внутрисекундного wash-круга!):
     act_a = (ask_qty > 1e-6) & (next_s_2d >= ask_act_s) & (pos_pre_buy.unsqueeze(1) > 1e-6)
-    strict_cross_a = nb1 >= (ask_px + 0.5 * tick_size)
-    hit_a = act_a & (strict_cross_a | ((na1 >= ask_px - 1e-6) & (bv > 0.0)))
-    any_strict_a = (act_a & strict_cross_a).any(dim=1, keepdim=True)
-    # При строгом пересечении без ленты объем физически ограничен встречной заявкой nb1_q (0 фантомных монет от a1_q!):
-    tot_flow_a = torch.where(any_strict_a, torch.maximum(bv, nb1_q), bv)
+    in_sp_ord_a = ask_px < (a1_2d - 0.1 * tick_size)
+    price_through_a = na1 > (ask_px + 0.5 * tick_size)
+    touch_only_a = (~price_through_a) & (na1 >= ask_px - 1e-6)
+    deep_cross_a = nb1 >= (ask_px + 2.5 * tick_size)
+    is_fomo_rip_a = a1_cleared | ((~pure_wash_tick) & (bv > 1.50 * sv + 15.0) & (depl_a1 > 5.0))
+
+    # На споте выход через Ask — это конкуренция с другими продавцами за реального покупателя (0 испарения очереди в нашу пользу!):
+    clr_bv_cap = torch.minimum(bv, (0.42 if harsh_stress else 0.72) * a1_q_2d + (0.08 if harsh_stress else 0.18) * bv)
+    org_bv_at_book = torch.where(a1_cleared, clr_bv_cap, torch.minimum(bv, depl_real_frac * depl_a1))
+    org_bv_in_sp = torch.where(
+        a1_cleared,
+        clr_bv_cap,
+        torch.where(pure_wash_tick, torch.zeros_like(bv), torch.minimum(bv, torch.maximum(depl_real_frac * depl_a1, in_sp_org_frac * bv))),
+    )
+    org_bv_slot = torch.where(in_sp_ord_a, org_bv_in_sp, org_bv_at_book)
+
+    hit_a = act_a & (deep_cross_a | ((price_through_a | touch_only_a) & (org_bv_slot > 1e-5)))
+    ask_fill_frac = (0.45 if harsh_stress else 0.68)
+    eff_bv_slot_a = torch.where(
+        price_through_a & a1_cleared,
+        ask_fill_frac * org_bv_slot,
+        touch_frac_fav * org_bv_slot,
+    )
+    tot_flow_a = torch.where(deep_cross_a, torch.maximum(eff_bv_slot_a, cross_q_cap * nb1_q), eff_bv_slot_a)
+    sweep_a = act_a & price_through_a & a1_cleared & (bv > 1e-5) & (na1 > ask_px + (1.5 if harsh_stress else 0.5) * tick_size)
+    hit_a = hit_a | sweep_a
+    tot_flow_a = torch.where(sweep_a, torch.maximum(tot_flow_a, bv), tot_flow_a)
 
     same_px_earlier_a = (
         (torch.abs(ask_px.unsqueeze(2) - ask_px.unsqueeze(1)) < 0.1 * tick_size)
         & act_a.unsqueeze(1)
         & tril_s
     ).any(dim=2)
-    inc_qa_a = torch.where(same_px_earlier_a, torch.zeros_like(ask_qa), ask_qa)
+    adj_ask_qa = ask_qa * qa_comp_fav
+    inc_qa_a = torch.where(same_px_earlier_a, torch.zeros_like(adj_ask_qa), adj_ask_qa)
     eff_qa_a = torch.where(hit_a, inc_qa_a, torch.zeros_like(ask_qa))
     eff_qty_a = torch.where(hit_a, ask_qty, torch.zeros_like(ask_qty))
 
@@ -955,13 +1067,15 @@ def _order3_clean_tick_step(
     qa_eaten_a = torch.minimum(ask_qa, rem_flow_at_slot_a)
     ask_qa = torch.where(hit_a, torch.clamp(ask_qa - qa_eaten_a, min=0.0), ask_qa)
 
-    want_a = torch.minimum(eff_qty_a, torch.clamp(rem_flow_at_slot_a - eff_qa_a, min=0.0))
+    want_a = torch.floor(torch.minimum(eff_qty_a, torch.clamp(rem_flow_at_slot_a - eff_qa_a, min=0.0)) * 10000.0) / 10000.0
     cum_want_a = torch.cumsum(want_a, dim=1)
-    f_qa = torch.minimum(want_a, torch.clamp(pos_pre_buy.unsqueeze(1) - (cum_want_a - want_a), min=0.0))
+    f_qa = torch.floor(torch.minimum(want_a, torch.clamp(pos_pre_buy.unsqueeze(1) - (cum_want_a - want_a), min=0.0)) * 10000.0) / 10000.0
 
     has_slot_a = f_qa > 1e-5
     tot_fqa = f_qa.sum(dim=1)
-    tot_rev = (f_qa * ask_px).sum(dim=1) * (1.0 - maker_fee)
+    near_opp_a = (next_s_2d == ask_act_s) & (ask_px <= b1.unsqueeze(1) + 2.1 * tick_size)
+    slot_fee_a = torch.where(near_opp_a, torch.full_like(ask_px, taker_fee if harsh_stress else 0.5 * (maker_fee + taker_fee)), torch.full_like(ask_px, eff_m_fee))
+    tot_rev = (f_qa * ask_px * (1.0 - slot_fee_a)).sum(dim=1)
     has_sell = tot_fqa > 1e-5
     n_fills = torch.clamp(n_fills.long() + has_sell.long(), max=2000000).to(torch.int32)
     fill_qp_a_step = torch.where(has_sell, (f_qa * pre_fill_qp_a).sum(dim=1) / torch.clamp(tot_fqa, min=1e-6), torch.zeros_like(tot_fqa))
@@ -1053,10 +1167,10 @@ _ORDER3_CUDAGRAPH_CACHE: dict[tuple, dict] = {}
 
 def _get_or_build_order3_cudagraph(
     W: int, C: int, win_len: int, t_blk_sz: int, dt: torch.dtype, device: torch.device,
-    tick_sz: float, maker_fee: float, taker_fee: float, true_latency: bool,
+    tick_sz: float, maker_fee: float, taker_fee: float, true_latency: bool, harsh_stress: bool = False,
 ) -> dict:
     """Строит и кэширует аппаратный CUDA Graph одного тика симуляции с индексацией на GPU (0 Python overhead в цикле!)."""
-    key = (W, C, win_len, t_blk_sz, dt, str(device), tick_sz, maker_fee, taker_fee, true_latency)
+    key = (W, C, win_len, t_blk_sz, dt, str(device), tick_sz, maker_fee, taker_fee, true_latency, harsh_stress)
     if key in _ORDER3_CUDAGRAPH_CACHE:
         return _ORDER3_CUDAGRAPH_CACHE[key]
 
@@ -1189,7 +1303,7 @@ def _get_or_build_order3_cudagraph(
             buf["wreg2_c"], buf["breg2b_c"], buf["breg2a_c"],
             buf["echelon_k01"], buf["budget"],
             *(buf[k] for k in state_keys),
-            tick_sz, maker_fee, taker_fee, true_latency,
+            tick_sz, maker_fee, taker_fee, true_latency, harsh_stress,
         )
         for k, v in zip(state_keys, outs):
             buf[k].copy_(v)
@@ -1235,6 +1349,9 @@ def evaluate_order3_basket(
     pad_to_max_c: bool = True,
     calib_jitter_std: float = 0.0,
     enforce_activity_floor: bool = False,
+    harsh_stress: bool = False,
+    budget_override: float | None = None,
+    trace_out: list | None = None,
 ) -> list[dict]:
     # Монолитный батч до 192 групп (1,152 агента и 18,432 стакана за 1 проход на GPU!) благодаря потоковому pre_mkt_blk
     C_total = len(cand_states)
@@ -1262,6 +1379,7 @@ def evaluate_order3_basket(
                 pad_to_max_c=pad_to_max_c,
                 calib_jitter_std=calib_jitter_std,
                 enforce_activity_floor=enforce_activity_floor,
+                harsh_stress=harsh_stress,
             )
             all_res.extend(sub_res)
         return all_res
@@ -1271,7 +1389,7 @@ def evaluate_order3_basket(
     if pad_to_max_c and device.type == "cuda" and 0 < C_total < max_chunk_c:
         target_c = max_chunk_c
         for k_cg in _ORDER3_CUDAGRAPH_CACHE:
-            if k_cg[0] == len(val_windows) and k_cg[2] == win_len and k_cg[5] == str(device):
+            if k_cg[0] == len(val_windows) and k_cg[2] == win_len and k_cg[5] == str(device) and k_cg[-1] == harsh_stress:
                 target_c = k_cg[1]
                 break
         if C_total < target_c:
@@ -1323,6 +1441,10 @@ def evaluate_order3_basket(
                 b2m_pad[:, :, 50:52] = 12.0  # sigmoid(12)=1.0 -> 0.00e+00 паритет старых чекпоинтов L70!
             if old_exp_d <= 52 and EXPERT_OUT_DIM_ORDER3 >= 54:
                 b2m_pad[:, :, 52:54] = -12.0  # sigmoid(-12)=0.0 -> 0.00e+00 паритет чекпоинтов L70/L71!
+            if old_exp_d <= 54 and EXPERT_OUT_DIM_ORDER3 >= 55:
+                b2m_pad[:, :, 54] = -12.0
+            if old_exp_d <= 55 and EXPERT_OUT_DIM_ORDER3 >= 56:
+                b2m_pad[:, :, 55] = -12.0
             w2m_t = w2m_pad.reshape(256, MOE_OUT_DIM_ORDER3)
             b2m_t = b2m_pad.reshape(1, MOE_OUT_DIM_ORDER3)
         w2m_l.append(w2m_t.to(dtype=dt))
@@ -1338,10 +1460,12 @@ def evaluate_order3_basket(
             bg1_pad = torch.zeros((1, ROUTER_H_DIM_ORDER3), dtype=torch.float32, device=device)
             ch_r = min(old_rh, ROUTER_H_DIM_ORDER3)
             bg1_pad[:, :ch_r] = bg1_t[:, :ch_r]
-            if old_rin == 358 and ROUTER_IN_DIM_ORDER3 == 362:
-                # 256+8+8+48+30 = 350 -> [350:354] 4D Order-2.5 -> [354:362] 8D prev_g_mode!
+            if old_rin == 362 and ROUTER_IN_DIM_ORDER3 == 368:
+                wg1_pad[:354, :ch_r] = wg1_t[:354, :ch_r]
+                wg1_pad[360:368, :ch_r] = wg1_t[354:362, :ch_r]
+            elif old_rin == 358 and ROUTER_IN_DIM_ORDER3 >= 362:
                 wg1_pad[:350, :ch_r] = wg1_t[:350, :ch_r]
-                wg1_pad[354:362, :ch_r] = wg1_t[350:358, :ch_r]
+                wg1_pad[ROUTER_IN_DIM_ORDER3 - 8 : ROUTER_IN_DIM_ORDER3, :ch_r] = wg1_t[350:358, :ch_r]
             elif old_rin == 326 and ROUTER_IN_DIM_ORDER3 >= 358:
                 wg1_pad[:304, :ch_r] = wg1_t[:304, :ch_r]
                 wg1_pad[320:342, :ch_r] = wg1_t[304:326, :ch_r]
@@ -1493,6 +1617,9 @@ def evaluate_order3_basket(
     bv_w_all = bv_all[t_steps_cl].contiguous()
 
     budget_tiers = torch.tensor([1200.0, 1500.0, 1800.0, 2150.0, 2550.0, 3000.0], device=device)
+    if budget_override is not None:
+        # Диагностический режим сверки с боевым сервером: все 6 сред получают точный бюджет live-счёта.
+        budget_tiers = torch.full((6,), float(budget_override), device=device)
     env_budgets_e = budget_tiers.unsqueeze(0).expand(C, B_bud).reshape(E)
     budget = env_budgets_e.unsqueeze(0).expand(W, E).reshape(N).contiguous()
 
@@ -1624,7 +1751,7 @@ def evaluate_order3_basket(
     if device.type == "cuda" and (C >= 32 or not pad_to_max_c):
         cg_entry = _get_or_build_order3_cudagraph(
             W=W, C=C, win_len=win_len, t_blk_sz=t_blk_sz, dt=dt, device=device,
-            tick_sz=tick_sz, maker_fee=maker_fee, taker_fee=taker_fee, true_latency=true_latency,
+            tick_sz=tick_sz, maker_fee=maker_fee, taker_fee=taker_fee, true_latency=true_latency, harsh_stress=harsh_stress,
         )
         g_replay = cg_entry["graph"]
         cb = cg_entry["buf"]
@@ -1667,6 +1794,14 @@ def evaluate_order3_basket(
             cb[k_s].copy_(t_s)
 
         si_buf, sni_buf, ui_buf = cb["s_idx"], cb["sn_idx"], cb["u_idx"]
+        # Диагностическая трасса сверки с live: 4 маленьких device-to-device копии на шаг, без синхронизации с CPU (CUDA Graph не ломается).
+        tr_pos = tr_cash = tr_nf = tr_nc = None
+        if trace_out is not None:
+            tr_pos = torch.zeros((total_sim_steps, N), dtype=torch.float32, device=device)
+            tr_cash = torch.zeros((total_sim_steps, N), dtype=torch.float32, device=device)
+            tr_nf = torch.zeros((total_sim_steps, N), dtype=torch.int32, device=device)
+            tr_nc = torch.zeros((total_sim_steps, N), dtype=torch.int32, device=device)
+            tr_slots = torch.zeros((total_sim_steps, 4, N, 12), dtype=torch.float32, device=device)
         for s_blk0 in range(0, total_sim_steps, t_blk_sz):
             s_blk1 = min(total_sim_steps, s_blk0 + t_blk_sz)
             blk_len = s_blk1 - s_blk0
@@ -1679,6 +1814,19 @@ def evaluate_order3_basket(
                 si_buf.fill_(s)
                 sni_buf.fill_(s + 1)
                 g_replay.replay()
+                if tr_pos is not None:
+                    tr_pos[s].copy_(cb["pos_qty"])
+                    tr_cash[s].copy_(cb["cash"])
+                    tr_nf[s].copy_(cb["n_fills"])
+                    tr_nc[s].copy_(cb["n_cancels"])
+                    tr_slots[s, 0].copy_(cb["bid_px"])
+                    tr_slots[s, 1].copy_(cb["bid_qty"])
+                    tr_slots[s, 2].copy_(cb["ask_px"])
+                    tr_slots[s, 3].copy_(cb["ask_qty"])
+        if tr_pos is not None:
+            p_np, c_np, f_np, k_np = tr_pos.cpu().numpy(), tr_cash.cpu().numpy(), tr_nf.cpu().numpy(), tr_nc.cpu().numpy()
+            sl_np = tr_slots.cpu().numpy()
+            trace_out.extend((s + 1, p_np[s], c_np[s], f_np[s], k_np[s], sl_np[s]) for s in range(total_sim_steps))
 
         (
             mem_h, gate_state, strat_state, cash, pos_qty, pos_cost_usd, avg_entry,
@@ -1724,8 +1872,10 @@ def evaluate_order3_basket(
                     sum_fqp, sum_val_err, prev_val_pred, prev_mtm_eq,
                     sum_mode_p, sum_mode_ent,
                     n_fills, n_cancels, n_requeues,
-                    tick_sz, maker_fee, taker_fee, true_latency,
+                    tick_sz, maker_fee, taker_fee, true_latency, harsh_stress,
                 )
+                if trace_out is not None:
+                    trace_out.append((s + 1, pos_qty.detach().float().cpu().numpy().copy(), cash.detach().float().cpu().numpy().copy(), n_fills.detach().cpu().numpy().copy(), n_cancels.detach().cpu().numpy().copy()))
 
     # 100% честная терминальная ликвидация по реальной 10-уровневой книге покупателей end_b10/end_bq10:
     # На коротких тренировочных окнах (enforce_activity_floor=True) рабочий ММ-инвентарь (<=35% бюджета, не в глубоком пробое)
@@ -1750,15 +1900,18 @@ def evaluate_order3_basket(
         rem_l2_q = torch.clamp(pos_qty - maker_q, min=0.0)
         rem_liq_10 = torch.clamp(torch.minimum(rem_l2_q.unsqueeze(1) - prev_end_bq, end_bq10), min=0.0)
         rem_exc = torch.clamp(rem_l2_q - rem_liq_10.sum(dim=1), min=0.0)
-        # 0 штрафа за открытую здоровую сделку (cost-basis нейтральность), НО 0 бумажной прибыли без РЕАЛЬНОГО закрытия в USDT!
-        cost_neutral_px = torch.minimum(end_mid * (1.0 - 1.2 * maker_fee), avg_entry * (1.0 + maker_fee))
-        carry_val = (
-            maker_q * cost_neutral_px
-            + (rem_liq_10 * end_b10).sum(dim=1) * (1.0 - maker_fee)
-            + rem_exc * tail_px * (1.0 - taker_fee)
-        )
+        # 0 бумажной прибыли без РЕАЛЬНОГО закрытия в USDT! В режиме harsh_stress=True незакрытый хвост оценивается по худшему из L2-ликвидации и себестоимости минус комиссия!
+        if harsh_stress:
+            carry_val = torch.minimum(strict_l2_carry * (1.0 - taker_fee), pos_qty * avg_entry * (1.0 - maker_fee * 1.30))
+        else:
+            cost_neutral_px = torch.minimum(end_mid * (1.0 - 1.2 * maker_fee), avg_entry * (1.0 + maker_fee))
+            carry_val = (
+                maker_q * cost_neutral_px
+                + (rem_liq_10 * end_b10).sum(dim=1) * (1.0 - maker_fee)
+                + rem_exc * tail_px * (1.0 - taker_fee)
+            )
     else:
-        carry_val = strict_l2_carry
+        carry_val = strict_l2_carry * (1.0 - taker_fee) if harsh_stress else strict_l2_carry
     rem = pos_qty > 1e-6
     end_cash = torch.clamp(torch.where(rem, cash + carry_val, cash), min=1.0)
     end_dd_pct = 100.0 * torch.clamp(peak_mtm_eq - end_cash, min=0.0) / budget
@@ -1909,14 +2062,30 @@ def evaluate_order3_basket(
     cl_turn_phr = cl_turn_v / win_hrs
     if enforce_activity_floor and len(clean_idx) >= 8:
         idle_cap_pen = 42.0 * torch.clamp(0.80 - cl_work_v, min=0.0)
-        # L72 Quality-Gated High-Velocity Engine: снимает потолок 2.80 и вознаграждает смелый оборот при высокой чистой марже сделки!
+        # L72/L79 Quality-Gated High-Velocity Engine (единый эталон органической активности в базовом и harsh_stress режимах!):
+        turn_floor_phr = 0.36
+        fills_floor_phr = 3.50
+        turn_ref_phr = 0.28
         edge_per_turn_bp = 100.0 * cl_ev_v / torch.clamp(cl_turn_v, min=0.04)
         qual_gate = torch.sigmoid((edge_per_turn_bp - 4.0) / 4.5) * torch.sigmoid(cl_ev_v * 18.0)
-        vel_mult = 0.45 * torch.clamp(cl_turn_phr / 0.35, min=0.25, max=3.80) + 0.55 * torch.sqrt(torch.clamp(cl_turn_phr / 0.28, min=0.10, max=20.0))
+        vel_mult = 0.45 * torch.clamp(cl_turn_phr / turn_ref_phr, min=0.25, max=3.80) + 0.55 * torch.sqrt(torch.clamp(cl_turn_phr / (0.80 * turn_ref_phr), min=0.10, max=20.0))
+        cnl_per_fill_v = cancels_v / torch.clamp(fills_v, min=2.0)
+        cnl_per_hr = (cancels_v / max(1.0, float(W))) / win_hrs
+        churn_pen = (
+            0.55 * torch.clamp(cnl_per_fill_v - 14.0, min=0.0, max=60.0)
+            + 0.12 * torch.clamp(cnl_per_hr - 120.0, min=0.0, max=400.0)
+        )
+        harsh_dd_pen = (
+            (16.0 * torch.clamp(dd_v - 1.75, min=0.0) + 0.55 * torch.clamp(-40.0 - cvar25_v, min=0.0))
+            if harsh_stress
+            else torch.zeros(C, device=device)
+        )
         dead_mm_pen = (
             idle_cap_pen
-            + 42.0 * torch.clamp(1.0 - cl_turn_phr / 0.65, min=0.0)
-            + 26.0 * torch.clamp(1.0 - cl_fills_phr / 5.20, min=0.0)
+            + churn_pen
+            + harsh_dd_pen
+            + 42.0 * torch.clamp(1.0 - cl_turn_phr / turn_floor_phr, min=0.0)
+            + 26.0 * torch.clamp(1.0 - cl_fills_phr / fills_floor_phr, min=0.0)
             + 22.0 * torch.clamp(cl_turn_phr - 2.00, min=0.0) * torch.sigmoid(-cl_ev_v * 35.0)
         )
         profit_vol_bonus = (
