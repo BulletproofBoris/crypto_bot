@@ -1909,41 +1909,8 @@ def evaluate_order3_basket(
     excess_end_q = torch.clamp(pos_qty - liq_10_tot, min=0.0)
     tail_px = torch.clamp(end_b10[:, -1] * 0.985, min=tick_sz)
     strict_l2_carry = (liq_10_q * end_b10).sum(dim=1) * (1.0 - maker_fee) + excess_end_q * tail_px * (1.0 - taker_fee)
-    if enforce_activity_floor:
-        work_cap_q = (0.96 * budget) / torch.clamp(end_mid, min=tick_sz)
-        healthy_mm = (init_pos_0 <= 1e-6) & (avg_entry > 1e-4) & (end_mid >= avg_entry * 0.985)
-        maker_q = torch.where(healthy_mm, torch.minimum(pos_qty, work_cap_q), torch.zeros_like(pos_qty))
-        rem_l2_q = torch.clamp(pos_qty - maker_q, min=0.0)
-        rem_liq_10 = torch.clamp(torch.minimum(rem_l2_q.unsqueeze(1) - prev_end_bq, end_bq10), min=0.0)
-        rem_exc = torch.clamp(rem_l2_q - rem_liq_10.sum(dim=1), min=0.0)
-        # 0 бумажной прибыли без РЕАЛЬНОГО закрытия в USDT! В режиме harsh_stress=True незакрытый хвост оценивается по худшему из L2-ликвидации и себестоимости минус комиссия!
-        if harsh_stress:
-            carry_val = torch.where(
-                init_pos_0 <= 1e-6,
-                torch.minimum(strict_l2_carry * (1.0 - taker_fee), pos_qty * avg_entry * (1.0 - maker_fee * 1.65)),
-                strict_l2_carry * (1.0 - taker_fee),
-            )
-        else:
-            cost_neutral_px = torch.minimum(end_mid * (1.0 - 1.2 * maker_fee), avg_entry * (1.0 + maker_fee))
-            carry_val = (
-                maker_q * cost_neutral_px
-                + (rem_liq_10 * end_b10).sum(dim=1) * (1.0 - maker_fee)
-                + rem_exc * tail_px * (1.0 - taker_fee)
-            )
-    else:
-        if harsh_stress:
-            carry_val = torch.where(
-                init_pos_0 <= 1e-6,
-                torch.minimum(strict_l2_carry * (1.0 - taker_fee), pos_qty * avg_entry * (1.0 - maker_fee * 1.65)),
-                strict_l2_carry * (1.0 - taker_fee),
-            )
-        else:
-            carry_val = strict_l2_carry
+    raw_max_dd_pct = max_dd_pct
     rem = pos_qty > 1e-6
-    stress_deduct = prev_val_pred if harsh_stress else torch.zeros_like(prev_val_pred)
-    end_cash = torch.clamp(torch.where(rem, cash + carry_val, cash) - stress_deduct, min=1.0)
-    end_dd_pct = 100.0 * torch.clamp(peak_mtm_eq - end_cash, min=0.0) / budget
-    max_dd_pct = torch.maximum(max_dd_pct + (100.0 * stress_deduct / budget), end_dd_pct)
 
     n_steps_f = float(win_len - 1)
     # Точный побитовый эталон пассивного портфеля (L2 ликвидация + точная траекторная просадка по всем шагам s=1..win_len-1 -> 0 сделок === 0.0000 bp!):
@@ -1963,13 +1930,8 @@ def evaluate_order3_basket(
     pass_mld_wb = torch.clamp(torch.log(p_peak_twb / p_eq_twb), min=0.0).mean(dim=0)  # [W, B_bud]
     pass_mld_we = pass_mld_wb.unsqueeze(1).expand(W, C, B_bud).reshape(W, E)
 
-    dlog_eq = torch.log(end_cash / ref_eq).view(W, E)
     raw_mean_log_dd = (sum_log_dd / n_steps_f).view(W, E)
-    # Вычитаем точную пассивную просадку: мягкий вес 0.30 не наказывает здоровые откаты -0.5% внутри +5% волны!
     rel_mean_log_dd = torch.clamp(raw_mean_log_dd - pass_mld_we, min=-0.0025)
-    traj_growth_bp = 10000.0 * (dlog_eq - 0.30 * rel_mean_log_dd)
-    mtm_delta_pct = (100.0 * (end_cash - ref_eq) / budget).view(W, E)
-    w_dd_mat = max_dd_pct.view(W, E)
     w_fills_mat = n_fills.float().view(W, E)
     w_cancels_mat = n_cancels.float().view(W, E)
     w_requeues_mat = n_requeues.float().view(W, E)
@@ -1980,92 +1942,9 @@ def evaluate_order3_basket(
     clean_idx = [wi for wi, (_, _, r0, _) in enumerate(val_windows) if r0 <= 0.01]
     inv_idx = [wi for wi, (_, _, r0, _) in enumerate(val_windows) if r0 > 0.01]
 
-    # Двухногая экономическая агрегация (100% защита от читерства занулением exp_bid_frac!):
     beta_risk = 0.06
     ln2 = math.log(2.0)
     M_wb = W * B_bud
-    g_mat = traj_growth_bp.view(W, C, B_bud).permute(1, 0, 2).reshape(C, M_wb)  # [C, W*B]
-    ent_bp_v = (-torch.logsumexp(-beta_risk * g_mat, dim=1) + math.log(float(M_wb))) / beta_risk
-    q_mat = torch.quantile(g_mat, torch.tensor([0.15, 0.35, 0.50, 0.65, 0.85], device=device), dim=1)
-    k_cvar = max(1, M_wb // 4)
-    cvar25_v = torch.topk(g_mat, k_cvar, dim=1, largest=False).values.mean(dim=1)
-    mean_g_v = g_mat.mean(dim=1)
-
-    mtm_wcb = mtm_delta_pct.view(W, C, B_bud)
-    cl_ev_v = mtm_wcb[clean_idx].mean(dim=(0, 2)) if clean_idx else torch.zeros(C, device=device)
-    inv_ev_v = mtm_wcb[inv_idx].mean(dim=(0, 2)) if inv_idx else torch.zeros(C, device=device)
-    full_ev_v = mtm_wcb.mean(dim=(0, 2))
-
-    fills_wcb = w_fills_mat.view(W, C, B_bud)
-    # Ножка 1 (Основная, 82%): чистый двухсторонний маркетмейкинг из кэша (clean_idx):
-    if clean_idx:
-        cl_g_mat = traj_growth_bp[clean_idx].view(len(clean_idx), C, B_bud).permute(1, 0, 2).reshape(C, len(clean_idx) * B_bud)
-        cl_q_mat = torch.quantile(cl_g_mat, torch.tensor([0.15, 0.35, 0.50], device=device), dim=1)
-        cl_mean_g_v = cl_g_mat.mean(dim=1)
-        cl_broad_v = torch.where(cl_g_mat > 0.0, 250.0 * torch.log1p(cl_g_mat / 250.0), cl_g_mat).mean(dim=1)
-        cl_cvar25_v = torch.topk(cl_g_mat, max(1, cl_g_mat.shape[1] // 4), dim=1, largest=False).values.mean(dim=1)
-        cl_cvar15_v = torch.topk(cl_g_mat, max(1, (cl_g_mat.shape[1] * 15) // 100), dim=1, largest=False).values.mean(dim=1)
-        cl_cvar10_v = torch.topk(cl_g_mat, max(1, cl_g_mat.shape[1] // 10), dim=1, largest=False).values.mean(dim=1)
-        cl_cvar05_v = torch.topk(cl_g_mat, max(1, cl_g_mat.shape[1] // 20), dim=1, largest=False).values.mean(dim=1)
-        cl_min_g_v = cl_g_mat.min(dim=1).values
-        cl_down_v = torch.sqrt(torch.mean(torch.clamp(-cl_g_mat, min=0.0) ** 2, dim=1))
-        # Трехслойный Cliff-Breaker для 85%-95% загрузки капитала: не штрафует рабочее дыхание волны (-1.0%..-1.5%), жестко отсекая реальные обвалы!
-        cl_tail_pen = (
-            0.35 * torch.clamp(-110.0 - cl_cvar15_v, min=0.0)
-            + 0.35 * torch.clamp(-185.0 - cl_cvar10_v, min=0.0)
-            + 0.45 * torch.clamp(-265.0 - cl_cvar05_v, min=0.0)
-        )
-        # Сняты микроскальперские потолки 0.45% / 50 bp: полный сложный рост капитала на волнах до +8.0% / +800 bp!
-        cl_mtm_sub = mtm_wcb[clean_idx]
-        pos_win_frac = (cl_mtm_sub > 0.05).float().mean(dim=(0, 2))
-        big_wave_frac = (cl_mtm_sub > 0.65).float().mean(dim=(0, 2))
-        breadth_bonus = 16.0 * pos_win_frac * torch.sigmoid(cl_ev_v * 12.0) + 32.0 * big_wave_frac * torch.sigmoid(cl_ev_v * 8.0)
-        cl_ev_rob_v = torch.where(
-            cl_mtm_sub > 8.0,
-            8.0 + 2.5 * torch.log1p((cl_mtm_sub - 8.0) / 2.5),
-            cl_mtm_sub,
-        ).mean(dim=(0, 2))
-        cl_mean_rob_v = torch.where(
-            cl_g_mat > 800.0,
-            800.0 + 250.0 * torch.log1p((cl_g_mat - 800.0) / 250.0),
-            cl_g_mat,
-        ).mean(dim=1)
-        geo_clean = (
-            0.40 * cl_broad_v
-            + 0.14 * cl_q_mat[2]
-            + 0.10 * cl_q_mat[1]
-            + 0.68 * cl_mean_rob_v
-            + 220.0 * cl_ev_rob_v
-            + breadth_bonus
-            + 0.24 * cl_cvar25_v
-            - 0.18 * cl_down_v
-            - 0.70 * cl_tail_pen
-        )
-    else:
-        geo_clean = torch.zeros(C, device=device)
-
-    # Ножка 2 (Стресс-прививка инвентаря, 15%): альфа разгрузки водопада (inv_cvar15) + полное удержание многопроцентного ралли:
-    if inv_idx:
-        inv_g_mat = traj_growth_bp[inv_idx].view(len(inv_idx), C, B_bud).permute(1, 0, 2).reshape(C, len(inv_idx) * B_bud)
-        inv_mean_rob_v = torch.where(
-            inv_g_mat > 500.0,
-            500.0 + 150.0 * torch.log1p((inv_g_mat - 500.0) / 150.0),
-            inv_g_mat,
-        ).mean(dim=1)
-        inv_mtm_sub = mtm_wcb[inv_idx]
-        inv_ev_rob_v = torch.where(
-            inv_mtm_sub > 5.0,
-            5.0 + 1.5 * torch.log1p((inv_mtm_sub - 5.0) / 1.5),
-            inv_mtm_sub,
-        ).mean(dim=(0, 2))
-        inv_q50_v = torch.median(inv_g_mat, dim=1).values
-        inv_cvar25_v = torch.topk(inv_g_mat, max(1, inv_g_mat.shape[1] // 4), dim=1, largest=False).values.mean(dim=1)
-        inv_cvar15_v = torch.topk(inv_g_mat, max(1, (inv_g_mat.shape[1] * 15) // 100), dim=1, largest=False).values.mean(dim=1)
-        geo_inv = 0.30 * inv_mean_rob_v + 0.20 * inv_q50_v + 45.0 * inv_ev_rob_v + 0.20 * inv_cvar25_v + 0.30 * inv_cvar15_v
-    else:
-        geo_inv = torch.zeros(C, device=device)
-
-    dd_v = w_dd_mat.view(W, C, B_bud).max(dim=0).values.mean(dim=1)
     fills_wcb = w_fills_mat.view(W, C, B_bud)
     fills_v = fills_wcb.sum(dim=0).mean(dim=1)
     cl_fills_v = fills_wcb[clean_idx].sum(dim=0).mean(dim=1) if clean_idx else fills_v
@@ -2083,61 +1962,144 @@ def evaluate_order3_basket(
 
     work_wcb = (sum_val_err / n_steps_f).view(W, C, B_bud)
     cl_work_v = work_wcb[clean_idx].mean(dim=(0, 2)) if clean_idx else work_wcb.mean(dim=(0, 2))
-
-    # L69 Full-Capital High-Velocity Engine: прямой стимул работы всем депозитом (work_frac >= 80%) + высокооборотный сбор спреда/волн!
     win_hrs = max(0.25, float(win_len - 1) / 3600.0)
     cl_fills_phr = cl_fills_pw / win_hrs
     cl_turn_phr = cl_turn_v / win_hrs
-    if enforce_activity_floor and len(clean_idx) >= 8:
-        idle_cap_pen = 42.0 * torch.clamp(0.80 - cl_work_v, min=0.0)
-        # L72/L79 Quality-Gated High-Velocity Engine (единый эталон органической активности в базовом и harsh_stress режимах!):
-        turn_floor_phr = 0.36
-        fills_floor_phr = 3.50
-        turn_ref_phr = 0.28
-        edge_per_turn_bp = 100.0 * cl_ev_v / torch.clamp(cl_turn_v, min=0.04)
-        qual_gate = torch.sigmoid((edge_per_turn_bp - 4.0) / 4.5) * torch.sigmoid(cl_ev_v * 18.0)
-        vel_mult = 0.45 * torch.clamp(cl_turn_phr / turn_ref_phr, min=0.25, max=3.80) + 0.55 * torch.sqrt(torch.clamp(cl_turn_phr / (0.80 * turn_ref_phr), min=0.10, max=20.0))
-        cnl_per_fill_v = cancels_v / torch.clamp(fills_v, min=2.0)
-        cnl_per_hr = (cancels_v / max(1.0, float(W))) / win_hrs
-        churn_pen = (
-            0.55 * torch.clamp(cnl_per_fill_v - 14.0, min=0.0, max=60.0)
-            + 0.12 * torch.clamp(cnl_per_hr - 120.0, min=0.0, max=400.0)
-        )
-        harsh_dd_pen = (
-            (16.0 * torch.clamp(dd_v - 1.75, min=0.0) + 0.55 * torch.clamp(-40.0 - cvar25_v, min=0.0))
-            if harsh_stress
-            else torch.zeros(C, device=device)
-        )
-        dead_mm_pen = (
-            idle_cap_pen
-            + churn_pen
-            + harsh_dd_pen
-            + 42.0 * torch.clamp(1.0 - cl_turn_phr / turn_floor_phr, min=0.0)
-            + 26.0 * torch.clamp(1.0 - cl_fills_phr / fills_floor_phr, min=0.0)
-            + 22.0 * torch.clamp(cl_turn_phr - 2.00, min=0.0) * torch.sigmoid(-cl_ev_v * 35.0)
-        )
-        profit_vol_bonus = (
-            325.0 * torch.clamp(cl_ev_v, min=0.0, max=12.0) * vel_mult
-            + 30.0 * torch.clamp(cl_fills_phr / 5.5, min=0.0, max=3.2) * qual_gate
-            + 22.0 * torch.clamp(cl_work_v - 0.55, min=0.0) * torch.sigmoid(cl_ev_v * 15.0)
+
+    if enforce_activity_floor:
+        work_cap_q = (0.96 * budget) / torch.clamp(end_mid, min=tick_sz)
+        healthy_mm = (init_pos_0 <= 1e-6) & (avg_entry > 1e-4) & (end_mid >= avg_entry * 0.985)
+        maker_q = torch.where(healthy_mm, torch.minimum(pos_qty, work_cap_q), torch.zeros_like(pos_qty))
+        rem_l2_q = torch.clamp(pos_qty - maker_q, min=0.0)
+        rem_liq_10 = torch.clamp(torch.minimum(rem_l2_q.unsqueeze(1) - prev_end_bq, end_bq10), min=0.0)
+        rem_exc = torch.clamp(rem_l2_q - rem_liq_10.sum(dim=1), min=0.0)
+        cost_neutral_px = torch.minimum(end_mid * (1.0 - 1.2 * maker_fee), avg_entry * (1.0 + maker_fee))
+        calib_carry_val = (
+            maker_q * cost_neutral_px
+            + (rem_liq_10 * end_b10).sum(dim=1) * (1.0 - maker_fee)
+            + rem_exc * tail_px * (1.0 - taker_fee)
         )
     else:
-        dead_mm_pen = torch.zeros(C, device=device)
-        profit_vol_bonus = torch.zeros(C, device=device)
+        calib_carry_val = strict_l2_carry
 
-    if clean_idx and inv_idx:
-        active_mm_gate = torch.clamp(cl_turn_phr / 0.25, 0.0, 1.0) * torch.clamp(cl_work_v / 0.65, 0.0, 1.0) * torch.sigmoid((geo_clean + 10.0) / 4.0) * torch.sigmoid(cl_ev_v * 20.0)
-        geo_v = 0.85 * (geo_clean + profit_vol_bonus - dead_mm_pen) + 0.15 * torch.where(geo_inv > 0.0, geo_inv * active_mm_gate, geo_inv)
-    elif clean_idx:
-        geo_v = geo_clean + profit_vol_bonus - dead_mm_pen
+    harsh_carry_val = torch.where(
+        init_pos_0 <= 1e-6,
+        torch.minimum(strict_l2_carry * (1.0 - taker_fee), pos_qty * avg_entry * (1.0 - maker_fee * 1.65)),
+        strict_l2_carry * (1.0 - taker_fee),
+    )
+
+    def _reduce_terminal_mode(is_h: bool):
+        c_val = harsh_carry_val if is_h else calib_carry_val
+        s_ded = prev_val_pred if is_h else torch.zeros_like(prev_val_pred)
+        e_cash = torch.clamp(torch.where(rem, cash + c_val, cash) - s_ded, min=1.0)
+        e_dd_pct = 100.0 * torch.clamp(peak_mtm_eq - e_cash, min=0.0) / budget
+        m_dd_pct = torch.maximum(raw_max_dd_pct + (100.0 * s_ded / budget), e_dd_pct)
+
+        dl_eq = torch.log(e_cash / ref_eq).view(W, E)
+        tg_bp = 10000.0 * (dl_eq - 0.30 * rel_mean_log_dd)
+        md_pct = (100.0 * (e_cash - ref_eq) / budget).view(W, E)
+        wd_mat = m_dd_pct.view(W, E)
+
+        gm = tg_bp.view(W, C, B_bud).permute(1, 0, 2).reshape(C, M_wb)
+        ent_v = (-torch.logsumexp(-beta_risk * gm, dim=1) + math.log(float(M_wb))) / beta_risk
+        qm = torch.quantile(gm, torch.tensor([0.15, 0.35, 0.50, 0.65, 0.85], device=device), dim=1)
+        kc = max(1, M_wb // 4)
+        cv25_v = torch.topk(gm, kc, dim=1, largest=False).values.mean(dim=1)
+
+        mw = md_pct.view(W, C, B_bud)
+        cev_v = mw[clean_idx].mean(dim=(0, 2)) if clean_idx else torch.zeros(C, device=device)
+        iev_v = mw[inv_idx].mean(dim=(0, 2)) if inv_idx else torch.zeros(C, device=device)
+        fev_v = mw.mean(dim=(0, 2))
+
+        if clean_idx:
+            cgm = tg_bp[clean_idx].view(len(clean_idx), C, B_bud).permute(1, 0, 2).reshape(C, len(clean_idx) * B_bud)
+            cqm = torch.quantile(cgm, torch.tensor([0.15, 0.35, 0.50], device=device), dim=1)
+            cbrd_v = torch.where(cgm > 0.0, 250.0 * torch.log1p(cgm / 250.0), cgm).mean(dim=1)
+            ccv25_v = torch.topk(cgm, max(1, cgm.shape[1] // 4), dim=1, largest=False).values.mean(dim=1)
+            ccv15_v = torch.topk(cgm, max(1, (cgm.shape[1] * 15) // 100), dim=1, largest=False).values.mean(dim=1)
+            ccv10_v = torch.topk(cgm, max(1, cgm.shape[1] // 10), dim=1, largest=False).values.mean(dim=1)
+            ccv05_v = torch.topk(cgm, max(1, cgm.shape[1] // 20), dim=1, largest=False).values.mean(dim=1)
+            cdwn_v = torch.sqrt(torch.mean(torch.clamp(-cgm, min=0.0) ** 2, dim=1))
+            ctail_p = (
+                0.35 * torch.clamp(-110.0 - ccv15_v, min=0.0)
+                + 0.35 * torch.clamp(-185.0 - ccv10_v, min=0.0)
+                + 0.45 * torch.clamp(-265.0 - ccv05_v, min=0.0)
+            )
+            cms = mw[clean_idx]
+            pw_f = (cms > 0.05).float().mean(dim=(0, 2))
+            bw_f = (cms > 0.65).float().mean(dim=(0, 2))
+            br_b = 16.0 * pw_f * torch.sigmoid(cev_v * 12.0) + 32.0 * bw_f * torch.sigmoid(cev_v * 8.0)
+            cer_v = torch.where(cms > 8.0, 8.0 + 2.5 * torch.log1p((cms - 8.0) / 2.5), cms).mean(dim=(0, 2))
+            cmr_v = torch.where(cgm > 800.0, 800.0 + 250.0 * torch.log1p((cgm - 800.0) / 250.0), cgm).mean(dim=1)
+            g_cl = (
+                0.40 * cbrd_v + 0.14 * cqm[2] + 0.10 * cqm[1] + 0.68 * cmr_v
+                + 220.0 * cer_v + br_b + 0.24 * ccv25_v - 0.18 * cdwn_v - 0.70 * ctail_p
+            )
+        else:
+            g_cl = torch.zeros(C, device=device)
+
+        if inv_idx:
+            igm = tg_bp[inv_idx].view(len(inv_idx), C, B_bud).permute(1, 0, 2).reshape(C, len(inv_idx) * B_bud)
+            imr_v = torch.where(igm > 500.0, 500.0 + 150.0 * torch.log1p((igm - 500.0) / 150.0), igm).mean(dim=1)
+            ims = mw[inv_idx]
+            ier_v = torch.where(ims > 5.0, 5.0 + 1.5 * torch.log1p((ims - 5.0) / 1.5), ims).mean(dim=(0, 2))
+            iq50_v = torch.median(igm, dim=1).values
+            icv25_v = torch.topk(igm, max(1, igm.shape[1] // 4), dim=1, largest=False).values.mean(dim=1)
+            icv15_v = torch.topk(igm, max(1, (igm.shape[1] * 15) // 100), dim=1, largest=False).values.mean(dim=1)
+            g_in = 0.30 * imr_v + 0.20 * iq50_v + 45.0 * ier_v + 0.20 * icv25_v + 0.30 * icv15_v
+        else:
+            g_in = torch.zeros(C, device=device)
+
+        dd_m = wd_mat.view(W, C, B_bud).max(dim=0).values.mean(dim=1)
+
+        if enforce_activity_floor and len(clean_idx) >= 8:
+            ic_pen = 42.0 * torch.clamp(0.80 - cl_work_v, min=0.0)
+            tf_phr = 0.36
+            ff_phr = 3.50
+            tr_phr = 0.28
+            ept_bp = 100.0 * cev_v / torch.clamp(cl_turn_v, min=0.04)
+            qg = torch.sigmoid((ept_bp - 4.0) / 4.5) * torch.sigmoid(cev_v * 18.0)
+            vm = 0.45 * torch.clamp(cl_turn_phr / tr_phr, min=0.25, max=3.80) + 0.55 * torch.sqrt(torch.clamp(cl_turn_phr / (0.80 * tr_phr), min=0.10, max=20.0))
+            cpf_v = cancels_v / torch.clamp(fills_v, min=2.0)
+            cph_v = (cancels_v / max(1.0, float(W))) / win_hrs
+            ch_pen = 0.55 * torch.clamp(cpf_v - 14.0, min=0.0, max=60.0) + 0.12 * torch.clamp(cph_v - 120.0, min=0.0, max=400.0)
+            h_dd_p = (16.0 * torch.clamp(dd_m - 1.75, min=0.0) + 0.55 * torch.clamp(-40.0 - cv25_v, min=0.0)) if is_h else torch.zeros(C, device=device)
+            dm_pen = (
+                ic_pen + ch_pen + h_dd_p
+                + 42.0 * torch.clamp(1.0 - cl_turn_phr / tf_phr, min=0.0)
+                + 26.0 * torch.clamp(1.0 - cl_fills_phr / ff_phr, min=0.0)
+                + 22.0 * torch.clamp(cl_turn_phr - 2.00, min=0.0) * torch.sigmoid(-cev_v * 35.0)
+            )
+            pv_bon = (
+                325.0 * torch.clamp(cev_v, min=0.0, max=12.0) * vm
+                + 30.0 * torch.clamp(cl_fills_phr / 5.5, min=0.0, max=3.2) * qg
+                + 22.0 * torch.clamp(cl_work_v - 0.55, min=0.0) * torch.sigmoid(cev_v * 15.0)
+            )
+        else:
+            dm_pen = torch.zeros(C, device=device)
+            pv_bon = torch.zeros(C, device=device)
+
+        if clean_idx and inv_idx:
+            am_gate = torch.clamp(cl_turn_phr / 0.25, 0.0, 1.0) * torch.clamp(cl_work_v / 0.65, 0.0, 1.0) * torch.sigmoid((g_cl + 10.0) / 4.0) * torch.sigmoid(cev_v * 20.0)
+            gv = 0.85 * (g_cl + pv_bon - dm_pen) + 0.15 * torch.where(g_in > 0.0, g_in * am_gate, g_in)
+        elif clean_idx:
+            gv = g_cl + pv_bon - dm_pen
+        else:
+            gv = g_in
+        return gv, ent_v, cv25_v, qm, fev_v, cev_v, iev_v, dd_m
+
+    geo_v, ent_bp_v, cvar25_v, q_mat, full_ev_v, cl_ev_v, inv_ev_v, dd_v = _reduce_terminal_mode(harsh_stress)
+    if harsh_stress:
+        cal_geo_v, _, _, _, _, cal_cl_ev_v, _, cal_dd_v = _reduce_terminal_mode(False)
     else:
-        geo_v = geo_inv
+        cal_geo_v, cal_cl_ev_v, cal_dd_v = geo_v, cl_ev_v, dd_v
 
-    # Единый перенос компактной матрицы метрик [C, 17] на CPU!
+    # Единый перенос компактной матрицы метрик [C, 20] на CPU (0.0002s overhead для одновременного Harsh + Calibrated отчёта!):
     stats_cpu = torch.stack(
         [
             geo_v, ent_bp_v, cvar25_v, q_mat[0], q_mat[2], q_mat[4],
             full_ev_v, cl_ev_v, inv_ev_v, dd_v, fills_v, cancels_v, requeues_v, fqp_v, mi_bits_v, cl_turn_v, cl_work_v,
+            cal_geo_v, cal_cl_ev_v, cal_dd_v,
         ],
         dim=1,
     ).cpu().tolist()
@@ -2169,5 +2131,8 @@ def evaluate_order3_basket(
             'mode_mi_bits': round(float(st[14]), 4),
             'turn_mult': round(float(st[15]), 4),
             'work_frac': round(float(st[16]), 4),
+            'calib_geo_score_bp': float(st[17]),
+            'calib_clean_ev_pct': float(st[18]),
+            'calib_dd_pct': float(st[19]),
         })
     return results[:orig_c]
