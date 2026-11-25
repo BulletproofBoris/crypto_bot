@@ -1341,6 +1341,27 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
         low_tranche_qty=float(getattr(trader, "tr_low_qty", getattr(trader, "low_tranche_qty", 0.0))),
     )
 
+    # Посекундная запись того, что реально видела нейросеть на сервере (94D рынок + 110D агент + режимы/экспозиция):
+    # позволяет прогонять симулятор на ровно тех входах, что были в бою, и отделить расхождение признаков от остального.
+    try:
+        import struct as _st
+        obs_f = getattr(trader, "_o3_obs_log_f", None)
+        if obs_f is None:
+            obs_p = BASE_DIR / "data" / "logs" / "order3_live_obs.bin"
+            obs_p.parent.mkdir(parents=True, exist_ok=True)
+            obs_f = open(obs_p, "ab", buffering=1 << 16)
+            trader._o3_obs_log_f = obs_f
+        g_m = np.asarray(plan.get("g_mode", np.zeros(K_MODES_ORDER3)), dtype=np.float32).reshape(-1)[:K_MODES_ORDER3]
+        rec_v = np.concatenate([
+            np.asarray(z_mkt, dtype=np.float32).reshape(-1)[:MKT_DIM_ORDER3],
+            np.asarray(z_ag, dtype=np.float32).reshape(-1)[:AG_DIM_ORDER3],
+            np.pad(g_m, (0, K_MODES_ORDER3 - len(g_m))),
+            np.array([float(plan.get("exp_bid_frac", 0.0)), float(trader.order3_engine.api_tokens), float(trader.pos_qty), float(trader.bot_cash_usd), b1, a1], dtype=np.float32),
+        ])
+        obs_f.write(_st.pack("<d", float(now_ts)) + rec_v.tobytes())
+    except Exception:
+        pass
+
     p_prec = int(getattr(trader, "price_precision", 4))
     a_prec = int(getattr(trader, "amount_precision", 4))
     min_amt = float(getattr(trader, "min_order_amount", 2.0))
