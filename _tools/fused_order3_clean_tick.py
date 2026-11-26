@@ -22,13 +22,16 @@ MKT_DIM_ORDER3 = 96
 AG_DIM_ORDER3 = 110
 TOTAL_DIM_ORDER3 = 206
 
-MEM_DIM_ORDER3 = 48
+MEM_DIM_ORDER3 = 64
 K_MODES_ORDER3 = 8
 EXPERT_OUT_DIM_ORDER3 = 58
 MOE_OUT_DIM_ORDER3 = K_MODES_ORDER3 * EXPERT_OUT_DIM_ORDER3  # 464
+MOE_MLP_H_ORDER3 = 48
+MOE_MLP_UP_DIM_ORDER3 = K_MODES_ORDER3 * (2 * MOE_MLP_H_ORDER3)  # 8 * 96 = 768
 ROUTER_EXTRA_DIM_ORDER3 = 42
-ROUTER_IN_DIM_ORDER3 = 256 + 8 + 8 + MEM_DIM_ORDER3 + ROUTER_EXTRA_DIM_ORDER3 + K_MODES_ORDER3  # 370
+ROUTER_IN_DIM_ORDER3 = 256 + 8 + 8 + MEM_DIM_ORDER3 + ROUTER_EXTRA_DIM_ORDER3 + K_MODES_ORDER3  # 386
 ROUTER_H_DIM_ORDER3 = 128
+ROUTER_RES_H_ORDER3 = 64
 ROUTER_OUT_DIM_ORDER3 = 2 * K_MODES_ORDER3  # 16: 8 mode logits + 8 liquid update gates!
 REG_IN_DIM_ORDER3 = 28 + K_MODES_ORDER3     # 36D per-slot features
 REG_H_DIM_ORDER3 = 64
@@ -169,8 +172,14 @@ def _order3_clean_tick_step(
     wr2_g: torch.Tensor,
     w2_moe_g: torch.Tensor,
     b2_moe_g: torch.Tensor,
+    w_moe_up_g: torch.Tensor,
+    b_moe_up_g: torch.Tensor,
+    w_moe_dn_g: torch.Tensor,
     w_gate1_g: torch.Tensor,
     b_gate1_g: torch.Tensor,
+    w_gate_res1_g: torch.Tensor,
+    b_gate_res_g: torch.Tensor,
+    w_gate_res2_g: torch.Tensor,
     w_gate2_g: torch.Tensor,
     b_gate2_g: torch.Tensor,
     w_rec_g: torch.Tensor,
@@ -367,12 +376,14 @@ def _order3_clean_tick_step(
     rec_u = torch.tanh(rec_raw[:, :, :MEM_DIM_ORDER3])
     rec_gate = torch.cat(
         [
-            torch.sigmoid(rec_raw[:, :, 48:56] + 1.0),
-            torch.sigmoid(rec_raw[:, :, 56:64] + 3.8),
-            torch.sigmoid(rec_raw[:, :, 64:72] + 5.2),
-            torch.sigmoid(rec_raw[:, :, 72:80] + 6.6),
-            torch.sigmoid(rec_raw[:, :, 80:88] + 2.2),
-            torch.sigmoid(rec_raw[:, :, 88:96] + 4.5),
+            torch.sigmoid(rec_raw[:, :, 64:72] + 1.0),
+            torch.sigmoid(rec_raw[:, :, 72:80] + 3.8),
+            torch.sigmoid(rec_raw[:, :, 80:88] + 5.2),
+            torch.sigmoid(rec_raw[:, :, 88:96] + 6.6),
+            torch.sigmoid(rec_raw[:, :, 96:104] + 2.2),
+            torch.sigmoid(rec_raw[:, :, 104:112] + 4.5),
+            torch.sigmoid(rec_raw[:, :, 112:120] + 7.5),
+            torch.sigmoid(rec_raw[:, :, 120:128] + 8.9),
         ],
         dim=-1,
     )
@@ -380,10 +391,10 @@ def _order3_clean_tick_step(
     mem_next_g = rec_gate * mem_prev_g + (1.0 - rec_gate) * rec_u
     mem_h = mem_next_g.view(G, W, B, MEM_DIM_ORDER3).permute(1, 0, 2, 3).reshape(N, MEM_DIM_ORDER3)
 
-    # Прямая обратная связь 48D многомасштабной памяти в экспертов и роутер (снимает 1-секундную слепоту MoE!):
+    # Прямая обратная связь 64D многомасштабной памяти в экспертов и роутер (снимает 1-секундную слепоту MoE!):
     h2_ctx = h2 + torch.bmm(mem_next_g, w_mem2h_g)
 
-    # 1B. Вентильный Рекуррентный Маршрутизатор (358D -> 128 -> 16: 8 логитов мод + 8 нелинейных Liquid-вентилей инерции!):
+    # 1B. Двухкаскадный Вентильный Рекуррентный Маршрутизатор (386D -> 128 SiLU + ResSwiGLU -> 16):
     acct_g = acct_8d.view(W, G, B, 8).permute(1, 0, 2, 3).reshape(G, M, 8)
     queue_g = queue_8d.view(W, G, B, 8).permute(1, 0, 2, 3).reshape(G, M, 8)
     r_extra_30d = torch.cat(
@@ -401,8 +412,11 @@ def _order3_clean_tick_step(
     gate_prev_g = gate_state.view(W, G, B, K_MODES_ORDER3).permute(1, 0, 2, 3).reshape(G, M, K_MODES_ORDER3)
     prev_g_mode_g = torch.softmax(gate_prev_g, dim=-1).to(dt)
 
-    router_in_g = torch.cat([h2_ctx, acct_g, queue_g, mem_next_g, r_extra_g, prev_g_mode_g], dim=-1)  # [G, M, 370]
-    r_hid_g = F.silu(torch.bmm(router_in_g, w_gate1_g) + b_gate1_g)  # [G, M, 128]
+    router_in_g = torch.cat([h2_ctx, acct_g, queue_g, mem_next_g, r_extra_g, prev_g_mode_g], dim=-1)  # [G, M, 386]
+    r_hid1_g = F.silu(torch.bmm(router_in_g, w_gate1_g) + b_gate1_g)  # [G, M, 128]
+    r_res_pre_g = torch.bmm(r_hid1_g, w_gate_res1_g) + b_gate_res_g   # [G, M, 128]
+    r_res_act_g = F.silu(r_res_pre_g[:, :, :ROUTER_RES_H_ORDER3]) * (2.0 * torch.sigmoid(r_res_pre_g[:, :, ROUTER_RES_H_ORDER3:]))
+    r_hid_g = r_hid1_g + torch.bmm(r_res_act_g, w_gate_res2_g)
 
     gate_out_g = torch.bmm(r_hid_g, w_gate2_g).float() + b_gate2_g.float()  # [G, M, 16]
     raw_logits_g = gate_out_g[:, :, :K_MODES_ORDER3]
@@ -411,7 +425,11 @@ def _order3_clean_tick_step(
     g_mode_g = torch.softmax(gate_next_g, dim=-1)  # [G, M, K]
     gate_state = gate_next_g.view(G, W, B, K_MODES_ORDER3).permute(1, 0, 2, 3).reshape(N, K_MODES_ORDER3)
 
-    moe_all_g = (torch.bmm(h2_ctx, w2_moe_g).float() + b2_moe_g.float()).view(G, M, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+    moe_lin_g = (torch.bmm(h2_ctx, w2_moe_g).float() + b2_moe_g.float()).view(G, M, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+    moe_up_raw = (torch.bmm(h2_ctx, w_moe_up_g) + b_moe_up_g).view(G, M, K_MODES_ORDER3, 2 * MOE_MLP_H_ORDER3)
+    moe_up_act = F.silu(moe_up_raw[:, :, :, :MOE_MLP_H_ORDER3]) * (2.0 * torch.sigmoid(moe_up_raw[:, :, :, MOE_MLP_H_ORDER3:]))
+    moe_mlp_g = torch.matmul(moe_up_act.permute(0, 2, 1, 3), w_moe_dn_g).permute(0, 2, 1, 3).float()
+    moe_all_g = moe_lin_g + moe_mlp_g
     strat_inst_g = (g_mode_g.unsqueeze(-1) * moe_all_g).sum(dim=2)  # [G, M, 58]
     strat_inst = strat_inst_g.view(G, W, B, EXPERT_OUT_DIM_ORDER3).permute(1, 0, 2, 3).reshape(N, EXPERT_OUT_DIM_ORDER3)
 
@@ -1259,8 +1277,14 @@ def _get_or_build_order3_cudagraph(
         "wr2_c": torch.zeros((C, 64, 256), dtype=dt, device=device),
         "w2m_c": torch.zeros((C, 256, MOE_OUT_DIM_ORDER3), dtype=dt, device=device),
         "b2m_c": torch.zeros((C, 1, MOE_OUT_DIM_ORDER3), dtype=torch.float32, device=device),
+        "wmup_c": torch.zeros((C, 256, MOE_MLP_UP_DIM_ORDER3), dtype=dt, device=device),
+        "bmup_c": torch.zeros((C, 1, MOE_MLP_UP_DIM_ORDER3), dtype=dt, device=device),
+        "wmdn_c": torch.zeros((C, K_MODES_ORDER3, MOE_MLP_H_ORDER3, EXPERT_OUT_DIM_ORDER3), dtype=dt, device=device),
         "wg1_c": torch.zeros((C, ROUTER_IN_DIM_ORDER3, ROUTER_H_DIM_ORDER3), dtype=dt, device=device),
         "bg1_c": torch.zeros((C, 1, ROUTER_H_DIM_ORDER3), dtype=dt, device=device),
+        "wgres1_c": torch.zeros((C, ROUTER_H_DIM_ORDER3, 2 * ROUTER_RES_H_ORDER3), dtype=dt, device=device),
+        "bgres_c": torch.zeros((C, 1, 2 * ROUTER_RES_H_ORDER3), dtype=dt, device=device),
+        "wgres2_c": torch.zeros((C, ROUTER_RES_H_ORDER3, ROUTER_H_DIM_ORDER3), dtype=dt, device=device),
         "wg2_c": torch.zeros((C, ROUTER_H_DIM_ORDER3, ROUTER_OUT_DIM_ORDER3), dtype=dt, device=device),
         "bg2_c": torch.zeros((C, 1, ROUTER_OUT_DIM_ORDER3), dtype=torch.float32, device=device),
         "wrec_c": torch.zeros((C, 256, 2 * MEM_DIM_ORDER3), dtype=dt, device=device),
@@ -1356,7 +1380,8 @@ def _get_or_build_order3_cudagraph(
             buf["sv_w_all"].index_select(0, sni).squeeze(0),
             buf["bv_w_all"].index_select(0, sni).squeeze(0),
             buf["w1_ag_c"], buf["wr1_c"], buf["br1_c"], buf["wr2_c"],
-            buf["w2m_c"], buf["b2m_c"], buf["wg1_c"], buf["bg1_c"], buf["wg2_c"], buf["bg2_c"],
+            buf["w2m_c"], buf["b2m_c"], buf["wmup_c"], buf["bmup_c"], buf["wmdn_c"],
+            buf["wg1_c"], buf["bg1_c"], buf["wgres1_c"], buf["bgres_c"], buf["wgres2_c"], buf["wg2_c"], buf["bg2_c"],
             buf["wrec_c"], buf["brec_c"], buf["wmem2h_c"],
             buf["wreg1_c"], buf["breg1b_c"], buf["breg1a_c"],
             buf["wreg_res1_c"], buf["breg_res_c"], buf["wreg_res2_c"],
@@ -1469,7 +1494,9 @@ def evaluate_order3_basket(
     echelon_k01 = torch.linspace(0.0, 1.0, 12, dtype=torch.float32, device=device)
 
     w1_l, b1_l, wr1_l, br1_l, wr2_l, w2m_l, b2m_l = [], [], [], [], [], [], []
-    wg1_l, bg1_l, wg2_l, bg2_l, wrec_l, brec_l, wmem2h_l = [], [], [], [], [], [], []
+    wmup_l, bmup_l, wmdn_l = [], [], []
+    wg1_l, bg1_l, wgres1_l, bgres_l, wgres2_l, wg2_l, bg2_l = [], [], [], [], [], [], []
+    wrec_l, brec_l, wmem2h_l = [], [], []
     wreg1_l, breg1b_l, breg1a_l, wregr1_l, bregr_l, wregr2_l, wreg2_l, breg2b_l, breg2a_l = [], [], [], [], [], [], [], [], []
     for st in cand_states:
         w1_t = st['w1'].to(device=device, dtype=torch.float32)
@@ -1514,6 +1541,14 @@ def evaluate_order3_basket(
             b2m_t = b2m_pad.reshape(1, MOE_OUT_DIM_ORDER3)
         w2m_l.append(w2m_t.to(dtype=dt))
         b2m_l.append(b2m_t.view(1, MOE_OUT_DIM_ORDER3))
+        if 'w_moe_up' in st and st['w_moe_up'].shape == (256, MOE_MLP_UP_DIM_ORDER3):
+            wmup_l.append(st['w_moe_up'].to(device=device, dtype=dt))
+            bmup_l.append(st['b_moe_up'].to(device=device, dtype=dt).view(1, MOE_MLP_UP_DIM_ORDER3))
+            wmdn_l.append(st['w_moe_dn'].to(device=device, dtype=dt).view(K_MODES_ORDER3, MOE_MLP_H_ORDER3, EXPERT_OUT_DIM_ORDER3))
+        else:
+            wmup_l.append(torch.zeros((256, MOE_MLP_UP_DIM_ORDER3), dtype=dt, device=device))
+            bmup_l.append(torch.zeros((1, MOE_MLP_UP_DIM_ORDER3), dtype=dt, device=device))
+            wmdn_l.append(torch.zeros((K_MODES_ORDER3, MOE_MLP_H_ORDER3, EXPERT_OUT_DIM_ORDER3), dtype=dt, device=device))
 
         wg1_t = st['w_gate1'].to(device=device, dtype=torch.float32)
         bg1_t = st['b_gate1'].to(device=device, dtype=torch.float32).view(1, -1)
@@ -1525,21 +1560,31 @@ def evaluate_order3_basket(
             bg1_pad = torch.zeros((1, ROUTER_H_DIM_ORDER3), dtype=torch.float32, device=device)
             ch_r = min(old_rh, ROUTER_H_DIM_ORDER3)
             bg1_pad[:, :ch_r] = bg1_t[:, :ch_r]
-            if old_rin == 368 and ROUTER_IN_DIM_ORDER3 == 370:
+            if old_rin == 370 and ROUTER_IN_DIM_ORDER3 == 386:
+                # 48D mem (idx 272..320) -> 64D mem (idx 272..336), extra+modes (idx 320..370) -> (idx 336..386)
+                wg1_pad[:320, :ch_r] = wg1_t[:320, :ch_r]
+                wg1_pad[336:386, :ch_r] = wg1_t[320:370, :ch_r]
+            elif old_rin == 368 and ROUTER_IN_DIM_ORDER3 == 386:
+                wg1_pad[:320, :ch_r] = wg1_t[:320, :ch_r]
+                wg1_pad[336:376, :ch_r] = wg1_t[320:360, :ch_r]
+                wg1_pad[378:386, :ch_r] = wg1_t[360:368, :ch_r]
+            elif old_rin == 368 and ROUTER_IN_DIM_ORDER3 == 370:
                 wg1_pad[:360, :ch_r] = wg1_t[:360, :ch_r]
                 wg1_pad[362:370, :ch_r] = wg1_t[360:368, :ch_r]
             elif old_rin == 362 and ROUTER_IN_DIM_ORDER3 >= 368:
-                wg1_pad[:354, :ch_r] = wg1_t[:354, :ch_r]
+                wg1_pad[:320, :ch_r] = wg1_t[:320, :ch_r]
+                wg1_pad[336:370, :ch_r] = wg1_t[320:354, :ch_r]
                 wg1_pad[ROUTER_IN_DIM_ORDER3 - 8 : ROUTER_IN_DIM_ORDER3, :ch_r] = wg1_t[354:362, :ch_r]
             elif old_rin == 358 and ROUTER_IN_DIM_ORDER3 >= 362:
-                wg1_pad[:350, :ch_r] = wg1_t[:350, :ch_r]
+                wg1_pad[:320, :ch_r] = wg1_t[:320, :ch_r]
+                wg1_pad[336:366, :ch_r] = wg1_t[320:350, :ch_r]
                 wg1_pad[ROUTER_IN_DIM_ORDER3 - 8 : ROUTER_IN_DIM_ORDER3, :ch_r] = wg1_t[350:358, :ch_r]
             elif old_rin == 326 and ROUTER_IN_DIM_ORDER3 >= 358:
                 wg1_pad[:304, :ch_r] = wg1_t[:304, :ch_r]
-                wg1_pad[320:342, :ch_r] = wg1_t[304:326, :ch_r]
+                wg1_pad[336:358, :ch_r] = wg1_t[304:326, :ch_r]
             elif old_rin == 295:
                 wg1_pad[:288, :ch_r] = wg1_t[:288, :ch_r]
-                wg1_pad[320:327, :ch_r] = wg1_t[288:295, :ch_r]
+                wg1_pad[336:343, :ch_r] = wg1_t[288:295, :ch_r]
             else:
                 cr = min(old_rin, ROUTER_IN_DIM_ORDER3)
                 wg1_pad[:cr, :ch_r] = wg1_t[:cr, :ch_r]
@@ -1555,6 +1600,14 @@ def evaluate_order3_basket(
             wg2_t, bg2_t = wg2_pad, bg2_pad
         wg1_l.append(wg1_t.to(dtype=dt))
         bg1_l.append(bg1_t.to(dtype=dt).view(1, ROUTER_H_DIM_ORDER3))
+        if 'w_gate_res1' in st and st['w_gate_res1'].shape == (ROUTER_H_DIM_ORDER3, 2 * ROUTER_RES_H_ORDER3):
+            wgres1_l.append(st['w_gate_res1'].to(device=device, dtype=dt))
+            bgres_l.append(st['b_gate_res'].to(device=device, dtype=dt).view(1, 2 * ROUTER_RES_H_ORDER3))
+            wgres2_l.append(st['w_gate_res2'].to(device=device, dtype=dt))
+        else:
+            wgres1_l.append(torch.zeros((ROUTER_H_DIM_ORDER3, 2 * ROUTER_RES_H_ORDER3), dtype=dt, device=device))
+            bgres_l.append(torch.zeros((1, 2 * ROUTER_RES_H_ORDER3), dtype=dt, device=device))
+            wgres2_l.append(torch.zeros((ROUTER_RES_H_ORDER3, ROUTER_H_DIM_ORDER3), dtype=dt, device=device))
         wg2_l.append(wg2_t.to(dtype=dt))
         bg2_l.append(bg2_t.view(1, ROUTER_OUT_DIM_ORDER3))
 
@@ -1572,8 +1625,15 @@ def evaluate_order3_basket(
             wrec_t, brec_t = wrec_pad, brec_pad
         wrec_l.append(wrec_t.to(dtype=dt))
         brec_l.append(brec_t.to(dtype=dt).view(1, 2 * MEM_DIM_ORDER3))
-        if 'w_mem2h' in st and st['w_mem2h'].shape == (MEM_DIM_ORDER3, 256):
-            wmem2h_l.append(st['w_mem2h'].to(device=device, dtype=dt))
+        if 'w_mem2h' in st:
+            wm2h_raw = st['w_mem2h'].to(device=device, dtype=torch.float32)
+            if wm2h_raw.shape == (MEM_DIM_ORDER3, 256):
+                wmem2h_l.append(wm2h_raw.to(dtype=dt))
+            else:
+                wm2h_pad = torch.zeros((MEM_DIM_ORDER3, 256), dtype=torch.float32, device=device)
+                cm2 = min(wm2h_raw.shape[0], MEM_DIM_ORDER3)
+                wm2h_pad[:cm2, :] = wm2h_raw[:cm2, :]
+                wmem2h_l.append(wm2h_pad.to(dtype=dt))
         else:
             wmem2h_l.append(torch.zeros((MEM_DIM_ORDER3, 256), dtype=dt, device=device))
 
@@ -1622,8 +1682,14 @@ def evaluate_order3_basket(
     wr2_c = torch.stack(wr2_l, dim=0).contiguous()
     w2m_c = torch.stack(w2m_l, dim=0).contiguous()
     b2m_c = torch.stack(b2m_l, dim=0).contiguous()
+    wmup_c = torch.stack(wmup_l, dim=0).contiguous()
+    bmup_c = torch.stack(bmup_l, dim=0).contiguous()
+    wmdn_c = torch.stack(wmdn_l, dim=0).contiguous()
     wg1_c = torch.stack(wg1_l, dim=0).contiguous()
     bg1_c = torch.stack(bg1_l, dim=0).contiguous()
+    wgres1_c = torch.stack(wgres1_l, dim=0).contiguous()
+    bgres_c = torch.stack(bgres_l, dim=0).contiguous()
+    wgres2_c = torch.stack(wgres2_l, dim=0).contiguous()
     wg2_c = torch.stack(wg2_l, dim=0).contiguous()
     bg2_c = torch.stack(bg2_l, dim=0).contiguous()
     wrec_c = torch.stack(wrec_l, dim=0).contiguous()
@@ -1715,12 +1781,14 @@ def evaluate_order3_basket(
         ru_w = torch.tanh(rr_w[:, :, :MEM_DIM_ORDER3])
         rg_1s = torch.cat(
             [
-                torch.sigmoid(rr_w[:, :, 48:56].float() + 1.0),
-                torch.sigmoid(rr_w[:, :, 56:64].float() + 3.8),
-                torch.sigmoid(rr_w[:, :, 64:72].float() + 5.2),
-                torch.sigmoid(rr_w[:, :, 72:80].float() + 6.6),
-                torch.sigmoid(rr_w[:, :, 80:88].float() + 2.2),
-                torch.sigmoid(rr_w[:, :, 88:96].float() + 4.5),
+                torch.sigmoid(rr_w[:, :, 64:72].float() + 1.0),
+                torch.sigmoid(rr_w[:, :, 72:80].float() + 3.8),
+                torch.sigmoid(rr_w[:, :, 80:88].float() + 5.2),
+                torch.sigmoid(rr_w[:, :, 88:96].float() + 6.6),
+                torch.sigmoid(rr_w[:, :, 96:104].float() + 2.2),
+                torch.sigmoid(rr_w[:, :, 104:112].float() + 4.5),
+                torch.sigmoid(rr_w[:, :, 112:120].float() + 7.5),
+                torch.sigmoid(rr_w[:, :, 120:128].float() + 8.9),
             ],
             dim=-1,
         )
@@ -1744,10 +1812,17 @@ def evaluate_order3_basket(
     z16_w = torch.zeros((C, W, 16), dtype=dt, device=device)
     p0_mode_w = torch.full((C, W, K_MODES_ORDER3), 1.0 / float(K_MODES_ORDER3), dtype=dt, device=device)
     rin_w = torch.cat([h2_w_ctx, z16_w, mem_cw, rex_w, p0_mode_w], dim=-1)
-    rh_w = F.silu(torch.bmm(rin_w, wg1_c) + bg1_c)
+    rh1_w = F.silu(torch.bmm(rin_w, wg1_c) + bg1_c)
+    rres_pre_w = torch.bmm(rh1_w, wgres1_c) + bgres_c
+    rres_act_w = F.silu(rres_pre_w[:, :, :ROUTER_RES_H_ORDER3]) * (2.0 * torch.sigmoid(rres_pre_w[:, :, ROUTER_RES_H_ORDER3:]))
+    rh_w = rh1_w + torch.bmm(rres_act_w, wgres2_c)
     go_w = (torch.bmm(rh_w, wg2_c).float() + bg2_c.float())[:, :, :K_MODES_ORDER3]
     gm_w = torch.softmax(go_w, dim=-1)
-    moe_w = (torch.bmm(h2_w_ctx, w2m_c).float() + b2m_c.float()).view(C, W, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+    moe_lin_w = (torch.bmm(h2_w_ctx, w2m_c).float() + b2m_c.float()).view(C, W, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+    moe_up_w = (torch.bmm(h2_w_ctx, wmup_c) + bmup_c).view(C, W, K_MODES_ORDER3, 2 * MOE_MLP_H_ORDER3)
+    moe_act_w = F.silu(moe_up_w[:, :, :, :MOE_MLP_H_ORDER3]) * (2.0 * torch.sigmoid(moe_up_w[:, :, :, MOE_MLP_H_ORDER3:]))
+    moe_mlp_w = torch.matmul(moe_act_w.permute(0, 2, 1, 3), wmdn_c).permute(0, 2, 1, 3).float()
+    moe_w = moe_lin_w + moe_mlp_w
     st_w = (gm_w.unsqueeze(-1) * moe_w).sum(dim=2)
 
     mem_h = mem_cw.permute(1, 0, 2).unsqueeze(2).expand(W, C, B_bud, MEM_DIM_ORDER3).reshape(N, MEM_DIM_ORDER3).contiguous()
@@ -1847,7 +1922,10 @@ def evaluate_order3_basket(
         cb["w1_ag_c"].copy_(w1_ag_c)
         cb["wr1_c"].copy_(wr1_c); cb["br1_c"].copy_(br1_c); cb["wr2_c"].copy_(wr2_c)
         cb["w2m_c"].copy_(w2m_c); cb["b2m_c"].copy_(b2m_c)
-        cb["wg1_c"].copy_(wg1_c); cb["bg1_c"].copy_(bg1_c); cb["wg2_c"].copy_(wg2_c); cb["bg2_c"].copy_(bg2_c)
+        cb["wmup_c"].copy_(wmup_c); cb["bmup_c"].copy_(bmup_c); cb["wmdn_c"].copy_(wmdn_c)
+        cb["wg1_c"].copy_(wg1_c); cb["bg1_c"].copy_(bg1_c)
+        cb["wgres1_c"].copy_(wgres1_c); cb["bgres_c"].copy_(bgres_c); cb["wgres2_c"].copy_(wgres2_c)
+        cb["wg2_c"].copy_(wg2_c); cb["bg2_c"].copy_(bg2_c)
         cb["wrec_c"].copy_(wrec_c); cb["brec_c"].copy_(brec_c); cb["wmem2h_c"].copy_(wmem2h_c)
         cb["wreg1_c"].copy_(wreg1_c); cb["breg1b_c"].copy_(breg1b_c); cb["breg1a_c"].copy_(breg1a_c)
         cb["wreg_res1_c"].copy_(wreg_res1_c); cb["breg_res_c"].copy_(breg_res_c); cb["wreg_res2_c"].copy_(wreg_res2_c)
@@ -1943,7 +2021,10 @@ def evaluate_order3_basket(
                     rb_w_all[s], rs_w_all[s],
                     b10_w_all[s], a10_w_all[s], bq10_w_all[s], aq10_w_all[s],
                     b1_w_all[s + 1], a1_w_all[s + 1], b1q_w_all[s + 1], a1q_w_all[s + 1], sv_w_all[s + 1], bv_w_all[s + 1],
-                    w1_ag_c, wr1_c, br1_c, wr2_c, w2m_c, b2m_c, wg1_c, bg1_c, wg2_c, bg2_c, wrec_c, brec_c, wmem2h_c,
+                    w1_ag_c, wr1_c, br1_c, wr2_c,
+                    w2m_c, b2m_c, wmup_c, bmup_c, wmdn_c,
+                    wg1_c, bg1_c, wgres1_c, bgres_c, wgres2_c, wg2_c, bg2_c,
+                    wrec_c, brec_c, wmem2h_c,
                     wreg1_c, breg1b_c, breg1a_c, wreg_res1_c, breg_res_c, wreg_res2_c, wreg2_c, breg2b_c, breg2a_c,
                     echelon_k01, budget,
                     mem_h, gate_state, strat_state, cash, pos_qty, pos_cost_usd, avg_entry,

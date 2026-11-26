@@ -44,8 +44,11 @@ from _tools.fused_order3_clean_tick import (
     K_MODES_ORDER3,
     EXPERT_OUT_DIM_ORDER3,
     MOE_OUT_DIM_ORDER3,
+    MOE_MLP_H_ORDER3,
+    MOE_MLP_UP_DIM_ORDER3,
     ROUTER_IN_DIM_ORDER3,
     ROUTER_H_DIM_ORDER3,
+    ROUTER_RES_H_ORDER3,
     ROUTER_OUT_DIM_ORDER3,
     REG_IN_DIM_ORDER3,
     REG_H_DIM_ORDER3,
@@ -177,19 +180,29 @@ def _normalize_weights_order3(state: dict, dtype: torch.dtype) -> dict:
     out["w2_moe"] = torch.cat(w2m_parts, dim=-1).to(dtype)
     out["b2_moe"] = torch.clamp(state["b2_moe"].float(), -12.0, 8.5).to(dtype)
 
-    # Раздельная нормировка прямого роутера w_gate1 (370D -> 128):
+    if "w_moe_up" in state:
+        wmup_f = state["w_moe_up"].float().view(*state["w_moe_up"].shape[:-2], 256, K_MODES_ORDER3, 2 * MOE_MLP_H_ORDER3)
+        n_mup = torch.linalg.vector_norm(wmup_f, dim=(-3, -1), keepdim=True).clamp(min=1e-6)
+        out["w_moe_up"] = (wmup_f * torch.clamp(38.0 / n_mup, max=1.0)).reshape(*state["w_moe_up"].shape[:-2], 256, MOE_MLP_UP_DIM_ORDER3).to(dtype)
+        out["b_moe_up"] = torch.clamp(state["b_moe_up"].float(), -2.8, 2.8).to(dtype)
+        wmdn_f = state["w_moe_dn"].float().view(*state["w_moe_dn"].shape[:-3], K_MODES_ORDER3, MOE_MLP_H_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        n_mdn = torch.linalg.vector_norm(wmdn_f, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+        out["w_moe_dn"] = (wmdn_f * torch.clamp(24.0 / n_mdn, max=1.0)).to(dtype)
+
+    # Раздельная нормировка прямого роутера w_gate1 (386D -> 128):
     wg1_f = state["w_gate1"].float()
     if wg1_f.shape[-2] >= 368:
         r_tot = wg1_f.shape[-2]
-        wg1_base = wg1_f[..., :336, :]
-        wg1_wave_ext = wg1_f[..., 336 : r_tot - 8, :]
+        mem_end = 272 + MEM_DIM_ORDER3
+        wg1_base = wg1_f[..., :mem_end, :]
+        wg1_wave_ext = wg1_f[..., mem_end : r_tot - 8, :]
         wg1_rec_m = wg1_f[..., r_tot - 8 : r_tot, :]
         nb_gb = torch.linalg.vector_norm(wg1_base, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
         nb_gw = torch.linalg.vector_norm(wg1_wave_ext, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
         nb_gr = torch.linalg.vector_norm(wg1_rec_m, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
         out["w_gate1"] = torch.cat(
             [
-                wg1_base * torch.clamp(32.0 / nb_gb, max=1.0),
+                wg1_base * torch.clamp(34.0 / nb_gb, max=1.0),
                 wg1_wave_ext * torch.clamp(18.0 / nb_gw, max=1.0),
                 wg1_rec_m * torch.clamp(8.5 / nb_gr, max=1.0),
             ],
@@ -229,12 +242,19 @@ def _normalize_weights_order3(state: dict, dtype: torch.dtype) -> dict:
         nw_g1 = torch.linalg.vector_norm(wg1_f, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
         out["w_gate1"] = (wg1_f * torch.clamp(30.0 / nw_g1, max=1.0)).to(dtype)
 
+    if "w_gate_res1" in state:
+        for k_gr, cap_gr in (("w_gate_res1", 26.0), ("w_gate_res2", 20.0)):
+            wf_gr = state[k_gr].float()
+            nw_gr = torch.linalg.vector_norm(wf_gr, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+            out[k_gr] = (wf_gr * torch.clamp(cap_gr / nw_gr, max=1.0)).to(dtype)
+        out["b_gate_res"] = torch.clamp(state["b_gate_res"].float(), -2.5, 2.5).to(dtype)
+
     for k, cap in (
         ("w_res1", 65.0),
         ("w_res2", 40.0),
         ("w_gate2", 18.0),
-        ("w_rec", 36.0),
-        ("w_mem2h", 16.0),
+        ("w_rec", 42.0),
+        ("w_mem2h", 20.0),
         ("w_reg1", 26.0),
         ("w_reg_res1", 24.0),
         ("w_reg_res2", 18.0),
@@ -270,7 +290,10 @@ class MultimodalMoEPolicyOrder3:
     PARAM_KEYS = (
         "w1", "b1", "w_res1", "b_res1", "w_res2",
         "w2_moe", "b2_moe",
-        "w_gate1", "b_gate1", "w_gate2", "b_gate2",
+        "w_moe_up", "b_moe_up", "w_moe_dn",
+        "w_gate1", "b_gate1",
+        "w_gate_res1", "b_gate_res", "w_gate_res2",
+        "w_gate2", "b_gate2",
         "w_rec", "b_rec", "w_mem2h",
         "w_reg1", "b_reg1_b", "b_reg1_a",
         "w_reg_res1", "b_reg_res", "w_reg_res2",
@@ -292,8 +315,15 @@ class MultimodalMoEPolicyOrder3:
 
         self.w2_moe = torch.empty((n_groups, 256, MOE_OUT_DIM_ORDER3), dtype=self.dtype, device=device)
         self.b2_moe = torch.empty((n_groups, 1, MOE_OUT_DIM_ORDER3), dtype=self.dtype, device=device)
+        self.w_moe_up = torch.empty((n_groups, 256, MOE_MLP_UP_DIM_ORDER3), dtype=self.dtype, device=device)
+        self.b_moe_up = torch.empty((n_groups, 1, MOE_MLP_UP_DIM_ORDER3), dtype=self.dtype, device=device)
+        self.w_moe_dn = torch.empty((n_groups, K_MODES_ORDER3, MOE_MLP_H_ORDER3, EXPERT_OUT_DIM_ORDER3), dtype=self.dtype, device=device)
+
         self.w_gate1 = torch.empty((n_groups, ROUTER_IN_DIM_ORDER3, ROUTER_H_DIM_ORDER3), dtype=self.dtype, device=device)
         self.b_gate1 = torch.empty((n_groups, 1, ROUTER_H_DIM_ORDER3), dtype=self.dtype, device=device)
+        self.w_gate_res1 = torch.empty((n_groups, ROUTER_H_DIM_ORDER3, 2 * ROUTER_RES_H_ORDER3), dtype=self.dtype, device=device)
+        self.b_gate_res = torch.empty((n_groups, 1, 2 * ROUTER_RES_H_ORDER3), dtype=self.dtype, device=device)
+        self.w_gate_res2 = torch.empty((n_groups, ROUTER_RES_H_ORDER3, ROUTER_H_DIM_ORDER3), dtype=self.dtype, device=device)
         self.w_gate2 = torch.empty((n_groups, ROUTER_H_DIM_ORDER3, ROUTER_OUT_DIM_ORDER3), dtype=self.dtype, device=device)
         self.b_gate2 = torch.empty((n_groups, 1, ROUTER_OUT_DIM_ORDER3), dtype=self.dtype, device=device)
 
@@ -356,11 +386,13 @@ class MultimodalMoEPolicyOrder3:
             and ck["b_gate2"].numel() == ROUTER_OUT_DIM_ORDER3
             and "w_mem2h" in ck
             and "w_reg_res1" in ck
+            and "w_moe_up" in ck
+            and "w_gate_res1" in ck
         ):
             state = {k: ck[k].to(dtype=self.dtype, device=self.device) for k in self.PARAM_KEYS}
         else:
-            # Хирургический Function-Preserving Net2Net перенос L70 -> L71 Liquid Gated v2 (0 потерь альфы на старте!):
-            gen = torch.Generator().manual_seed(20261171)
+            # Хирургический Function-Preserving Net2Net перенос v1 -> Order-3 v2 (0.00e+00 потерь на старте!):
+            gen = torch.Generator().manual_seed(20261186)
             w1_mkt = torch.zeros((MKT_DIM_ORDER3, 384), dtype=torch.float32)
             b1_vec = ck["b1"].view(1, 384).float().clone()
             if is_order3:
@@ -413,7 +445,14 @@ class MultimodalMoEPolicyOrder3:
             old_rin, old_rh = wg1_old.shape
             ch_r = min(old_rh, ROUTER_H_DIM_ORDER3)
             bg1_new[:, :ch_r] = bg1_old[:, :ch_r]
-            if old_rin == 368 and ROUTER_IN_DIM_ORDER3 == 370:
+            if old_rin == 370 and ROUTER_IN_DIM_ORDER3 == 386:
+                wg1_new[:320, :ch_r] = wg1_old[:320, :ch_r]
+                wg1_new[336:386, :ch_r] = wg1_old[320:370, :ch_r]
+            elif old_rin == 368 and ROUTER_IN_DIM_ORDER3 == 386:
+                wg1_new[:320, :ch_r] = wg1_old[:320, :ch_r]
+                wg1_new[336:376, :ch_r] = wg1_old[320:360, :ch_r]
+                wg1_new[378:386, :ch_r] = wg1_old[360:368, :ch_r]
+            elif old_rin == 368 and ROUTER_IN_DIM_ORDER3 == 370:
                 wg1_new[:360, :ch_r] = wg1_old[:360, :ch_r]
                 wg1_new[362:370, :ch_r] = wg1_old[360:368, :ch_r]
             elif old_rin == 362 and ROUTER_IN_DIM_ORDER3 >= 368:
@@ -523,7 +562,32 @@ class MultimodalMoEPolicyOrder3:
             else:
                 wrec_new, brec_new = wrec_old, brec_old
 
-            wmem2h_new = ck["w_mem2h"].float() if ("w_mem2h" in ck and ck["w_mem2h"].shape == (MEM_DIM_ORDER3, 256)) else torch.zeros((MEM_DIM_ORDER3, 256), dtype=torch.float32)
+            if "w_mem2h" in ck:
+                wm2h_old = ck["w_mem2h"].float()
+                wmem2h_new = torch.zeros((MEM_DIM_ORDER3, 256), dtype=torch.float32)
+                cm2 = min(wm2h_old.shape[0], MEM_DIM_ORDER3)
+                wmem2h_new[:cm2, :] = wm2h_old[:cm2, :]
+            else:
+                wmem2h_new = torch.zeros((MEM_DIM_ORDER3, 256), dtype=torch.float32)
+
+            if "w_moe_up" in ck and ck["w_moe_up"].shape == (256, MOE_MLP_UP_DIM_ORDER3):
+                wmup_new = ck["w_moe_up"].float()
+                bmup_new = ck["b_moe_up"].float().view(1, MOE_MLP_UP_DIM_ORDER3)
+                wmdn_new = ck["w_moe_dn"].float().view(K_MODES_ORDER3, MOE_MLP_H_ORDER3, EXPERT_OUT_DIM_ORDER3)
+            else:
+                # Живой ортогональный базис в 1-м слое + нулевой выходной слой w_moe_dn -> 0.00e+00 паритет на Gen 0 и мгновенный градиент с Gen 1!
+                wmup_new = torch.randn((256, MOE_MLP_UP_DIM_ORDER3), generator=gen) * 0.055
+                bmup_new = torch.zeros((1, MOE_MLP_UP_DIM_ORDER3), dtype=torch.float32)
+                wmdn_new = torch.zeros((K_MODES_ORDER3, MOE_MLP_H_ORDER3, EXPERT_OUT_DIM_ORDER3), dtype=torch.float32)
+
+            if "w_gate_res1" in ck and ck["w_gate_res1"].shape == (ROUTER_H_DIM_ORDER3, 2 * ROUTER_RES_H_ORDER3):
+                wgres1_new = ck["w_gate_res1"].float()
+                bgres_new = ck["b_gate_res"].float().view(1, 2 * ROUTER_RES_H_ORDER3)
+                wgres2_new = ck["w_gate_res2"].float()
+            else:
+                wgres1_new = torch.randn((ROUTER_H_DIM_ORDER3, 2 * ROUTER_RES_H_ORDER3), generator=gen) * 0.055
+                bgres_new = torch.zeros((1, 2 * ROUTER_RES_H_ORDER3), dtype=torch.float32)
+                wgres2_new = torch.zeros((ROUTER_RES_H_ORDER3, ROUTER_H_DIM_ORDER3), dtype=torch.float32)
 
             wreg1_old = ck["w_reg1"].float()
             breg1b_old = ck["b_reg1_b"].float().view(1, -1)
@@ -561,8 +625,14 @@ class MultimodalMoEPolicyOrder3:
                 "w_res2": ck["w_res2"].to(dtype=self.dtype, device=self.device),
                 "w2_moe": w2m_flat.to(dtype=self.dtype, device=self.device),
                 "b2_moe": b2m_flat.to(dtype=self.dtype, device=self.device),
+                "w_moe_up": wmup_new.to(dtype=self.dtype, device=self.device),
+                "b_moe_up": bmup_new.to(dtype=self.dtype, device=self.device),
+                "w_moe_dn": wmdn_new.to(dtype=self.dtype, device=self.device),
                 "w_gate1": wg1_new.to(dtype=self.dtype, device=self.device),
                 "b_gate1": bg1_new.to(dtype=self.dtype, device=self.device),
+                "w_gate_res1": wgres1_new.to(dtype=self.dtype, device=self.device),
+                "b_gate_res": bgres_new.to(dtype=self.dtype, device=self.device),
+                "w_gate_res2": wgres2_new.to(dtype=self.dtype, device=self.device),
                 "w_gate2": wg2_new.to(dtype=self.dtype, device=self.device),
                 "b_gate2": bg2_new.to(dtype=self.dtype, device=self.device),
                 "w_rec": wrec_new.to(dtype=self.dtype, device=self.device),
@@ -681,15 +751,24 @@ class MultimodalMoEPolicyOrder3:
                     dw2m_v[:, :, :, 55] = 0.0; db2m_v[:, :, :, 55] = 0.0  # D4: скальп [55] выключен до живой калибровки!
         self.w2_moe[2 : 2 + 2 * half].copy_(base_gpu["w2_moe"].unsqueeze(0) + dw2m.to(self.dtype))
         self.b2_moe[2 : 2 + 2 * half].copy_(base_gpu["b2_moe"].unsqueeze(0) + db2m.to(self.dtype))
+        dw_mup = _anti_ring((256, MOE_MLP_UP_DIM_ORDER3), moe_sig * 1.45, low_rank=16).to(self.dtype)
+        db_mup = _anti_ring((1, MOE_MLP_UP_DIM_ORDER3), moe_sig * 1.15).to(self.dtype)
+        dw_mdn = _anti_ring((K_MODES_ORDER3, MOE_MLP_H_ORDER3, EXPERT_OUT_DIM_ORDER3), moe_sig * 1.85).to(self.dtype)
+        self.w_moe_up[2 : 2 + 2 * half].copy_(base_gpu["w_moe_up"].unsqueeze(0) + dw_mup)
+        self.b_moe_up[2 : 2 + 2 * half].copy_(base_gpu["b_moe_up"].unsqueeze(0) + db_mup)
+        self.w_moe_dn[2 : 2 + 2 * half].copy_(base_gpu["w_moe_dn"].unsqueeze(0) + dw_mdn)
 
         gate_mult = 2.60 if lesson_stage in ("l81_risk_off", "l85_joint") else (1.35 if lesson_stage == "l82_up_carry_f" else 0.65)
         dw_g1 = _anti_ring((ROUTER_IN_DIM_ORDER3, ROUTER_H_DIM_ORDER3), moe_sig * 1.85 * gate_mult, low_rank=12).to(self.dtype)
-        dw_g1[:, 272:320, :] *= 2.60  # 48D многомасштабная память в роутере
-        dw_g1[:, 320:, :] *= 4.20     # прямые сигналы (Wave + O1 + O2 + O2.5 + Struct/CVD) + 8D prev_g_mode рекуррентность!
+        dw_g1[:, 272 : 272 + MEM_DIM_ORDER3, :] *= 2.60  # 64D многомасштабная память в роутере
+        dw_g1[:, 272 + MEM_DIM_ORDER3 :, :] *= 4.20      # прямые сигналы (Wave + O1 + O2 + O2.5 + Struct/CVD) + 8D prev_g_mode!
         if ROUTER_IN_DIM_ORDER3 >= 370:
-            dw_g1[:, 354:362, :] *= 1.55  # дополнительный буст (6.51x) для 30m+2h Struct/CVD [88..95] в роутере!
+            dw_g1[:, ROUTER_IN_DIM_ORDER3 - 16 : ROUTER_IN_DIM_ORDER3 - 8, :] *= 1.55
         self.w_gate1[2 : 2 + 2 * half].copy_(base_gpu["w_gate1"].unsqueeze(0) + dw_g1)
         self.b_gate1[2 : 2 + 2 * half].copy_(base_gpu["b_gate1"].unsqueeze(0) + _anti_ring((1, ROUTER_H_DIM_ORDER3), moe_sig * 1.35 * gate_mult).to(self.dtype))
+        self.w_gate_res1[2 : 2 + 2 * half].copy_(base_gpu["w_gate_res1"].unsqueeze(0) + _anti_ring((ROUTER_H_DIM_ORDER3, 2 * ROUTER_RES_H_ORDER3), moe_sig * 1.75 * gate_mult, low_rank=12).to(self.dtype))
+        self.b_gate_res[2 : 2 + 2 * half].copy_(base_gpu["b_gate_res"].unsqueeze(0) + _anti_ring((1, 2 * ROUTER_RES_H_ORDER3), moe_sig * 1.15 * gate_mult).to(self.dtype))
+        self.w_gate_res2[2 : 2 + 2 * half].copy_(base_gpu["w_gate_res2"].unsqueeze(0) + _anti_ring((ROUTER_RES_H_ORDER3, ROUTER_H_DIM_ORDER3), moe_sig * 2.10 * gate_mult, low_rank=12).to(self.dtype))
         dw_g2 = _anti_ring((ROUTER_H_DIM_ORDER3, ROUTER_OUT_DIM_ORDER3), moe_sig * 2.00 * gate_mult)
         db_g2 = _anti_ring((1, ROUTER_OUT_DIM_ORDER3), moe_sig * 1.40 * gate_mult)
         dw_g2[:, :, K_MODES_ORDER3:] *= 2.20

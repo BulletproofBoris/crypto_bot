@@ -110,12 +110,14 @@ def main():
             rr = h2 @ engine.w_rec + engine.b_rec
             rg = torch.cat(
                 [
-                    torch.sigmoid(rr[:, 48:56] + 1.0),
-                    torch.sigmoid(rr[:, 56:64] + 3.8),
-                    torch.sigmoid(rr[:, 64:72] + 5.2),
-                    torch.sigmoid(rr[:, 72:80] + 6.6),
-                    torch.sigmoid(rr[:, 80:88] + 2.2),
-                    torch.sigmoid(rr[:, 88:96] + 4.5),
+                    torch.sigmoid(rr[:, 64:72] + 1.0),
+                    torch.sigmoid(rr[:, 72:80] + 3.8),
+                    torch.sigmoid(rr[:, 80:88] + 5.2),
+                    torch.sigmoid(rr[:, 88:96] + 6.6),
+                    torch.sigmoid(rr[:, 96:104] + 2.2),
+                    torch.sigmoid(rr[:, 104:112] + 4.5),
+                    torch.sigmoid(rr[:, 112:120] + 7.5),
+                    torch.sigmoid(rr[:, 120:128] + 8.9),
                 ],
                 dim=-1,
             )
@@ -132,11 +134,17 @@ def main():
             )
             prev_gm = torch.softmax(ref_gate_st, dim=-1)
             rin = torch.cat([h2_ctx, za_raw[:, 54:62], za_raw[:, 62:70], ref_mem_h, r_extra, prev_gm], dim=-1)
-            go = F.silu(rin @ engine.w_gate1 + engine.b_gate1) @ engine.w_gate2 + engine.b_gate2
+            rh1 = F.silu(rin @ engine.w_gate1 + engine.b_gate1)
+            rr_pre = rh1 @ engine.w_gate_res1 + engine.b_gate_res
+            rh = rh1 + (F.silu(rr_pre[:, :64]) * (2.0 * torch.sigmoid(rr_pre[:, 64:128]))) @ engine.w_gate_res2
+            go = rh @ engine.w_gate2 + engine.b_gate2
             beta_g = torch.sigmoid(go[:, engine.k_modes : 2 * engine.k_modes])
             ref_gate_st = (1.0 - beta_g) * ref_gate_st + beta_g * go[:, :engine.k_modes]
             gm = torch.softmax(ref_gate_st, dim=-1)
-            moe = (h2_ctx @ engine.w2_moe + engine.b2_moe).view(1, engine.k_modes, EXPERT_OUT_DIM_ORDER3)
+            moe_lin = (h2_ctx @ engine.w2_moe + engine.b2_moe).view(1, engine.k_modes, EXPERT_OUT_DIM_ORDER3)
+            moe_up = (h2_ctx @ engine.w_moe_up + engine.b_moe_up).view(1, engine.k_modes, 96)
+            moe_act = F.silu(moe_up[:, :, :48]) * (2.0 * torch.sigmoid(moe_up[:, :, 48:96]))
+            moe = moe_lin + torch.matmul(moe_act.permute(1, 0, 2), engine.w_moe_dn).permute(1, 0, 2)
             si = (gm.unsqueeze(-1) * moe).sum(dim=1)
             ab = torch.sigmoid(si[:, 50:51])
             aa = torch.sigmoid(si[:, 51:52])

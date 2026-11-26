@@ -28,9 +28,12 @@ from _tools.fused_order3_clean_tick import (
     K_MODES_ORDER3,
     EXPERT_OUT_DIM_ORDER3,
     MOE_OUT_DIM_ORDER3,
+    MOE_MLP_H_ORDER3,
+    MOE_MLP_UP_DIM_ORDER3,
     ROUTER_EXTRA_DIM_ORDER3,
     ROUTER_IN_DIM_ORDER3,
     ROUTER_H_DIM_ORDER3,
+    ROUTER_RES_H_ORDER3,
     ROUTER_OUT_DIM_ORDER3,
     REG_IN_DIM_ORDER3,
     REG_H_DIM_ORDER3,
@@ -104,8 +107,15 @@ class Order3LiveInferenceEngine:
             wrec_raw, brec_raw = wrec_pad, brec_pad
         self.w_rec = wrec_raw.to(device=self.device)
         self.b_rec = brec_raw.view(1, 2 * MEM_DIM_ORDER3).to(device=self.device)
-        if "w_mem2h" in ck and ck["w_mem2h"].shape == (MEM_DIM_ORDER3, 256):
-            self.w_mem2h = ck["w_mem2h"].to(device=self.device, dtype=torch.float32)
+        if "w_mem2h" in ck:
+            wm2h_raw = ck["w_mem2h"].to(dtype=torch.float32)
+            if wm2h_raw.shape == (MEM_DIM_ORDER3, 256):
+                self.w_mem2h = wm2h_raw.to(device=self.device)
+            else:
+                wm2h_pad = torch.zeros((MEM_DIM_ORDER3, 256), dtype=torch.float32)
+                cm2 = min(wm2h_raw.shape[0], MEM_DIM_ORDER3)
+                wm2h_pad[:cm2, :] = wm2h_raw[:cm2, :]
+                self.w_mem2h = wm2h_pad.to(device=self.device)
         else:
             self.w_mem2h = torch.zeros((MEM_DIM_ORDER3, 256), dtype=torch.float32, device=self.device)
 
@@ -115,7 +125,7 @@ class Order3LiveInferenceEngine:
         self.moe_out_dim = self.k_modes * EXPERT_OUT_DIM_ORDER3
         self.reg_in_dim = 28 + self.k_modes
 
-        # Вентильный рекуррентный маршрутизатор (358D -> 128 -> 16, с бесшовной обратной совместимостью 326D->64->8!)
+        # Двухкаскадный Вентильный рекуррентный маршрутизатор (386D -> 128 + ResSwiGLU -> 16)
         wg1_raw = ck["w_gate1"].to(dtype=torch.float32)
         bg1_raw = ck["b_gate1"].to(dtype=torch.float32).view(1, -1)
         wg2_raw = ck["w_gate2"].to(dtype=torch.float32)
@@ -126,21 +136,30 @@ class Order3LiveInferenceEngine:
             bg1_adap = torch.zeros((1, ROUTER_H_DIM_ORDER3), dtype=torch.float32)
             ch_r = min(old_rh, ROUTER_H_DIM_ORDER3)
             bg1_adap[:, :ch_r] = bg1_raw[:, :ch_r]
-            if old_rin == 368 and ROUTER_IN_DIM_ORDER3 == 370:
+            if old_rin == 370 and ROUTER_IN_DIM_ORDER3 == 386:
+                wg1_adap[:320, :ch_r] = wg1_raw[:320, :ch_r]
+                wg1_adap[336:386, :ch_r] = wg1_raw[320:370, :ch_r]
+            elif old_rin == 368 and ROUTER_IN_DIM_ORDER3 == 386:
+                wg1_adap[:320, :ch_r] = wg1_raw[:320, :ch_r]
+                wg1_adap[336:376, :ch_r] = wg1_raw[320:360, :ch_r]
+                wg1_adap[378:386, :ch_r] = wg1_raw[360:368, :ch_r]
+            elif old_rin == 368 and ROUTER_IN_DIM_ORDER3 == 370:
                 wg1_adap[:360, :ch_r] = wg1_raw[:360, :ch_r]
                 wg1_adap[362:370, :ch_r] = wg1_raw[360:368, :ch_r]
             elif old_rin == 362 and ROUTER_IN_DIM_ORDER3 >= 368:
-                wg1_adap[:354, :ch_r] = wg1_raw[:354, :ch_r]
+                wg1_adap[:320, :ch_r] = wg1_raw[:320, :ch_r]
+                wg1_adap[336:370, :ch_r] = wg1_raw[320:354, :ch_r]
                 wg1_adap[ROUTER_IN_DIM_ORDER3 - 8 : ROUTER_IN_DIM_ORDER3, :ch_r] = wg1_raw[354:362, :ch_r]
             elif old_rin == 358 and ROUTER_IN_DIM_ORDER3 >= 362:
-                wg1_adap[:350, :ch_r] = wg1_raw[:350, :ch_r]
+                wg1_adap[:320, :ch_r] = wg1_raw[:320, :ch_r]
+                wg1_adap[336:366, :ch_r] = wg1_raw[320:350, :ch_r]
                 wg1_adap[ROUTER_IN_DIM_ORDER3 - 8 : ROUTER_IN_DIM_ORDER3, :ch_r] = wg1_raw[350:358, :ch_r]
             elif old_rin == 326 and ROUTER_IN_DIM_ORDER3 >= 358:
                 wg1_adap[:304, :ch_r] = wg1_raw[:304, :ch_r]
-                wg1_adap[320:342, :ch_r] = wg1_raw[304:326, :ch_r]
+                wg1_adap[336:358, :ch_r] = wg1_raw[304:326, :ch_r]
             elif old_rin == 295:
                 wg1_adap[:288, :ch_r] = wg1_raw[:288, :ch_r]
-                wg1_adap[320:327, :ch_r] = wg1_raw[288:295, :ch_r]
+                wg1_adap[336:343, :ch_r] = wg1_raw[288:295, :ch_r]
             else:
                 copy_r = min(ROUTER_IN_DIM_ORDER3, old_rin)
                 wg1_adap[:copy_r, :ch_r] = wg1_raw[:copy_r, :ch_r]
@@ -156,10 +175,18 @@ class Order3LiveInferenceEngine:
             wg2_raw, bg2_raw = wg2_adap, bg2_adap
         self.w_gate1 = wg1_raw.to(device=self.device)
         self.b_gate1 = bg1_raw.view(1, ROUTER_H_DIM_ORDER3).to(device=self.device)
+        if "w_gate_res1" in ck and ck["w_gate_res1"].shape == (ROUTER_H_DIM_ORDER3, 2 * ROUTER_RES_H_ORDER3):
+            self.w_gate_res1 = ck["w_gate_res1"].to(device=self.device, dtype=torch.float32)
+            self.b_gate_res = ck["b_gate_res"].view(1, 2 * ROUTER_RES_H_ORDER3).to(device=self.device, dtype=torch.float32)
+            self.w_gate_res2 = ck["w_gate_res2"].to(device=self.device, dtype=torch.float32)
+        else:
+            self.w_gate_res1 = torch.zeros((ROUTER_H_DIM_ORDER3, 2 * ROUTER_RES_H_ORDER3), dtype=torch.float32, device=self.device)
+            self.b_gate_res = torch.zeros((1, 2 * ROUTER_RES_H_ORDER3), dtype=torch.float32, device=self.device)
+            self.w_gate_res2 = torch.zeros((ROUTER_RES_H_ORDER3, ROUTER_H_DIM_ORDER3), dtype=torch.float32, device=self.device)
         self.w_gate2 = wg2_raw.to(device=self.device)
         self.b_gate2 = bg2_raw.view(1, 2 * self.k_modes).to(device=self.device)
 
-        # MoE эксперты (с бесшовной обратной совместимостью 45D / 48D / 50D / 54D -> 55D на моду)
+        # MoE эксперты (линейный путь + нелинейная Residual SwiGLU ветка на каждую моду)
         w2m_raw = ck["w2_moe"].to(dtype=torch.float32)
         b2m_raw = ck["b2_moe"].to(dtype=torch.float32).view(1, -1)
         if b2m_raw.numel() != self.moe_out_dim:
@@ -189,6 +216,14 @@ class Order3LiveInferenceEngine:
             b2m_raw = b2m_pad.reshape(1, self.moe_out_dim)
         self.w2_moe = w2m_raw.to(device=self.device)
         self.b2_moe = b2m_raw.view(1, self.moe_out_dim).to(device=self.device)
+        if "w_moe_up" in ck and ck["w_moe_up"].shape == (256, MOE_MLP_UP_DIM_ORDER3):
+            self.w_moe_up = ck["w_moe_up"].to(device=self.device, dtype=torch.float32)
+            self.b_moe_up = ck["b_moe_up"].view(1, MOE_MLP_UP_DIM_ORDER3).to(device=self.device, dtype=torch.float32)
+            self.w_moe_dn = ck["w_moe_dn"].view(self.k_modes, MOE_MLP_H_ORDER3, EXPERT_OUT_DIM_ORDER3).to(device=self.device, dtype=torch.float32)
+        else:
+            self.w_moe_up = torch.zeros((256, MOE_MLP_UP_DIM_ORDER3), dtype=torch.float32, device=self.device)
+            self.b_moe_up = torch.zeros((1, MOE_MLP_UP_DIM_ORDER3), dtype=torch.float32, device=self.device)
+            self.w_moe_dn = torch.zeros((self.k_modes, MOE_MLP_H_ORDER3, EXPERT_OUT_DIM_ORDER3), dtype=torch.float32, device=self.device)
 
         # Двухкаскадный ResSwiGLU регулятор слотов (36D -> 64 -> ResSwiGLU -> 2)
         wreg1_raw = ck["w_reg1"].to(dtype=torch.float32)
@@ -302,24 +337,26 @@ class Order3LiveInferenceEngine:
         res_mid = torch.relu(res_pre[:, :64]) * (2.0 * torch.sigmoid(res_pre[:, 64:128]))
         h2 = h1 + res_mid @ self.w_res2
 
-        # 6-горизонтная латентная память 48D + обратная проекция в экспертов и роутер h2_ctx
+        # 8-горизонтная латентная память 64D + обратная проекция в экспертов и роутер h2_ctx
         rec_raw = h2 @ self.w_rec + self.b_rec
         rec_u = torch.tanh(rec_raw[:, :MEM_DIM_ORDER3])
         rec_gate = torch.cat(
             [
-                torch.sigmoid(rec_raw[:, 48:56] + 1.0),
-                torch.sigmoid(rec_raw[:, 56:64] + 3.8),
-                torch.sigmoid(rec_raw[:, 64:72] + 5.2),
-                torch.sigmoid(rec_raw[:, 72:80] + 6.6),
-                torch.sigmoid(rec_raw[:, 80:88] + 2.2),
-                torch.sigmoid(rec_raw[:, 88:96] + 4.5),
+                torch.sigmoid(rec_raw[:, 64:72] + 1.0),
+                torch.sigmoid(rec_raw[:, 72:80] + 3.8),
+                torch.sigmoid(rec_raw[:, 80:88] + 5.2),
+                torch.sigmoid(rec_raw[:, 88:96] + 6.6),
+                torch.sigmoid(rec_raw[:, 96:104] + 2.2),
+                torch.sigmoid(rec_raw[:, 104:112] + 4.5),
+                torch.sigmoid(rec_raw[:, 112:120] + 7.5),
+                torch.sigmoid(rec_raw[:, 120:128] + 8.9),
             ],
             dim=-1,
         )
         self.mem_h = rec_gate * self.mem_h + (1.0 - rec_gate) * rec_u
         h2_ctx = h2 + self.mem_h @ self.w_mem2h
 
-        # Вентильный рекуррентный маршрутизатор (358D -> 128 -> 16: 8 логитов мод + 8 нелинейных Liquid-вентилей инерции!)
+        # Двухкаскадный Вентильный рекуррентный маршрутизатор (386D -> 128 SiLU + ResSwiGLU -> 16)
         acct_8d = za[:, 54:62]
         queue_8d = za[:, 62:70]
         r_extra_30d = torch.cat(
@@ -335,15 +372,22 @@ class Order3LiveInferenceEngine:
         )
         prev_g_mode = torch.softmax(self.gate_state, dim=-1)
         router_in = torch.cat([h2_ctx, acct_8d, queue_8d, self.mem_h, r_extra_30d, prev_g_mode], dim=-1)
-        r_hid = F.silu(router_in @ self.w_gate1 + self.b_gate1)
+        r_hid1 = F.silu(router_in @ self.w_gate1 + self.b_gate1)
+        r_res_pre = r_hid1 @ self.w_gate_res1 + self.b_gate_res
+        r_res_act = F.silu(r_res_pre[:, :ROUTER_RES_H_ORDER3]) * (2.0 * torch.sigmoid(r_res_pre[:, ROUTER_RES_H_ORDER3:]))
+        r_hid = r_hid1 + r_res_act @ self.w_gate_res2
         gate_out = (r_hid @ self.w_gate2 + self.b_gate2).float()
         raw_logits = gate_out[:, :self.k_modes]
         beta_gate = torch.sigmoid(gate_out[:, self.k_modes : 2 * self.k_modes])
         self.gate_state = (1.0 - beta_gate) * self.gate_state + beta_gate * raw_logits
         g_mode = torch.softmax(self.gate_state, dim=-1)
 
-        # K Латентных экспертов (EXPERT_OUT_DIM_ORDER3 = 58) + Адаптивный нелинейный демпфер плана котирования!
-        moe_all = (h2_ctx @ self.w2_moe + self.b2_moe).float().view(1, self.k_modes, EXPERT_OUT_DIM_ORDER3)
+        # K Нелинейных экспертов (Linear 58D + Residual SwiGLU 256 -> 96 [48 gated] -> 58D)
+        moe_lin = (h2_ctx @ self.w2_moe + self.b2_moe).float().view(1, self.k_modes, EXPERT_OUT_DIM_ORDER3)
+        moe_up = (h2_ctx @ self.w_moe_up + self.b_moe_up).view(1, self.k_modes, 2 * MOE_MLP_H_ORDER3)
+        moe_act = F.silu(moe_up[:, :, :MOE_MLP_H_ORDER3]) * (2.0 * torch.sigmoid(moe_up[:, :, MOE_MLP_H_ORDER3:]))
+        moe_mlp = torch.matmul(moe_act.permute(1, 0, 2), self.w_moe_dn).permute(1, 0, 2).float()
+        moe_all = moe_lin + moe_mlp
         strat_inst = (g_mode.unsqueeze(-1) * moe_all).sum(dim=1)  # [1, 58]
         alpha_bid = torch.sigmoid(strat_inst[:, 50:51])
         alpha_ask = torch.sigmoid(strat_inst[:, 51:52])
@@ -1221,10 +1265,15 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
             z16_w = torch.zeros((1, 16), dtype=torch.float32, device=eng_w.device)
             p0_m = torch.full((1, eng_w.k_modes), 1.0 / float(eng_w.k_modes), dtype=torch.float32, device=eng_w.device)
             rin_w = torch.cat([h2w_ctx, z16_w, eng_w.mem_h, rex_w, p0_m], dim=-1)
-            rh_w = F.silu(rin_w @ eng_w.w_gate1 + eng_w.b_gate1)
+            rh1_w = F.silu(rin_w @ eng_w.w_gate1 + eng_w.b_gate1)
+            rres_pw = rh1_w @ eng_w.w_gate_res1 + eng_w.b_gate_res
+            rh_w = rh1_w + (F.silu(rres_pw[:, :ROUTER_RES_H_ORDER3]) * (2.0 * torch.sigmoid(rres_pw[:, ROUTER_RES_H_ORDER3:]))) @ eng_w.w_gate_res2
             go_w = (rh_w @ eng_w.w_gate2 + eng_w.b_gate2)[:, :eng_w.k_modes]
             gm_w = torch.softmax(go_w, dim=-1)
-            moe_w = (h2w_ctx @ eng_w.w2_moe + eng_w.b2_moe).view(1, eng_w.k_modes, EXPERT_OUT_DIM_ORDER3)
+            moe_lin_w = (h2w_ctx @ eng_w.w2_moe + eng_w.b2_moe).view(1, eng_w.k_modes, EXPERT_OUT_DIM_ORDER3)
+            moe_up_w = (h2w_ctx @ eng_w.w_moe_up + eng_w.b_moe_up).view(1, eng_w.k_modes, 2 * MOE_MLP_H_ORDER3)
+            moe_act_w = F.silu(moe_up_w[:, :, :MOE_MLP_H_ORDER3]) * (2.0 * torch.sigmoid(moe_up_w[:, :, MOE_MLP_H_ORDER3:]))
+            moe_w = moe_lin_w + torch.matmul(moe_act_w.permute(1, 0, 2), eng_w.w_moe_dn).permute(1, 0, 2)
             eng_w.gate_state.copy_(go_w)
             eng_w.strat_state.copy_((gm_w.unsqueeze(-1) * moe_w).sum(dim=1))
             eng_w._mem_warmed = True
