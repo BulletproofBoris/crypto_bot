@@ -1679,15 +1679,17 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
             trader._sync_24slot_orders(b1, count_hold=False, pre_fetched_orders=c_map)
 
     # 3. Постановка Bid-слотов 1-в-1 с fused_order3_clean_tick.py (сортировка по pi_bid, шлюз g_plc_b):
+    # Важно: Peatio v2 (SafeTrade) блокирует под лимитный BUY qty * px * (1 + taker_fee = 1.002), поэтому резервируем 1.0025 + буфер 0.990 от ex_usdt_free, чтобы исключить HTTP 422 на дальнем слоте #11!
     exp_b = float(plan["exp_bid_frac"])
-    res_b_usd = sum(float(s.get("qty", 0.0)) * float(s.get("px", 0.0)) * 1.001 for s in trader.bid_slots if s.get("id") is not None)
-    free_cash_b = max(0.0, min(core_cash_usd * 0.998 - res_b_usd, max(0.0, float(trader.ex_usdt_free) - (can_cash_res if can_pos_q < 1.95 and can_info.get("canary_bid_oid") is None else 0.0))))
-    rem_exp_b = max(0.0, tot_eq * 0.996 * exp_b - core_pos_qty * b1 - res_b_usd)
+    res_b_usd = sum(float(s.get("qty", 0.0)) * float(s.get("px", 0.0)) * 1.002 for s in trader.bid_slots if s.get("id") is not None)
+    ex_free_net = max(0.0, float(trader.ex_usdt_free) - (can_cash_res if can_pos_q < 1.95 and can_info.get("canary_bid_oid") is None else 0.0)) * 0.994
+    free_cash_b = max(0.0, min(core_cash_usd * 0.992 - res_b_usd, ex_free_net))
+    rem_exp_b = max(0.0, tot_eq * 0.990 * exp_b - core_pos_qty * b1 - res_b_usd)
     avail_b_usd = min(free_cash_b, rem_exp_b)
 
     cand_b_slots = [
         s for s in sorted(range(12), key=lambda i: float(plan["pi_bid"][i]), reverse=True)
-        if trader.bid_slots[s].get("id") is None and bool(plan["g_plc_b"][s]) and float(plan["pi_bid"][s]) > 1e-4 and (avail_b_usd / max(1e-6, float(plan["t_bid_px"][s]) * 1.001)) >= min_amt
+        if trader.bid_slots[s].get("id") is None and bool(plan["g_plc_b"][s]) and float(plan["pi_bid"][s]) > 1e-4 and (avail_b_usd / max(1e-6, float(plan["t_bid_px"][s]) * 1.0025)) >= min_amt
     ]
     sel_b = []
     for s in cand_b_slots:
@@ -1702,14 +1704,17 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
 
     sum_pi_b = sum(float(plan["pi_bid"][s]) + 1e-5 for s in sel_b)
     b_tasks = []
+    rem_batch_usd = ex_free_net
     for s in sel_b:
         px_s = round(min(max_safe_bid, float(plan["t_bid_px"][s])), p_prec)
         full_sh_b = (float(plan["pi_bid"][s]) + 1e-5) / max(1e-6, sum_pi_b)
         raw_sh_b = min(float(plan["pi_bid"][s]), full_sh_b)
         share_s = renorm_b * full_sh_b + (1.0 - renorm_b) * raw_sh_b
-        q_s = math.floor(((avail_b_usd * share_s * 0.999) / max(1e-6, px_s * 1.001)) * 10000.0) / 10000.0
+        alloc_s_usd = min(avail_b_usd * share_s * 0.998, rem_batch_usd)
+        q_s = math.floor((alloc_s_usd / max(1e-6, px_s * 1.0025)) * 10000.0) / 10000.0
         if q_s >= min_amt and px_s > 0:
             b_tasks.append((s, q_s, px_s))
+            rem_batch_usd = max(0.0, rem_batch_usd - q_s * px_s * 1.0025)
         else:
             trader.order3_engine.api_tokens = min(LIVE_TOKEN_BUCKET_CAP, trader.order3_engine.api_tokens + 1.0)
 

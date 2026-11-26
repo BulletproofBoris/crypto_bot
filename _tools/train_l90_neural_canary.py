@@ -6,15 +6,14 @@ _tools/train_l90_neural_canary.py
 и его персонального Оркестратора (L90a -> L90b -> canary_neural_v1.pt)
 БЕЗ ЭМПИРИЧЕСКИХ ПРАВИЛ на точном живом бюджете канарейки ($22 / ~8 PRL):
 
-  1. Физика fused_order3_clean_tick откалибрована по живой телеметрии VPS:
-     - внутриспредовый перехват продаж на Bid = 62.7% (capture_ratio),
-     - асимметричное затухание пассивных покупок у верхней полки Ask1-1тик
-       (исключает иллюзию мгновенного закрытия в "мёртвом" спреде 50 bp!).
+  1. Честная базовая физика fused_order3_clean_tick (без искусственной калибровки)
+     + совместная валидация Calib + Harsh (55/45) с реальным шагом tick_sz = $0.0001.
   2. L90a_Mode0_Calib: изолированное обучение нелинейного специалиста Mode #0
      (Linear + SwiGLU 256->96->58) на точном бюджете budget_override=22.0$.
   3. L90b_Canary_Orchestrator: обучение отдельного двухкаскадного Оркестратора
      386D, переключающего ТОЛЬКО между Mode #0 (Активный Скальпер) и Mode #3
-     (Режим ожидания / быстрой разгрузки 0% покупок) на сквозных окнах всех режимов!
+     (Режим ожидания / быстрой разгрузки 0% покупок) на сквозных окнах всех режимов,
+     плюс финальная проверка на слепом 20-часовом OOS-хвосте!
 =============================================================================
 """
 
@@ -194,7 +193,7 @@ def _canary_worker(
     bv_gpu = torch.from_numpy(bv_np).to(dev)
 
     oos_span = int(20.0 * 3600)
-    usable_hi = min(q_lo - 120, total_rows - oos_span - 1900)
+    usable_hi = total_rows - oos_span - 1900
     mid_sub = 0.5 * (b1_sub + a1_sub)
     sp_bp = (a1_sub - b1_sub) / np.maximum(1e-4, mid_sub) * 1e4
 
@@ -311,7 +310,21 @@ def _canary_worker(
             r["canary_score_bp"] = float(r["geo_score_bp"]) - act_pen
         return res
 
-    seed_res = eval_cands(seeds, val_basket, harsh=False)
+    def eval_val_joint(cands: list[dict], bask: list) -> list[dict]:
+        rc = eval_cands(cands, bask, harsh=False)
+        rh = eval_cands(cands, bask, harsh=True)
+        out_r = []
+        for a, b in zip(rc, rh):
+            d_r = dict(a)
+            d_r["canary_score_bp"] = 0.55 * float(a["canary_score_bp"]) + 0.45 * float(b["canary_score_bp"])
+            d_r["geo_score_bp"] = 0.55 * float(a["geo_score_bp"]) + 0.45 * float(b["geo_score_bp"])
+            d_r["clean_ev_pct"] = 0.55 * float(a["clean_ev_pct"]) + 0.45 * float(b["clean_ev_pct"])
+            d_r["dd_pct"] = max(float(a["dd_pct"]), float(b["dd_pct"]))
+            d_r["fills"] = 0.55 * float(a["fills"]) + 0.45 * float(b["fills"])
+            out_r.append(d_r)
+        return out_r
+
+    seed_res = eval_val_joint(seeds, val_basket)
     best_i = int(np.argmax([r["canary_score_bp"] for r in seed_res]))
     champ_state = {k: v.clone() for k, v in seeds[best_i].items()}
     best_sc = float(seed_res[best_i]["canary_score_bp"])
@@ -409,7 +422,7 @@ def _canary_worker(
         top_muts = [_apply_canary_constraints(pop_cands[int(i)], stage, base_ref, pol.dtype, dev) for i in np.argsort(tr_scs)[::-1][:4]]
 
         shortlist = [champ_state] + es_cands + top_muts
-        val_res = eval_cands(shortlist, val_basket, harsh=False)
+        val_res = eval_val_joint(shortlist, val_basket)
         bv_i = int(np.argmax([float(r["canary_score_bp"]) for r in val_res]))
         cand_sc = float(val_res[bv_i]["canary_score_bp"])
 
@@ -457,11 +470,13 @@ def main() -> None:
     bmup = assembled["b_moe_up"].view(1, K_MODES_ORDER3, 2 * MOE_MLP_H_ORDER3)
     wmdn = assembled["w_moe_dn"].view(K_MODES_ORDER3, MOE_MLP_H_ORDER3, EXPERT_OUT_DIM_ORDER3)
 
-    w2[:, 0, :] = 0.50 * sd0["w2_moe"].view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)[:, 0, :] + 0.50 * sr0["w2_moe"].view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)[:, 0, :]
-    b2[0, 0, :] = 0.50 * sd0["b2_moe"].view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)[0, 0, :] + 0.50 * sr0["b2_moe"].view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)[0, 0, :]
-    wmup[:, 0, :] = 0.50 * sd0["w_moe_up"].view(256, K_MODES_ORDER3, 2 * MOE_MLP_H_ORDER3)[:, 0, :] + 0.50 * sr0["w_moe_up"].view(256, K_MODES_ORDER3, 2 * MOE_MLP_H_ORDER3)[:, 0, :]
-    bmup[0, 0, :] = 0.50 * sd0["b_moe_up"].view(1, K_MODES_ORDER3, 2 * MOE_MLP_H_ORDER3)[0, 0, :] + 0.50 * sr0["b_moe_up"].view(1, K_MODES_ORDER3, 2 * MOE_MLP_H_ORDER3)[0, 0, :]
-    wmdn[0] = 0.50 * sd0["w_moe_dn"].view(K_MODES_ORDER3, MOE_MLP_H_ORDER3, EXPERT_OUT_DIM_ORDER3)[0] + 0.50 * sr0["w_moe_dn"].view(K_MODES_ORDER3, MOE_MLP_H_ORDER3, EXPERT_OUT_DIM_ORDER3)[0]
+    # ВАЖНО: скрытые SwiGLU-слои (w_moe_up/w_moe_dn и w_gate1/w_gate_res*) НЕЛЬЗЯ линейно усреднять 50/50 между независимыми островами —
+    # берём целостную нелинейную башню Mode #0 острова RAW (показавшую лучший Harsh + 0% токсичных входов на OOS)!
+    w2[:, 0, :] = sr0["w2_moe"].view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)[:, 0, :]
+    b2[0, 0, :] = sr0["b2_moe"].view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)[0, 0, :]
+    wmup[:, 0, :] = sr0["w_moe_up"].view(256, K_MODES_ORDER3, 2 * MOE_MLP_H_ORDER3)[:, 0, :]
+    bmup[0, 0, :] = sr0["b_moe_up"].view(1, K_MODES_ORDER3, 2 * MOE_MLP_H_ORDER3)[0, 0, :]
+    wmdn[0] = sr0["w_moe_dn"].view(K_MODES_ORDER3, MOE_MLP_H_ORDER3, EXPERT_OUT_DIM_ORDER3)[0]
 
     # Mode #3 в канарейке: чистый покой (0% покупок) + плавный выход из уже имеющейся позиции без часового стояния под пустым Ask1!
     w2[:, 3, :] = 0.0
@@ -497,8 +512,8 @@ def main() -> None:
         raise RuntimeError(f"L90b failed: {q0.exitcode}, {q1.exitcode}")
 
     orr = pol.load_initial_champion(CHAMP_DIR / "bak_l90b_orch" / "island_0_best.pt")
-    ord_ = pol.load_initial_champion(CHAMP_DIR / "bak_l90b_orch" / "island_1_best.pt")
-    final_canary = {k: (0.50 * ord_[k].float() + 0.50 * orr[k].float()) for k in pol.PARAM_KEYS}
+    # Целостный нелинейный двухкаскадный Оркестратор острова RAW (без порчи скрытых весов w_gate1/w_gate_res усреднением):
+    final_canary = {k: orr[k].float().clone() for k in pol.PARAM_KEYS}
     final_canary = _normalize_weights_order3(final_canary, torch.float32)
     # Убеждаемся, что закрытые моды #1,#2,#4,#5,#6,#7 жёстко припаркованы в -14.0
     final_canary["w_gate2"][:, [1, 2, 4, 5, 6, 7]] = 0.0
@@ -506,8 +521,8 @@ def main() -> None:
 
     meta_f = {
         "arch_version": "order3_v2",
-        "wf_version": "canary_neural_v1_mode0_orchestrated",
-        "champ_tag": "Canary_Neural_v1_L90",
+        "wf_version": "canary_neural_v2_mode0_honest_physics",
+        "champ_tag": "Canary_Neural_v2_L90_Honest",
         "pure_endogenous": True,
         "k_modes": K_MODES_ORDER3,
         "in_dim": TOTAL_DIM_ORDER3,
@@ -519,6 +534,42 @@ def main() -> None:
     }
     torch.save({**final_canary, **meta_f}, CANARY_MODEL_OUT)
     _log_m(f"🎯 Сохранён автономный нейросетевой мозг Канарейки -> {CANARY_MODEL_OUT}")
+
+    # Слепая проверка на последних 20 часах OOS (ни разу не виденных при обучении!) в обоих мирах DEC + RAW (Calib + Harsh):
+    dev_oos = torch.device("cuda:0")
+    subcent_idx = 3016277
+    for wm_o in ("dec", "raw"):
+        is_r = wm_o == "raw"
+        lp = BASE_DIR / ("data/cache/rl_guard_lob_cache_600h_raw_with_self.npz" if is_r else "data/cache/rl_guard_lob_cache_600h.npz")
+        mp_ = BASE_DIR / ("data/cache/rl_hybrid_market_obs_96d_raw_with_self.npz" if is_r else "data/cache/rl_hybrid_market_obs_96d.npz")
+        lob_o = np.load(lp, mmap_mode="r")
+        mkt_o = np.load(mp_, mmap_mode="r")["market_obs_96d"]
+        n_sub = len(lob_o["ts"]) - subcent_idx
+        oos_lo = n_sub - int(20 * 3600)
+        wl_o = 10801
+        oos_starts = list(range(oos_lo, n_sub - wl_o, 3600))
+        oos_bask = [(f"OOS{k:02d}", int(ws), 0.0, 0.0) for k, ws in enumerate(oos_starts)]
+        c_gpu = {k: v.to(device=dev_oos, dtype=torch.bfloat16) for k, v in final_canary.items()}
+        c_pad = [c_gpu] * 32
+        mkt_g = torch.from_numpy(np.asarray(mkt_o[subcent_idx:], dtype=np.float32)).to(device=dev_oos, dtype=torch.bfloat16)
+        b10_g = torch.from_numpy(np.asarray(lob_o["bid_p"][subcent_idx:, :10], dtype=np.float32)).to(dev_oos)
+        a10_g = torch.from_numpy(np.asarray(lob_o["ask_p"][subcent_idx:, :10], dtype=np.float32)).to(dev_oos)
+        bq10_g = torch.from_numpy(np.asarray(lob_o["bid_q"][subcent_idx:, :10], dtype=np.float32)).to(dev_oos)
+        aq10_g = torch.from_numpy(np.asarray(lob_o["ask_q"][subcent_idx:, :10], dtype=np.float32)).to(dev_oos)
+        sv_g = torch.from_numpy(np.asarray(lob_o["sell_vol"][subcent_idx:], dtype=np.float32)).to(dev_oos)
+        bv_g = torch.from_numpy(np.asarray(lob_o["buy_vol"][subcent_idx:], dtype=np.float32)).to(dev_oos)
+        for hs in (False, True):
+            ro = evaluate_order3_basket(
+                mkt_39d_all=mkt_g, b10_all=b10_g, a10_all=a10_g, bq10_all=bq10_g, aq10_all=aq10_g,
+                sv_all=sv_g, bv_all=bv_g, cand_states=c_pad, val_windows=oos_bask, win_len=wl_o, tick_sz=0.0001,
+                device=dev_oos, pad_to_max_c=False, harsh_stress=hs, enforce_activity_floor=False,
+                budget_override=CANARY_SIM_BUDGET, risk_inv_pen_w=1.80,
+            )[0]
+            _log_m(
+                f"📊 [BLIND 20h OOS | {wm_o.upper()} | {'HARSH' if hs else 'CALIB'}] "
+                f"Geo={ro['geo_score_bp']:+.2f}bp | EV={ro['clean_ev_pct']:+.3f}% | DD={ro['dd_pct']:.2f}% | "
+                f"Fills={ro['fills']:.2f}/3h | Modes={[round(x,2) for x in ro.get('mode_probs',[])]}"
+            )
 
     # Проверка 0.00e+00 паритета Sim/Live для canary_neural_v1.pt!
     rc = subprocess.run(

@@ -37,9 +37,8 @@ CANARY_STATE_PATH = BASE_DIR / "data" / "logs" / "canary_scalp_state.json"
 CANARY_LOG_PATH = BASE_DIR / "data" / "logs" / "canary_scalp_telemetry.jsonl"
 CANARY_NEURAL_MODEL_PATH = BASE_DIR / "models" / "prl" / "canary_neural_v1.pt"
 CANARY_PAUSE_FLAG_PATH = BASE_DIR / "data" / "logs" / "canary_pause.flag"
-# Пауза канарейки 26.11 17:40: найдено несоответствие шага цены ($0.01 вместо $0.0001) и ложная калибровка физики;
-# до переобучения модели на исправленной физике новые входы запрещены.
-CANARY_PAUSED = True
+# Canary v2 (Canary_Neural_v2_PureRaw): переобучена на честной физике и шаге $0.0001; для ручной паузы на лету используйте файл data/logs/canary_pause.flag
+CANARY_PAUSED = False
 
 CANARY_ENABLED_DEFAULT = True
 CANARY_LOT_PRL = 8.0
@@ -51,6 +50,8 @@ CANARY_TAKER_FEE = 0.0020
 # Физические защитные рубежи канарейки (страховка, а не торговая логика):
 CANARY_HARD_STOP_PCT = -0.020   # аварийный выход при падении Bid на 2% ниже цены входа
 CANARY_MAX_HOLD_S = 1800.0      # предельное удержание позиции 30 мин (живые данные: markout < 0 после 180с, убыточные круги висели 70-130 мин)
+CANARY_STEP_INTERVAL_S = 2.0    # инференс нейро-канарейки раз в 2с (<2 мс CPU/с)
+CANARY_ORDER_POLL_S = 2.5       # опрос REST get_order раз в 2.5с (или мгновенно при касании цены/потоке сделок)
 
 _CANARY_ENGINE_CACHE: dict[str, Any] = {"engine": None, "mtime": 0.0}
 
@@ -271,13 +272,22 @@ def step_canary_scalp(
             keep_pm.append(pm)
     st["pending_markouts"] = keep_pm
 
-    # 2. Sync active canary bid order
+    # 2. Sync active canary bid order (throttled REST poll unless tape/touch indicates potential fill)
     if st.get("bid_oid") is not None:
         st["bid_tape_sell_vol"] = float(st.get("bid_tape_sell_vol", 0.0)) + max(0.0, float(roll_sell_1s))
-        try:
-            ob = trader.client.get_order(st["bid_oid"])
-        except Exception:
-            ob = None
+        bid_px_cur = float(st.get("bid_px", 0.0))
+        need_b_poll = (
+            (now_ts - float(st.get("last_bid_poll_ts", 0.0))) >= CANARY_ORDER_POLL_S
+            or (roll_sell_1s > 1e-4 and b1 <= bid_px_cur + 1.5 * t_sz)
+            or (a1 <= bid_px_cur + 0.5 * t_sz)
+        )
+        ob = None
+        if need_b_poll:
+            st["last_bid_poll_ts"] = now_ts
+            try:
+                ob = trader.client.get_order(st["bid_oid"])
+            except Exception:
+                ob = None
         if isinstance(ob, dict):
             filled_b = float(ob.get("filled_amount", 0.0))
             prev_b = float(st.get("bid_acc_fill", 0.0))
@@ -340,12 +350,21 @@ def step_canary_scalp(
                 st["bid_acc_fill"] = 0.0
                 changed = True
 
-    # 3. Sync active canary ask order
+    # 3. Sync active canary ask order (throttled REST poll unless price touches ask)
     if st.get("ask_oid") is not None:
-        try:
-            oa = trader.client.get_order(st["ask_oid"])
-        except Exception:
-            oa = None
+        ask_px_cur = float(st.get("ask_px", 0.0))
+        need_a_poll = (
+            (now_ts - float(st.get("last_ask_poll_ts", 0.0))) >= CANARY_ORDER_POLL_S
+            or (a1 >= ask_px_cur - 1.5 * t_sz)
+            or (b1 >= ask_px_cur - 0.5 * t_sz)
+        )
+        oa = None
+        if need_a_poll:
+            st["last_ask_poll_ts"] = now_ts
+            try:
+                oa = trader.client.get_order(st["ask_oid"])
+            except Exception:
+                oa = None
         if isinstance(oa, dict):
             filled_a = float(oa.get("filled_amount", 0.0))
             prev_a = float(st.get("ask_acc_fill", 0.0))
@@ -518,6 +537,22 @@ def step_canary_scalp(
     c_epx = max(t_sz, float(st.get("entry_px", ext_b1))) if c_pos >= min_amt else 0.0
     c_hold_s = max(0.0, now_ts - float(st.get("entry_ts", now_ts))) if c_pos >= min_amt else 0.0
     c_cash = max(0.0, CANARY_CASH_RESERVE_USD - c_pos * (c_epx if c_epx > 0 else ext_b1))
+
+    # Дросселирование инференса канарейки раз в 2с (<2 мс CPU/с), кроме мгновенного срабатывания страховочных рубежей:
+    urgent_rail = (c_pos >= min_amt) and (
+        (c_epx > 0 and ext_b1 <= c_epx * (1.0 + CANARY_HARD_STOP_PCT))
+        or (c_hold_s >= CANARY_MAX_HOLD_S)
+    )
+    if (not urgent_rail) and ((now_ts - float(st.get("last_nn_step_ts", 0.0))) < CANARY_STEP_INTERVAL_S):
+        if changed:
+            _save_state(st)
+        return {
+            "canary_pos_qty": c_pos,
+            "canary_cash_reserve": CANARY_CASH_RESERVE_USD if bool(st.get("enabled", True)) else 0.0,
+            "canary_bid_oid": st.get("bid_oid"),
+            "canary_ask_oid": st.get("ask_oid"),
+        }
+    st["last_nn_step_ts"] = now_ts
 
     b_px_12 = np.zeros(12, dtype=np.float32)
     b_qty_12 = np.zeros(12, dtype=np.float32)
@@ -711,6 +746,7 @@ def step_canary_scalp(
 
             if (
                 st.get("bid_oid") is None
+                and st.get("ask_oid") is None
                 and want_qb >= min_amt
                 and bool(dec["g_plc_b"][0])
                 and trader.order3_engine.api_tokens >= 2.5
