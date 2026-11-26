@@ -44,6 +44,9 @@ CANARY_MAX_ROUNDS = 80
 CANARY_MAX_LOSS_USD = -2.50
 CANARY_MAKER_FEE = 0.0010
 CANARY_TAKER_FEE = 0.0020
+# Физические защитные рубежи канарейки (страховка, а не торговая логика):
+CANARY_HARD_STOP_PCT = -0.020   # аварийный выход при падении Bid на 2% ниже цены входа
+CANARY_MAX_HOLD_S = 1800.0      # предельное удержание позиции 30 мин (живые данные: markout < 0 после 180с, убыточные круги висели 70-130 мин)
 
 _CANARY_ENGINE_CACHE: dict[str, Any] = {"engine": None, "mtime": 0.0}
 
@@ -364,6 +367,8 @@ def step_canary_scalp(
                 if st["pos_qty"] < min_amt:
                     st["pos_qty"] = 0.0
                     st["completed_rounds"] = int(st.get("completed_rounds", 0)) + 1
+                    forced_r = str(st.get("force_reason", "") or "")
+                    st["force_reason"] = ""
                     _append_telemetry({
                         "event": "canary_round_complete",
                         "round_id": st.get("round_id"),
@@ -377,6 +382,7 @@ def step_canary_scalp(
                         "net_pnl_usd": round(pnl_u, 4),
                         "cum_pnl_usd": st["cum_pnl_usd"],
                         "mean_pnl_bp": round(st["cum_pnl_bp"] / max(1, st["completed_rounds"]), 2),
+                        "forced_exit": forced_r,
                     })
                     print(
                         f"  🐤💰 [CANARY EXIT ASK | R#{st.get('round_id')} ({st['completed_rounds']}/{CANARY_MAX_ROUNDS})] "
@@ -567,6 +573,32 @@ def step_canary_scalp(
         targ_ask = round(max(ext_b1 + t_sz, float(dec["t_ask_px"][0])), p_prec)
         want_cnl_a = bool(dec["g_cnl_a"][0]) or (u_tk_c > 0.25)
 
+        # Физические защитные рубежи (страховка, НЕ торговая стратегия): аварийный стоп -2% и предельное время удержания.
+        force_reason = ""
+        if c_epx > 0 and ext_b1 <= c_epx * (1.0 + CANARY_HARD_STOP_PCT):
+            force_reason = "hard_stop_-2pct"
+        elif c_hold_s >= CANARY_MAX_HOLD_S:
+            force_reason = f"max_hold_{int(CANARY_MAX_HOLD_S)}s"
+        force_px = 0.0
+        if force_reason:
+            force_px = round(max(t_sz, ext_b1 * (0.994 if force_reason.startswith("hard_stop") else 1.0)), p_prec)
+            cur_apx_f = float(st.get("ask_px", 0.0)) if st.get("ask_oid") is not None else 0.0
+            already_forced = st.get("ask_oid") is not None and cur_apx_f <= force_px + 0.1 * t_sz
+            u_tk_c = 1.0
+            want_cnl_a = not already_forced
+            if st.get("force_reason") != force_reason:
+                st["force_reason"] = force_reason
+                _append_telemetry({
+                    "event": "canary_forced_exit",
+                    "reason": force_reason,
+                    "round_id": st.get("round_id"),
+                    "entry_px": round(c_epx, 4),
+                    "ext_b1": round(ext_b1, 4),
+                    "hold_sec": round(c_hold_s, 1),
+                })
+                print(f"  🐤⚡ [CANARY SAFETY RAIL] {force_reason}: принудительный выход {c_pos:.4f} PRL @ ~${force_px:.4f} (entry=${c_epx:.4f}, hold={c_hold_s:.0f}s) | t={_msk_iso()}")
+                changed = True
+
         if st.get("ask_oid") is not None and want_cnl_a and trader.order3_engine.api_tokens >= 2.0 and can_eng.api_tokens >= 1.0:
             cur_apx = float(st.get("ask_px", 0.0))
             if (u_tk_c > 0.25) or (abs(targ_ask - cur_apx) >= 0.9 * t_sz):
@@ -580,7 +612,10 @@ def step_canary_scalp(
 
         if st.get("ask_oid") is None and trader.order3_engine.api_tokens >= 1.5 and can_eng.api_tokens >= 1.0:
             q_sell = math.floor(c_pos * 10000.0) / 10000.0
-            px_out = round(max(t_sz, ext_b1 * (1.0 - float(dec["max_slip_pct"]))), p_prec) if u_tk_c > 0.25 else targ_ask
+            if force_reason:
+                px_out = force_px
+            else:
+                px_out = round(max(t_sz, ext_b1 * (1.0 - float(dec["max_slip_pct"]))), p_prec) if u_tk_c > 0.25 else targ_ask
             if q_sell >= min_amt and (bool(dec["g_plc_a"][0]) or u_tk_c > 0.25):
                 try:
                     res_a = trader.client.place_limit_order(trader.market, "sell", q_sell, px_out, price_precision=p_prec, amount_precision=a_prec, min_amount=min_amt)
