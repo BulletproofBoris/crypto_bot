@@ -47,5 +47,7 @@ models/prl/order3_champion/night_marathon_*/
 models/prl/order3_champion/islands/
 models/prl/order3_champion/global_best.pt
 models/prl/order3_champion/order3_champ_resume.pt
+models/prl/order3_champion/l83_*.pt
+models/prl/order3_champion/l84_*.pt
 models/quantus/
 

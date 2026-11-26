@@ -1,38 +1,39 @@
-# 🚀 PRL/USDT & QUANTUS/USDT Autonomous Trading System (`crypto_bot`)
+# 🚀 SafeTrade Order-3 Autonomous Multi-Regime Trading System (`crypto_bot`)
 
-Автономная высокочастотная и среднесрочная система алгоритмического маркет-мейкинга и микроструктурного исполнения для биржи **SafeTrade** (`PRL/USDT`, `QUANTUS/USDT`).
+Автономная каузальная система алгоритмического маркет-мейкинга и селективного исполнения для рынка **`PRL/USDT` (SafeTrade)** с кросс-биржевым радаром (`BigONE`, `Gate.io`, `Ourbit`, `Binance`) и математическим паритетом симуляции и боя **`0.00e+00`**.
 
 ---
 
-## 🏗️ Единый 7-этапный пайплайн разработки и эксплуатации
+## 🏗️ Актуальная архитектура (`Signal Stack v7`: `96D` → `206D` → `K=8 Liquid MoE × 58D`)
 
-Весь рабочий цикл сосредоточен в [`Trading bot notebook.ipynb`](file:///home/restorator/crypto_bot/Trading%20bot%20notebook.ipynb), [`RL_Execution_Lab.ipynb`](file:///home/restorator/crypto_bot/RL_Execution_Lab.ipynb) и [`Live_RL_Monitor.ipynb`](file:///home/restorator/crypto_bot/Live_RL_Monitor.ipynb):
-
-| Этап | Модуль | Команда / Назначение |
+| Уровень | Ключевые модули | Назначение |
 | :--- | :--- | :--- |
-| **1. Сбор данных 24/7 (VPS)** | `_tools/monitor_vps.py` | Контроль 5 системных служб на VPS (`81.19.137.18:2222`): стаканы L2 топ-50 и сделки SafeTrade + BigONE, DEX Rhea, макро Binance (`BTC`, `NEAR`), ончейн Pearl/Quantus. |
-| **2. Синхронизация Data Lake** | `_tools/sync_all_data.py` | Скачивание архивов `.csv.gz` с Google Drive и горячих CSV + боевой телеметрии (`rl_telemetry.csv`) с VPS, санитарная очистка и сборка 13 таблиц в `data/processed/`. |
-| **3. Инженерия 1s-признаков и разметка** | `_tools/prepare_1s_dataset.py`<br>`_tools/data_labeler.py` | Строгая 1-секундная сетка (`642` признака, стационарный фильтр-банк `W=[5,20,60,300]s` без утечки из будущего `shift(1)`) и 7-классовая разметка по 4 ортогональным масштабам **`5:3, 12:3.5, 25:3, 60:3`**. |
-| **4. Планирование окон Walk-Forward** | `_tools/plan_rolling_windows.py` | Хронологическая сетка окон от начала датасета (`win_00..win_N`): проверка накопления данных для новых окон по горизонтам `H = 5, 12, 25, 60s`. |
-| **5. Обучение роя экспертов (Swarm)** | `_tools/train_rolling_swarm.py`<br>`_tools/colab_neural_trainer.py` | Обучение пула деревьев **LightGBM** (`70` моделей по 4 горизонтам) и 4 нейросетевых архитектур (**`Conv1D+GRU`**, **`Causal CNN`**, **`Attention`**, **`MLP Bottleneck`** — `280` моделей). |
-| **6. Обучение RL-агента исполнения** | `_tools/train_rl_execution.py`<br>`_tools/rl_gpu_population.py` | Предрасчёт кэша триады + макро `H=60s` (`data/cache/rl_triad_lob_cache_prl_176h.npz`), 10-уровневая L2 FIFO-среда `SafeTradeL2ExecutionEnv`, `Behavioral Cloning Warm-Start` и обучение **`Maskable PPO v3` + CEM GPU Population Search**. |
-| **7. Шлюз регрессии и боевой демон** | `_tools/regression_gate.py`<br>`_tools/live_rl_trader.py` | Проверка чекпоинта `best_maskable_ppo.pt` на эталонных рыночных режимах (`Non-Regression Gate`) и деплой в боевой демон `LiveTriadRLTrader` (`2.8 Гц`, чистый PyTorch `FastKerasModel` без TensorFlow). |
+| **1. Сбор данных 24/7 (VPS)** | `_tools/watchdog_collectors.py`<br>`_tools/collect_*_realtime.py` | Непрерывный сбор стаканов и ленты сделок `SafeTrade`, `BigONE`, `Gate.io`, `Ourbit`, макро `Binance` и ончейн-метрик с авто-ротацией в облако (`_tools/rotate_and_upload.py`). |
+| **2. Каузальный конвейер данных (`96D`)** | `_tools/update_data_pipeline_96d.py`<br>`_tools/build_hybrid_market_obs_96d.py` | Синхронизация данных, декантаминация собственных сделок (`RAW → DEC`), дообучение Walk-Forward бустеров (`Order-1`, `Order-2`, `Wave`, `Order-2.5`) и сборка каузальных матриц `96D` для обоих миров (`0%` утечки будущего). |
+| **3. Тензорное ядро симуляции** | `_tools/fused_order3_clean_tick.py` | 10-уровневый FIFO-симулятор 24 слотов с физикой `DEC / RAW × Calib / Harsh`, якорем рециклинга всплесков `ch[56]`, эндогенным гистерезисом отмен `ch[57]` и порежимной атрибуцией (`UP / DN / FL`). |
+| **4. Многостадийное обучение и модульные специалисты** | `_tools/train_order3_champion.py`<br>`_tools/train_l83_l84_specialists_and_router.py` | Обучение полного ансамбля (`L80..L85`), а также изолированная «Школа узких специалистов» (`Mode #0..#3`) + отдельный «Урок Чистого Оркестратора» (`L84_Router`, `370D` Liquid Gate) на двух GPU. |
+| **5. Боевой демон, паритет и канарейка** | `_tools/live_rl_trader.py`<br>`_tools/order3_live_bridge.py`<br>`_tools/canary_scalp_probe.py` | Боевое исполнение 24 слотов на VPS, проверка побитового паритета (`_tools/test_order3_sim_live_parity.py`), изолированный канареечный зонд широкого спреда (`8 PRL`, `_tools/analyze_canary_scalp.py`) и деплой одной командой (`_tools/deploy_vps.py`). |
 
 ---
 
-## ⚡ Быстрый запуск из терминала
+## ⚡ Основные команды эксплуатации
 
 ```bash
-# 1-3. Обновить данные с VPS/GDrive, пересобрать 1s-признаки и разметку 4 горизонтов:
-.venv/bin/python -m _tools.sync_all_data
-.venv/bin/python -m _tools.prepare_1s_dataset --coin prl
-.venv/bin/python -m _tools.data_labeler --coin prl --pairs "5:3,12:3.5,25:3,60:3"
+# 1. Полное обновление данных с VPS, дообучение WF-бустеров и сборка 96D кэша (DEC + RAW):
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python _tools/update_data_pipeline_96d.py --device cuda:0
 
-# 4-5. Проверить доступность новых окон и дообучить пул экспертов:
-.venv/bin/python -m _tools.plan_rolling_windows --coin prl --horizons 5,12,25,60
-.venv/bin/python _tools/train_rolling_swarm.py --coins prl --horizons 5,12,25,60
+# 2. Проверка математического паритета Sim/Live (0.00e+00) и латентности CPU:
+.venv/bin/python _tools/test_order3_sim_live_parity.py models/prl/release_champion_v1.pt
 
-# 6-7. Обновить RL-кэш, обучить Maskable PPO v3 и проверить статус боевого бота:
-.venv/bin/python _tools/train_rl_execution.py --coin prl --tail-hours 176 --epochs 30
-.venv/bin/python _tools/regression_gate.py
+# 3. Изолированное дообучение отдельной моды-специалиста и Оркестратора (на обеих GPU):
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python _tools/train_l83_l84_specialists_and_router.py --stage mode0_scalp --world-mode raw --island-id 0
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python _tools/train_l83_l84_specialists_and_router.py --stage mode0_scalp --world-mode dec --island-id 1
+.venv/bin/python _tools/train_l83_l84_specialists_and_router.py --stage assemble
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python _tools/train_l83_l84_specialists_and_router.py --stage router --world-mode raw --island-id 0
+
+# 4. Анализ живой телеметрии канареечного теста широкого спреда:
+.venv/bin/python _tools/analyze_canary_scalp.py
+
+# 5. Единая выгрузка обновлений/чемпиона на боевой VPS + авто-синхронизация с Git:
+.venv/bin/python _tools/deploy_vps.py
 ```
