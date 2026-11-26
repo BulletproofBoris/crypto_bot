@@ -1,0 +1,35 @@
+{
+  "win_idx": 74,
+  "val_range": [
+    3369600,
+    3412800
+  ],
+  "models": {
+    "wave_ret_h300s": {
+      "oos_ic": 0.2431,
+      "best_ntree": 16
+    },
+    "wave_ret_h900s": {
+      "oos_ic": 0.1152,
+      "best_ntree": 1
+    },
+    "wave_ret_h1800s": {
+      "oos_ic": 0.0412,
+      "best_ntree": 1
+    },
+    "wave_ret_h3600s": {
+      "oos_ic": 0.0144,
+      "best_ntree": 1
+    },
+    "wave_launch_30m": {
+      "oos_auc": 0.4163,
+      "pos_rate": 0.0333,
+      "best_ntree": 319
+    },
+    "wave_top_15m": {
+      "oos_auc": 0.8016,
+      "pos_rate": 0.0366,
+      "best_ntree": 318
+    }
+  }
+}

@@ -43,6 +43,7 @@ models/prl/walk_forward_ppo/recurrent_ppo_fold_*.pt
 models/prl/*_pre_*.pt
 models/prl/release_champion_v1_backup_*.pt
 models/prl/order3_champion/bak_*/
+models/prl/order3_champion/night_marathon_*/
 models/prl/order3_champion/islands/
 models/prl/order3_champion/global_best.pt
 models/prl/order3_champion/order3_champ_resume.pt
