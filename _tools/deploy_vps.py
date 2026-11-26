@@ -207,7 +207,22 @@ def main():
     # Автоматическая фиксация и отправка (git commit & push) кода и актуального Чемпиона в Git
     try:
         subprocess.run(
-            ["git", "add", "STATUS_CONTEXT.md", "models/prl/release_champion_v1.pt", "models/prl/cross_venue_first_order", "_tools"],
+            [
+                "git",
+                "add",
+                "STATUS_CONTEXT.md",
+                "models/prl/release_champion_v1.pt",
+                "models/prl/cross_venue_first_order",
+                "models/prl/order25_live",
+                "models/prl/order3_champion/l85_dualsoup_50d_50r.pt",
+                "models/prl/order3_champion/order3_champ_latest.pt",
+                "models/prl/order3_champion/order3_soup_top3.pt",
+                "models/prl/order1_wave_wf/walkforward_wave_summary.json",
+                "models/prl/order1_wave_wf/win_82/metrics.json",
+                "models/prl/order1_wave_wf/win_88",
+                "models/prl/order1_wave_wf/win_89",
+                "_tools",
+            ],
             cwd=str(BASE_DIR),
             check=False,
             capture_output=True,

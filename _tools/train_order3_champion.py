@@ -81,7 +81,23 @@ def _normalize_weights_order3(state: dict, dtype: torch.dtype) -> dict:
     w1_ag = w1_f[..., MKT_DIM_ORDER3:, :]
 
     # Блок 3 L70..L78: Раздельная поблочная нормировка 7 групп рынка (94D Signal Stack v6 с Order-2.5 + 5m..30m Structure/CVD):
-    if MKT_DIM_ORDER3 >= 94:
+    if MKT_DIM_ORDER3 >= 96:
+        grp_specs = (
+            ([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 40, 41, 42, 43, 56, 57, 58, 59, 66, 67, 68, 69, 70, 71], 5.8),
+            ([29, 30, 31, 32, 33, 44, 45, 46, 47, 48, 49], 6.8),
+            ([34, 35, 36, 37, 38, 39, 50, 51, 52, 53, 54, 55], 7.8),
+            ([60, 61, 62, 63, 64, 65], 8.2),
+            ([72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83], 8.0),
+            ([84, 85, 86, 87], 7.5),
+            ([88, 89, 90, 91, 92, 93, 94, 95], 7.8),
+        )
+        w1_mkt_norm = w1_mkt.clone()
+        for idxs_g, mult_g in grp_specs:
+            sub_g = w1_mkt[..., idxs_g, :]
+            cap_g = mult_g * math.sqrt(float(len(idxs_g)))
+            nb_g = torch.linalg.vector_norm(sub_g, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+            w1_mkt_norm[..., idxs_g, :] = sub_g * torch.clamp(cap_g / nb_g, max=1.0)
+    elif MKT_DIM_ORDER3 >= 94:
         grp_specs = (
             ([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 40, 41, 42, 43, 56, 57, 58, 59, 66, 67, 68, 69, 70, 71], 5.8),
             ([29, 30, 31, 32, 33, 44, 45, 46, 47, 48, 49], 6.8),
@@ -159,21 +175,22 @@ def _normalize_weights_order3(state: dict, dtype: torch.dtype) -> dict:
         nk = torch.linalg.vector_norm(wk, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
         w2m_parts.append(wk * torch.clamp(64.0 / nk, max=1.0))
     out["w2_moe"] = torch.cat(w2m_parts, dim=-1).to(dtype)
-    out["b2_moe"] = torch.clamp(state["b2_moe"].float(), -7.5, 6.5).to(dtype)
+    out["b2_moe"] = torch.clamp(state["b2_moe"].float(), -12.0, 8.5).to(dtype)
 
-    # Раздельная нормировка прямого роутера w_gate1 (368D -> 128):
+    # Раздельная нормировка прямого роутера w_gate1 (370D -> 128):
     wg1_f = state["w_gate1"].float()
     if wg1_f.shape[-2] >= 368:
+        r_tot = wg1_f.shape[-2]
         wg1_base = wg1_f[..., :336, :]
-        wg1_wave_ext = wg1_f[..., 336:360, :]
-        wg1_rec_m = wg1_f[..., 360:368, :]
+        wg1_wave_ext = wg1_f[..., 336 : r_tot - 8, :]
+        wg1_rec_m = wg1_f[..., r_tot - 8 : r_tot, :]
         nb_gb = torch.linalg.vector_norm(wg1_base, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
         nb_gw = torch.linalg.vector_norm(wg1_wave_ext, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
         nb_gr = torch.linalg.vector_norm(wg1_rec_m, dim=(-2, -1), keepdim=True).clamp(min=1e-6)
         out["w_gate1"] = torch.cat(
             [
                 wg1_base * torch.clamp(32.0 / nb_gb, max=1.0),
-                wg1_wave_ext * torch.clamp(17.5 / nb_gw, max=1.0),
+                wg1_wave_ext * torch.clamp(18.0 / nb_gw, max=1.0),
                 wg1_rec_m * torch.clamp(8.5 / nb_gr, max=1.0),
             ],
             dim=-2,
@@ -381,6 +398,9 @@ class MultimodalMoEPolicyOrder3:
                     w1_mkt[91] = 0.05 * bull_dir94
                     w1_mkt[92] = 0.07 * bull_dir94
                     w1_mkt[93] = 0.06 * bull_dir94
+                if old_mkt_d < 96 and MKT_DIM_ORDER3 >= 96 and old_mkt_d >= 94:
+                    # L80 Net2Net нулевой старт 2h Exhaustion/Capitulation [94..95] (0.00e+00 паритет на старте!):
+                    w1_mkt[94:96] = 0.0
             else:
                 w1_ag = ck["w1"][370:, :].float().clone()
             w1_full = torch.cat([w1_mkt, w1_ag], dim=0)
@@ -393,9 +413,12 @@ class MultimodalMoEPolicyOrder3:
             old_rin, old_rh = wg1_old.shape
             ch_r = min(old_rh, ROUTER_H_DIM_ORDER3)
             bg1_new[:, :ch_r] = bg1_old[:, :ch_r]
-            if old_rin == 362 and ROUTER_IN_DIM_ORDER3 == 368:
+            if old_rin == 368 and ROUTER_IN_DIM_ORDER3 == 370:
+                wg1_new[:360, :ch_r] = wg1_old[:360, :ch_r]
+                wg1_new[362:370, :ch_r] = wg1_old[360:368, :ch_r]
+            elif old_rin == 362 and ROUTER_IN_DIM_ORDER3 >= 368:
                 wg1_new[:354, :ch_r] = wg1_old[:354, :ch_r]
-                wg1_new[360:368, :ch_r] = wg1_old[354:362, :ch_r]
+                wg1_new[ROUTER_IN_DIM_ORDER3 - 8 : ROUTER_IN_DIM_ORDER3, :ch_r] = wg1_old[354:362, :ch_r]
                 bull_rg94 = 0.50 * wg1_old[337, :ch_r] + 0.50 * wg1_old[353, :ch_r]
                 crash_rg94 = 0.50 * wg1_old[329, :ch_r] + 0.50 * wg1_old[352, :ch_r]
                 wg1_new[354, :ch_r] = 0.05 * bull_rg94
@@ -476,6 +499,10 @@ class MultimodalMoEPolicyOrder3:
                 w2m_new[:, :, 55] = torch.randn((256, K_MODES_ORDER3), generator=gen) * 0.035
                 b2m_new[:, :, 55] = -1.60
                 b2m_new[:, 4, 55] = -4.80
+            if old_exp_d <= 56 and EXPERT_OUT_DIM_ORDER3 >= 58:
+                # L80 Function-preserving Net2Net старт для [56] recycle_anchor_z и [57] deep_hyst_z (-12.0 -> 0.00e+00 паритет до разморозки):
+                w2m_new[:, :, 56:58] = 0.0
+                b2m_new[:, :, 56:58] = -12.0
 
             w2m_flat = w2m_new.reshape(256, MOE_OUT_DIM_ORDER3)
             b2m_flat = b2m_new.reshape(1, MOE_OUT_DIM_ORDER3)
@@ -562,6 +589,7 @@ class MultimodalMoEPolicyOrder3:
         stage: str = "explore",
         sigma_scale: float = 1.0,
         alt_elite_state: dict | None = None,
+        lesson_stage: str = "l80_wick",
     ) -> None:
         base_gpu = {k: v.to(device=self.device, dtype=self.dtype) for k, v in center_state.items()}
         alt_gpu = {k: v.to(device=self.device, dtype=self.dtype) for k, v in alt_elite_state.items()} if alt_elite_state is not None else base_gpu
@@ -592,14 +620,19 @@ class MultimodalMoEPolicyOrder3:
 
         dw1 = _anti_ring((TOTAL_DIM_ORDER3, 384), sig_trunk, low_rank=16).to(self.dtype)
         dw1[:, 0:1, :] *= 2.40
-        dw1[:, 1:32, :] *= 1.35
+        dw1[:, 1:12, :] *= 1.35
+        dw1[:, 12:22, :] *= (5.50 if lesson_stage == "l80_wick" else 2.60)  # Межбиржевой гвард BigONE G [12..21] для фильтрации фитилей!
+        dw1[:, 22:32, :] *= 1.35
         dw1[:, 32:40, :] *= 3.00  # ускоренное обучение Order-1 (1s..160s) на фоне 15% anti-spoof LOB Dropout!
         dw1[:, 40:60, :] *= 2.20
         if MKT_DIM_ORDER3 > 60:
             hi_88 = min(88, MKT_DIM_ORDER3)
             dw1[:, 60:hi_88, :] *= 4.20  # ускоренное подключение 12D Wave Radar + Order-2.5!
         if MKT_DIM_ORDER3 > 88:
-            dw1[:, 88:MKT_DIM_ORDER3, :] *= 6.50  # форсированная распайка недообученного блока 60m Struct/CVD [88..93]!
+            hi_94 = min(94, MKT_DIM_ORDER3)
+            dw1[:, 88:hi_94, :] *= 6.50  # форсированная распайка 30m Struct/CVD [88..93]!
+        if MKT_DIM_ORDER3 >= 96:
+            dw1[:, 94:96, :] *= (6.50 if lesson_stage in ("l82_up_carry_f", "l85_joint") else 0.50)
         dw1[:, MKT_DIM_ORDER3:, :] *= 0.90
 
         self.w1[2 : 2 + 2 * half].copy_(base_gpu["w1"].unsqueeze(0) + dw1)
@@ -617,37 +650,49 @@ class MultimodalMoEPolicyOrder3:
             db2m_v = db2m.view(-1, 1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
             dw2m_v[:, :, :7, 25] *= 0.15
             db2m_v[:, :, :7, 25] *= 0.15
-            dw2m_v[:, :, :, 48] *= 2.40  # разморозка импульсного снайперского u_taker_buy [48] в L72!
-            db2m_v[:, :, :, 48] *= 2.80
-            dw2m_v[:, :, :, 49] *= 3.40
-            db2m_v[:, :, :, 49] *= 3.80
-            dw2m_v[:, :, :, 0] *= 2.20
-            db2m_v[:, :, :, 0] *= 2.50
+            dw2m_v[:, :, :, 0] *= 2.80
+            db2m_v[:, :, :, 0] *= 3.20
+            dw2m_v[:, :, :, 34] *= 3.20     # концентрация слотов tau_b [34]
+            db2m_v[:, :, :, 34] *= 3.60
+            dw2m_v[:, :, :, 38:45] *= 3.40  # глубина фитилей retreat/span/gamma + разгрузка skew/z42/inside_a/max_share!
+            db2m_v[:, :, :, 38:45] *= 3.80
             if EXPERT_OUT_DIM_ORDER3 >= 52:
-                dw2m_v[:, :, :, 50:52] *= 2.60  # активный поиск оптимального нелинейного демпфирования плана!
-                db2m_v[:, :, :, 50:52] *= 3.00
-            if EXPERT_OUT_DIM_ORDER3 >= 54:
-                dw2m_v[:, :, :, 52:54] *= 4.40  # ускоренный поиск Tranche Carousel [52] и Spread Sniper [53]!
-                db2m_v[:, :, :, 52:54] *= 5.00
+                dw2m_v[:, :, :, 50:52] *= 2.40
+                db2m_v[:, :, :, 50:52] *= 2.80
             if EXPERT_OUT_DIM_ORDER3 >= 55:
-                dw2m_v[:, :, :, 54] *= 4.80     # ускоренное обучение Controlled Maker Stop-Unwind [54]!
+                dw2m_v[:, :, :, 54] *= 4.80     # Controlled Maker Stop-Unwind [54]!
                 db2m_v[:, :, :, 54] *= 5.60
-            if EXPERT_OUT_DIM_ORDER3 >= 56:
-                dw2m_v[:, :, :, 55] *= 5.00     # ускоренное обучение Wide-Spread Micro-Sniper [55]!
-                db2m_v[:, :, :, 55] *= 5.80
+            if EXPERT_OUT_DIM_ORDER3 >= 58:
+                dw2m_v[:, :, :, 57] *= 4.50     # T0.4 Гистерезис глубоких заявок [57]!
+                db2m_v[:, :, :, 57] *= 5.20
+                if lesson_stage in ("l82_up_carry_f", "l85_joint"):
+                    dw2m_v[:, :, :, 48:50] *= 3.80  # u_taker_buy [48] + wave_hold [49]
+                    db2m_v[:, :, :, 48:50] *= 4.40
+                    dw2m_v[:, :, :, 56] *= 5.50     # T0.6 Якорь рециклинга всплесков вверх [56]!
+                    db2m_v[:, :, :, 56] *= 6.20
+                else:
+                    # В L80/L81 замораживаем импульсный тейкер [48], микро-снайпер [55] (до живого замера D4!) и рециклинг [56]:
+                    dw2m_v[:, :, :, 48] = 0.0; db2m_v[:, :, :, 48] = 0.0
+                    dw2m_v[:, :, :, 49] *= 0.25; db2m_v[:, :, :, 49] *= 0.25
+                    dw2m_v[:, :, :, 53] = 0.0; db2m_v[:, :, :, 53] = 0.0
+                    dw2m_v[:, :, :, 55:57] = 0.0; db2m_v[:, :, :, 55:57] = 0.0
+                if lesson_stage in ("l82_up_carry_f", "l85_joint"):
+                    dw2m_v[:, :, :, 48] = 0.0; db2m_v[:, :, :, 48] = 0.0  # запрет импульсного тейкера
+                    dw2m_v[:, :, :, 55] = 0.0; db2m_v[:, :, :, 55] = 0.0  # D4: скальп [55] выключен до живой калибровки!
         self.w2_moe[2 : 2 + 2 * half].copy_(base_gpu["w2_moe"].unsqueeze(0) + dw2m.to(self.dtype))
         self.b2_moe[2 : 2 + 2 * half].copy_(base_gpu["b2_moe"].unsqueeze(0) + db2m.to(self.dtype))
 
-        dw_g1 = _anti_ring((ROUTER_IN_DIM_ORDER3, ROUTER_H_DIM_ORDER3), moe_sig * 1.85, low_rank=12).to(self.dtype)
+        gate_mult = 2.60 if lesson_stage in ("l81_risk_off", "l85_joint") else (1.35 if lesson_stage == "l82_up_carry_f" else 0.65)
+        dw_g1 = _anti_ring((ROUTER_IN_DIM_ORDER3, ROUTER_H_DIM_ORDER3), moe_sig * 1.85 * gate_mult, low_rank=12).to(self.dtype)
         dw_g1[:, 272:320, :] *= 2.60  # 48D многомасштабная память в роутере
         dw_g1[:, 320:, :] *= 4.20     # прямые сигналы (Wave + O1 + O2 + O2.5 + Struct/CVD) + 8D prev_g_mode рекуррентность!
-        if ROUTER_IN_DIM_ORDER3 >= 368:
-            dw_g1[:, 354:360, :] *= 1.55  # дополнительный буст (4.20 * 1.55 = 6.51x) для 6D Struct/CVD [88..93] в роутере!
+        if ROUTER_IN_DIM_ORDER3 >= 370:
+            dw_g1[:, 354:362, :] *= 1.55  # дополнительный буст (6.51x) для 30m+2h Struct/CVD [88..95] в роутере!
         self.w_gate1[2 : 2 + 2 * half].copy_(base_gpu["w_gate1"].unsqueeze(0) + dw_g1)
-        self.b_gate1[2 : 2 + 2 * half].copy_(base_gpu["b_gate1"].unsqueeze(0) + _anti_ring((1, ROUTER_H_DIM_ORDER3), moe_sig * 1.35).to(self.dtype))
-        dw_g2 = _anti_ring((ROUTER_H_DIM_ORDER3, ROUTER_OUT_DIM_ORDER3), moe_sig * 2.00)
-        db_g2 = _anti_ring((1, ROUTER_OUT_DIM_ORDER3), moe_sig * 1.40)
-        dw_g2[:, :, K_MODES_ORDER3:] *= 2.20  # пластичность нелинейных Liquid-вентилей роутера!
+        self.b_gate1[2 : 2 + 2 * half].copy_(base_gpu["b_gate1"].unsqueeze(0) + _anti_ring((1, ROUTER_H_DIM_ORDER3), moe_sig * 1.35 * gate_mult).to(self.dtype))
+        dw_g2 = _anti_ring((ROUTER_H_DIM_ORDER3, ROUTER_OUT_DIM_ORDER3), moe_sig * 2.00 * gate_mult)
+        db_g2 = _anti_ring((1, ROUTER_OUT_DIM_ORDER3), moe_sig * 1.40 * gate_mult)
+        dw_g2[:, :, K_MODES_ORDER3:] *= 2.20
         db_g2[:, :, K_MODES_ORDER3:] *= 2.50
         self.w_gate2[2 : 2 + 2 * half].copy_(base_gpu["w_gate2"].unsqueeze(0) + dw_g2.to(self.dtype))
         self.b_gate2[2 : 2 + 2 * half].copy_(base_gpu["b_gate2"].unsqueeze(0) + db_g2.to(self.dtype))
@@ -658,16 +703,17 @@ class MultimodalMoEPolicyOrder3:
         self.b_rec[2 : 2 + 2 * half].copy_(base_gpu["b_rec"].unsqueeze(0) + _anti_ring((1, 2 * MEM_DIM_ORDER3), sig_trunk * 0.5).to(self.dtype))
         self.w_mem2h[2 : 2 + 2 * half].copy_(base_gpu["w_mem2h"].unsqueeze(0) + _anti_ring((MEM_DIM_ORDER3, 256), sig_trunk * 2.50, low_rank=10).to(self.dtype))
 
-        bias_reg_sig = 0.040 * float(sigma_scale)
-        dw_reg1 = _anti_ring((REG_IN_DIM_ORDER3, REG_H_DIM_ORDER3), sig_trunk * 1.75)
+        reg_mult = 2.00 if lesson_stage in ("l81_risk_off", "l85_joint") else 0.75
+        bias_reg_sig = 0.040 * float(sigma_scale) * reg_mult
+        dw_reg1 = _anti_ring((REG_IN_DIM_ORDER3, REG_H_DIM_ORDER3), sig_trunk * 1.75 * reg_mult)
         dw_reg1[:, 20:28, :] *= 2.80
         self.w_reg1[2 : 2 + 2 * half].copy_(base_gpu["w_reg1"].unsqueeze(0) + dw_reg1.to(self.dtype))
-        self.b_reg1_b[2 : 2 + 2 * half].copy_(base_gpu["b_reg1_b"].unsqueeze(0) + _anti_ring((1, REG_H_DIM_ORDER3), sig_trunk * 1.10).to(self.dtype))
-        self.b_reg1_a[2 : 2 + 2 * half].copy_(base_gpu["b_reg1_a"].unsqueeze(0) + _anti_ring((1, REG_H_DIM_ORDER3), sig_trunk * 1.10).to(self.dtype))
-        self.w_reg_res1[2 : 2 + 2 * half].copy_(base_gpu["w_reg_res1"].unsqueeze(0) + _anti_ring((REG_H_DIM_ORDER3, 64), sig_trunk * 2.20).to(self.dtype))
-        self.b_reg_res[2 : 2 + 2 * half].copy_(base_gpu["b_reg_res"].unsqueeze(0) + _anti_ring((1, 64), sig_trunk * 1.10).to(self.dtype))
-        self.w_reg_res2[2 : 2 + 2 * half].copy_(base_gpu["w_reg_res2"].unsqueeze(0) + _anti_ring((32, REG_H_DIM_ORDER3), sig_trunk * 2.20).to(self.dtype))
-        self.w_reg2[2 : 2 + 2 * half].copy_(base_gpu["w_reg2"].unsqueeze(0) + _anti_ring((REG_H_DIM_ORDER3, 2), sig_trunk * 1.60).to(self.dtype))
+        self.b_reg1_b[2 : 2 + 2 * half].copy_(base_gpu["b_reg1_b"].unsqueeze(0) + _anti_ring((1, REG_H_DIM_ORDER3), sig_trunk * 1.10 * reg_mult).to(self.dtype))
+        self.b_reg1_a[2 : 2 + 2 * half].copy_(base_gpu["b_reg1_a"].unsqueeze(0) + _anti_ring((1, REG_H_DIM_ORDER3), sig_trunk * 1.10 * reg_mult).to(self.dtype))
+        self.w_reg_res1[2 : 2 + 2 * half].copy_(base_gpu["w_reg_res1"].unsqueeze(0) + _anti_ring((REG_H_DIM_ORDER3, 64), sig_trunk * 2.20 * reg_mult).to(self.dtype))
+        self.b_reg_res[2 : 2 + 2 * half].copy_(base_gpu["b_reg_res"].unsqueeze(0) + _anti_ring((1, 64), sig_trunk * 1.10 * reg_mult).to(self.dtype))
+        self.w_reg_res2[2 : 2 + 2 * half].copy_(base_gpu["w_reg_res2"].unsqueeze(0) + _anti_ring((32, REG_H_DIM_ORDER3), sig_trunk * 2.20 * reg_mult).to(self.dtype))
+        self.w_reg2[2 : 2 + 2 * half].copy_(base_gpu["w_reg2"].unsqueeze(0) + _anti_ring((REG_H_DIM_ORDER3, 2), sig_trunk * 1.60 * reg_mult).to(self.dtype))
         self.b_reg2_b[2 : 2 + 2 * half].copy_(base_gpu["b_reg2_b"].unsqueeze(0) + _anti_ring((1, 2), bias_reg_sig).to(self.dtype))
         self.b_reg2_a[2 : 2 + 2 * half].copy_(base_gpu["b_reg2_a"].unsqueeze(0) + _anti_ring((1, 2), bias_reg_sig).to(self.dtype))
 
@@ -755,6 +801,8 @@ def train_order3(
     inv_stress_frac: float = 0.35,
     world_mode: str = "dec",
     harsh_stress: bool = True,
+    lesson_stage: str = "l80_wick",
+    seed_champ_path: str | None = None,
 ) -> None:
     t_start = time.time()
     device = torch.device(device_str if torch.cuda.is_available() else "cpu")
@@ -765,18 +813,18 @@ def train_order3(
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     log_msg("=" * 90)
-    log_msg(f"🚀 ORDER-3 WFv2 ISLAND #{island_id}/{num_islands} ({island_mode.upper()} | WORLD={world_mode.upper()}) ON {device} | GROUPS={n_groups} (POP={n_groups * 6})")
+    log_msg(f"🚀 ORDER-3 WFv2 [{lesson_stage.upper()}] ISLAND #{island_id}/{num_islands} ({island_mode.upper()} | WORLD={world_mode.upper()}) ON {device} | GROUPS={n_groups} (POP={n_groups * 6})")
     log_msg("=" * 90)
 
-    # 1. Загрузка строго каузальных 94D данных Signal Stack v6 (поддержка как RAW мира без вырезанных ордеров, так и DEC интерактивного мира!)
+    # 1. Загрузка строго каузальных 96D данных Signal Stack v7 (DEC и RAW миры):
     if world_mode == "raw":
-        mkt_p = BASE_DIR / "data/cache/rl_hybrid_market_obs_94d_raw_with_self.npz"
+        mkt_p = BASE_DIR / "data/cache/rl_hybrid_market_obs_96d_raw_with_self.npz"
         lob_p = BASE_DIR / "data/cache/rl_guard_lob_cache_600h_raw_with_self.npz"
-        log_msg("📦 Загрузка каузальной 94D матрицы Signal Stack v6 [WORLD=RAW UNTOUCHED BOOK] и выделение эпохи тика $0.0001...")
+        log_msg("📦 Загрузка каузальной 96D матрицы Signal Stack v7 [WORLD=RAW UNTOUCHED BOOK] и выделение эпохи тика $0.0001...")
     else:
-        mkt_p = BASE_DIR / "data/cache/rl_hybrid_market_obs_94d.npz"
+        mkt_p = BASE_DIR / "data/cache/rl_hybrid_market_obs_96d.npz"
         lob_p = BASE_DIR / "data/cache/rl_guard_lob_cache_600h.npz"
-        log_msg("📦 Загрузка каузальной 94D матрицы Signal Stack v6 [WORLD=DEC INTERACTIVE BOOK] и выделение эпохи тика $0.0001...")
+        log_msg("📦 Загрузка каузальной 96D матрицы Signal Stack v7 [WORLD=DEC INTERACTIVE BOOK] и выделение эпохи тика $0.0001...")
     mkt_raw = np.load(mkt_p, mmap_mode="r")
     lob_raw = np.load(lob_p, mmap_mode="r")
 
@@ -785,7 +833,8 @@ def train_order3(
     subcent_offset = int(subcent_hits[0]) if len(subcent_hits) > 0 else 0
     log_msg(f"🔍 Обнаружена граница перехода биржи на тик $0.0001: idx={subcent_offset:,} (отсечено {subcent_offset:,} старых $0.01 тиков!)")
 
-    mkt_sub = np.asarray(mkt_raw["market_obs_94d"][subcent_offset:], dtype=np.float32)
+    mkt_key = "market_obs_96d" if "market_obs_96d" in mkt_raw else "market_obs_94d"
+    mkt_sub = np.asarray(mkt_raw[mkt_key][subcent_offset:], dtype=np.float32)
     total_rows = len(mkt_sub)
     tick_sz = 0.0001
     if win_len > total_rows // 8:
@@ -916,6 +965,14 @@ def train_order3(
     oos_macro_basket = _assign_stratified_inv(oos_macro_idx, "OMAC", 0.0)
     oos_micro_basket = _assign_stratified_inv(oos_micro_idx, "OMIC", 0.0)
 
+    # T0.1: Длинная корзина слайдов и суток (24 непрерывных 6ч окна = 144ч покрытия поздней эпохи с водопадами 19.11, 20.11, 23.11, 24.11):
+    slide_win_len = 21601
+    slide_lo = max(360000, oos_start - 24 * 16000)
+    slide_hi = max(slide_lo + 1000, oos_start - slide_win_len - 250)
+    val_slide_idx = np.array([_sanitize_ws(int(x), slide_win_len) for x in _build_clean_grid(slide_lo, slide_hi, slide_win_len, n_bask_w)], dtype=int)
+    val_slide_basket = _assign_stratified_inv(val_slide_idx, "VSLD", 0.0)
+    risk_pen_stage = 1.65 if lesson_stage in ("l81_risk_off", "l82_up_carry_f", "l85_joint") else 0.35
+
     # Повышенный вес свежих волатильных и медвежьих зон (сегменты 4..8 = 73% выборки Train!):
     rng_train = np.random.default_rng(20261150 + island_id * 1009 + (int(time.time()) % 9973))
     raw_w = np.array([0.05, 0.06, 0.07, 0.09, 0.12, 0.14, 0.15, 0.16, 0.16][:len(tr_segments)], dtype=np.float64)
@@ -959,7 +1016,7 @@ def train_order3(
                 bq10_all=bq10_gpu, aq10_all=aq10_gpu, sv_all=sv_gpu, bv_all=bv_gpu,
                 cand_states=cands_in, val_windows=bask, win_len=w_len, tick_sz=tick_sz, device=device,
                 pad_to_max_c=pad_max, calib_jitter_std=calib_jitter_std, enforce_activity_floor=enforce_activity_floor,
-                harsh_stress=use_harsh,
+                harsh_stress=use_harsh, risk_inv_pen_w=(risk_pen_stage if enforce_activity_floor else 0.0),
             )[:orig_n_c]
         chunks_res = []
         weights = []
@@ -972,7 +1029,7 @@ def train_order3(
                 bq10_all=bq10_gpu, aq10_all=aq10_gpu, sv_all=sv_gpu, bv_all=bv_gpu,
                 cand_states=cands_in, val_windows=sub_padded, win_len=w_len, tick_sz=tick_sz, device=device,
                 pad_to_max_c=pad_max, calib_jitter_std=calib_jitter_std, enforce_activity_floor=enforce_activity_floor,
-                harsh_stress=use_harsh,
+                harsh_stress=use_harsh, risk_inv_pen_w=(risk_pen_stage if enforce_activity_floor else 0.0),
             )[:orig_n_c]
             chunks_res.append(r_sub)
             weights.append(float(len(sub_b)))
@@ -1001,6 +1058,7 @@ def train_order3(
         enforce_mi: bool = False,
         calib_jitter_std: float = 0.0,
         harsh_override: bool | None = None,
+        slide_bask: list | None = None,
     ) -> list[dict]:
         r_mac = _eval_basket_chunked(
             cands, mac_bask, (mac_len or macro_win_len), calib_jitter_std=calib_jitter_std, enforce_activity_floor=enforce_mi, harsh_override=harsh_override
@@ -1008,38 +1066,58 @@ def train_order3(
         r_mic = _eval_basket_chunked(
             cands, mic_bask, micro_win_len, calib_jitter_std=calib_jitter_std, enforce_activity_floor=enforce_mi, harsh_override=harsh_override
         )
+        r_sld = (
+            _eval_basket_chunked(
+                cands, slide_bask, slide_win_len, calib_jitter_std=0.0, enforce_activity_floor=enforce_mi, harsh_override=harsh_override
+            )
+            if slide_bask is not None
+            else None
+        )
         merged = []
-        for a, b in zip(r_mac, r_mic):
-            # Сбалансированный двухмасштабный скор (Macro 100m + Micro 25m) + барьер против коллапса K=8 роутера в одну моду:
+        for idx_c, (a, b) in enumerate(zip(r_mac, r_mic)):
+            s_r = r_sld[idx_c] if r_sld is not None else a
             mi_join = 0.5 * float(a["mode_mi_bits"]) + 0.5 * float(b["mode_mi_bits"])
-            tot_f = float(a["fills"]) + float(b["fills"])
-            mi_pen = (3.5 * max(0.0, 0.55 - mi_join)) if (enforce_mi and tot_f >= 2.0) else 0.0
-            joint_geo = 0.50 * float(a["geo_score_bp"]) + 0.50 * (1.55 * float(b["geo_score_bp"])) - mi_pen
-            cal_mac_g = float(a.get("calib_geo_score_bp", a["geo_score_bp"]))
-            cal_mic_g = float(b.get("calib_geo_score_bp", b["geo_score_bp"]))
-            cal_joint_geo = 0.50 * cal_mac_g + 0.50 * (1.55 * cal_mic_g) - mi_pen
-            tot_c = float(a["cancels"]) + float(b["cancels"])
+            tot_f = float(a["fills"]) + float(b["fills"]) + (float(s_r["fills"]) if r_sld is not None else 0.0)
+            mi_pen = (2.5 * max(0.0, 0.35 - mi_join)) if (enforce_mi and tot_f >= 2.0) else 0.0
+            if r_sld is not None:
+                # T0.1: Трёхмасштабный скор (45% Long Slide 6h + 35% Macro + 20% Micro) — исключает ловлю ножей на суточных обвалах!
+                joint_geo = 0.45 * float(s_r["geo_score_bp"]) + 0.35 * float(a["geo_score_bp"]) + 0.20 * (1.35 * float(b["geo_score_bp"])) - mi_pen
+                cal_sld_g = float(s_r.get("calib_geo_score_bp", s_r["geo_score_bp"]))
+                cal_mac_g = float(a.get("calib_geo_score_bp", a["geo_score_bp"]))
+                cal_mic_g = float(b.get("calib_geo_score_bp", b["geo_score_bp"]))
+                cal_joint_geo = 0.45 * cal_sld_g + 0.35 * cal_mac_g + 0.20 * (1.35 * cal_mic_g) - mi_pen
+            else:
+                joint_geo = 0.60 * float(a["geo_score_bp"]) + 0.40 * (1.35 * float(b["geo_score_bp"])) - mi_pen
+                cal_mac_g = float(a.get("calib_geo_score_bp", a["geo_score_bp"]))
+                cal_mic_g = float(b.get("calib_geo_score_bp", b["geo_score_bp"]))
+                cal_joint_geo = 0.60 * cal_mac_g + 0.40 * (1.35 * cal_mic_g) - mi_pen
+            tot_c = float(a["cancels"]) + float(b["cancels"]) + (float(s_r["cancels"]) if r_sld is not None else 0.0)
             mp_join = [round(0.5 * float(x) + 0.5 * float(y), 4) for x, y in zip(a["mode_probs"], b["mode_probs"])]
+            up_bp = float(s_r.get("pnl_up_bp", a.get("pnl_up_bp", 0.0)))
+            dn_bp = float(s_r.get("pnl_dn_bp", a.get("pnl_dn_bp", 0.0)))
+            fl_bp = float(s_r.get("pnl_fl_bp", a.get("pnl_fl_bp", 0.0)))
+            beta_sh = (abs(up_bp) + abs(dn_bp)) / (abs(up_bp) + abs(dn_bp) + abs(fl_bp) + 1e-4)
             merged.append({
                 "geo_score_bp": joint_geo,
                 "macro_geo_bp": float(a["geo_score_bp"]),
                 "micro_geo_bp": float(b["geo_score_bp"]),
+                "slide_geo_bp": float(s_r["geo_score_bp"]),
                 "calib_geo_bp": cal_joint_geo,
                 "calib_macro_geo_bp": cal_mac_g,
                 "calib_micro_geo_bp": cal_mic_g,
-                "calib_clean_ev_pct": float(a.get("calib_clean_ev_pct", a["clean_ev_pct"])) + float(b.get("calib_clean_ev_pct", b["clean_ev_pct"])),
-                "calib_dd_pct": max(float(a.get("calib_dd_pct", a["dd_pct"])), float(b.get("calib_dd_pct", b["dd_pct"]))),
+                "calib_clean_ev_pct": float(a.get("calib_clean_ev_pct", a["clean_ev_pct"])) + float(b.get("calib_clean_ev_pct", b["clean_ev_pct"])) + (float(s_r.get("calib_clean_ev_pct", 0.0)) if r_sld is not None else 0.0),
+                "calib_dd_pct": max(float(a.get("calib_dd_pct", a["dd_pct"])), float(b.get("calib_dd_pct", b["dd_pct"])), float(s_r.get("calib_dd_pct", 0.0)) if r_sld is not None else 0.0),
                 "entropic_growth_bp": 0.5 * float(a["entropic_growth_bp"]) + 0.5 * float(b["entropic_growth_bp"]),
                 "cvar25_bp": 0.5 * float(a["cvar25_bp"]) + 0.5 * float(b["cvar25_bp"]),
                 "q15_bp": 0.5 * float(a["q15_bp"]) + 0.5 * float(b["q15_bp"]),
                 "q50_bp": 0.5 * float(a["q50_bp"]) + 0.5 * float(b["q50_bp"]),
                 "q85_bp": 0.5 * float(a["q85_bp"]) + 0.5 * float(b["q85_bp"]),
-                "full_ev_pct": float(a["full_ev_pct"]) + float(b["full_ev_pct"]),
-                "clean_ev_pct": float(a["clean_ev_pct"]) + float(b["clean_ev_pct"]),
+                "full_ev_pct": float(a["full_ev_pct"]) + float(b["full_ev_pct"]) + (float(s_r["full_ev_pct"]) if r_sld is not None else 0.0),
+                "clean_ev_pct": float(a["clean_ev_pct"]) + float(b["clean_ev_pct"]) + (float(s_r["clean_ev_pct"]) if r_sld is not None else 0.0),
                 "macro_ev_pct": float(a["clean_ev_pct"]),
                 "micro_ev_pct": float(b["clean_ev_pct"]),
                 "inv_delta_ev_pct": float(a.get("inv_delta_ev_pct", 0.0)) + float(b.get("inv_delta_ev_pct", 0.0)),
-                "dd_pct": max(float(a["dd_pct"]), float(b["dd_pct"])),
+                "dd_pct": max(float(a["dd_pct"]), float(b["dd_pct"]), float(s_r["dd_pct"]) if r_sld is not None else 0.0),
                 "fills": tot_f,
                 "cancels": tot_c,
                 "requeues": float(a["requeues"]) + float(b["requeues"]),
@@ -1049,6 +1127,13 @@ def train_order3(
                 "mode_mi_bits": round(mi_join, 4),
                 "turn_mult": round(float(a.get("turn_mult", 0.0)) + float(b.get("turn_mult", 0.0)), 4),
                 "work_frac": round(0.5 * float(a.get("work_frac", 0.0)) + 0.5 * float(b.get("work_frac", 0.0)), 4),
+                "pnl_up_bp": round(up_bp, 2),
+                "pnl_dn_bp": round(dn_bp, 2),
+                "pnl_fl_bp": round(fl_bp, 2),
+                "beta_share": round(beta_sh, 4),
+                "risk_inv_pct": round(float(s_r.get("risk_inv_pct", a.get("risk_inv_pct", 0.0))), 3),
+                "bo_calm_fills": round(float(a.get("bo_calm_fills", 0.0)) + (float(s_r.get("bo_calm_fills", 0.0)) if r_sld is not None else 0.0), 1),
+                "bo_drop_fills": round(float(a.get("bo_drop_fills", 0.0)) + (float(s_r.get("bo_drop_fills", 0.0)) if r_sld is not None else 0.0), 1),
             })
         return merged
 
@@ -1142,23 +1227,163 @@ def train_order3(
         st_n = _normalize_weights_order3(d, policy.dtype)
         return {k: v.to(device=device, dtype=policy.dtype) for k, v in st_n.items()}
 
-    st_live_champ = _load_gpu_seed(BASE_DIR / "models/prl/release_champion_v1.pt")
+    def _build_wick_teacher_seed(
+        st_base: dict,
+        exp_frac: float = 0.42,
+        r1_pct: float = 0.020,
+        gap_pct: float = 0.010,
+        two_slots: bool = True,
+        hyst57_z: float = 1.65,
+        modes_mask: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6, 7),
+        bo_guard_gain: float = 0.14,
+        enable_recycle_f: bool = False,
+    ) -> dict:
+        """
+        T0.3: Библиотека учителей концентрированного сбора фитилей (D2+D3) + гистерезис [57] (T0.4) + межбиржевой гвард BO [12,21] (G)
+        и опциональная активация продавца всплесков [56] (Mode F для L82).
+        """
+        d = {k: st_base[k].detach().cpu().float().clone() for k in MultimodalMoEPolicyOrder3.PARAM_KEYS}
+        w1 = d["w1"]
+        w2 = d["w2_moe"].view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        b2 = d["b2_moe"].view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+
+        sg_r = min(0.95, max(0.05, r1_pct / 0.04))
+        spn = (gap_pct / ((1.0 / 11.0) ** 0.40)) if two_slots else 0.0006
+        sg_s = min(0.95, max(0.01, (spn - 0.0005) / 0.2495))
+        z_exp = math.log(exp_frac / (1.0 - exp_frac))
+        z_ret = math.log(sg_r / (1.0 - sg_r))
+        z_spn = math.log(sg_s / (1.0 - sg_s)) if two_slots else -8.0
+
+        caution_dir = -w2[:, 4, 0].clone()
+        bull_dir = w2[:, 1, 0].clone()
+
+        for m in modes_mask:
+            # Мягкое сохранение 20% живой модуляции h2_ctx, чтобы OpenAI-ES сразу чувствовал градиент от сенсоров BigONE/O2!
+            w2[:, m, 0] = 0.20 * w2[:, m, 0] - 0.12 * caution_dir
+            b2[0, m, 0] = z_exp if m != 4 else (z_exp - 0.45)
+            w2[:, m, 1] *= 0.15; b2[0, m, 1] = 8.0
+            if two_slots:
+                w2[:, m, 2] *= 0.15; b2[0, m, 2] = 8.0
+                w2[:, m, 3:13] *= 0.10; b2[0, m, 3:13] = -8.5
+            else:
+                w2[:, m, 2:13] *= 0.10; b2[0, m, 2:13] = -8.5
+            w2[:, m, 13] *= 0.15; b2[0, m, 13] = 8.0
+            w2[:, m, 14:25] *= 0.15; b2[0, m, 14:25] = -6.0
+            w2[:, m, 25] *= 0.15; b2[0, m, 25] = -8.0
+            w2[:, m, 37] *= 0.15; b2[0, m, 37] = -8.0
+            w2[:, m, 38] = 0.20 * w2[:, m, 38] + 0.10 * caution_dir
+            b2[0, m, 38] = z_ret if m != 4 else min(3.2, z_ret + 0.55)
+            w2[:, m, 39] *= 0.15; b2[0, m, 39] = z_spn
+            w2[:, m, 40] *= 0.15; b2[0, m, 40] = -8.0
+            w2[:, m, 41] *= 0.20; b2[0, m, 41] = -6.5   # мгновенная разгрузка фитиля у Ask1 (D3)!
+            w2[:, m, 42] *= 0.20; b2[0, m, 42] = 0.0
+            w2[:, m, 43] *= 0.20; b2[0, m, 43] = -6.5
+            w2[:, m, 44] *= 0.20; b2[0, m, 44] = 6.5
+            w2[:, m, 48] = 0.0;   b2[0, m, 48] = -9.0
+            w2[:, m, 49] *= 0.20; b2[0, m, 49] = -6.0
+            w2[:, m, 50:52] *= 0.25; b2[0, m, 50:52] = 4.0
+            w2[:, m, 52:54] = 0.0;   b2[0, m, 52:54] = -8.5
+            w2[:, m, 54] = 0.20 * w2[:, m, 54] + 0.12 * caution_dir; b2[0, m, 54] = -1.50
+            w2[:, m, 55] = 0.0;   b2[0, m, 55] = -10.0  # D4: скальп выключен до живого замера!
+            if EXPERT_OUT_DIM_ORDER3 >= 58:
+                w2[:, m, 56] = (0.12 * bull_dir) if enable_recycle_f else torch.zeros_like(bull_dir)
+                b2[0, m, 56] = 0.60 if enable_recycle_f else -10.0
+                w2[:, m, 57] = 0.08 * caution_dir
+                b2[0, m, 57] = hyst57_z
+
+        if bo_guard_gain > 0.0:
+            # Синергия G: при падении BigONE (ch[12] basis < 0, ch[21] bo_ret_30s < 0) усиливаем защитное направление (увеличение retreat / снижение exp)!
+            bear_w1 = 0.55 * w1[31, :] + 0.45 * w1[86, :]
+            w1[12, :] = w1[12, :] - (0.80 * bo_guard_gain) * bear_w1
+            w1[18, :] = w1[18, :] - (0.50 * bo_guard_gain) * bear_w1
+            w1[21, :] = w1[21, :] - (1.10 * bo_guard_gain) * bear_w1
+            if MKT_DIM_ORDER3 >= 96 and enable_recycle_f:
+                w1[94, :] = w1[94, :] + (0.75 * bo_guard_gain) * bear_w1  # H-up: выдох после 2ч пампа -> осторожность/разгрузка!
+            d["w1"] = w1
+
+        d["w2_moe"] = w2.reshape(256, MOE_OUT_DIM_ORDER3)
+        d["b2_moe"] = b2.reshape(1, MOE_OUT_DIM_ORDER3)
+        st_n = _normalize_weights_order3(d, policy.dtype)
+        return {k: v.to(device=device, dtype=policy.dtype) for k, v in st_n.items()}
+
+    base_seed_p = Path(seed_champ_path) if seed_champ_path else (BASE_DIR / "models/prl/release_champion_v1.pt")
+    st_live_champ = _load_gpu_seed(base_seed_p)
     st_live_anchor = _make_function_preserving_anchor(st_live_champ)
-    st_l77_prev = _load_gpu_seed(BASE_DIR / "models/prl/release_champion_v1_bak_l77_pre_l78.pt", st_live_champ)
     st_l78_i0 = _load_gpu_seed(SAVE_DIR / "bak_l78/island_0_raw_best.pt", st_live_champ)
     st_l78_i1 = _load_gpu_seed(SAVE_DIR / "bak_l78/island_1_dec_best.pt", st_live_champ)
-    st_l78_soup = _load_gpu_seed(SAVE_DIR / "bak_l78/order3_soup_top3.pt", st_live_champ)
-    st_l77_i1 = _load_gpu_seed(SAVE_DIR / "bak_l77/island_1_dec_best.pt", st_l77_prev)
 
-    st_l79_unfr_live = _build_l79_unfrozen_seed(st_live_champ, micro55_z=-0.95, carousel52_z=-2.25, unwind54_z=-2.15, struct_gain=0.18)
-    st_l79_unfr_i0 = _build_l79_unfrozen_seed(st_l78_i0, micro55_z=-0.80, carousel52_z=-2.05, unwind54_z=-2.00, struct_gain=0.22)
-    st_l79_unfr_i1 = _build_l79_unfrozen_seed(st_l78_i1, micro55_z=-1.05, carousel52_z=-2.35, unwind54_z=-2.20, struct_gain=0.16)
+    st_sib_soup = _load_gpu_seed(base_seed_p.parent / "order3_soup_top3.pt", st_live_champ)
+    st_sib_i0 = _load_gpu_seed(base_seed_p.parent / "island_0_best.pt", st_live_champ)
+    st_sib_i1 = _load_gpu_seed(base_seed_p.parent / "island_1_best.pt", st_live_champ)
+    st_orig_rel = _load_gpu_seed(BASE_DIR / "models/prl/release_champion_v1.pt", st_live_champ)
 
-    seed_pool = (
-        [st_live_anchor, st_live_champ, st_l79_unfr_live, st_l79_unfr_i0, st_l78_i0, st_l78_soup]
-        if island_id == 0
-        else [st_live_anchor, st_live_champ, st_l79_unfr_live, st_l79_unfr_i1, st_l78_i1, st_l78_soup]
-    )
+    if lesson_stage == "l80_wick":
+        t_two40 = _build_wick_teacher_seed(st_live_champ, exp_frac=0.42, r1_pct=0.020, gap_pct=0.010, two_slots=True, hyst57_z=1.75)
+        t_two55 = _build_wick_teacher_seed(st_live_champ, exp_frac=0.54, r1_pct=0.021, gap_pct=0.010, two_slots=True, hyst57_z=1.85)
+        t_wick3 = _build_wick_teacher_seed(st_live_champ, exp_frac=0.38, r1_pct=0.028, gap_pct=0.008, two_slots=False, hyst57_z=1.95)
+        # Модальная химера: моды #0,#1,#3 от чемпиона (рост), моды #2,#4,#5,#6,#7 — концентрированный сборщик фитилей с гвардом BO!
+        t_chimera = _build_wick_teacher_seed(st_live_champ, exp_frac=0.45, r1_pct=0.020, gap_pct=0.010, two_slots=True, hyst57_z=1.75, modes_mask=(2, 4, 5, 6, 7))
+        t_alt = _build_wick_teacher_seed(st_l78_i0 if island_id == 0 else st_l78_i1, exp_frac=0.46, r1_pct=0.022, gap_pct=0.009, two_slots=True, hyst57_z=1.70)
+        seed_pool = [t_two40, t_two55, t_wick3, t_chimera, t_alt, st_live_anchor]
+    elif lesson_stage == "l81_risk_off":
+        # Мягкий хирургический щит поверх выученного L80 (без затирания весов L80!): усиливаем Mode #4 в RISK-OFF и быструю разгрузку [54]
+        d_ro = {k: st_sib_soup[k].detach().cpu().float().clone() for k in MultimodalMoEPolicyOrder3.PARAM_KEYS}
+        w2_ro = d_ro["w2_moe"].view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        b2_ro = d_ro["b2_moe"].view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        b2_ro[0, 4, 0] = min(float(b2_ro[0, 4, 0].item()), -1.40)    # пониженная экспозиция в краш-моде #4
+        b2_ro[0, 4, 38] = max(float(b2_ro[0, 4, 38].item()), 0.55)   # глубокий отступ бида (>2.5%) в краш-моде #4
+        b2_ro[0, :, 54] = torch.clamp(b2_ro[0, :, 54] + 0.55, -2.5, 2.5)  # более быстрая разгрузка инвентаря при просадке!
+        b2_ro[0, :, 55] = -10.0  # D4 holdoff
+        d_ro["w2_moe"] = w2_ro.reshape(256, MOE_OUT_DIM_ORDER3)
+        d_ro["b2_moe"] = b2_ro.reshape(1, MOE_OUT_DIM_ORDER3)
+        t_risk_trim = {k: v.to(device=device, dtype=policy.dtype) for k, v in _normalize_weights_order3(d_ro, policy.dtype).items()}
+        t_strict = _build_wick_teacher_seed(st_live_champ, exp_frac=0.38, r1_pct=0.022, gap_pct=0.010, two_slots=True, hyst57_z=1.85, modes_mask=(4, 6, 7), bo_guard_gain=0.20)
+        seed_pool = [st_sib_soup, st_sib_i0, st_sib_i1, t_risk_trim, t_strict]
+    elif lesson_stage == "l82_up_carry_f":
+        # 1) Разблокировка якоря рециклинга [56] и умеренного удержания волны [49] + 2h blowoff [94] в бычьих модах #0,#1 поверх победителя L81!
+        d_f = {k: st_live_champ[k].detach().cpu().float().clone() for k in MultimodalMoEPolicyOrder3.PARAM_KEYS}
+        w1_f = d_f["w1"]
+        w2_f = d_f["w2_moe"].view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        b2_f = d_f["b2_moe"].view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        for m_b in (0, 1):
+            b2_f[0, m_b, 56] = 0.95   # якорь рециклинга активен после продажи всплеска!
+            b2_f[0, m_b, 42] = 2.20   # продажа всплесков около +1.6%..+2.2% в бычьих модах!
+            b2_f[0, m_b, 49] = -0.80  # мягкий UP-carry
+            b2_f[0, m_b, 54] = -0.90  # быстрая защита при смене режима
+        b2_f[0, :, 55] = -10.0
+        if MKT_DIM_ORDER3 >= 96:
+            bear_dir_w1 = 0.55 * w1_f[31, :] + 0.45 * w1_f[86, :]
+            bull_dir_w1 = 0.45 * w1_f[38, :] + 0.55 * w1_f[39, :]
+            w1_f[94, :] = w1_f[94, :] + 0.16 * bear_dir_w1   # H-up: перегрев 2ч -> разгрузка / торможение ребая
+            w1_f[95, :] = w1_f[95, :] + 0.14 * bull_dir_w1   # 2ч CVD поддержка тренда
+            d_f["w1"] = w1_f
+        d_f["w2_moe"] = w2_f.reshape(256, MOE_OUT_DIM_ORDER3)
+        d_f["b2_moe"] = b2_f.reshape(1, MOE_OUT_DIM_ORDER3)
+        t_up_f = {k: v.to(device=device, dtype=policy.dtype) for k, v in _normalize_weights_order3(d_f, policy.dtype).items()}
+
+        # 2) Мультимодальная химера: бычий эксперт Mode #1 от живого release_champion (с защитой ch[56] рециклинга и 2 слотами!) + моды #0,#2..#7 от L81!
+        d_ch = {k: st_live_champ[k].detach().cpu().float().clone() for k in MultimodalMoEPolicyOrder3.PARAM_KEYS}
+        w2_ch = d_ch["w2_moe"].view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        b2_ch = d_ch["b2_moe"].view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        w2_rel = st_orig_rel["w2_moe"].detach().cpu().float().view(256, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        b2_rel = st_orig_rel["b2_moe"].detach().cpu().float().view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+        w2_ch[:, 1, :] = 0.65 * w2_ch[:, 1, :] + 0.35 * w2_rel[:, 1, :]
+        b2_ch[0, 1, :] = 0.65 * b2_ch[0, 1, :] + 0.35 * b2_rel[0, 1, :]
+        b2_ch[0, 1, 3:13] = -8.0   # строго не более 2 слотов бида даже в бычьей моде (D2)!
+        b2_ch[0, 1, 56] = 1.15     # якорь рециклинга F активен!
+        b2_ch[0, :, 55] = -10.0    # D4 holdoff
+        d_ch["w2_moe"] = w2_ch.reshape(256, MOE_OUT_DIM_ORDER3)
+        d_ch["b2_moe"] = b2_ch.reshape(1, MOE_OUT_DIM_ORDER3)
+        t_bull_chimera = {k: v.to(device=device, dtype=policy.dtype) for k, v in _normalize_weights_order3(d_ch, policy.dtype).items()}
+
+        seed_pool = [st_live_champ, st_sib_i0, st_sib_i1, st_sib_soup, t_up_f, t_bull_chimera]
+    else:
+        st_l85_clean = _make_function_preserving_anchor(st_live_champ)
+        # Гарантия D4 holdoff (ch[55] <= -10.0) в финальной полировке L85:
+        for st_cand in (st_live_champ, st_sib_soup, st_sib_i0, st_sib_i1, st_l85_clean):
+            b2_c = st_cand["b2_moe"].view(1, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
+            b2_c[0, :, 55] = -10.0
+        seed_pool = [st_live_champ, st_sib_i0, st_sib_i1, st_sib_soup, st_l85_clean]
     resume_iter = 0
     for res_p in [SAVE_DIR / "islands" / f"island_{island_id}_best.pt", SAVE_DIR / "global_best.pt", RESUME_CHAMP_PATH]:
         if res_p.exists():
@@ -1173,10 +1398,17 @@ def train_order3(
             except Exception as e_res:
                 log_msg(f"⚠️ Пропуск чтения чекпоинта продолжения {res_p.name}: {e_res}")
 
-    seed_val = eval_dual_scale(seed_pool, val_macro_basket, val_micro_basket, enforce_mi=True)
+    seed_val = eval_dual_scale(seed_pool, val_macro_basket, val_micro_basket, enforce_mi=True, slide_bask=val_slide_basket)
+    for si_p, sv_r in enumerate(seed_val):
+        log_msg(
+            f"   [Seed #{si_p}] HarshGeo={sv_r['geo_score_bp']:+.2f} (Sld={sv_r['slide_geo_bp']:+.1f}, Mac={sv_r['macro_geo_bp']:+.1f}, Mic={sv_r['micro_geo_bp']:+.1f}) | "
+            f"CalibEV={sv_r['calib_clean_ev_pct']:+.3f}% DD={sv_r['calib_dd_pct']:.2f}% | "
+            f"Reg=[UP:{sv_r['pnl_up_bp']:+.1f} DN:{sv_r['pnl_dn_bp']:+.1f} FL:{sv_r['pnl_fl_bp']:+.1f}bp Beta={sv_r['beta_share']:.0%}] | "
+            f"BO=[Calm:{sv_r['bo_calm_fills']:.0f} Drop:{sv_r['bo_drop_fills']:.0f}] Cnl={sv_r['cancels']:.0f}"
+        )
     best_seed_i = int(np.argmax([r["geo_score_bp"] for r in seed_val]))
     champion_state = seed_pool[best_seed_i]
-    val_basket = val_macro_basket + val_micro_basket
+    val_basket = val_macro_basket + val_micro_basket + val_slide_basket
     oos_basket = oos_macro_basket + oos_micro_basket
     log_msg(
         f"🌱 Выбрано стартовое семя #{best_seed_i} (ValHarshGeo={seed_val[best_seed_i]['geo_score_bp']:+.2f} bp | "
@@ -1258,7 +1490,7 @@ def train_order3(
                     if "w1" in n_ck and n_ck["w1"].shape[0] == TOTAL_DIM_ORDER3 and n_ck.get("wf_version") == wf_version:
                         nb_st = {k: n_ck[k].to(device=device, dtype=policy.dtype) for k in MultimodalMoEPolicyOrder3.PARAM_KEYS if k in n_ck}
                         if len(nb_st) == len(MultimodalMoEPolicyOrder3.PARAM_KEYS):
-                            nb_local_res = eval_dual_scale([nb_st], val_macro_basket, val_micro_basket, enforce_mi=True)[0]
+                            nb_local_res = eval_dual_scale([nb_st], val_macro_basket, val_micro_basket, enforce_mi=True, slide_bask=val_slide_basket)[0]
                             nb_local_geo = float(nb_local_res["geo_score_bp"])
                             elite_archive.append((nb_local_geo, {k: v.clone() for k, v in nb_st.items()}))
                             if len(elite_archive) > 8:
@@ -1324,7 +1556,7 @@ def train_order3(
             center = best_state
 
         sigma_scale = base_sigma * (1.0 + 0.10 * min(3, patience // 6))
-        policy.sample_population(center, stage=stage, sigma_scale=sigma_scale, alt_elite_state=best_state)
+        policy.sample_population(center, stage=stage, sigma_scale=sigma_scale, alt_elite_state=best_state, lesson_stage=lesson_stage)
         cand_list = policy.get_candidate_states()
 
         t_batch = time.time()
@@ -1337,7 +1569,7 @@ def train_order3(
         k_mut_top = max(4, min(32 - len(es_cands), len(cand_list)))
         top_mut_idx = np.argsort(tr_geos)[-k_mut_top:][::-1].tolist()
         val_cands = es_cands + [cand_list[i] for i in top_mut_idx]
-        val_results = eval_dual_scale(val_cands, val_macro_basket, val_micro_basket, enforce_mi=True)
+        val_results = eval_dual_scale(val_cands, val_macro_basket, val_micro_basket, enforce_mi=True, slide_bask=val_slide_basket)
         dt_batch = time.time() - t_batch
 
         val_geos = [r["geo_score_bp"] for r in val_results]
@@ -1425,9 +1657,10 @@ def train_order3(
             src_tag = f"ES-Grad#{best_v_local}" if is_es_win else "Mutant"
             log_msg(
                 f"⭐ [It {it:03d} | +{delta_bp:.2f} bp | {src_tag}] NEW K=8 CHAMPION! "
-                f"HarshGeo={best_geo_bp:+.2f} bp (EV={best_clean_ev:+.4f}%, DD={best_metrics['dd_pct']:.2f}%) | "
-                f"CalibGeo={best_metrics['calib_geo_bp']:+.2f} bp (EV={best_metrics['calib_clean_ev_pct']:+.4f}%, DD={best_metrics['calib_dd_pct']:.2f}%) | "
-                f"Fills/w={best_metrics['fills']/w_cnt_f:.1f} | MI={best_metrics['mode_mi_bits']:.2f}b | Time={time.time() - t_it:.1f}s"
+                f"HarshGeo={best_geo_bp:+.2f} bp (Sld={best_metrics.get('slide_geo_bp', 0.0):+.1f}, EV={best_clean_ev:+.4f}%, DD={best_metrics['dd_pct']:.2f}%) | "
+                f"CalibEV={best_metrics['calib_clean_ev_pct']:+.4f}% (DD={best_metrics['calib_dd_pct']:.2f}%) | "
+                f"Reg=[UP:{best_metrics.get('pnl_up_bp', 0.0):+.1f} DN:{best_metrics.get('pnl_dn_bp', 0.0):+.1f} FL:{best_metrics.get('pnl_fl_bp', 0.0):+.1f}bp Beta={best_metrics.get('beta_share', 0.0):.0%} RInv={best_metrics.get('risk_inv_pct', 0.0):.1f}%] | "
+                f"BO=[{best_metrics.get('bo_calm_fills', 0.0):.0f}/{best_metrics.get('bo_drop_fills', 0.0):.0f}] Cnl/F={best_metrics['cnl_per_fill']:.1f} | Time={time.time() - t_it:.1f}s"
             )
         else:
             patience += 1
@@ -1503,7 +1736,7 @@ def train_order3(
                 t1_w = uniq_elites[1][1][k].detach().to(device=device, dtype=torch.float32)
                 soup_state[k] = (0.75 * t0_w + 0.25 * t1_w).to(dtype=policy.dtype)
         soup_norm = _normalize_weights_order3(soup_state, policy.dtype)
-        soup_val = eval_dual_scale([soup_norm], val_macro_basket, val_micro_basket, enforce_mi=True)[0]
+        soup_val = eval_dual_scale([soup_norm], val_macro_basket, val_micro_basket, enforce_mi=True, slide_bask=val_slide_basket)[0]
         log_msg(f"🍲 Router-Preserving Soup JointGeo={soup_val['geo_score_bp']:+.2f} bp (vs Top1 {best_geo_bp:+.2f} bp)")
         save_soup = True
         if SOUP_CHAMP_PATH.exists():
@@ -1524,7 +1757,8 @@ def train_order3(
         f"Baseline={baseline_oos_geo:+.2f} bp -> Final={oos_final['geo_score_bp']:+.2f} bp "
         f"(Mac={oos_final['macro_geo_bp']:+.2f}, Mic={oos_final['micro_geo_bp']:+.2f}) | "
         f"OOS_EV={oos_final['clean_ev_pct']:+.4f}% | DD={oos_final['dd_pct']:.2f}% | "
-        f"Fills/w={oos_final['fills']/max(1.0, float(len(oos_basket))):.1f}"
+        f"Reg=[UP:{oos_final['pnl_up_bp']:+.1f} DN:{oos_final['pnl_dn_bp']:+.1f} FL:{oos_final['pnl_fl_bp']:+.1f}bp Beta={oos_final['beta_share']:.0%} RInv={oos_final['risk_inv_pct']:.1f}%] | "
+        f"BO=[{oos_final['bo_calm_fills']:.0f}/{oos_final['bo_drop_fills']:.0f}]"
     )
     log_msg(
         f"📈 [BLIND {len(oos_basket)}-WINDOW OOS EXAM ({oos_span/3600:.1f}h) | CALIB] "
@@ -1537,7 +1771,7 @@ def train_order3(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Order-3 RL Champion Walk-Forward v4 (60D Signal Stack v2) Trainer")
+    parser = argparse.ArgumentParser(description="Order-3 RL Champion Walk-Forward v4 (96D Signal Stack v7) Trainer")
     parser.add_argument("--device", type=str, default="cuda:0", help="CUDA device (e.g. cuda:0 or cuda:1)")
     parser.add_argument("--groups", type=int, default=160, help="Number of candidate groups")
     parser.add_argument("--iters", type=int, default=800, help="Maximum iterations")
@@ -1549,11 +1783,13 @@ def main():
     parser.add_argument("--early-stop-min", type=float, default=32.0, help="Early stopping stagnation minutes (0 to disable)")
     parser.add_argument("--island-mode", type=str, default="exploit", choices=["exploit", "balanced", "explore", "wide"], help="Island Mode")
     parser.add_argument("--log-file", type=str, default=None, help="Custom log file")
-    parser.add_argument("--wf-version", type=str, default="pure_wf_v35_l65_wave_rider", help="Lesson / WF version tag")
+    parser.add_argument("--wf-version", type=str, default="pure_wf_v50_l80_wick_harvester_96d", help="Lesson / WF version tag")
     parser.add_argument("--oos-hours", type=float, default=22.0, help="Blind OOS tail hours reserved at end of dataset")
     parser.add_argument("--inv-stress", type=float, default=0.35, help="Fraction of windows with pre-loaded inventory stress")
     parser.add_argument("--world-mode", type=str, default="dec", choices=["dec", "raw"], help="Orderbook world mode: dec (decontaminated+interactive) or raw (untouched)")
     parser.add_argument("--no-harsh-stress", action="store_true", help="Disable harsh_stress execution physics (default: harsh_stress=True)")
+    parser.add_argument("--lesson-stage", type=str, default="l80_wick", choices=["l80_wick", "l81_risk_off", "l82_up_carry_f", "l85_joint"], help="Curriculum stage")
+    parser.add_argument("--seed-champ", type=str, default=None, help="Optional seed champion checkpoint path")
     args = parser.parse_args()
 
     train_order3(
@@ -1573,6 +1809,8 @@ def main():
         inv_stress_frac=args.inv_stress,
         world_mode=args.world_mode,
         harsh_stress=(not args.no_harsh_stress),
+        lesson_stage=args.lesson_stage,
+        seed_champ_path=args.seed_champ,
     )
 
 

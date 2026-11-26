@@ -34,21 +34,22 @@ from _tools.fused_order3_clean_tick import (
     _scale_mkt_44d,
 )
 
-MKT_PATH = BASE_DIR / "data/cache/rl_hybrid_market_obs_94d.npz"
+MKT_PATH = BASE_DIR / "data/cache/rl_hybrid_market_obs_96d.npz"
 LOB_PATH = BASE_DIR / "data/cache/rl_guard_lob_cache_600h.npz"
 CHAMP_PATH = BASE_DIR / "models/prl/release_champion_v1.pt"
 
 
 def main():
     print("=" * 80)
-    print("🧪 ORDER-3 TRUE BITWISE SIM / LIVE PARITY & LATENCY VERIFICATION (SIGNAL STACK V6 94D)")
+    print("🧪 ORDER-3 TRUE BITWISE SIM / LIVE PARITY & LATENCY VERIFICATION (SIGNAL STACK V7 96D / 58D)")
     print("=" * 80)
 
+    ck_path = Path(sys.argv[1]) if len(sys.argv) > 1 else CHAMP_PATH
     # Используем CPU, как на боевом VPS, для честного замера латентности без 14с холодного старта CUDA
-    engine = Order3LiveInferenceEngine(checkpoint_path=CHAMP_PATH, device="cpu")
-    print("  ✅ Order3LiveInferenceEngine (CPU) инициализирован.")
+    engine = Order3LiveInferenceEngine(checkpoint_path=ck_path, device="cpu")
+    print(f"  ✅ Order3LiveInferenceEngine (CPU) инициализирован: {ck_path.name}")
 
-    mkt_raw = np.load(MKT_PATH, mmap_mode="r")["market_obs_94d"]
+    mkt_raw = np.load(MKT_PATH, mmap_mode="r")["market_obs_96d"]
     lob_raw = np.load(LOB_PATH, mmap_mode="r")
     assert mkt_raw.shape[1] == MKT_DIM_ORDER3, f"Expected {MKT_DIM_ORDER3}D market matrix, got {mkt_raw.shape}"
     col_stds = np.std(np.asarray(mkt_raw[3016277::100], dtype=np.float32), axis=0)
@@ -125,7 +126,7 @@ def main():
                     zm[:, 0:1], zm[:, 40:44], zm[:, 44:45], zm[:, 48:49],
                     zm[:, 29:34], zm[:, 36:37], zm[:, 39:40], zm[:, 55:56], zm[:, 12:13],
                     zm[:, 60:66], zm[:, 72:76], zm[:, 79:82], zm[:, 83:84],
-                    zm[:, 84:88], zm[:, 88:94],
+                    zm[:, 84:88], zm[:, 88:96],
                 ],
                 dim=-1,
             )
@@ -145,7 +146,7 @@ def main():
                 [
                     bb[:, 0:13], ak[:, 13:25], si[:, 25:26], bb[:, 26:35], ak[:, 35:36], si[:, 36:37],
                     bb[:, 37:41], ak[:, 41:44], bb[:, 44:45], ak[:, 45:47], bb[:, 47:48], si[:, 48:49],
-                    ak[:, 49:50], si[:, 50:52], ak[:, 52:53], bb[:, 53:54], ak[:, 54:55], bb[:, 55:56],
+                    ak[:, 49:50], si[:, 50:52], ak[:, 52:53], bb[:, 53:54], ak[:, 54:55], bb[:, 55:58],
                 ],
                 dim=-1,
             )
@@ -168,6 +169,11 @@ def main():
             eff_ret_k = retreat_b * (1.0 - ech0_m * eff_mic_s)
             eff_ins_k = torch.clamp(inside_b + ech0_m * (min(spread_room, 0.0002) * eff_mic_s), max=spread_room)
             raw_t_bid = (b1 + eff_ins_k - eff_ret_k) - span_b_usd * torch.pow(echelon_k01, gamma_b)
+            test_ls_px, test_ls_age = a1 * 1.018, 180.0
+            rec_w_s = float(torch.sigmoid(sr[56]).item()) * np.exp(-test_ls_age / 1800.0)
+            rec_w_k = rec_w_s * (1.0 - ech0_m * eff_mic_s)
+            rec_disc = 0.0040 + 0.0160 * float(torch.sigmoid(sr[56] - 1.0).item())
+            raw_t_bid = (1.0 - rec_w_k) * raw_t_bid + rec_w_k * torch.clamp(raw_t_bid, max=test_ls_px * (1.0 - rec_disc))
             ref_t_bid = torch.clamp(torch.round(torch.clamp(raw_t_bid, max=max(0.0001, a1 - 0.0001)) / 0.0001) * 0.0001, min=0.0001).numpy()
 
             min_bp_test, low_tq_test = b1 * 0.994, 45.0
@@ -196,6 +202,7 @@ def main():
             budget=budget, pos_qty=pos_qty, cash=cash,
             bid_px_12=bid_px, bid_qty_12=bid_qty, ask_px_12=ask_px, ask_qty_12=ask_qty,
             trader_entry=entry_px, min_buy_px=min_bp_test, low_tranche_qty=low_tq_test,
+            last_sell_px=test_ls_px, last_sell_age_s=test_ls_age,
         )
         latencies_ms.append((time.perf_counter() - t0) * 1000.0)
 

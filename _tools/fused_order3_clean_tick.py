@@ -18,16 +18,16 @@ os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
 import torch
 import torch.nn.functional as F
 
-MKT_DIM_ORDER3 = 94
+MKT_DIM_ORDER3 = 96
 AG_DIM_ORDER3 = 110
-TOTAL_DIM_ORDER3 = 204
+TOTAL_DIM_ORDER3 = 206
 
 MEM_DIM_ORDER3 = 48
 K_MODES_ORDER3 = 8
-EXPERT_OUT_DIM_ORDER3 = 56
-MOE_OUT_DIM_ORDER3 = K_MODES_ORDER3 * EXPERT_OUT_DIM_ORDER3  # 448
-ROUTER_EXTRA_DIM_ORDER3 = 40
-ROUTER_IN_DIM_ORDER3 = 256 + 8 + 8 + MEM_DIM_ORDER3 + ROUTER_EXTRA_DIM_ORDER3 + K_MODES_ORDER3  # 368
+EXPERT_OUT_DIM_ORDER3 = 58
+MOE_OUT_DIM_ORDER3 = K_MODES_ORDER3 * EXPERT_OUT_DIM_ORDER3  # 464
+ROUTER_EXTRA_DIM_ORDER3 = 42
+ROUTER_IN_DIM_ORDER3 = 256 + 8 + 8 + MEM_DIM_ORDER3 + ROUTER_EXTRA_DIM_ORDER3 + K_MODES_ORDER3  # 370
 ROUTER_H_DIM_ORDER3 = 128
 ROUTER_OUT_DIM_ORDER3 = 2 * K_MODES_ORDER3  # 16: 8 mode logits + 8 liquid update gates!
 REG_IN_DIM_ORDER3 = 28 + K_MODES_ORDER3     # 36D per-slot features
@@ -106,6 +106,10 @@ def _scale_mkt_44d(z_mkt: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
         # Signal Stack v6 (L78 Medium-Term 5m..30m Structure & Tape CVD):
         zm[..., 88:91] = zm[..., 88:91] * 2.5
         zm[..., 91:94] = zm[..., 91:94] * 2.0
+    if zm.shape[-1] >= 96:
+        # Signal Stack v7 (L80 2-Hour Exhaustion/Capitulation & Tape CVD):
+        zm[..., 94] = zm[..., 94] * 2.5
+        zm[..., 95] = zm[..., 95] * 2.0
     return zm.to(dt)
 
 
@@ -219,6 +223,9 @@ def _order3_clean_tick_step(
     n_fills: torch.Tensor,
     n_cancels: torch.Tensor,
     n_requeues: torch.Tensor,
+    last_sell_px: torch.Tensor,
+    last_sell_s: torch.Tensor,
+    reg_stats: torch.Tensor,
     tick_size: float,
     maker_fee: float,
     taker_fee: float,
@@ -386,7 +393,7 @@ def _order3_clean_tick_step(
             mkt_w[:, 60:66],
             mkt_w[:, 72:76], mkt_w[:, 79:82], mkt_w[:, 83:84],
             mkt_w[:, 84:88],
-            mkt_w[:, 88:94],
+            mkt_w[:, 88:96],
         ],
         dim=-1,
     ).to(dt)
@@ -394,7 +401,7 @@ def _order3_clean_tick_step(
     gate_prev_g = gate_state.view(W, G, B, K_MODES_ORDER3).permute(1, 0, 2, 3).reshape(G, M, K_MODES_ORDER3)
     prev_g_mode_g = torch.softmax(gate_prev_g, dim=-1).to(dt)
 
-    router_in_g = torch.cat([h2_ctx, acct_g, queue_g, mem_next_g, r_extra_g, prev_g_mode_g], dim=-1)  # [G, M, 368]
+    router_in_g = torch.cat([h2_ctx, acct_g, queue_g, mem_next_g, r_extra_g, prev_g_mode_g], dim=-1)  # [G, M, 370]
     r_hid_g = F.silu(torch.bmm(router_in_g, w_gate1_g) + b_gate1_g)  # [G, M, 128]
 
     gate_out_g = torch.bmm(r_hid_g, w_gate2_g).float() + b_gate2_g.float()  # [G, M, 16]
@@ -405,7 +412,7 @@ def _order3_clean_tick_step(
     gate_state = gate_next_g.view(G, W, B, K_MODES_ORDER3).permute(1, 0, 2, 3).reshape(N, K_MODES_ORDER3)
 
     moe_all_g = (torch.bmm(h2_ctx, w2_moe_g).float() + b2_moe_g.float()).view(G, M, K_MODES_ORDER3, EXPERT_OUT_DIM_ORDER3)
-    strat_inst_g = (g_mode_g.unsqueeze(-1) * moe_all_g).sum(dim=2)  # [G, M, 55]
+    strat_inst_g = (g_mode_g.unsqueeze(-1) * moe_all_g).sum(dim=2)  # [G, M, 58]
     strat_inst = strat_inst_g.view(G, W, B, EXPERT_OUT_DIM_ORDER3).permute(1, 0, 2, 3).reshape(N, EXPERT_OUT_DIM_ORDER3)
 
     # Адаптивный нелинейный демпфер плана котирования (разрывает петлю PLACE -> free_cash -> CANCEL, оставляя Taker мгновенным!):
@@ -433,6 +440,8 @@ def _order3_clean_tick_step(
             bid_blend[:, 53:54],    # [53] sniper_front_z (подавление отступа трусости у Bid1!)
             ask_blend[:, 54:55],    # [54] unwind_front_z (L78 ранний мейкер-сброс передних эшелонов при сломе тренда!)
             bid_blend[:, 55:56],    # [55] micro_sniper_z (L79 изолированный микро-снайпер широкого спреда на слоте #00!)
+            bid_blend[:, 56:57],    # [56] recycle_anchor_z (L80 якорь рециклинга: потолок откупа ниже last_sell_px!)
+            bid_blend[:, 57:58],    # [57] deep_hyst_z (L80 эндогенный гистерезис перестановки глубоких заявок!)
         ],
         dim=-1,
     )
@@ -477,6 +486,9 @@ def _order3_clean_tick_step(
 
     eff_t_fee = taker_fee
     proceeds = (take_10 * b_p10).sum(dim=1) * (1.0 - eff_t_fee)
+    tk_sell_px = (take_10 * b_p10).sum(dim=1) / torch.clamp(actual_taker_q, min=1e-6)
+    last_sell_px = torch.where(exec_taker, tk_sell_px, last_sell_px)
+    last_sell_s = torch.where(exec_taker, s_nxt_i16.expand_as(last_sell_s), last_sell_s)
     rem_pos = torch.clamp(pos_qty - actual_taker_q, min=0.0)
     rem_frac = torch.where(pos_qty > 1e-6, rem_pos / torch.clamp(pos_qty, min=1e-6), torch.zeros_like(pos_qty))
     full_exit = rem_pos < 2.0
@@ -552,6 +564,13 @@ def _order3_clean_tick_step(
     micro_step_in = torch.minimum(spread_room, torch.full_like(spread_room, 2.0 * tick_size)) * eff_micro_s
     eff_inside_k = torch.minimum(spread_room.unsqueeze(1), inside_b.unsqueeze(1) + ech0_m * micro_step_in.unsqueeze(1))
     raw_t_bid = (b1.unsqueeze(1) + eff_inside_k - eff_retreat_k) - span_b_usd.unsqueeze(1) * curve_b
+    # T0.6: Якорь рециклинга [56] — потолок откупа ниже last_sell_px после продажи всплеска (Mode F, 0.00e+00 при b2=-12):
+    sell_age_s = torch.clamp(s_cur_f - last_sell_s.float(), min=0.0)
+    has_rec_anc = (last_sell_px > 1e-4) & (sell_age_s < 3600.0)
+    rec_w = (torch.sigmoid(strat_raw[:, 56]) * torch.exp(-sell_age_s / 1800.0) * has_rec_anc.float()).unsqueeze(1) * (1.0 - ech0_m * eff_micro_s.unsqueeze(1))
+    rec_disc = 0.0040 + 0.0160 * torch.sigmoid(strat_raw[:, 56] - 1.0)
+    rec_cap_px = (last_sell_px * (1.0 - rec_disc)).unsqueeze(1)
+    raw_t_bid = (1.0 - rec_w) * raw_t_bid + rec_w * torch.minimum(raw_t_bid, rec_cap_px)
     max_maker_bid = torch.clamp(a1 - tick_size, min=tick_size).unsqueeze(1)
     t_bid_px = torch.clamp(torch.round(torch.minimum(raw_t_bid, max_maker_bid) / tick_size) * tick_size, min=tick_size)
 
@@ -713,15 +732,21 @@ def _order3_clean_tick_step(
     ra_h = ra_h0 + torch.bmm(torch.relu(ra_res_p[:, :, :32]) * (2.0 * torch.sigmoid(ra_res_p[:, :, 32:64])), w_reg_res2_g)
     rb_out = (torch.bmm(rb_h, w_reg2_g).float() + b_reg2_b_g.float()).view(G, W, B, S, 2).permute(1, 0, 2, 3, 4).reshape(N, S, 2)
     ra_out = (torch.bmm(ra_h, w_reg2_g).float() + b_reg2_a_g.float()).view(G, W, B, S, 2).permute(1, 0, 2, 3, 4).reshape(N, S, 2)
+    # T0.4: Эндогенный гистерезис перестановки глубоких заявок [57] (снижает churn отмен в 10-15x, 0.00e+00 при b2=-12):
+    hyst_band = 0.0080 * torch.sigmoid(strat_raw[:, 57]).unsqueeze(1)
+    abs_drift_b = torch.abs(t_bid_px - bid_px) / torch.clamp(b1.unsqueeze(1), min=tick_size)
+    deep_rest_b = (had_b_pre & (bid_px < b1.unsqueeze(1) * 0.992) & (hyst_band > 2e-5)).float()
+    hyst_damp_b = 8.0 * torch.sigmoid((hyst_band - abs_drift_b) * 1200.0) * deep_rest_b
+    rb_cnl_adj = rb_out[:, :, 1] - hyst_damp_b
     g_plc_b = rb_out[:, :, 0] > 0.0
-    g_cnl_b = rb_out[:, :, 1] > 0.0
+    g_cnl_b = rb_cnl_b_mask = rb_cnl_adj > 0.0
     g_plc_a = ra_out[:, :, 0] > 0.0
     g_cnl_a = ra_out[:, :, 1] > 0.0
     # 5. Ранжированное по срочности снятие ордеров (в полёте HTTP до bid_act_s/ask_act_s ордер ещё не подтверждён движком Peatio -> рутинный cancel ждёт оседания в книге!):
     settled_b = (s_2d >= bid_act_s) if true_latency else torch.ones_like(had_b_pre)
     crossed_b = bid_px >= (a1.unsqueeze(1) - 0.1 * tick_size)
     want_cnl_b = had_b_pre & (crossed_b | (settled_b & g_cnl_b))
-    prio_cnl_b = torch.where(want_cnl_b, rb_out[:, :, 1] + crossed_b.float() * 100.0, torch.full_like(bid_qty, -1e4))
+    prio_cnl_b = torch.where(want_cnl_b, rb_cnl_adj + crossed_b.float() * 100.0, torch.full_like(bid_qty, -1e4))
     ord_cb = torch.argsort(prio_cnl_b, dim=1, descending=True)
     inv_cb = torch.argsort(ord_cb, dim=1)
     want_cb_s = torch.gather(want_cnl_b.float(), 1, ord_cb)
@@ -1076,6 +1101,9 @@ def _order3_clean_tick_step(
     slot_fee_a = torch.where(near_opp_a, torch.full_like(ask_px, 0.5 * (maker_fee + taker_fee)), torch.full_like(ask_px, maker_fee))
     tot_rev = (f_qa * ask_px * (1.0 - slot_fee_a)).sum(dim=1)
     has_sell = tot_fqa > 1e-5
+    mk_sell_px = (f_qa * ask_px).sum(dim=1) / torch.clamp(tot_fqa, min=1e-6)
+    last_sell_px = torch.where(has_sell, mk_sell_px, last_sell_px)
+    last_sell_s = torch.where(has_sell, s_nxt_i16.expand_as(last_sell_s), last_sell_s)
     n_fills = torch.clamp(n_fills.long() + has_sell.long(), max=2000000).to(torch.int32)
     fill_qp_a_step = torch.where(has_sell, (f_qa * pre_fill_qp_a).sum(dim=1) / torch.clamp(tot_fqa, min=1e-6), torch.zeros_like(tot_fqa))
     sum_fill_qprog = sum_fill_qprog + fill_qp_b_step + fill_qp_a_step
@@ -1148,6 +1176,25 @@ def _order3_clean_tick_step(
     )
     is_danger_mkt = is_spike_danger | is_macro_bear
     sum_val_err = sum_val_err + torch.where(is_danger_mkt, torch.ones_like(raw_work_frac), raw_work_frac)
+    # T0.2 & T0.8: Порежимная атрибуция dEq (UP/DN/FL), время с запасом в RISK-OFF и исполнения глубоких Bid при спокойном vs падающем BigONE:
+    deq_step = mtm_eq - prev_mtm_eq
+    is_up_30m = mkt_w[:, 88] > 0.445
+    is_dn_30m = mkt_w[:, 88] < -0.445
+    is_risk_off = is_dn_30m | (mkt_w[:, 81] > 0.285)
+    is_deep_fill = has_buy & (avg_fill_b_px < b1 * 0.988)
+    bo_dropped = mkt_w[:, 21] <= -1.25
+    d_reg = torch.stack(
+        [
+            torch.where(is_up_30m, deq_step, torch.zeros_like(deq_step)),
+            torch.where(is_dn_30m, deq_step, torch.zeros_like(deq_step)),
+            torch.where((~is_up_30m) & (~is_dn_30m), deq_step, torch.zeros_like(deq_step)),
+            torch.where(is_risk_off, torch.clamp((pos_qty * nb1_1d) / torch.clamp(budget, min=25.0), 0.0, 1.5), torch.zeros_like(deq_step)),
+            (is_deep_fill & (~bo_dropped)).float(),
+            (is_deep_fill & bo_dropped).float(),
+        ],
+        dim=-1,
+    )
+    reg_stats = reg_stats + d_reg
     prev_val_pred = stress_acc_usd
     prev_mtm_eq = mtm_eq
 
@@ -1166,6 +1213,7 @@ def _order3_clean_tick_step(
         sum_fill_qprog, sum_val_err, prev_val_pred, prev_mtm_eq,
         sum_mode_p, sum_mode_ent,
         n_fills, n_cancels, n_requeues,
+        last_sell_px, last_sell_s, reg_stats,
     )
 
 
@@ -1265,6 +1313,9 @@ def _get_or_build_order3_cudagraph(
         "n_fills": torch.zeros(N, dtype=torch.int32, device=device),
         "n_cancels": torch.zeros(N, dtype=torch.int32, device=device),
         "n_requeues": torch.zeros(N, dtype=torch.int32, device=device),
+        "last_sell_px": torch.zeros(N, dtype=torch.float32, device=device),
+        "last_sell_s": torch.full((N,), -9999, dtype=torch.int32, device=device),
+        "reg_stats": torch.zeros((N, 6), dtype=torch.float32, device=device),
     }
 
     state_keys = [
@@ -1276,6 +1327,7 @@ def _get_or_build_order3_cudagraph(
         "sum_fqp", "sum_val_err", "prev_val_pred", "prev_mtm_eq",
         "sum_mode_p", "sum_mode_ent",
         "n_fills", "n_cancels", "n_requeues",
+        "last_sell_px", "last_sell_s", "reg_stats",
     ]
 
     def _run_step():
@@ -1360,6 +1412,7 @@ def evaluate_order3_basket(
     harsh_stress: bool = False,
     budget_override: float | None = None,
     trace_out: list | None = None,
+    risk_inv_pen_w: float = 0.0,
 ) -> list[dict]:
     # Монолитный батч до 192 групп (1,152 агента и 18,432 стакана за 1 проход на GPU!) благодаря потоковому pre_mkt_blk
     C_total = len(cand_states)
@@ -1388,6 +1441,8 @@ def evaluate_order3_basket(
                 calib_jitter_std=calib_jitter_std,
                 enforce_activity_floor=enforce_activity_floor,
                 harsh_stress=harsh_stress,
+                budget_override=budget_override,
+                risk_inv_pen_w=risk_inv_pen_w,
             )
             all_res.extend(sub_res)
         return all_res
@@ -1453,6 +1508,8 @@ def evaluate_order3_basket(
                 b2m_pad[:, :, 54] = -12.0
             if old_exp_d <= 55 and EXPERT_OUT_DIM_ORDER3 >= 56:
                 b2m_pad[:, :, 55] = -12.0
+            if old_exp_d <= 56 and EXPERT_OUT_DIM_ORDER3 >= 58:
+                b2m_pad[:, :, 56:58] = -12.0
             w2m_t = w2m_pad.reshape(256, MOE_OUT_DIM_ORDER3)
             b2m_t = b2m_pad.reshape(1, MOE_OUT_DIM_ORDER3)
         w2m_l.append(w2m_t.to(dtype=dt))
@@ -1468,9 +1525,12 @@ def evaluate_order3_basket(
             bg1_pad = torch.zeros((1, ROUTER_H_DIM_ORDER3), dtype=torch.float32, device=device)
             ch_r = min(old_rh, ROUTER_H_DIM_ORDER3)
             bg1_pad[:, :ch_r] = bg1_t[:, :ch_r]
-            if old_rin == 362 and ROUTER_IN_DIM_ORDER3 == 368:
+            if old_rin == 368 and ROUTER_IN_DIM_ORDER3 == 370:
+                wg1_pad[:360, :ch_r] = wg1_t[:360, :ch_r]
+                wg1_pad[362:370, :ch_r] = wg1_t[360:368, :ch_r]
+            elif old_rin == 362 and ROUTER_IN_DIM_ORDER3 >= 368:
                 wg1_pad[:354, :ch_r] = wg1_t[:354, :ch_r]
-                wg1_pad[360:368, :ch_r] = wg1_t[354:362, :ch_r]
+                wg1_pad[ROUTER_IN_DIM_ORDER3 - 8 : ROUTER_IN_DIM_ORDER3, :ch_r] = wg1_t[354:362, :ch_r]
             elif old_rin == 358 and ROUTER_IN_DIM_ORDER3 >= 362:
                 wg1_pad[:350, :ch_r] = wg1_t[:350, :ch_r]
                 wg1_pad[ROUTER_IN_DIM_ORDER3 - 8 : ROUTER_IN_DIM_ORDER3, :ch_r] = wg1_t[350:358, :ch_r]
@@ -1677,7 +1737,7 @@ def evaluate_order3_basket(
             zw_last[:, 60:66],
             zw_last[:, 72:76], zw_last[:, 79:82], zw_last[:, 83:84],
             zw_last[:, 84:88],
-            zw_last[:, 88:94],
+            zw_last[:, 88:96],
         ],
         dim=-1,
     ).to(dt).unsqueeze(0).expand(C, W, ROUTER_EXTRA_DIM_ORDER3)
@@ -1754,6 +1814,9 @@ def evaluate_order3_basket(
     n_fills = torch.zeros(N, dtype=torch.int32, device=device)
     n_cancels = torch.zeros(N, dtype=torch.int32, device=device)
     n_requeues = torch.zeros(N, dtype=torch.int32, device=device)
+    last_sell_px = torch.zeros(N, dtype=torch.float32, device=device)
+    last_sell_s = torch.full((N,), -9999, dtype=torch.int32, device=device)
+    reg_stats = torch.zeros((N, 6), dtype=torch.float32, device=device)
 
     s_steps_i32 = torch.arange(win_len, dtype=torch.int32, device=device)
     total_sim_steps = win_len - 1
@@ -1800,6 +1863,7 @@ def evaluate_order3_basket(
             sum_fqp, sum_val_err, prev_val_pred, prev_mtm_eq,
             sum_mode_p, sum_mode_ent,
             n_fills, n_cancels, n_requeues,
+            last_sell_px, last_sell_s, reg_stats,
         ]
         for k_s, t_s in zip(cg_entry["state_keys"], init_states):
             cb[k_s].copy_(t_s)
@@ -1853,6 +1917,7 @@ def evaluate_order3_basket(
             sum_fqp, sum_val_err, prev_val_pred, prev_mtm_eq,
             sum_mode_p, sum_mode_ent,
             n_fills, n_cancels, n_requeues,
+            last_sell_px, last_sell_s, reg_stats,
         ) = [cb[k_s] for k_s in cg_entry["state_keys"]]
     else:
         for s_blk0 in range(0, total_sim_steps, t_blk_sz):
@@ -1871,6 +1936,7 @@ def evaluate_order3_basket(
                     sum_fqp, sum_val_err, prev_val_pred, prev_mtm_eq,
                     sum_mode_p, sum_mode_ent,
                     n_fills, n_cancels, n_requeues,
+                    last_sell_px, last_sell_s, reg_stats,
                 ) = _order3_clean_tick_step(
                     s_steps_i32[s], s_steps_i32[s + 1], pre_mkt_blk[u], z_mkt_w[s],
                     b1_w_all[s], a1_w_all[s], b1q_w_all[s], a1q_w_all[s],
@@ -1888,6 +1954,7 @@ def evaluate_order3_basket(
                     sum_fqp, sum_val_err, prev_val_pred, prev_mtm_eq,
                     sum_mode_p, sum_mode_ent,
                     n_fills, n_cancels, n_requeues,
+                    last_sell_px, last_sell_s, reg_stats,
                     tick_sz, maker_fee, taker_fee, true_latency, harsh_stress,
                 )
                 if trace_out is not None:
@@ -2051,55 +2118,62 @@ def evaluate_order3_basket(
             g_in = torch.zeros(C, device=device)
 
         dd_m = wd_mat.view(W, C, B_bud).max(dim=0).values.mean(dim=1)
+        rs_wcb = reg_stats.view(W, C, B_bud, 6)
+        bud_wcb = budget.view(W, C, B_bud)
+        up_bp_c = (10000.0 * rs_wcb[clean_idx, :, :, 0] / bud_wcb[clean_idx]).mean(dim=(0, 2)) if clean_idx else torch.zeros(C, device=device)
+        dn_bp_c = (10000.0 * rs_wcb[clean_idx, :, :, 1] / bud_wcb[clean_idx]).mean(dim=(0, 2)) if clean_idx else torch.zeros(C, device=device)
+        fl_bp_c = (10000.0 * rs_wcb[clean_idx, :, :, 2] / bud_wcb[clean_idx]).mean(dim=(0, 2)) if clean_idx else torch.zeros(C, device=device)
+        rinv_c = (rs_wcb[clean_idx, :, :, 3] / n_steps_f).mean(dim=(0, 2)) if clean_idx else (rs_wcb[:, :, :, 3] / n_steps_f).mean(dim=(0, 2))
+        bo_calm_c = rs_wcb[:, :, :, 4].sum(dim=0).mean(dim=1)
+        bo_drop_c = rs_wcb[:, :, :, 5].sum(dim=0).mean(dim=1)
 
-        if enforce_activity_floor and len(clean_idx) >= 8:
-            ic_pen = 42.0 * torch.clamp(0.80 - cl_work_v, min=0.0)
-            tf_phr = 0.36
-            ff_phr = 3.50
-            tr_phr = 0.28
-            ept_bp = 100.0 * cev_v / torch.clamp(cl_turn_v, min=0.04)
-            qg = torch.sigmoid((ept_bp - 4.0) / 4.5) * torch.sigmoid(cev_v * 18.0)
-            vm = 0.45 * torch.clamp(cl_turn_phr / tr_phr, min=0.25, max=3.80) + 0.55 * torch.sqrt(torch.clamp(cl_turn_phr / (0.80 * tr_phr), min=0.10, max=20.0))
-            cpf_v = cancels_v / torch.clamp(fills_v, min=2.0)
+        if enforce_activity_floor and len(clean_idx) >= 4:
+            # Директива D6: бездействие на сжатом флэте НЕ штрафуется! Штрафуются только лишние отмены, DD, ловля ножа при падении BO и запас в RISK-OFF:
+            tr_phr = 0.16
+            ept_bp = 100.0 * cev_v / torch.clamp(cl_turn_v, min=0.02)
+            qg = torch.sigmoid((ept_bp - 6.0) / 5.0) * torch.sigmoid(cev_v * 18.0)
+            vm = 0.50 * torch.clamp(cl_turn_phr / tr_phr, min=0.35, max=3.20) + 0.50 * torch.sqrt(torch.clamp(cl_turn_phr / tr_phr, min=0.15, max=12.0))
+            cpf_v = cancels_v / torch.clamp(fills_v, min=1.0)
             cph_v = (cancels_v / max(1.0, float(W))) / win_hrs
-            ch_pen = 0.55 * torch.clamp(cpf_v - 14.0, min=0.0, max=60.0) + 0.12 * torch.clamp(cph_v - 120.0, min=0.0, max=400.0)
-            h_dd_p = (16.0 * torch.clamp(dd_m - 1.75, min=0.0) + 0.55 * torch.clamp(-40.0 - cv25_v, min=0.0)) if is_h else torch.zeros(C, device=device)
+            ch_pen = 0.25 * torch.clamp(cpf_v - 35.0, min=0.0, max=80.0) + 0.14 * torch.clamp(cph_v - 65.0, min=0.0, max=450.0)
+            h_dd_p = (18.0 * torch.clamp(dd_m - 2.20, min=0.0) + 0.55 * torch.clamp(-35.0 - cv25_v, min=0.0)) if is_h else torch.zeros(C, device=device)
+            dn_bleed_p = 0.45 * torch.clamp(-dn_bp_c - 15.0, min=0.0)
+            rinv_p = float(risk_inv_pen_w) * 100.0 * rinv_c
+            bo_guard_p = 1.8 * (bo_drop_c / max(1.0, float(W)))
             dm_pen = (
-                ic_pen + ch_pen + h_dd_p
-                + 42.0 * torch.clamp(1.0 - cl_turn_phr / tf_phr, min=0.0)
-                + 26.0 * torch.clamp(1.0 - cl_fills_phr / ff_phr, min=0.0)
-                + 22.0 * torch.clamp(cl_turn_phr - 2.00, min=0.0) * torch.sigmoid(-cev_v * 35.0)
+                ch_pen + h_dd_p + dn_bleed_p + rinv_p + bo_guard_p
+                + 24.0 * torch.clamp(cl_turn_phr - 1.50, min=0.0) * torch.sigmoid(-cev_v * 35.0)
             )
             pv_bon = (
-                325.0 * torch.clamp(cev_v, min=0.0, max=12.0) * vm
-                + 30.0 * torch.clamp(cl_fills_phr / 5.5, min=0.0, max=3.2) * qg
-                + 22.0 * torch.clamp(cl_work_v - 0.55, min=0.0) * torch.sigmoid(cev_v * 15.0)
+                260.0 * torch.clamp(cev_v, min=0.0, max=12.0) * vm
+                + 24.0 * torch.clamp(bo_calm_c / max(1.0, float(W)), min=0.0, max=4.0) * qg
             )
         else:
-            dm_pen = torch.zeros(C, device=device)
+            dm_pen = float(risk_inv_pen_w) * 100.0 * rinv_c
             pv_bon = torch.zeros(C, device=device)
 
         if clean_idx and inv_idx:
-            am_gate = torch.clamp(cl_turn_phr / 0.25, 0.0, 1.0) * torch.clamp(cl_work_v / 0.65, 0.0, 1.0) * torch.sigmoid((g_cl + 10.0) / 4.0) * torch.sigmoid(cev_v * 20.0)
+            am_gate = torch.sigmoid((g_cl + 10.0) / 4.0) * torch.sigmoid(cev_v * 20.0)
             gv = 0.85 * (g_cl + pv_bon - dm_pen) + 0.15 * torch.where(g_in > 0.0, g_in * am_gate, g_in)
         elif clean_idx:
             gv = g_cl + pv_bon - dm_pen
         else:
             gv = g_in
-        return gv, ent_v, cv25_v, qm, fev_v, cev_v, iev_v, dd_m
+        return gv, ent_v, cv25_v, qm, fev_v, cev_v, iev_v, dd_m, up_bp_c, dn_bp_c, fl_bp_c, rinv_c, bo_calm_c, bo_drop_c
 
-    geo_v, ent_bp_v, cvar25_v, q_mat, full_ev_v, cl_ev_v, inv_ev_v, dd_v = _reduce_terminal_mode(harsh_stress)
+    geo_v, ent_bp_v, cvar25_v, q_mat, full_ev_v, cl_ev_v, inv_ev_v, dd_v, up_bp_v, dn_bp_v, fl_bp_v, rinv_v, bo_calm_v, bo_drop_v = _reduce_terminal_mode(harsh_stress)
     if harsh_stress:
-        cal_geo_v, _, _, _, _, cal_cl_ev_v, _, cal_dd_v = _reduce_terminal_mode(False)
+        cal_geo_v, _, _, _, _, cal_cl_ev_v, _, cal_dd_v, _, _, _, _, _, _ = _reduce_terminal_mode(False)
     else:
         cal_geo_v, cal_cl_ev_v, cal_dd_v = geo_v, cl_ev_v, dd_v
 
-    # Единый перенос компактной матрицы метрик [C, 20] на CPU (0.0002s overhead для одновременного Harsh + Calibrated отчёта!):
+    # Единый перенос компактной матрицы метрик [C, 26] на CPU:
     stats_cpu = torch.stack(
         [
             geo_v, ent_bp_v, cvar25_v, q_mat[0], q_mat[2], q_mat[4],
             full_ev_v, cl_ev_v, inv_ev_v, dd_v, fills_v, cancels_v, requeues_v, fqp_v, mi_bits_v, cl_turn_v, cl_work_v,
             cal_geo_v, cal_cl_ev_v, cal_dd_v,
+            up_bp_v, dn_bp_v, fl_bp_v, 100.0 * rinv_v, bo_calm_v, bo_drop_v,
         ],
         dim=1,
     ).cpu().tolist()
@@ -2111,6 +2185,9 @@ def evaluate_order3_basket(
         fills_f = float(st[10])
         cancels_f = float(st[11])
         fqp_f = float(st[13])
+        up_b, dn_b, fl_b = float(st[20]), float(st[21]), float(st[22])
+        denom_b = abs(up_b) + abs(dn_b) + abs(fl_b) + 1e-4
+        beta_sh = (abs(up_b) + abs(dn_b)) / denom_b
         results.append({
             'geo_score_bp': float(st[0]),
             'entropic_growth_bp': float(st[1]),
@@ -2134,5 +2211,12 @@ def evaluate_order3_basket(
             'calib_geo_score_bp': float(st[17]),
             'calib_clean_ev_pct': float(st[18]),
             'calib_dd_pct': float(st[19]),
+            'pnl_up_bp': round(up_b, 2),
+            'pnl_dn_bp': round(dn_b, 2),
+            'pnl_fl_bp': round(fl_b, 2),
+            'beta_share': round(beta_sh, 4),
+            'risk_inv_pct': round(float(st[23]), 3),
+            'bo_calm_fills': round(float(st[24]), 1),
+            'bo_drop_fills': round(float(st[25]), 1),
         })
     return results[:orig_c]

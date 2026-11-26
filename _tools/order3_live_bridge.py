@@ -126,9 +126,12 @@ class Order3LiveInferenceEngine:
             bg1_adap = torch.zeros((1, ROUTER_H_DIM_ORDER3), dtype=torch.float32)
             ch_r = min(old_rh, ROUTER_H_DIM_ORDER3)
             bg1_adap[:, :ch_r] = bg1_raw[:, :ch_r]
-            if old_rin == 362 and ROUTER_IN_DIM_ORDER3 == 368:
+            if old_rin == 368 and ROUTER_IN_DIM_ORDER3 == 370:
+                wg1_adap[:360, :ch_r] = wg1_raw[:360, :ch_r]
+                wg1_adap[362:370, :ch_r] = wg1_raw[360:368, :ch_r]
+            elif old_rin == 362 and ROUTER_IN_DIM_ORDER3 >= 368:
                 wg1_adap[:354, :ch_r] = wg1_raw[:354, :ch_r]
-                wg1_adap[360:368, :ch_r] = wg1_raw[354:362, :ch_r]
+                wg1_adap[ROUTER_IN_DIM_ORDER3 - 8 : ROUTER_IN_DIM_ORDER3, :ch_r] = wg1_raw[354:362, :ch_r]
             elif old_rin == 358 and ROUTER_IN_DIM_ORDER3 >= 362:
                 wg1_adap[:350, :ch_r] = wg1_raw[:350, :ch_r]
                 wg1_adap[ROUTER_IN_DIM_ORDER3 - 8 : ROUTER_IN_DIM_ORDER3, :ch_r] = wg1_raw[350:358, :ch_r]
@@ -180,6 +183,8 @@ class Order3LiveInferenceEngine:
                 b2m_pad[:, :, 54] = -12.0
             if old_ed <= 55 and EXPERT_OUT_DIM_ORDER3 >= 56:
                 b2m_pad[:, :, 55] = -12.0
+            if old_ed <= 56 and EXPERT_OUT_DIM_ORDER3 >= 58:
+                b2m_pad[:, :, 56:58] = -12.0
             w2m_raw = w2m_pad.reshape(256, self.moe_out_dim)
             b2m_raw = b2m_pad.reshape(1, self.moe_out_dim)
         self.w2_moe = w2m_raw.to(device=self.device)
@@ -272,6 +277,8 @@ class Order3LiveInferenceEngine:
         hold_sec: float = 0.0,
         min_buy_px: float = 0.0,
         low_tranche_qty: float = 0.0,
+        last_sell_px: float = 0.0,
+        last_sell_age_s: float = 99999.0,
     ) -> Dict[str, Any]:
         """
         Полный шаг инференса Order-3 (L46/L48 100% паритет с fused_order3_clean_tick.py).
@@ -322,7 +329,7 @@ class Order3LiveInferenceEngine:
                 zm[:, 60:66],
                 zm[:, 72:76], zm[:, 79:82], zm[:, 83:84],
                 zm[:, 84:88],
-                zm[:, 88:94],
+                zm[:, 88:96],
             ],
             dim=-1,
         )
@@ -335,9 +342,9 @@ class Order3LiveInferenceEngine:
         self.gate_state = (1.0 - beta_gate) * self.gate_state + beta_gate * raw_logits
         g_mode = torch.softmax(self.gate_state, dim=-1)
 
-        # K Латентных экспертов (EXPERT_OUT_DIM_ORDER3 = 56) + Адаптивный нелинейный демпфер плана котирования!
+        # K Латентных экспертов (EXPERT_OUT_DIM_ORDER3 = 58) + Адаптивный нелинейный демпфер плана котирования!
         moe_all = (h2_ctx @ self.w2_moe + self.b2_moe).float().view(1, self.k_modes, EXPERT_OUT_DIM_ORDER3)
-        strat_inst = (g_mode.unsqueeze(-1) * moe_all).sum(dim=1)  # [1, 56]
+        strat_inst = (g_mode.unsqueeze(-1) * moe_all).sum(dim=1)  # [1, 58]
         alpha_bid = torch.sigmoid(strat_inst[:, 50:51])
         alpha_ask = torch.sigmoid(strat_inst[:, 51:52])
         bid_blend = (1.0 - alpha_bid) * self.strat_state + alpha_bid * strat_inst
@@ -350,7 +357,7 @@ class Order3LiveInferenceEngine:
                 ask_blend[:, 45:47], bid_blend[:, 47:48], strat_inst[:, 48:49],
                 ask_blend[:, 49:50], strat_inst[:, 50:52],
                 ask_blend[:, 52:53], bid_blend[:, 53:54],
-                ask_blend[:, 54:55], bid_blend[:, 55:56],
+                ask_blend[:, 54:55], bid_blend[:, 55:58],
             ],
             dim=-1,
         )
@@ -393,6 +400,14 @@ class Order3LiveInferenceEngine:
         micro_step_in = min(spread_room, 2.0 * tick_sz) * eff_micro_s
         eff_inside_k = torch.clamp(inside_b + ech0_m * micro_step_in, max=spread_room)
         raw_t_bid = (b1 + eff_inside_k - eff_retreat_k) - span_b_usd * curve_b
+        # T0.6: Якорь рециклинга [56] — потолок откупа ниже last_sell_px (1-в-1 с fused_order3_clean_tick.py):
+        s_age_f = max(0.0, float(last_sell_age_s))
+        if float(last_sell_px) > 1e-4 and s_age_f < 3600.0:
+            rec_w_s = float(torch.sigmoid(strat_raw[56]).item()) * math.exp(-s_age_f / 1800.0)
+            rec_w_k = rec_w_s * (1.0 - ech0_m * eff_micro_s)
+            rec_disc = 0.0040 + 0.0160 * float(torch.sigmoid(strat_raw[56] - 1.0).item())
+            rec_cap_px = float(last_sell_px) * (1.0 - rec_disc)
+            raw_t_bid = (1.0 - rec_w_k) * raw_t_bid + rec_w_k * torch.clamp(raw_t_bid, max=rec_cap_px)
         max_maker_bid = max(tick_sz, a1 - tick_sz)
         t_bid_px = torch.clamp(torch.round(torch.clamp(raw_t_bid, max=max_maker_bid) / tick_sz) * tick_sz, min=tick_sz)
 
@@ -592,9 +607,15 @@ class Order3LiveInferenceEngine:
         ra_h = ra_h0 + (torch.relu(ra_rp[:, :32]) * (2.0 * torch.sigmoid(ra_rp[:, 32:64]))) @ self.w_reg_res2
         rb_out = rb_h @ self.w_reg2 + self.b_reg2_b  # [12, 2]
         ra_out = ra_h @ self.w_reg2 + self.b_reg2_a
+        # T0.4: Эндогенный гистерезис перестановки глубоких заявок [57] (1-в-1 с fused_order3_clean_tick.py):
+        hyst_band = 0.0080 * float(torch.sigmoid(strat_raw[57]).item())
+        abs_drift_b = torch.abs(t_bid_px - cur_b_px) / max(tick_sz, float(b1))
+        deep_rest_b = (had_b_pre & (cur_b_px < float(b1) * 0.992) & (hyst_band > 2e-5)).float()
+        hyst_damp_b = 8.0 * torch.sigmoid((hyst_band - abs_drift_b) * 1200.0) * deep_rest_b
+        rb_cnl_adj = rb_out[:, 1] - hyst_damp_b
 
         g_plc_b = (rb_out[:, 0] > 0.0).cpu().numpy()
-        g_cnl_b = (rb_out[:, 1] > 0.0).cpu().numpy()
+        g_cnl_b = (rb_cnl_adj > 0.0).cpu().numpy()
         g_plc_a = (ra_out[:, 0] > 0.0).cpu().numpy()
         g_cnl_a = (ra_out[:, 1] > 0.0).cpu().numpy()
 
@@ -615,7 +636,7 @@ class Order3LiveInferenceEngine:
             "g_cnl_b": g_cnl_b,
             "g_plc_a": g_plc_a,
             "g_cnl_a": g_cnl_a,
-            "cnl_logit_b": rb_out[:, 1].cpu().numpy(),
+            "cnl_logit_b": rb_cnl_adj.cpu().numpy(),
             "cnl_logit_a": ra_out[:, 1].cpu().numpy(),
             "t_vis_bq": t_vis_bq.cpu().numpy(),
             "t_vis_aq": t_vis_aq.cpu().numpy(),
@@ -1008,8 +1029,8 @@ def build_live_hybrid_market_obs_40d(trader, b1: float, a1: float) -> np.ndarray
                 n_bh = len(bh_warm)
                 mh.extend((now_m - float(n_bh - i), float(v) + sp_half) for i, v in enumerate(bh_warm))
         mh.append((now_m, st_mid))
-        if len(mh) > 4000 or (mh and (now_m - mh[0][0]) > 3660.0):
-            mh[:] = [x for x in mh if (now_m - x[0]) <= 3605.0]
+        if len(mh) > 8000 or (mh and (now_m - mh[0][0]) > 7260.0):
+            mh[:] = [x for x in mh if (now_m - x[0]) <= 7205.0]
         m_5m = next((x[1] for x in reversed(mh) if (now_m - x[0]) >= 299.5), mh[0][1])
         m_15m = next((x[1] for x in reversed(mh) if (now_m - x[0]) >= 899.5), mh[0][1])
         m_60m = next((x[1] for x in reversed(mh) if (now_m - x[0]) >= 3599.5), mh[0][1])
@@ -1106,8 +1127,8 @@ def build_live_hybrid_market_obs_40d(trader, b1: float, a1: float) -> np.ndarray
                     fh1800.append((ts_v, max(0.0, float(it_f[2])), max(0.0, float(it_f[3]))))
                     last_ts1800 = ts_v
             _LIVE_WF_CACHE["last_fh1800_ts"] = last_ts1800
-        if len(fh1800) > 2000 or (fh1800 and (now_m94 - fh1800[0][0]) > 1830.0):
-            fh1800[:] = [x for x in fh1800 if (now_m94 - x[0]) <= 1802.0]
+        if len(fh1800) > 8000 or (fh1800 and (now_m94 - fh1800[0][0]) > 7260.0):
+            fh1800[:] = [x for x in fh1800 if (now_m94 - x[0]) <= 7205.0]
         b5 = sum(x[1] for x in fh1800 if (now_m94 - x[0]) <= 299.5)
         s5 = sum(x[2] for x in fh1800 if (now_m94 - x[0]) <= 299.5)
         b15 = sum(x[1] for x in fh1800 if (now_m94 - x[0]) <= 899.5)
@@ -1117,6 +1138,12 @@ def build_live_hybrid_market_obs_40d(trader, b1: float, a1: float) -> np.ndarray
         z[91] = float(np.clip((b5 - s5) / (b5 + s5 + 50.0), -1.0, 1.0))
         z[92] = float(np.clip((b15 - s15) / (b15 + s15 + 150.0), -1.0, 1.0))
         z[93] = float(np.clip((b30 - s30) / (b30 + s30 + 300.0), -1.0, 1.0))
+        if MKT_DIM_ORDER3 >= 96:
+            m_120m = next((x[1] for x in reversed(mh94) if (now_m94 - x[0]) >= 7199.5), mh94[0][1])
+            b120 = sum(x[1] for x in fh1800 if (now_m94 - x[0]) <= 7199.5)
+            s120 = sum(x[2] for x in fh1800 if (now_m94 - x[0]) <= 7199.5)
+            z[94] = float(math.tanh((st_mid / max(m_120m, 1e-4) - 1.0) * 8.0))
+            z[95] = float(np.clip((b120 - s120) / (b120 + s120 + 1000.0), -1.0, 1.0))
 
     return z
 
@@ -1166,7 +1193,7 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
                     zm_w[:, 0:1], zm_w[:, 40:44], zm_w[:, 44:45], zm_w[:, 48:49],
                     zm_w[:, 29:34], zm_w[:, 36:37], zm_w[:, 39:40], zm_w[:, 55:56], zm_w[:, 12:13],
                     zm_w[:, 60:66], zm_w[:, 72:76], zm_w[:, 79:82], zm_w[:, 83:84],
-                    zm_w[:, 84:88], zm_w[:, 88:94],
+                    zm_w[:, 84:88], zm_w[:, 88:96],
                 ],
                 dim=-1,
             )
@@ -1339,6 +1366,8 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
         hold_sec=float(getattr(trader, "hold_sec", 0.0)),
         min_buy_px=float(getattr(trader, "tr_low_px", getattr(trader, "min_buy_px", 0.0))),
         low_tranche_qty=float(getattr(trader, "tr_low_qty", getattr(trader, "low_tranche_qty", 0.0))),
+        last_sell_px=float(getattr(trader, "last_exit_price", getattr(trader, "last_sell_px", 0.0))),
+        last_sell_age_s=(now_ts - float(getattr(trader, "last_exit_ts", getattr(trader, "last_sell_ts", 0.0)))) if float(getattr(trader, "last_exit_ts", getattr(trader, "last_sell_ts", 0.0))) > 0.0 else 99999.0,
     )
 
     # Посекундная запись того, что реально видела нейросеть на сервере (94D рынок + 110D агент + режимы/экспозиция):
