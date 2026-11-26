@@ -49,5 +49,9 @@ models/prl/order3_champion/global_best.pt
 models/prl/order3_champion/order3_champ_resume.pt
 models/prl/order3_champion/l83_*.pt
 models/prl/order3_champion/l84_*.pt
+models/prl/order3_champion/l86_*.pt
+models/prl/order3_champion/l87_*.pt
+models/prl/order3_champion/l88_*.pt
+models/prl/order3_champion/l89_*.pt
 models/quantus/
 
