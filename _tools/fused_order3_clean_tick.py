@@ -955,20 +955,18 @@ def _order3_clean_tick_step(
     qa_comp_fav = 1.12
 
     # При неизменном b1 падение b1_q (depl_b1) частично вызвано отменами, а объём сделки СТРОГО ограничен сверху реальной лентой sv!
-    # Живая калибровка по канарейке (26.11): ордер внутри спреда впереди b1 (in_sp_ord_b) забирает 62.7% реальных продаж!
-    in_sp_bid_cap = 0.62
     clr_sv_cap = torch.minimum(sv, b1_q_2d + 0.35 * sv)
     org_sv_at_book = torch.where(b1_cleared, clr_sv_cap, torch.minimum(sv, depl_real_frac * depl_b1))
     org_sv_in_sp = torch.where(
         b1_cleared,
         clr_sv_cap,
-        torch.where(pure_wash_tick, torch.zeros_like(sv), torch.minimum(sv, torch.maximum(depl_real_frac * depl_b1, in_sp_bid_cap * sv))),
+        torch.where(pure_wash_tick, torch.zeros_like(sv), torch.minimum(sv, torch.maximum(depl_real_frac * depl_b1, in_sp_org_frac * sv))),
     )
     org_sv_slot = torch.where(in_sp_ord_b, org_sv_in_sp, org_sv_at_book)
 
     hit_b = act_b & (deep_cross_b | ((price_through_b | touch_only_b) & (org_sv_slot > 1e-5)))
     eff_sv_slot_b = torch.where(
-        in_sp_ord_b | (price_through_b & b1_cleared & is_toxic_dump_b),
+        price_through_b & b1_cleared & is_toxic_dump_b,
         org_sv_slot,
         torch.where(is_toxic_dump_b, touch_frac_tox * org_sv_slot, touch_frac_fav * org_sv_slot),
     )
@@ -1066,16 +1064,13 @@ def _order3_clean_tick_step(
     deep_cross_a = nb1 >= (ask_px + 2.5 * tick_size)
     is_fomo_rip_a = a1_cleared | ((~pure_wash_tick) & (bv > 1.50 * sv + 15.0) & (depl_a1 > 5.0))
 
-    # На споте выход через Ask — это конкуренция с другими продавцами за реального покупателя (живая калибровка по канарейке 26.11):
-    # возле высокой полки Ask1-1тик (sp_pos_a -> 1.0) без пробоя a1 выкупов почти нет (~50 мин ожидания), поток растёт только при спуске к середине/Bid1!
-    sp_pos_a = torch.clamp((ask_px - b1_2d) / torch.clamp(a1_2d - b1_2d, min=tick_size), 0.0, 1.0)
-    in_sp_ask_frac = 0.0012 + 0.36 * torch.pow(1.0 - sp_pos_a, 3.0)
+    # На споте выход через Ask — это конкуренция с другими продавцами за реального покупателя (единая калибровка с реальными ордерами SafeTrade):
     clr_bv_cap = torch.minimum(bv, 0.72 * a1_q_2d + 0.18 * bv)
     org_bv_at_book = torch.where(a1_cleared, clr_bv_cap, torch.minimum(bv, depl_real_frac * depl_a1))
     org_bv_in_sp = torch.where(
         a1_cleared,
         clr_bv_cap,
-        torch.where(pure_wash_tick, torch.zeros_like(bv), torch.minimum(bv, torch.maximum(depl_real_frac * depl_a1, in_sp_ask_frac * bv))),
+        torch.where(pure_wash_tick, torch.zeros_like(bv), torch.minimum(bv, torch.maximum(depl_real_frac * depl_a1, in_sp_org_frac * bv))),
     )
     org_bv_slot = torch.where(in_sp_ord_a, org_bv_in_sp, org_bv_at_book)
 

@@ -36,6 +36,10 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 CANARY_STATE_PATH = BASE_DIR / "data" / "logs" / "canary_scalp_state.json"
 CANARY_LOG_PATH = BASE_DIR / "data" / "logs" / "canary_scalp_telemetry.jsonl"
 CANARY_NEURAL_MODEL_PATH = BASE_DIR / "models" / "prl" / "canary_neural_v1.pt"
+CANARY_PAUSE_FLAG_PATH = BASE_DIR / "data" / "logs" / "canary_pause.flag"
+# Пауза канарейки 26.11 17:40: найдено несоответствие шага цены ($0.01 вместо $0.0001) и ложная калибровка физики;
+# до переобучения модели на исправленной физике новые входы запрещены.
+CANARY_PAUSED = True
 
 CANARY_ENABLED_DEFAULT = True
 CANARY_LOT_PRL = 8.0
@@ -223,7 +227,8 @@ def step_canary_scalp(
         st = _load_state()
         trader._canary_scalp_st = st
 
-    t_sz = float(getattr(trader, "tick_size", 0.0001))
+    # ВАЖНО: реальный биржевой шаг цены ($0.0001) = exec_tick_size; trader.tick_size — это признаковый шаг $0.01 (НЕ для ордеров!).
+    t_sz = float(getattr(trader, "exec_tick_size", 0.0) or 0.0) or float(getattr(trader, "tick_size", 0.0001))
     p_prec = int(getattr(trader, "price_precision", 4))
     a_prec = int(getattr(trader, "amount_precision", 4))
     min_amt = float(getattr(trader, "min_order_amount", 2.0))
@@ -286,6 +291,8 @@ def step_canary_scalp(
                 old_cq = float(st.get("pos_qty", 0.0))
                 if old_cq < 1e-4:
                     st["round_id"] = int(st.get("round_id", 0)) + 1
+                    st["round_pnl_usd"] = 0.0
+                    st["round_cost_usd"] = 0.0
                     st["entry_ts"] = now_ts
                     st["entry_px"] = px_b
                     st["entry_sp_bp"] = float(st.get("bid_init_sp_bp", 0.0))
@@ -358,15 +365,39 @@ def step_canary_scalp(
                 st["pos_qty"] = max(0.0, round(float(st.get("pos_qty", 0.0)) - d_a, 4))
                 st["ask_acc_fill"] = filled_a
                 st["cum_pnl_usd"] = round(float(st.get("cum_pnl_usd", 0.0)) + pnl_u, 4)
-                st["cum_pnl_bp"] = round(float(st.get("cum_pnl_bp", 0.0)) + pnl_bp, 2)
+                # Раунд считается целиком (сумма всех частичных продаж), а не по каждому частичному исполнению:
+                st["round_pnl_usd"] = float(st.get("round_pnl_usd", 0.0)) + pnl_u
+                st["round_cost_usd"] = float(st.get("round_cost_usd", 0.0)) + entry_cost_u
                 trader.bot_cash_usd = float(trader.bot_cash_usd) + proceeds_u
                 trader.ex_usdt_free = float(getattr(trader, "ex_usdt_free", 0.0)) + proceeds_u
                 trader.pos_qty = max(0.0, math.floor((float(trader.pos_qty) - d_a) * 10000.0) / 10000.0)
 
                 hold_dur = round(now_ts - float(st.get("entry_ts", now_ts)), 2)
-                if st["pos_qty"] < min_amt:
+                already_closed = st.get("last_closed_round") == st.get("round_id")
+                if st["pos_qty"] < min_amt and already_closed:
+                    # Хвост частично исполненного Ask после закрытия раунда: учитываем деньги, но НЕ считаем новый раунд.
+                    st["pos_qty"] = 0.0
+                    st["round_pnl_usd"] = 0.0
+                    st["round_cost_usd"] = 0.0
+                    _append_telemetry({
+                        "event": "canary_exit_residual",
+                        "round_id": st.get("round_id"),
+                        "qty": round(d_a, 4),
+                        "exit_px": round(px_a, 4),
+                        "net_pnl_usd": round(pnl_u, 4),
+                        "cum_pnl_usd": st["cum_pnl_usd"],
+                    })
+                elif st["pos_qty"] < min_amt:
                     st["pos_qty"] = 0.0
                     st["completed_rounds"] = int(st.get("completed_rounds", 0)) + 1
+                    st["last_closed_round"] = st.get("round_id")
+                    r_cost = max(1e-6, float(st.get("round_cost_usd", entry_cost_u)))
+                    r_pnl = float(st.get("round_pnl_usd", pnl_u))
+                    pnl_u = r_pnl
+                    pnl_bp = (r_pnl / r_cost) * 1e4
+                    st["cum_pnl_bp"] = round(float(st.get("cum_pnl_bp", 0.0)) + pnl_bp, 2)
+                    st["round_pnl_usd"] = 0.0
+                    st["round_cost_usd"] = 0.0
                     forced_r = str(st.get("force_reason", "") or "")
                     st["force_reason"] = ""
                     _append_telemetry({
@@ -448,6 +479,27 @@ def step_canary_scalp(
             changed = True
 
     # 5. 100% ЭНДОГЕННОЕ НЕЙРОСЕТЕВОЕ УПРАВЛЕНИЕ (без единого эмпирического порога спреда/таймера!):
+    # ПАУЗА: при CANARY_PAUSED=True или наличии файла data/logs/canary_pause.flag новые входы запрещены,
+    # стоящая заявка на покупку снимается; уже открытая позиция (если есть) доводится до выхода с защитными рубежами.
+    is_paused = CANARY_PAUSED or CANARY_PAUSE_FLAG_PATH.exists()
+    if is_paused and float(st.get("pos_qty", 0.0)) < min_amt:
+        if st.get("bid_oid") is not None:
+            rc_bp = _cancel_canary_oid(trader, st["bid_oid"])
+            if rc_bp is not None:
+                trader.ex_usdt_free = float(getattr(trader, "ex_usdt_free", 0.0)) + max(0.0, float(st.get("bid_qty", 0.0)) - float(st.get("bid_acc_fill", 0.0))) * float(st.get("bid_px", 0.0))
+                st["bid_oid"] = None; st["bid_px"] = 0.0; st["bid_qty"] = 0.0
+                changed = True
+        if not st.get("pause_logged"):
+            st["pause_logged"] = True
+            _append_telemetry({"event": "canary_paused", "cum_pnl_usd": st.get("cum_pnl_usd"), "completed_rounds": st.get("completed_rounds")})
+            print(f"  🐤⏸️ [CANARY PAUSED] Канарейка на паузе: новых входов нет (Cum=${float(st.get('cum_pnl_usd', 0.0)):+.3f}) | t={_msk_iso()}")
+            changed = True
+        if changed:
+            _save_state(st)
+        return {"canary_pos_qty": 0.0, "canary_cash_reserve": 0.0, "canary_bid_oid": st.get("bid_oid"), "canary_ask_oid": st.get("ask_oid")}
+    if not is_paused and st.get("pause_logged"):
+        st["pause_logged"] = False
+        changed = True
     # собственный экземпляр Order3LiveInferenceEngine(canary_neural_v1.pt) сам оценивает 96D рынок +
     # свой микро-портфель ($22 / 8 PRL, hold_sec, entry_px) и через свой персональный Оркестратор
     # переключает Mode #0 (нелинейный Скальпер) <-> Mode #3 (Ожидание / Выход 0% покупок).
