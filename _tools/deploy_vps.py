@@ -34,6 +34,7 @@ CODE_FILES = (
     "_tools/order_orchestrator.py",
     "_tools/live_rl_trader.py",
     "_tools/order3_live_bridge.py",
+    "_tools/canary_scalp_probe.py",
     "_tools/fused_order3_clean_tick.py",
     "_tools/l28_live_bridge.py",
     "_tools/fused_l28_hierarchical_subcent_tick.py",

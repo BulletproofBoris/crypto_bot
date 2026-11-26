@@ -1167,16 +1167,37 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
     now_ts = time.time()
     trader.order3_engine.refill_tokens(now_ts)
 
-    # 1. Извлечение 84D вектора рынка и 110D вектора агента из трейдера
-    tot_eq = max(float(getattr(trader, "initial_budget_usd", 1022.54)), float(getattr(trader, "bot_cash_usd", 0.0)) + float(getattr(trader, "pos_qty", 0.0)) * b1)
-
-    # Подготовка текущих массивов слотов
+    # Подготовка текущих массивов слотов и чистого стакана
     b_px = np.array([float(s.get("px", 0.0)) for s in trader.bid_slots], dtype=np.float32)
     b_qty = np.array([float(s.get("qty", 0.0)) for s in trader.bid_slots], dtype=np.float32)
     a_px = np.array([float(s.get("px", 0.0)) for s in trader.ask_slots], dtype=np.float32)
     a_qty = np.array([float(s.get("qty", 0.0)) for s in trader.ask_slots], dtype=np.float32)
 
     z_mkt = build_live_hybrid_market_obs_40d(trader, b1, a1)
+
+    # Изолированный канареечный прибор широкого спреда (8 PRL, авто-стоп -$2.50 / 80 кругов):
+    bp10_pre = np.asarray(getattr(trader, "last_clean_bp_10", [b1] * 10), dtype=np.float32)[:10]
+    ap10_pre = np.asarray(getattr(trader, "last_clean_ap_10", [a1] * 10), dtype=np.float32)[:10]
+    bq10_pre = np.asarray(getattr(trader, "last_clean_bq_10", np.zeros(10, dtype=np.float32)), dtype=np.float32)[:10]
+    aq10_pre = np.asarray(getattr(trader, "last_clean_aq_10", np.zeros(10, dtype=np.float32)), dtype=np.float32)[:10]
+    fh_pre = list(getattr(trader, "flow_hist_10s", []))
+    rs_1s_pre = float(fh_pre[-1][3]) if fh_pre else 0.0
+    try:
+        from _tools.canary_scalp_probe import step_canary_scalp
+        can_info = step_canary_scalp(
+            trader=trader, b1=b1, a1=a1, z_mkt=z_mkt,
+            bp10_live=bp10_pre, bq10_live=bq10_pre, ap10_live=ap10_pre, aq10_live=aq10_pre,
+            roll_sell_1s=rs_1s_pre, now_ts=now_ts,
+        )
+    except Exception as e_can:
+        print(f"  ⚠️ [CANARY PROBE WARN]: {e_can}")
+        can_info = {"canary_pos_qty": 0.0, "canary_cash_reserve": 0.0, "canary_bid_oid": None, "canary_ask_oid": None}
+
+    can_pos_q = max(0.0, float(can_info.get("canary_pos_qty", 0.0)))
+    can_cash_res = max(0.0, float(can_info.get("canary_cash_reserve", 0.0)))
+    core_pos_qty = max(0.0, float(getattr(trader, "pos_qty", 0.0)) - can_pos_q)
+    core_cash_usd = max(0.0, float(getattr(trader, "bot_cash_usd", 0.0)) - (can_cash_res if can_pos_q < 1.95 else 0.0))
+    tot_eq = max(float(getattr(trader, "initial_budget_usd", 1022.54)) - can_cash_res, core_cash_usd + core_pos_qty * b1)
     if not getattr(trader.order3_engine, "_mem_warmed", False):
         with torch.no_grad():
             eng_w = trader.order3_engine
@@ -1216,7 +1237,7 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
         l1_bid_usd = max(100.0, b1 * b1_q_live)
         l1_ask_usd = max(100.0, a1 * a1_q_live)
         res_b_usd_ag = float(np.sum(b_qty * b_px * 1.001))
-        unres_cash_ag = max(0.0, float(trader.bot_cash_usd) - res_b_usd_ag)
+        unres_cash_ag = max(0.0, core_cash_usd - res_b_usd_ag)
         roll_buy_1s = max(10.0, float(getattr(trader, "last_buy_vol_10s", 100.0)) / 10.0)
         low_tr_q = float(getattr(trader, "tr_low_qty", getattr(trader, "low_tranche_qty", 0.0)))
         raw_min_p = float(getattr(trader, "tr_low_px", getattr(trader, "min_buy_px", 0.0)))
@@ -1224,18 +1245,18 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
 
         t_sz_ag = max(1e-6, float(getattr(trader, "exec_tick_size", trader.tick_size)))
         m_fee_ag = 0.0010
-        has_p_ag = float(trader.pos_qty) > 1e-6
-        pos_rat_ag = float(np.clip((float(trader.pos_qty) * b1) / max(tot_eq, 1.0), 0.0, 1.5))
+        has_p_ag = core_pos_qty > 1e-6
+        pos_rat_ag = float(np.clip((core_pos_qty * b1) / max(tot_eq, 1.0), 0.0, 1.5))
         eff_ps_ag = float(np.clip(pos_rat_ag / 0.25, 0.15, 1.0))
 
         z_ag[0] = math.log1p(tot_eq / l1_bid_usd) / 3.0
         z_ag[1] = math.log1p(unres_cash_ag / l1_bid_usd) / 3.0
-        z_ag[2] = min(4.0, (trader.pos_qty * a1) / l1_ask_usd) / 2.0
-        z_ag[3] = min(10.0, trader.pos_qty / roll_buy_1s) / 5.0
-        z_ag[4] = float(np.clip(low_tr_q / max(trader.pos_qty, 1e-6), 0.0, 1.0)) if has_p_ag else 0.0
+        z_ag[2] = min(4.0, (core_pos_qty * a1) / l1_ask_usd) / 2.0
+        z_ag[3] = min(10.0, core_pos_qty / roll_buy_1s) / 5.0
+        z_ag[4] = float(np.clip(low_tr_q / max(core_pos_qty, 1e-6), 0.0, 1.0)) if has_p_ag else 0.0
         z_ag[5] = float(np.clip((((b1 - min_buy_p) / max(min_buy_p, t_sz_ag)) - 2.0 * m_fee_ag) * 30.0, -2.5, 2.5)) if (has_p_ag and min_buy_p > 0) else 0.0
         z_ag[6:18] = np.clip((b_qty * b1) / max(tot_eq, 25.0), 0.0, 1.0)
-        z_ag[18:30] = np.clip(a_qty / max(trader.pos_qty, 2.0), 0.0, 1.0)
+        z_ag[18:30] = np.clip(a_qty / max(core_pos_qty, 2.0), 0.0, 1.0)
         z_ag[30:42] = np.where(b_qty > 1e-6, np.log1p(np.maximum(0.0, (b1 - b_px) / t_sz_ag)) / 3.5, 0.0)
         z_ag[42:54] = np.where(a_qty > 1e-6, np.log1p(np.maximum(0.0, (a_px - a1) / t_sz_ag)) / 3.5, 0.0)
         z_ag[54] = 1.0 if has_p_ag else 0.0
@@ -1341,8 +1362,8 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
         b1=b1,
         a1=a1,
         budget=tot_eq,
-        pos_qty=float(trader.pos_qty),
-        cash=float(trader.bot_cash_usd),
+        pos_qty=core_pos_qty,
+        cash=core_cash_usd,
         bid_px_12=b_px,
         bid_qty_12=b_qty,
         ask_px_12=a_px,
@@ -1385,7 +1406,7 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
             np.asarray(z_mkt, dtype=np.float32).reshape(-1)[:MKT_DIM_ORDER3],
             np.asarray(z_ag, dtype=np.float32).reshape(-1)[:AG_DIM_ORDER3],
             np.pad(g_m, (0, K_MODES_ORDER3 - len(g_m))),
-            np.array([float(plan.get("exp_bid_frac", 0.0)), float(trader.order3_engine.api_tokens), float(trader.pos_qty), float(trader.bot_cash_usd), b1, a1], dtype=np.float32),
+            np.array([float(plan.get("exp_bid_frac", 0.0)), float(trader.order3_engine.api_tokens), core_pos_qty, core_cash_usd, b1, a1], dtype=np.float32),
         ])
         obs_f.write(_st.pack("<d", float(now_ts)) + rec_v.tobytes())
     except Exception:
@@ -1403,8 +1424,8 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
     # 1B. Импульсный Taker-Buy вентиль на старте волны (1-в-1 с fused_order3_clean_tick.py):
     if u_taker_buy > 1e-4 and u_taker <= 1e-4 and trader.order3_engine.api_tokens >= 1.0:
         res_b_pre = sum(float(s.get("qty", 0.0)) * float(s.get("px", 0.0)) * 1.001 for s in trader.bid_slots if s.get("id") is not None)
-        free_c_tb = max(0.0, min(float(trader.bot_cash_usd) * 0.996 - res_b_pre, float(trader.ex_usdt_free)))
-        rem_e_tb = max(0.0, tot_eq * 0.996 * float(plan["exp_bid_frac"]) - float(trader.pos_qty) * b1 - res_b_pre)
+        free_c_tb = max(0.0, min(core_cash_usd * 0.996 - res_b_pre, float(trader.ex_usdt_free)))
+        rem_e_tb = max(0.0, tot_eq * 0.996 * float(plan["exp_bid_frac"]) - core_pos_qty * b1 - res_b_pre)
         tb_usd = min(free_c_tb, rem_e_tb) * u_taker_buy
         lim_buy_px = round(math.ceil((a1 * (1.0 + min(0.03, max_slip_pct))) / t_sz) * t_sz, p_prec)
         buy_q_tb = math.floor((tb_usd / max(1e-6, lim_buy_px * 1.002)) * 10000.0) / 10000.0
@@ -1423,10 +1444,10 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
             return
 
     # 1. Эндогенный Taker-вентиль БЕЗ карательного сноса обеспеченных Ask-слотов при частичном хеджировании:
-    if (float(trader.pos_qty) * u_taker) >= min_amt and trader.order3_engine.api_tokens >= 1.0:
-        raw_sq = float(trader.pos_qty) * u_taker
-        sell_q = float(trader.pos_qty) if (float(trader.pos_qty) - raw_sq) < min_amt else raw_sq
-        rem_pos_est = max(0.0, float(trader.pos_qty) - sell_q)
+    if (core_pos_qty * u_taker) >= min_amt and trader.order3_engine.api_tokens >= 1.0:
+        raw_sq = core_pos_qty * u_taker
+        sell_q = core_pos_qty if (core_pos_qty - raw_sq) < min_amt else raw_sq
+        rem_pos_est = max(0.0, core_pos_qty - sell_q)
         cum_aq = 0.0
         drop_ask_oids = []
         drop_ask_slots = []
@@ -1440,7 +1461,7 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
                     drop_ask_slots.append(s)
         if drop_ask_oids:
             n_open_all_a = sum(1 for s in trader.ask_slots if s.get("id") is not None)
-            if len(drop_ask_oids) >= 2 and len(drop_ask_oids) == n_open_all_a:
+            if len(drop_ask_oids) >= 2 and len(drop_ask_oids) == n_open_all_a and can_info.get("canary_ask_oid") is None:
                 try:
                     raw_all_a = trader.client.cancel_all_orders(trader.market, side="sell")
                     c_m = {o.get("id"): o for o in (raw_all_a if isinstance(raw_all_a, list) else []) if isinstance(o, dict) and o.get("id") is not None}
@@ -1489,7 +1510,7 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
             to_cnl_b.append((s, oid, crossed_ask))
             trader.order3_engine.api_tokens -= 1.0
 
-    hp_now = float(trader.pos_qty) >= min_amt
+    hp_now = core_pos_qty >= min_amt
     cand_ca = []
     for s in range(12):
         if trader.ask_slots[s].get("id") is not None:
@@ -1508,8 +1529,8 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
     if to_cnl_b or to_cnl_a:
         n_open_b = sum(1 for s in trader.bid_slots if s.get("id") is not None)
         n_open_a = sum(1 for s in trader.ask_slots if s.get("id") is not None)
-        bulk_b = (len(to_cnl_b) >= 2) and (len(to_cnl_b) == n_open_b)
-        bulk_a = (len(to_cnl_a) >= 2) and (len(to_cnl_a) == n_open_a)
+        bulk_b = (len(to_cnl_b) >= 2) and (len(to_cnl_b) == n_open_b) and (can_info.get("canary_bid_oid") is None)
+        bulk_a = (len(to_cnl_a) >= 2) and (len(to_cnl_a) == n_open_a) and (can_info.get("canary_ask_oid") is None)
         c_map = {}
         indiv_oids = []
         bulk_sides = []
@@ -1611,8 +1632,8 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
     # 3. Постановка Bid-слотов 1-в-1 с fused_order3_clean_tick.py (сортировка по pi_bid, шлюз g_plc_b):
     exp_b = float(plan["exp_bid_frac"])
     res_b_usd = sum(float(s.get("qty", 0.0)) * float(s.get("px", 0.0)) * 1.001 for s in trader.bid_slots if s.get("id") is not None)
-    free_cash_b = max(0.0, min(trader.bot_cash_usd * 0.998 - res_b_usd, trader.ex_usdt_free))
-    rem_exp_b = max(0.0, tot_eq * 0.996 * exp_b - float(trader.pos_qty) * b1 - res_b_usd)
+    free_cash_b = max(0.0, min(core_cash_usd * 0.998 - res_b_usd, max(0.0, float(trader.ex_usdt_free) - (can_cash_res if can_pos_q < 1.95 and can_info.get("canary_bid_oid") is None else 0.0))))
+    rem_exp_b = max(0.0, tot_eq * 0.996 * exp_b - core_pos_qty * b1 - res_b_usd)
     avail_b_usd = min(free_cash_b, rem_exp_b)
 
     cand_b_slots = [
@@ -1645,11 +1666,11 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
 
     # 4. Постановка Ask-слотов 1-в-1 с fused_order3_clean_tick.py (эндогенный резерв renorm_blend):
     res_a_qty = sum(float(s.get("qty", 0.0)) for s in trader.ask_slots if s.get("id") is not None)
-    avail_a_qty = max(0.0, min(float(trader.pos_qty) - res_a_qty, float(getattr(trader, "ex_coin_free", trader.pos_qty))))
+    avail_a_qty = max(0.0, min(core_pos_qty - res_a_qty, float(getattr(trader, "ex_coin_free", core_pos_qty))))
 
     cand_a_slots = [
         s for s in sorted(range(12), key=lambda i: float(plan["pi_ask"][i]), reverse=True)
-        if float(trader.pos_qty) >= min_amt and avail_a_qty >= min_amt and trader.ask_slots[s].get("id") is None and bool(plan["g_plc_a"][s]) and float(plan["pi_ask"][s]) > 1e-4
+        if core_pos_qty >= min_amt and avail_a_qty >= min_amt and trader.ask_slots[s].get("id") is None and bool(plan["g_plc_a"][s]) and float(plan["pi_ask"][s]) > 1e-4
     ]
     sel_a = []
     for s in cand_a_slots:
