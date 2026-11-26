@@ -82,6 +82,7 @@ def compile_continuous_oos_matrix():
             if model_file.exists():
                 bst = xgb.Booster()
                 bst.load_model(str(model_file))
+                bst.set_param({"device": "cuda:0"})
                 oos_matrix_16d[s_idx:e_idx, col_idx] = bst.predict(d_slice)
 
     out_npz = BASE_DIR / "data" / "cache" / "order2_risk_matrix_11d.npz"
@@ -114,7 +115,12 @@ def main():
     parser.add_argument("--start-win", type=int, default=0, help="Start window")
     parser.add_argument("--end-win", type=int, default=71, help="End window")
     parser.add_argument("--force", action="store_true", help="Force re-training")
+    parser.add_argument("--eval-only", action="store_true", help="Compile 11D & 16D risk caches from existing .ubj models without retraining")
     args = parser.parse_args()
+
+    if args.eval_only:
+        compile_continuous_oos_matrix()
+        return
 
     from _tools.walkforward_order2_trainer import TARGET_NAMES
     completed = set()

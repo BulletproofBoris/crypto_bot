@@ -265,7 +265,7 @@ def worker_train(gpu_id: int, mod_parity: int):
         print(f"[GPU {gpu_id}] ✅ win_{w_k:02d} [{v_s:,}..{v_e:,}] за {time.time()-t0:.1f}с | OOS IC_30m={ic30:+.4f}, IC_60m={ic60:+.4f} | AUC_launch={auc_l:.4f}, AUC_top={auc_t:.4f}", flush=True)
 
 
-def build_wave_cache():
+def build_wave_cache(eval_only: bool = False):
     print("\n======================================================================")
     print("🌊 СБОРКА 100% КАУЗАЛЬНОЙ МАТРИЦЫ ORDER-1 WAVE STACK (6D)")
     print("======================================================================", flush=True)
@@ -277,7 +277,23 @@ def build_wave_cache():
     for m in rg_meta[:-1]:
         rg_offsets.append(rg_offsets[-1] + m.num_rows)
 
-    wins = build_wf_grid(total_rows)
+    if eval_only:
+        # Используем строго уже обученные окна win_XX на диске (последнее окно каузально покрывает хвост до total_rows, 1-в-1 с Live VPS!):
+        avail_ks = sorted(
+            int(d.name.split("_")[1])
+            for d in OUT_MODELS_DIR.glob("win_*")
+            if d.is_dir() and all((d / f"{nm}.ubj").exists() for nm in WAVE_MODEL_NAMES)
+        )
+        assert avail_ks, f"Нет готовых окон в {OUT_MODELS_DIR}"
+        wins = []
+        for idx_k, k in enumerate(avail_ks):
+            v_s = 172800 + k * 43200
+            if v_s >= total_rows:
+                break
+            v_e = total_rows if (idx_k == len(avail_ks) - 1 or (172800 + avail_ks[idx_k + 1] * 43200) >= total_rows) else (172800 + avail_ks[idx_k + 1] * 43200)
+            wins.append((k, v_s, v_e))
+    else:
+        wins = build_wf_grid(total_rows)
     wave_mat = np.zeros((total_rows, 6), dtype=np.float32)
 
     t0 = time.time()
@@ -295,8 +311,9 @@ def build_wave_cache():
         gc.collect()
         print(f"  [{step_i+1:2d}/{len(wins)}] Слайс win_{w_k:02d} [{v_s:,}..{v_e:,}] собран за {time.time()-t_s:.1f}с", flush=True)
 
-    summary = {f"win_{w_k:02d}": json.loads((OUT_MODELS_DIR / f"win_{w_k:02d}/metrics.json").read_text()) for w_k, _, _ in wins}
-    (OUT_MODELS_DIR / "walkforward_wave_summary.json").write_text(json.dumps(summary, indent=2))
+    if not eval_only:
+        summary = {f"win_{w_k:02d}": json.loads((OUT_MODELS_DIR / f"win_{w_k:02d}/metrics.json").read_text()) for w_k, _, _ in wins}
+        (OUT_MODELS_DIR / "walkforward_wave_summary.json").write_text(json.dumps(summary, indent=2))
 
     tmp_p = OUT_CACHE_PATH.with_name("order1_wave_matrix_6d_tmp.npz")
     np.savez(tmp_p, wave_matrix_6d=wave_mat, model_names=np.array(WAVE_MODEL_NAMES))
@@ -311,9 +328,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker-gpu", type=int, default=-1)
     parser.add_argument("--mod", type=int, default=0)
+    parser.add_argument("--eval-only", action="store_true", help="Compile 6D wave cache using existing trained .ubj windows without retraining")
     args = parser.parse_args()
 
     OUT_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    if args.eval_only:
+        build_wave_cache(eval_only=True)
+        return
     if args.worker_gpu >= 0:
         worker_train(args.worker_gpu, args.mod)
         return

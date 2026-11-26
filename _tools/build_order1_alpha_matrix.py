@@ -150,6 +150,7 @@ def main():
                 continue
             bst = xgb.Booster()
             bst.load_model(str(model_file))
+            bst.set_param({"device": "cuda:0"})
             p_h = bst.predict(d_slice)  # [n_rows, 7]
 
             c_start = h_i * 7

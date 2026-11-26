@@ -14,6 +14,7 @@ and builds `data/cache/rl_hybrid_market_obs_88d.npz`!
 """
 from __future__ import annotations
 
+import argparse
 import json
 import time
 from pathlib import Path
@@ -24,9 +25,12 @@ from sklearn.metrics import roc_auc_score
 BASE_DIR = Path("/home/restorator/crypto_bot")
 INT_PATH = BASE_DIR / "data/cache/order25_live_interventions.npz"
 OBS84_PATH = BASE_DIR / "data/cache/rl_hybrid_market_obs_84d.npz"
+OBS84_RAW_PATH = BASE_DIR / "data/cache/rl_hybrid_market_obs_84d_raw_with_self.npz"
 LOB_PATH = BASE_DIR / "data/cache/rl_guard_lob_cache_600h.npz"
+LOB_RAW_PATH = BASE_DIR / "data/cache/rl_guard_lob_cache_600h_raw_with_self.npz"
 OUT_MODELS_DIR = BASE_DIR / "models/prl/order25_live"
 OUT_88D_PATH = BASE_DIR / "data/cache/rl_hybrid_market_obs_88d.npz"
+OUT_88D_RAW_PATH = BASE_DIR / "data/cache/rl_hybrid_market_obs_88d_raw_with_self.npz"
 
 
 def train_wf_xgb_binary(X: np.ndarray, y: np.ndarray, name: str, n_folds: int = 5, max_depth: int = 4, reg_lambda: float = 8.0) -> tuple[xgb.Booster, float]:
@@ -81,101 +85,33 @@ def train_wf_xgb_binary(X: np.ndarray, y: np.ndarray, name: str, n_folds: int = 
     return bst_live, float(oos_auc), params, best_rounds
 
 
-def main():
-    t0 = time.time()
-    OUT_MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    print("=" * 96)
-    print("🧠 STEP 3: TRAINING CAUSAL ORDER-2.5 MARKET-IMPACT & LIVE-REGRET MODELS")
-    print("=" * 96, flush=True)
-
-    data = np.load(INT_PATH)
-    X_place = data["X_place"]   # [27374, 90]: 84D mkt + [side, dist_bp/50, log_usd/6, usd/l1, usd/top5, sp_bp/30]
-    Y_place = data["Y_place"]   # [27374, 3] : [penny_5s, push_10s, filled]
-    X_fill = data["X_fill"]     # [3077, 87] : 84D mkt + [side, log_usd/6, slot/11]
-    Y_fill = data["Y_fill"]     # [3077, 4]  : [mk10, mk30, mk180, is_trap]
-    spans = data["events_span"]
-
-    # 1. Near-touch Order-2.5 Impact model: predicts P(penny_jump_5s OR adverse_push_10s) conditioned on (z_mkt_84d, action_6d)
-    near_mask = X_place[:, 85] <= 0.60  # dist_bp <= 30 bp
-    Xp_near = X_place[near_mask]
-    Yp_impact = np.clip(Y_place[near_mask, 0] + Y_place[near_mask, 1], 0.0, 1.0)
-    bst_impact, auc_imp, p_imp, r_imp = train_wf_xgb_binary(Xp_near, Yp_impact, "order25_bot_impact", n_folds=5, max_depth=4, reg_lambda=8.0)
-    bst_impact.save_model(str(OUT_MODELS_DIR / "order25_bot_impact.ubj"))
-
-    # 2. Live Buy Toxic Trap model (trained strictly on real live BUY fills, side==0): P(mk180 <= -35 bp)
-    buy_mask = X_fill[:, 84] < 0.5
-    Xf_buy = X_fill[buy_mask, :84]  # pure 84D market context so agent sees trap risk BEFORE buying!
-    Yf_buy_trap = (Y_fill[buy_mask, 2] <= -35.0).astype(np.float32)
-    bst_buy_trap, auc_bt, p_bt, r_bt = train_wf_xgb_binary(Xf_buy, Yf_buy_trap, "order25_buy_trap_3m", n_folds=4, max_depth=3, reg_lambda=10.0)
-    bst_buy_trap.save_model(str(OUT_MODELS_DIR / "order25_buy_trap_3m.ubj"))
-
-    # 3. Live Sell Premature-Exit Regret model (trained strictly on real live SELL fills, side==1): P(mk180 <= -35 bp => price rallied >= +45bp above our Ask!)
-    sell_mask = X_fill[:, 84] > 0.5
-    Xf_sell = X_fill[sell_mask, :84]
-    Yf_sell_regret = (Y_fill[sell_mask, 2] <= -35.0).astype(np.float32)
-    bst_sell_reg, auc_sr, p_sr, r_sr = train_wf_xgb_binary(Xf_sell, Yf_sell_regret, "order25_sell_regret_3m", n_folds=4, max_depth=3, reg_lambda=10.0)
-    bst_sell_reg.save_model(str(OUT_MODELS_DIR / "order25_sell_regret_3m.ubj"))
-
-    # =========================================================================
-    # BUILD STRICTLY CAUSAL 88D SIGNAL STACK V5 CACHE (0% IN-SAMPLE LEAKAGE!)
-    # =========================================================================
-    # How we guarantee 0% lookahead on the sub-cent era [3,016,277 .. 3,889,299]:
-    # Split the sub-cent timeline into 4 causal segments S0, S1, S2, S3:
-    # - S0 uses prefix boosters trained only on pre-S0 / first 25% with out-of-fold predictions,
-    # - S1 uses boosters trained strictly on data < S1_start,
-    # - S2 uses boosters trained strictly on data < S2_start,
-    # - S3 (incl. entire 20h Blind OOS!) uses boosters trained strictly on data < S3_start (before 20h OOS)!
-    obs84 = np.load(OBS84_PATH, mmap_mode="r")["market_obs_84d"]
-    lob = np.load(LOB_PATH, mmap_mode="r")
+def _build_88d_world(
+    tag: str,
+    obs84_path: Path,
+    lob_path: Path,
+    out_88d_path: Path,
+    bst_imp_early: xgb.Booster,
+    bst_imp_pre_oos: xgb.Booster,
+    bst_bt_early: xgb.Booster,
+    bst_bt_pre_oos: xgb.Booster,
+    bst_sr_early: xgb.Booster,
+    bst_sr_pre_oos: xgb.Booster,
+    mid_cut: int | None = None,
+) -> None:
+    t_w = time.time()
+    obs84 = np.load(obs84_path, mmap_mode="r")["market_obs_84d"]
+    lob = np.load(lob_path, mmap_mode="r")
     bp10 = lob["bid_p"]
     bq10 = lob["bid_q"]
     ap10 = lob["ask_p"]
     N = len(obs84)
     subcent_off = int(np.where(np.abs(bp10[:, 0] * 100.0 - np.round(bp10[:, 0] * 100.0)) > 1e-3)[0][0])
+    if mid_cut is None:
+        mid_cut = subcent_off
 
-    # Use exact event row indices of near_places, buy_fills, sell_fills for strict temporal cutoffs!
-    place_row_exact = data["place_idx"][near_mask]
-    buy_row_exact = data["fill_idx"][buy_mask]
-    sell_row_exact = data["fill_idx"][sell_mask]
-
-    oos_cut = N - 75000  # strictly BEFORE the 20h (72,000s) Blind OOS!
-    mid_cut = subcent_off + (oos_cut - subcent_off) // 2
-
-    def fit_cutoff(X_all, y_all, row_idx, cut_row, prms, rnds):
-        m = row_idx < (cut_row - 600)
-        if np.sum(m) < 80 or len(np.unique(y_all[m])) < 2:
-            m = np.arange(len(X_all)) < max(80, len(X_all) // 3)
-        return xgb.train(prms, xgb.DMatrix(X_all[m], label=y_all[m]), num_boost_round=rnds, verbose_eval=False)
-
-    bst_imp_early = fit_cutoff(Xp_near, Yp_impact, place_row_exact, mid_cut, p_imp, r_imp)
-    bst_imp_pre_oos = fit_cutoff(Xp_near, Yp_impact, place_row_exact, oos_cut, p_imp, r_imp)
-
-    bst_bt_early = fit_cutoff(Xf_buy, Yf_buy_trap, buy_row_exact, mid_cut, p_bt, r_bt)
-    bst_bt_pre_oos = fit_cutoff(Xf_buy, Yf_buy_trap, buy_row_exact, oos_cut, p_bt, r_bt)
-
-    bst_sr_early = fit_cutoff(Xf_sell, Yf_sell_regret, sell_row_exact, mid_cut, p_sr, r_sr)
-    bst_sr_pre_oos = fit_cutoff(Xf_sell, Yf_sell_regret, sell_row_exact, oos_cut, p_sr, r_sr)
-
-    # Also save pre_oos boosters metadata
-    meta_o25 = {
-        "models": {
-            "order25_bot_impact": {"oos_auc": round(auc_imp, 4), "rounds": r_imp},
-            "order25_buy_trap_3m": {"oos_auc": round(auc_bt, 4), "rounds": r_bt},
-            "order25_sell_regret_3m": {"oos_auc": round(auc_sr, 4), "rounds": r_sr},
-        },
-        "channels_88d": {
-            "84": "p_penny_jump_small ($40 at BBO)",
-            "85": "p_penny_jump_whale ($250 at BBO)",
-            "86": "p_live_buy_trap_3m (real live adverse fill markout <= -35bp)",
-            "87": "p_live_sell_regret_3m (real live premature ask fill rally >= +35bp)",
-        },
-    }
-    (OUT_MODELS_DIR / "meta_order25.json").write_text(json.dumps(meta_o25, indent=2))
-
-    print(f"\n🌊 Computing 4 Causal Order-2.5 Channels across sub-cent rows [{subcent_off:,} .. {N:,}]...")
+    print(f"\n🌊 [{tag}] Computing 4 Causal Order-2.5 Channels across sub-cent rows [{subcent_off:,} .. {N:,}]...", flush=True)
     obs88 = np.zeros((N, 88), dtype=np.float32)
     obs88[:, :84] = obs84
-    # Neutral baseline prior before subcent_off
     obs88[:subcent_off, 84] = 0.35
     obs88[:subcent_off, 85] = 0.50
     obs88[:subcent_off, 86] = 0.23
@@ -192,8 +128,6 @@ def main():
         t5_u = np.maximum(50.0, np.sum(bq10[s_c:e_c, :5] * bp10[s_c:e_c, :5], axis=1))
         sp_s = np.clip(((a1_c - b1_c) / b1_c * 10000.0) / 30.0, 0.0, 4.0)
 
-        # Standardized counterfactual queries (100% identical formula in Live Bridge!):
-        # Query A: Small $40 Bid at BBO (side=0, dist=0, usd=40)
         q_small = np.column_stack([
             m_c,
             np.zeros(n_c, dtype=np.float32),
@@ -204,7 +138,6 @@ def main():
             sp_s,
         ]).astype(np.float32)
 
-        # Query B: Whale $250 Bid at BBO (side=0, dist=0, usd=250)
         q_whale = np.column_stack([
             m_c,
             np.zeros(n_c, dtype=np.float32),
@@ -228,12 +161,104 @@ def main():
 
     sub88 = obs88[subcent_off:]
     for ci, nm in [(84, "p_penny_jump_small"), (85, "p_penny_jump_whale"), (86, "p_live_buy_trap_3m"), (87, "p_live_sell_regret_3m")]:
-        print(f"   ch[{ci}] {nm:<24}: mean={sub88[:, ci].mean():.4f} | std={sub88[:, ci].std():.4f} | p10={np.percentile(sub88[:, ci], 10):.4f} | p90={np.percentile(sub88[:, ci], 90):.4f}")
+        print(f"   [{tag}] ch[{ci}] {nm:<24}: mean={sub88[:, ci].mean():.4f} | std={sub88[:, ci].std():.4f}", flush=True)
 
-    tmp_88 = OUT_88D_PATH.with_name("rl_hybrid_market_obs_88d_tmp.npz")
+    tmp_88 = out_88d_path.with_name(out_88d_path.stem + "_tmp.npz")
     np.savez(tmp_88, market_obs_88d=obs88)
-    tmp_88.replace(OUT_88D_PATH)
-    print(f"✅ Step 3 Completed! Saved {OUT_88D_PATH.name} ({obs88.shape}, {OUT_88D_PATH.stat().st_size/1e6:.1f} MB) in {time.time()-t0:.1f}s!")
+    tmp_88.replace(out_88d_path)
+    print(f"✅ [{tag}] Saved {out_88d_path.name} ({obs88.shape}, {out_88d_path.stat().st_size/1e6:.1f} MB) in {time.time()-t_w:.1f}s!", flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--eval-only", action="store_true", help="Build 88D DEC + RAW caches using existing live .ubj boosters without retraining")
+    args = parser.parse_args()
+
+    t0 = time.time()
+    OUT_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    if args.eval_only:
+        print("=" * 96)
+        print("🧊 STEP 3 (EVAL-ONLY): COMPILING 88D DEC + RAW CACHES USING FROZEN LIVE .UBJ BOOSTERS")
+        print("=" * 96, flush=True)
+        b_imp = xgb.Booster(); b_imp.load_model(str(OUT_MODELS_DIR / "order25_bot_impact.ubj")); b_imp.set_param({"device": "cuda:0"})
+        b_bt = xgb.Booster(); b_bt.load_model(str(OUT_MODELS_DIR / "order25_buy_trap_3m.ubj")); b_bt.set_param({"device": "cuda:0"})
+        b_sr = xgb.Booster(); b_sr.load_model(str(OUT_MODELS_DIR / "order25_sell_regret_3m.ubj")); b_sr.set_param({"device": "cuda:0"})
+        _build_88d_world("DEC", OBS84_PATH, LOB_PATH, OUT_88D_PATH, b_imp, b_imp, b_bt, b_bt, b_sr, b_sr)
+        if OBS84_RAW_PATH.exists() and LOB_RAW_PATH.exists():
+            _build_88d_world("RAW", OBS84_RAW_PATH, LOB_RAW_PATH, OUT_88D_RAW_PATH, b_imp, b_imp, b_bt, b_bt, b_sr, b_sr)
+        return
+
+    print("=" * 96)
+    print("🧠 STEP 3: TRAINING CAUSAL ORDER-2.5 MARKET-IMPACT & LIVE-REGRET MODELS")
+    print("=" * 96, flush=True)
+
+    data = np.load(INT_PATH)
+    X_place = data["X_place"]   # [27374, 90]: 84D mkt + [side, dist_bp/50, log_usd/6, usd/l1, usd/top5, sp_bp/30]
+    Y_place = data["Y_place"]   # [27374, 3] : [penny_5s, push_10s, filled]
+    X_fill = data["X_fill"]     # [3077, 87] : 84D mkt + [side, log_usd/6, slot/11]
+    Y_fill = data["Y_fill"]     # [3077, 4]  : [mk10, mk30, mk180, is_trap]
+
+    near_mask = X_place[:, 85] <= 0.60
+    Xp_near = X_place[near_mask]
+    Yp_impact = np.clip(Y_place[near_mask, 0] + Y_place[near_mask, 1], 0.0, 1.0)
+    bst_impact, auc_imp, p_imp, r_imp = train_wf_xgb_binary(Xp_near, Yp_impact, "order25_bot_impact", n_folds=5, max_depth=4, reg_lambda=8.0)
+    bst_impact.save_model(str(OUT_MODELS_DIR / "order25_bot_impact.ubj"))
+
+    buy_mask = X_fill[:, 84] < 0.5
+    Xf_buy = X_fill[buy_mask, :84]
+    Yf_buy_trap = (Y_fill[buy_mask, 2] <= -35.0).astype(np.float32)
+    bst_buy_trap, auc_bt, p_bt, r_bt = train_wf_xgb_binary(Xf_buy, Yf_buy_trap, "order25_buy_trap_3m", n_folds=4, max_depth=3, reg_lambda=10.0)
+    bst_buy_trap.save_model(str(OUT_MODELS_DIR / "order25_buy_trap_3m.ubj"))
+
+    sell_mask = X_fill[:, 84] > 0.5
+    Xf_sell = X_fill[sell_mask, :84]
+    Yf_sell_regret = (Y_fill[sell_mask, 2] <= -35.0).astype(np.float32)
+    bst_sell_reg, auc_sr, p_sr, r_sr = train_wf_xgb_binary(Xf_sell, Yf_sell_regret, "order25_sell_regret_3m", n_folds=4, max_depth=3, reg_lambda=10.0)
+    bst_sell_reg.save_model(str(OUT_MODELS_DIR / "order25_sell_regret_3m.ubj"))
+
+    obs84_n = len(np.load(OBS84_PATH, mmap_mode="r")["market_obs_84d"])
+    lob_bp = np.load(LOB_PATH, mmap_mode="r")["bid_p"]
+    subcent_off = int(np.where(np.abs(lob_bp[:, 0] * 100.0 - np.round(lob_bp[:, 0] * 100.0)) > 1e-3)[0][0])
+
+    place_row_exact = data["place_idx"][near_mask]
+    buy_row_exact = data["fill_idx"][buy_mask]
+    sell_row_exact = data["fill_idx"][sell_mask]
+
+    oos_cut = obs84_n - 75000
+    mid_cut = subcent_off + (oos_cut - subcent_off) // 2
+
+    def fit_cutoff(X_all, y_all, row_idx, cut_row, prms, rnds):
+        m = row_idx < (cut_row - 600)
+        if np.sum(m) < 80 or len(np.unique(y_all[m])) < 2:
+            m = np.arange(len(X_all)) < max(80, len(X_all) // 3)
+        return xgb.train(prms, xgb.DMatrix(X_all[m], label=y_all[m]), num_boost_round=rnds, verbose_eval=False)
+
+    bst_imp_early = fit_cutoff(Xp_near, Yp_impact, place_row_exact, mid_cut, p_imp, r_imp)
+    bst_imp_pre_oos = fit_cutoff(Xp_near, Yp_impact, place_row_exact, oos_cut, p_imp, r_imp)
+    bst_bt_early = fit_cutoff(Xf_buy, Yf_buy_trap, buy_row_exact, mid_cut, p_bt, r_bt)
+    bst_bt_pre_oos = fit_cutoff(Xf_buy, Yf_buy_trap, buy_row_exact, oos_cut, p_bt, r_bt)
+    bst_sr_early = fit_cutoff(Xf_sell, Yf_sell_regret, sell_row_exact, mid_cut, p_sr, r_sr)
+    bst_sr_pre_oos = fit_cutoff(Xf_sell, Yf_sell_regret, sell_row_exact, oos_cut, p_sr, r_sr)
+
+    meta_o25 = {
+        "models": {
+            "order25_bot_impact": {"oos_auc": round(auc_imp, 4), "rounds": r_imp},
+            "order25_buy_trap_3m": {"oos_auc": round(auc_bt, 4), "rounds": r_bt},
+            "order25_sell_regret_3m": {"oos_auc": round(auc_sr, 4), "rounds": r_sr},
+        },
+        "channels_88d": {
+            "84": "p_penny_jump_small ($40 at BBO)",
+            "85": "p_penny_jump_whale ($250 at BBO)",
+            "86": "p_live_buy_trap_3m (real live adverse fill markout <= -35bp)",
+            "87": "p_live_sell_regret_3m (real live premature ask fill rally >= +35bp)",
+        },
+    }
+    (OUT_MODELS_DIR / "meta_order25.json").write_text(json.dumps(meta_o25, indent=2))
+
+    _build_88d_world("DEC", OBS84_PATH, LOB_PATH, OUT_88D_PATH, bst_imp_early, bst_imp_pre_oos, bst_bt_early, bst_bt_pre_oos, bst_sr_early, bst_sr_pre_oos, mid_cut=mid_cut)
+    if OBS84_RAW_PATH.exists() and LOB_RAW_PATH.exists():
+        _build_88d_world("RAW", OBS84_RAW_PATH, LOB_RAW_PATH, OUT_88D_RAW_PATH, bst_imp_early, bst_imp_pre_oos, bst_bt_early, bst_bt_pre_oos, bst_sr_early, bst_sr_pre_oos, mid_cut=mid_cut)
+    print(f"✅ Step 3 Total Completed in {time.time()-t0:.1f}s!")
 
 
 if __name__ == "__main__":
