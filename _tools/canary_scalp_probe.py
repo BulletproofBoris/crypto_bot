@@ -481,9 +481,11 @@ def step_canary_scalp(
     ext_mid = 0.5 * (ext_b1 + ext_a1)
     ext_sp_bp = ((ext_a1 - ext_b1) / max(1e-6, ext_mid)) * 1e4
 
-    # Detect penny-jumping by rival bots while our canary bid is resting
+    # Detect penny-jumping by rival bots ONLY when our canary bid was placed at/above top external Bid (not deep passive limit)
     if st.get("bid_oid") is not None and not bool(st.get("bid_penny_jumped", False)):
-        if ext_b1 > float(st.get("bid_px", 0.0)) + 0.45 * t_sz:
+        bid_px_now = float(st.get("bid_px", 0.0))
+        init_eb1 = float(st.get("bid_init_ext_b1", 999.0))
+        if bid_px_now >= init_eb1 - 0.1 * t_sz and ext_b1 > bid_px_now + 0.45 * t_sz:
             pj_dt = round(now_ts - float(st.get("bid_place_ts", now_ts)), 2)
             st["bid_penny_jumped"] = True
             st["bid_penny_jump_dt"] = pj_dt
@@ -764,10 +766,11 @@ def step_canary_scalp(
                         st["bid_place_ts"] = now_ts
                         st["bid_acc_fill"] = 0.0
                         st["bid_init_sp_bp"] = round(ext_sp_bp, 2)
+                        st["bid_init_ext_b1"] = round(ext_b1, 4)
                         st["bid_penny_jumped"] = False
                         st["bid_penny_jump_dt"] = -1.0
                         st["bid_tape_sell_vol"] = 0.0
-                        trader.ex_usdt_free = max(0.0, float(getattr(trader, "ex_usdt_free", 0.0)) - st["bid_qty"] * st["bid_px"] * 1.001)
+                        trader.ex_usdt_free = max(0.0, float(getattr(trader, "ex_usdt_free", 0.0)) - st["bid_qty"] * st["bid_px"] * 1.002)
                         _append_telemetry({
                             "event": "canary_bid_place",
                             "engine": "canary_neural_v1",
