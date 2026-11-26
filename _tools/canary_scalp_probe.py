@@ -35,16 +35,30 @@ import numpy as np
 BASE_DIR = Path(__file__).resolve().parent.parent
 CANARY_STATE_PATH = BASE_DIR / "data" / "logs" / "canary_scalp_state.json"
 CANARY_LOG_PATH = BASE_DIR / "data" / "logs" / "canary_scalp_telemetry.jsonl"
+CANARY_NEURAL_MODEL_PATH = BASE_DIR / "models" / "prl" / "canary_neural_v1.pt"
 
 CANARY_ENABLED_DEFAULT = True
 CANARY_LOT_PRL = 8.0
 CANARY_CASH_RESERVE_USD = 22.0
-CANARY_ENTRY_SPREAD_BP = 50.0
-CANARY_KEEP_SPREAD_BP = 36.0
 CANARY_MAX_ROUNDS = 80
 CANARY_MAX_LOSS_USD = -2.50
 CANARY_MAKER_FEE = 0.0010
 CANARY_TAKER_FEE = 0.0020
+
+_CANARY_ENGINE_CACHE: dict[str, Any] = {"engine": None, "mtime": 0.0}
+
+
+def _get_canary_neural_engine():
+    if not CANARY_NEURAL_MODEL_PATH.exists():
+        return None
+    mt = float(CANARY_NEURAL_MODEL_PATH.stat().st_mtime)
+    if _CANARY_ENGINE_CACHE["engine"] is None or abs(mt - float(_CANARY_ENGINE_CACHE["mtime"])) > 1e-3:
+        from _tools.order3_live_bridge import Order3LiveInferenceEngine
+        eng = Order3LiveInferenceEngine(CANARY_NEURAL_MODEL_PATH, device="cpu")
+        _CANARY_ENGINE_CACHE["engine"] = eng
+        _CANARY_ENGINE_CACHE["mtime"] = mt
+        print(f"  🐤🧠 [CANARY NEURAL LOADED] Активирован автономный нейро-движок {CANARY_NEURAL_MODEL_PATH.name} (Mode#0 + Персональный Оркестратор)!")
+    return _CANARY_ENGINE_CACHE["engine"]
 
 
 def _msk_iso() -> str:
@@ -427,146 +441,203 @@ def step_canary_scalp(
             })
             changed = True
 
-    # Risk-OFF filter from causal 96D market vector:
-    # z[88] = tanh(ret_30m * 12) -> -0.178 corresponds to ret_30m = -1.5%
-    # z[81] = guard_crash_900s, z[31] = guard_crash_300s, z[12] = bo_basis*10, z[21] = bo_ret_30s
-    z88 = float(z_mkt[88]) if len(z_mkt) > 88 else 0.0
-    z81 = float(z_mkt[81]) if len(z_mkt) > 81 else 0.0
-    z31 = float(z_mkt[31]) if len(z_mkt) > 31 else 0.0
-    z12 = float(z_mkt[12]) if len(z_mkt) > 12 else 0.0
-    z21 = float(z_mkt[21]) if len(z_mkt) > 21 else 0.0
-    risk_off = (z88 < -0.178) or (z81 > 0.42) or (z31 > 0.55) or (z12 < -0.15) or (z21 < -0.50)
+    # 5. 100% ЭНДОГЕННОЕ НЕЙРОСЕТЕВОЕ УПРАВЛЕНИЕ (без единого эмпирического порога спреда/таймера!):
+    # собственный экземпляр Order3LiveInferenceEngine(canary_neural_v1.pt) сам оценивает 96D рынок +
+    # свой микро-портфель ($22 / 8 PRL, hold_sec, entry_px) и через свой персональный Оркестратор
+    # переключает Mode #0 (нелинейный Скальпер) <-> Mode #3 (Ожидание / Выход 0% покупок).
+    can_eng = _get_canary_neural_engine()
+    if can_eng is None:
+        if changed:
+            _save_state(st)
+        return {
+            "canary_pos_qty": float(st.get("pos_qty", 0.0)),
+            "canary_cash_reserve": CANARY_CASH_RESERVE_USD if bool(st.get("enabled", True)) else 0.0,
+            "canary_bid_oid": st.get("bid_oid"),
+            "canary_ask_oid": st.get("ask_oid"),
+        }
 
-    # 5A. EXIT MANAGEMENT when holding canary position (>= min_amt)
-    if float(st.get("pos_qty", 0.0)) >= min_amt:
-        # Cancel any leftover bid immediately
+    c_pos = max(0.0, float(st.get("pos_qty", 0.0)))
+    c_epx = max(t_sz, float(st.get("entry_px", ext_b1))) if c_pos >= min_amt else 0.0
+    c_hold_s = max(0.0, now_ts - float(st.get("entry_ts", now_ts))) if c_pos >= min_amt else 0.0
+    c_cash = max(0.0, CANARY_CASH_RESERVE_USD - c_pos * (c_epx if c_epx > 0 else ext_b1))
+
+    b_px_12 = np.zeros(12, dtype=np.float32)
+    b_qty_12 = np.zeros(12, dtype=np.float32)
+    b_act_12 = np.zeros(12, dtype=np.float64)
+    a_px_12 = np.zeros(12, dtype=np.float32)
+    a_qty_12 = np.zeros(12, dtype=np.float32)
+    a_act_12 = np.zeros(12, dtype=np.float64)
+
+    if st.get("bid_oid") is not None:
+        b_px_12[0] = float(st.get("bid_px", 0.0))
+        b_qty_12[0] = max(0.0, float(st.get("bid_qty", 0.0)) - float(st.get("bid_acc_fill", 0.0)))
+        b_act_12[0] = float(st.get("bid_place_ts", now_ts))
+    if st.get("ask_oid") is not None:
+        a_px_12[0] = float(st.get("ask_px", 0.0))
+        a_qty_12[0] = max(0.0, float(st.get("ask_qty", 0.0)) - float(st.get("ask_acc_fill", 0.0)))
+        a_act_12[0] = float(st.get("ask_place_ts", now_ts))
+
+    # Build 100% exact 110D agent vector for the isolated $22 canary account (1-to-1 with fused_order3_clean_tick)
+    import torch
+    from _tools.fused_order3_clean_tick import AG_DIM_ORDER3, _scale_mkt_44d
+
+    z_ag_c = np.zeros(AG_DIM_ORDER3, dtype=np.float32)
+    b1_q_ext = max(1.0, float(bq10_live[0]) if len(bq10_live) > 0 else 10.0)
+    a1_q_ext = max(1.0, float(aq10_live[0]) if len(aq10_live) > 0 else 10.0)
+    l1_b_usd = max(100.0, ext_b1 * b1_q_ext)
+    l1_a_usd = max(100.0, ext_a1 * a1_q_ext)
+    res_b_u = float(b_qty_12[0] * b_px_12[0] * 1.001)
+    unres_u = max(0.0, c_cash - res_b_u)
+    rb_1s = max(10.0, float(getattr(trader, "last_buy_vol_10s", 100.0)) / 10.0)
+    has_cp = c_pos >= min_amt
+    tot_c_eq = max(CANARY_CASH_RESERVE_USD, c_cash + c_pos * ext_b1)
+    pos_rat_c = float(np.clip((c_pos * ext_b1) / max(tot_c_eq, 1.0), 0.0, 1.5))
+    eff_ps_c = float(np.clip(pos_rat_c / 0.25, 0.15, 1.0))
+
+    z_ag_c[0] = math.log1p(tot_c_eq / l1_b_usd) / 3.0
+    z_ag_c[1] = math.log1p(unres_u / l1_b_usd) / 3.0
+    z_ag_c[2] = min(4.0, (c_pos * ext_a1) / l1_a_usd) / 2.0
+    z_ag_c[3] = min(10.0, c_pos / rb_1s) / 5.0
+    z_ag_c[4] = 1.0 if has_cp else 0.0
+    z_ag_c[5] = float(np.clip((((ext_b1 - c_epx) / max(c_epx, t_sz)) - 2.0 * CANARY_MAKER_FEE) * 30.0, -2.5, 2.5)) if (has_cp and c_epx > 0) else 0.0
+    z_ag_c[6:18] = np.clip((b_qty_12 * ext_b1) / max(tot_c_eq, 25.0), 0.0, 1.0)
+    z_ag_c[18:30] = np.clip(a_qty_12 / max(c_pos, 2.0), 0.0, 1.0)
+    z_ag_c[30:42] = np.where(b_qty_12 > 1e-6, np.log1p(np.maximum(0.0, (ext_b1 - b_px_12) / t_sz)) / 3.5, 0.0)
+    z_ag_c[42:54] = np.where(a_qty_12 > 1e-6, np.log1p(np.maximum(0.0, (a_px_12 - ext_a1) / t_sz)) / 3.5, 0.0)
+    z_ag_c[54] = 1.0 if has_cp else 0.0
+    z_ag_c[55] = pos_rat_c
+    z_ag_c[56] = float(np.clip(unres_u / max(tot_c_eq, 1.0), 0.0, 1.0))
+    z_ag_c[57] = float(np.clip(((((ext_b1 - c_epx) / max(t_sz, c_epx)) - 2.0 * CANARY_MAKER_FEE) * 25.0 * eff_ps_c), -2.5, 2.5)) if (has_cp and c_epx > 0) else 0.0
+    z_ag_c[58] = (min(2.0, max(0.0, c_hold_s / 300.0)) * eff_ps_c) if has_cp else 0.0
+    z_ag_c[59] = 1.0 if b_qty_12[0] > 1e-6 else 0.0
+    z_ag_c[60] = 1.0 if a_qty_12[0] > 1e-6 else 0.0
+    z_ag_c[61] = ((1.0 if b_qty_12[0] > 1e-6 else 0.0) - (1.0 if a_qty_12[0] > 1e-6 else 0.0)) / 12.0
+    z_ag_c[62] = min(2.0, max(0.0, (now_ts - b_act_12[0]) / 60.0)) if (b_qty_12[0] > 1e-6 and b_act_12[0] > 0) else 0.0
+    z_ag_c[63] = min(2.0, max(0.0, (now_ts - a_act_12[0]) / 60.0)) if (a_qty_12[0] > 1e-6 and a_act_12[0] > 0) else 0.0
+
+    zm_sc_c = _scale_mkt_44d(torch.from_numpy(z_mkt).float(), torch.float32).numpy()
+    for ci, mi in ((64, 12), (65, 13), (66, 10), (67, 3), (68, 44), (69, 48)):
+        z_ag_c[ci] = float(zm_sc_c[mi]) if len(zm_sc_c) > mi else 0.0
+    z_ag_c[70:86] = can_eng.mem_h[:, :16].squeeze(0).cpu().numpy()
+    z_ag_c[86:98] = np.where(b_qty_12 > 1e-6, np.clip((now_ts - b_act_12) / 60.0, 0.0, 2.0), -1.0).astype(np.float32)
+    z_ag_c[98:110] = np.where(a_qty_12 > 1e-6, np.clip((now_ts - a_act_12) / 60.0, 0.0, 2.0), -1.0).astype(np.float32)
+
+    can_eng.refill_tokens(now_ts)
+    dec = can_eng.forward_tick(
+        z_mkt_39d=z_mkt,
+        z_ag_110d=z_ag_c,
+        b1=ext_b1,
+        a1=ext_a1,
+        budget=CANARY_CASH_RESERVE_USD,
+        pos_qty=c_pos,
+        cash=c_cash,
+        bid_px_12=b_px_12,
+        bid_qty_12=b_qty_12,
+        ask_px_12=a_px_12,
+        ask_qty_12=a_qty_12,
+        tick_sz=t_sz,
+        maker_fee=CANARY_MAKER_FEE,
+        trader_entry=c_epx,
+        bid_act_12=b_act_12,
+        ask_act_12=a_act_12,
+        now_ts=now_ts,
+        bp_10=bp10_live,
+        bq_10=bq10_live,
+        ap_10=ap10_live,
+        aq_10=aq10_live,
+        roll_sell_1s=max(1.0, float(roll_sell_1s)),
+        roll_buy_1s=rb_1s,
+        hold_sec=c_hold_s,
+        min_buy_px=c_epx,
+        low_tranche_qty=c_pos,
+    )
+    gm_c = dec["g_mode"]
+    p_m0 = float(gm_c[0])
+    p_m3 = float(gm_c[3])
+
+    # 5A. ВЫХОД ПО НЕЙРОСЕТИ при наличии позиции канарейки (>= min_amt)
+    if has_cp:
         if st.get("bid_oid") is not None:
             rc_b = _cancel_canary_oid(trader, st["bid_oid"])
             if rc_b is not None:
-                st["bid_oid"] = None
-                st["bid_px"] = 0.0
-                st["bid_qty"] = 0.0
+                st["bid_oid"] = None; st["bid_px"] = 0.0; st["bid_qty"] = 0.0
                 changed = True
 
-        epx = max(t_sz, float(st.get("entry_px", ext_b1)))
-        hold_s = max(0.0, now_ts - float(st.get("entry_ts", now_ts)))
+        u_tk_c = float(dec["u_taker"])
+        targ_ask = round(max(ext_b1 + t_sz, float(dec["t_ask_px"][0])), p_prec)
+        want_cnl_a = bool(dec["g_cnl_a"][0]) or (u_tk_c > 0.25)
 
-        # Emergency -2.0% stop-loss
-        if ext_b1 <= epx * 0.980:
-            if st.get("ask_oid") is not None:
-                _cancel_canary_oid(trader, st["ask_oid"])
-                st["ask_oid"] = None
-                st["ask_px"] = 0.0
-                st["ask_qty"] = 0.0
-            q_stop = math.floor(min(float(st["pos_qty"]), max(float(st["pos_qty"]), float(getattr(trader, "ex_coin_free", 0.0)))) * 10000.0) / 10000.0
-            if q_stop >= min_amt:
-                stop_px = round(max(t_sz, ext_b1 * 0.994), p_prec)
+        if st.get("ask_oid") is not None and want_cnl_a and trader.order3_engine.api_tokens >= 2.0 and can_eng.api_tokens >= 1.0:
+            cur_apx = float(st.get("ask_px", 0.0))
+            if (u_tk_c > 0.25) or (abs(targ_ask - cur_apx) >= 0.9 * t_sz):
+                rc_a = _cancel_canary_oid(trader, st["ask_oid"])
+                trader.order3_engine.api_tokens = max(0.0, trader.order3_engine.api_tokens - 1.0)
+                can_eng.api_tokens = max(0.0, can_eng.api_tokens - 1.0)
+                if rc_a is not None and float(rc_a.get("filled_amount", 0.0)) <= float(st.get("ask_acc_fill", 0.0)) + 1e-4:
+                    trader.ex_coin_free = float(getattr(trader, "ex_coin_free", 0.0)) + float(st.get("ask_qty", 0.0))
+                    st["ask_oid"] = None; st["ask_px"] = 0.0; st["ask_qty"] = 0.0
+                    changed = True
+
+        if st.get("ask_oid") is None and trader.order3_engine.api_tokens >= 1.5 and can_eng.api_tokens >= 1.0:
+            q_sell = math.floor(c_pos * 10000.0) / 10000.0
+            px_out = round(max(t_sz, ext_b1 * (1.0 - float(dec["max_slip_pct"]))), p_prec) if u_tk_c > 0.25 else targ_ask
+            if q_sell >= min_amt and (bool(dec["g_plc_a"][0]) or u_tk_c > 0.25):
                 try:
-                    res_s = trader.client.place_limit_order(trader.market, "sell", q_stop, stop_px, price_precision=p_prec, amount_precision=a_prec, min_amount=min_amt)
-                    if res_s and res_s.get("id") is not None:
-                        st["ask_oid"] = res_s.get("id")
-                        st["ask_px"] = float(res_s.get("price", stop_px))
-                        st["ask_qty"] = float(res_s.get("origin_amount", q_stop))
+                    res_a = trader.client.place_limit_order(trader.market, "sell", q_sell, px_out, price_precision=p_prec, amount_precision=a_prec, min_amount=min_amt)
+                    trader.order3_engine.api_tokens = max(0.0, trader.order3_engine.api_tokens - 1.0)
+                    can_eng.api_tokens = max(0.0, can_eng.api_tokens - 1.0)
+                    if res_a and res_a.get("id") is not None:
+                        st["ask_oid"] = res_a.get("id")
+                        st["ask_px"] = float(res_a.get("price", px_out))
+                        st["ask_qty"] = float(res_a.get("origin_amount", q_sell))
                         st["ask_place_ts"] = now_ts
                         st["ask_acc_fill"] = 0.0
-                        print(f"  🐤⚡ [CANARY STOP-LOSS -2%] id={st['ask_oid']} | {q_stop:.4f} PRL @ >=${stop_px:.4f} | t={_msk_iso()}")
+                        trader.ex_coin_free = max(0.0, float(getattr(trader, "ex_coin_free", 0.0)) - st["ask_qty"])
+                        print(f"  🐤📤 [CANARY NEURAL ASK] id={st['ask_oid']} | {st['ask_qty']:.4f} PRL @ ${st['ask_px']:.4f} (M0={p_m0:.0%} M3={p_m3:.0%}, hold={c_hold_s:.0f}s) | t={_msk_iso()}")
                         changed = True
                 except Exception:
                     pass
-        else:
-            # Dynamic chasing maker ask: +22 bp floor for 0..120s, linear ramp to -30 bp at 300s, -60 bp >300s
-            if hold_s <= 120.0:
-                floor_mult = 1.0022
-            elif hold_s <= 300.0:
-                frac = (hold_s - 120.0) / 180.0
-                floor_mult = 1.0022 * (1.0 - frac) + 0.9970 * frac
-            else:
-                floor_mult = 0.9940
-            floor_px = math.ceil((epx * floor_mult) / t_sz) * t_sz
-            min_safe_a = ext_b1 + 2.0 * t_sz if (ext_a1 - ext_b1) >= 2.9 * t_sz else ext_b1 + t_sz
-            targ_ask = round(max(min_safe_a, floor_px, ext_a1 - t_sz), p_prec)
 
-            if st.get("ask_oid") is not None:
-                cur_apx = float(st.get("ask_px", 0.0))
-                age_a = now_ts - float(st.get("ask_place_ts", 0.0))
-                crossed_b = cur_apx <= ext_b1 + 0.1 * t_sz
-                need_reprice_a = crossed_b or (abs(targ_ask - cur_apx) >= 1.9 * t_sz and age_a >= 3.5)
-                if need_reprice_a and trader.order3_engine.api_tokens >= 2.0:
-                    rc_a = _cancel_canary_oid(trader, st["ask_oid"])
-                    trader.order3_engine.api_tokens = max(0.0, trader.order3_engine.api_tokens - 1.0)
-                    if rc_a is not None and float(rc_a.get("filled_amount", 0.0)) <= float(st.get("ask_acc_fill", 0.0)) + 1e-4:
-                        trader.ex_coin_free = float(getattr(trader, "ex_coin_free", 0.0)) + float(st.get("ask_qty", 0.0))
-                        st["ask_oid"] = None
-                        st["ask_px"] = 0.0
-                        st["ask_qty"] = 0.0
-                        changed = True
-
-            if st.get("ask_oid") is None and trader.order3_engine.api_tokens >= 1.5:
-                q_sell = math.floor(float(st["pos_qty"]) * 10000.0) / 10000.0
-                if q_sell >= min_amt:
-                    try:
-                        res_a = trader.client.place_limit_order(trader.market, "sell", q_sell, targ_ask, price_precision=p_prec, amount_precision=a_prec, min_amount=min_amt)
-                        trader.order3_engine.api_tokens = max(0.0, trader.order3_engine.api_tokens - 1.0)
-                        if res_a and res_a.get("id") is not None:
-                            st["ask_oid"] = res_a.get("id")
-                            st["ask_px"] = float(res_a.get("price", targ_ask))
-                            st["ask_qty"] = float(res_a.get("origin_amount", q_sell))
-                            st["ask_place_ts"] = now_ts
-                            st["ask_acc_fill"] = 0.0
-                            trader.ex_coin_free = max(0.0, float(getattr(trader, "ex_coin_free", 0.0)) - st["ask_qty"])
-                            print(f"  🐤📤 [CANARY PLACE ASK] id={st['ask_oid']} | {st['ask_qty']:.4f} PRL @ ${st['ask_px']:.4f} (hold={hold_s:.0f}s) | t={_msk_iso()}")
-                            changed = True
-                    except Exception:
-                        pass
-
-    # 5B. ENTRY MANAGEMENT when flat on canary position
+    # 5B. ВХОД ПО НЕЙРОСЕТИ И ЕЁ ОРКЕСТРАТОРУ при пустой позиции канарейки
     else:
         if not bool(st.get("enabled", True)):
             if st.get("bid_oid") is not None:
                 _cancel_canary_oid(trader, st["bid_oid"])
-                st["bid_oid"] = None
-                st["bid_px"] = 0.0
-                st["bid_qty"] = 0.0
+                st["bid_oid"] = None; st["bid_px"] = 0.0; st["bid_qty"] = 0.0
                 changed = True
         else:
-            max_safe_b = max(t_sz, ext_a1 - 2.0 * t_sz) if (ext_a1 - ext_b1) >= 2.9 * t_sz else max(t_sz, ext_a1 - t_sz)
-            targ_bid = round(min(max_safe_b, ext_b1 + t_sz), p_prec)
+            targ_bid = round(min(max(t_sz, ext_a1 - t_sz), float(dec["t_bid_px"][0])), p_prec)
+            raw_qb = float(dec["q_target_b"][0])
+            want_qb = min(CANARY_LOT_PRL, math.floor(raw_qb * 10000.0) / 10000.0) if raw_qb >= min_amt else 0.0
+            want_cnl_b = bool(dec["g_cnl_b"][0]) or (want_qb < min_amt)
 
-            if st.get("bid_oid") is not None:
+            if st.get("bid_oid") is not None and want_cnl_b and trader.order3_engine.api_tokens >= 2.0 and can_eng.api_tokens >= 1.0:
                 cur_bpx = float(st.get("bid_px", 0.0))
-                age_b = now_ts - float(st.get("bid_place_ts", 0.0))
-                crossed_a = cur_bpx >= ext_a1 - 0.1 * t_sz
-                should_pull = risk_off or (ext_sp_bp < CANARY_KEEP_SPREAD_BP) or crossed_a
-                # Re-step only if rival jumped ahead AND spread is still >= 50bp (rate-limited >= 4.5s) or book dropped >15bp
-                need_restep = (
-                    (ext_b1 > cur_bpx + 0.5 * t_sz and ext_sp_bp >= CANARY_ENTRY_SPREAD_BP and age_b >= 4.5)
-                    or ((cur_bpx - ext_b1) > 0.0015 * ext_b1 and age_b >= 3.0)
-                )
-                if (should_pull or need_restep) and trader.order3_engine.api_tokens >= 2.0:
+                if (want_qb < min_amt) or (abs(targ_bid - cur_bpx) >= 0.9 * t_sz):
                     rc_b = _cancel_canary_oid(trader, st["bid_oid"])
                     trader.order3_engine.api_tokens = max(0.0, trader.order3_engine.api_tokens - 1.0)
+                    can_eng.api_tokens = max(0.0, can_eng.api_tokens - 1.0)
                     if rc_b is not None and float(rc_b.get("filled_amount", 0.0)) <= float(st.get("bid_acc_fill", 0.0)) + 1e-4:
                         trader.ex_usdt_free = float(getattr(trader, "ex_usdt_free", 0.0)) + float(st.get("bid_qty", 0.0)) * cur_bpx
-                        st["bid_oid"] = None
-                        st["bid_px"] = 0.0
-                        st["bid_qty"] = 0.0
+                        st["bid_oid"] = None; st["bid_px"] = 0.0; st["bid_qty"] = 0.0
                         changed = True
 
             if (
                 st.get("bid_oid") is None
-                and (not risk_off)
-                and ext_sp_bp >= CANARY_ENTRY_SPREAD_BP
+                and want_qb >= min_amt
+                and bool(dec["g_plc_b"][0])
                 and trader.order3_engine.api_tokens >= 2.5
-                and float(getattr(trader, "ex_usdt_free", 0.0)) >= CANARY_LOT_PRL * targ_bid * 1.02
+                and can_eng.api_tokens >= 1.0
+                and float(getattr(trader, "ex_usdt_free", 0.0)) >= want_qb * targ_bid * 1.02
             ):
-                q_buy = CANARY_LOT_PRL
                 try:
-                    res_b = trader.client.place_limit_order(trader.market, "buy", q_buy, targ_bid, price_precision=p_prec, amount_precision=a_prec, min_amount=min_amt)
+                    res_b = trader.client.place_limit_order(trader.market, "buy", want_qb, targ_bid, price_precision=p_prec, amount_precision=a_prec, min_amount=min_amt)
                     trader.order3_engine.api_tokens = max(0.0, trader.order3_engine.api_tokens - 1.0)
+                    can_eng.api_tokens = max(0.0, can_eng.api_tokens - 1.0)
                     if res_b and res_b.get("id") is not None:
                         st["bid_oid"] = res_b.get("id")
                         st["bid_px"] = float(res_b.get("price", targ_bid))
-                        st["bid_qty"] = float(res_b.get("origin_amount", q_buy))
+                        st["bid_qty"] = float(res_b.get("origin_amount", want_qb))
                         st["bid_place_ts"] = now_ts
                         st["bid_acc_fill"] = 0.0
                         st["bid_init_sp_bp"] = round(ext_sp_bp, 2)
@@ -576,14 +647,17 @@ def step_canary_scalp(
                         trader.ex_usdt_free = max(0.0, float(getattr(trader, "ex_usdt_free", 0.0)) - st["bid_qty"] * st["bid_px"] * 1.001)
                         _append_telemetry({
                             "event": "canary_bid_place",
+                            "engine": "canary_neural_v1",
                             "oid": st["bid_oid"],
                             "px": st["bid_px"],
                             "qty": st["bid_qty"],
                             "ext_b1": round(ext_b1, 4),
                             "ext_a1": round(ext_a1, 4),
                             "ext_sp_bp": round(ext_sp_bp, 1),
+                            "p_m0": round(p_m0, 3),
+                            "p_m3": round(p_m3, 3),
                         })
-                        print(f"  🐤📥 [CANARY PLACE BID] id={st['bid_oid']} | {st['bid_qty']:.1f} PRL @ ${st['bid_px']:.4f} (ext_sp={ext_sp_bp:.1f}bp) | t={_msk_iso()}")
+                        print(f"  🐤📥 [CANARY NEURAL BID] id={st['bid_oid']} | {st['bid_qty']:.2f} PRL @ ${st['bid_px']:.4f} (ext_sp={ext_sp_bp:.1f}bp | M0={p_m0:.0%} M3={p_m3:.0%}) | t={_msk_iso()}")
                         changed = True
                 except Exception:
                     pass

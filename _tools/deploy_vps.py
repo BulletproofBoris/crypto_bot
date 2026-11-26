@@ -63,6 +63,7 @@ CODE_FILES = (
     "_tools/vps_kpd_audit.py",
 )
 AUX_MODEL_FILES = (
+    "models/prl/canary_neural_v1.pt",
     "models/prl/cross_venue_first_order/cross_venue_first_order_v1.pt",
     "models/prl/hierarchical_tree_index_l28.json",
     "models/prl_bo/hierarchical_tree_index_l28.json",
@@ -213,6 +214,7 @@ def main():
                 "add",
                 "STATUS_CONTEXT.md",
                 "models/prl/release_champion_v1.pt",
+                "models/prl/canary_neural_v1.pt",
                 "models/prl/cross_venue_first_order",
                 "models/prl/order25_live",
                 "models/prl/order3_champion/l85_dualsoup_50d_50r.pt",
