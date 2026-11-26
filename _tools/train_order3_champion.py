@@ -250,13 +250,13 @@ def _normalize_weights_order3(state: dict, dtype: torch.dtype) -> dict:
     if bg2_f.shape[-1] >= 2 * K_MODES_ORDER3:
         out["b_gate2"] = torch.cat(
             [
-                torch.clamp(bg2_f[..., :K_MODES_ORDER3], -2.8, 2.8),
-                torch.clamp(bg2_f[..., K_MODES_ORDER3:], -4.5, 4.5),
+                torch.clamp(bg2_f[..., :K_MODES_ORDER3], -15.0, 15.0),
+                torch.clamp(bg2_f[..., K_MODES_ORDER3:], -6.0, 6.0),
             ],
             dim=-1,
         ).to(dtype)
     else:
-        out["b_gate2"] = torch.clamp(bg2_f, -2.8, 2.8).to(dtype)
+        out["b_gate2"] = torch.clamp(bg2_f, -15.0, 15.0).to(dtype)
     out["b_rec"] = torch.clamp(state["b_rec"].float(), -2.5, 2.5).to(dtype)
     out["b_reg1_b"] = torch.clamp(state["b_reg1_b"].float(), -3.0, 3.0).to(dtype)
     out["b_reg1_a"] = torch.clamp(state["b_reg1_a"].float(), -3.0, 3.0).to(dtype)
