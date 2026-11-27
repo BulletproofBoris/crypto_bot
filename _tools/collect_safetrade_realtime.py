@@ -34,10 +34,6 @@ MARKETS = [
     {
         "id": "pearlusdt",
         "data_dir": "/opt/crypto_bot/data/realtime/prlusdt"
-    },
-    {
-        "id": "quantususdt",
-        "data_dir": "/opt/crypto_bot/data/realtime/quantususdt"
     }
 ]
 
@@ -70,7 +66,11 @@ last_market_depth_time = {m["id"]: 0.0 for m in MARKETS}
 DEPTH_TAIL_COLS = [
     "deep_bid_vol", "deep_ask_vol",
     "max_bid_wall_price", "max_bid_wall_qty",
-    "max_ask_wall_price", "max_ask_wall_qty"
+    "max_ask_wall_price", "max_ask_wall_qty",
+    "cum_bid_05pct", "cum_bid_1pct", "cum_bid_2pct", "cum_bid_3pct", "cum_bid_4pct", "cum_bid_6pct", "cum_bid_10pct",
+    "cum_ask_05pct", "cum_ask_1pct", "cum_ask_2pct", "cum_ask_3pct", "cum_ask_5pct",
+    "work_bid_wall_price", "work_bid_wall_qty",
+    "work_ask_wall_price", "work_ask_wall_qty",
 ]
 
 def build_depth_headers():
@@ -171,6 +171,15 @@ def write_depth(market_id, timestamp_ms):
     max_bid_wall = max(all_bids, key=lambda x: parse_float(x[1][1]))
     max_ask_wall = max(all_asks, key=lambda x: parse_float(x[1][1]))
 
+    b_pq = [(p_f, parse_float(pq_s[1]), pq_s[0], pq_s[1]) for p_f, pq_s in all_bids]
+    a_pq = [(p_f, parse_float(pq_s[1]), pq_s[0], pq_s[1]) for p_f, pq_s in all_asks]
+    cum_b = [sum(q for p, q, _, _ in b_pq if p >= best_bid_p * (1.0 - thr)) for thr in (0.005, 0.01, 0.02, 0.03, 0.04, 0.06, 0.10)]
+    cum_a = [sum(q for p, q, _, _ in a_pq if p <= best_ask_p * (1.0 + thr)) for thr in (0.005, 0.01, 0.02, 0.03, 0.05)]
+    wb_cands = [x for x in b_pq if best_bid_p * 0.935 <= x[0] <= best_bid_p * 0.997] or b_pq
+    wa_cands = [x for x in a_pq if best_ask_p * 1.003 <= x[0] <= best_ask_p * 1.065] or a_pq
+    wb_max = max(wb_cands, key=lambda x: x[1])
+    wa_max = max(wa_cands, key=lambda x: x[1])
+
     file_path = os.path.join(m_info["data_dir"], "depth.csv")
     file_exists = os.path.exists(file_path)
 
@@ -200,7 +209,13 @@ def write_depth(market_id, timestamp_ms):
             max_bid_wall[1][0],
             max_bid_wall[1][1],
             max_ask_wall[1][0],
-            max_ask_wall[1][1]
+            max_ask_wall[1][1],
+            *[f"{v:.4f}" for v in cum_b],
+            *[f"{v:.4f}" for v in cum_a],
+            wb_max[2],
+            wb_max[3],
+            wa_max[2],
+            wa_max[3],
         ])
         writer.writerow(row)
 
@@ -209,7 +224,7 @@ def write_depth(market_id, timestamp_ms):
 
 async def fetch_snapshot(session, market_id):
     logger.info(f"📥 [{market_id}] Скачиваем снимок стакана...")
-    rest_url = f"https://safe.trade/api/v2/trade/public/markets/{market_id}/depth?limit=300"
+    rest_url = f"https://safe.trade/api/v2/trade/public/markets/{market_id}/depth?limit=500"
 
     attempts = [("DIRECT", None)]
     if FALLBACK_PROXY:

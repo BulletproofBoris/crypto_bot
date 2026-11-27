@@ -54,8 +54,11 @@ CODE_FILES = (
     "_tools/multitask_lob_net.py",
     "_tools/cross_venue_first_order_net.py",
     "_tools/fast_neural_engine.py",
+    "_tools/collect_safetrade_realtime.py",
+    "_tools/collect_bigone_realtime.py",
     "_tools/collect_gate_realtime.py",
     "_tools/collect_ourbit_realtime.py",
+    "_tools/collect_binance_macro.py",
     "_tools/watchdog_collectors.py",
     "_tools/train_rl_execution.py",
     "_tools/rotate_and_upload.py",
@@ -186,13 +189,19 @@ def main():
             print(f"⏸️ [VPS STAGE ONLY — SERVICE STOPPED]: {out_r.read().decode('utf-8', errors='ignore').strip()}")
         else:
             collector_map = {
+                "_tools/collect_safetrade_realtime.py": "safetrade-collector.service",
+                "_tools/collect_bigone_realtime.py": "bigone-collector.service",
                 "_tools/collect_gate_realtime.py": "gate-collector.service",
                 "_tools/collect_ourbit_realtime.py": "ourbit-collector.service",
+                "_tools/collect_binance_macro.py": "binance-collector.service",
                 "_tools/collect_onchain_and_rules.py": "onchain-collector.service",
             }
             non_trader_only = {
+                "_tools/collect_safetrade_realtime.py",
+                "_tools/collect_bigone_realtime.py",
                 "_tools/collect_gate_realtime.py",
                 "_tools/collect_ourbit_realtime.py",
+                "_tools/collect_binance_macro.py",
                 "_tools/collect_onchain_and_rules.py",
                 "_tools/watchdog_collectors.py",
                 "_tools/rotate_and_upload.py",

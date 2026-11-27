@@ -114,48 +114,17 @@ REMOTE_FILES = [
         "local": os.path.join(HOT_VPS_DIR, "ourbit_trades_hot.csv"),
         "name": "Ourbit Trades Hot (PEARL)"
     },
-    # QUANTUS / QTC
-    {
-        "remote": "/opt/crypto_bot/data/realtime/quantususdt/depth.csv",
-        "local": os.path.join(HOT_VPS_DIR, "safetrade_quantus_depth_hot.csv"),
-        "name": "SafeTrade Depth Hot (Quantus)"
-    },
-    {
-        "remote": "/opt/crypto_bot/data/realtime/quantususdt/trades.csv",
-        "local": os.path.join(HOT_VPS_DIR, "safetrade_quantus_trades_hot.csv"),
-        "name": "SafeTrade Trades Hot (Quantus)"
-    },
-    {
-        "remote": "/opt/crypto_bot/data/realtime/quantus_bigone/depth_bigone.csv",
-        "local": os.path.join(HOT_VPS_DIR, "bigone_quantus_depth_hot.csv"),
-        "name": "BigONE Depth Hot (Quantus)"
-    },
-    {
-        "remote": "/opt/crypto_bot/data/realtime/quantus_bigone/trades_bigone.csv",
-        "local": os.path.join(HOT_VPS_DIR, "bigone_quantus_trades_hot.csv"),
-        "name": "BigONE Trades Hot (Quantus)"
-    },
-    {
-        "remote": "/opt/crypto_bot/data/realtime/quantus_rhea/price_rhea.csv",
-        "local": os.path.join(HOT_VPS_DIR, "rhea_quantus_price_hot.csv"),
-        "name": "Rhea Finance Price Hot (Quantus)"
-    },
     # Binance Macro Leading Indicators (BTC + NEAR)
     {
         "remote": "/opt/crypto_bot/data/realtime/macro_binance/binance_macro.csv",
         "local": os.path.join(HOT_VPS_DIR, "binance_macro_hot.csv"),
         "name": "Binance Macro Hot (BTC + NEAR)"
     },
-    # On-chain Data
+    # On-chain Data (PRL only; Quantus excluded)
     {
         "remote": "/opt/crypto_bot/data/realtime/onchain/prl_onchain.csv",
         "local": os.path.join(HOT_VPS_DIR, "prl_onchain_hot.csv"),
         "name": "Pearl On-chain Hot (PRL)"
-    },
-    {
-        "remote": "/opt/crypto_bot/data/realtime/onchain/quantus_onchain.csv",
-        "local": os.path.join(HOT_VPS_DIR, "quantus_onchain_hot.csv"),
-        "name": "Quantus On-chain Hot (QTC)"
     },
     # Metadata & Rules
     {
@@ -256,61 +225,6 @@ DATASET_CONFIGS = [
         "hot_file": os.path.join(HOT_VPS_DIR, "prl_onchain_hot.csv"),
         "parquet_file": os.path.join(PROCESSED_DIR, "prl_onchain.parquet"),
         "hierarchical_file": os.path.join(PROCESSED_DIR, "prl", "onchain.parquet"),
-        "dedup_key": "timestamp",
-    },
-    # Quantus Datasets
-    {
-        "key": "safetrade_quantus_depth",
-        "coin": "quantus",
-        "cache_pattern": "safetrade_quantus_depth_*.csv.gz",
-        "hot_file": os.path.join(HOT_VPS_DIR, "safetrade_quantus_depth_hot.csv"),
-        "parquet_file": os.path.join(PROCESSED_DIR, "safetrade_quantus_depth.parquet"),
-        "hierarchical_file": os.path.join(PROCESSED_DIR, "quantus", "safetrade_depth.parquet"),
-        "dedup_key": "timestamp",
-    },
-    {
-        "key": "safetrade_quantus_trades",
-        "coin": "quantus",
-        "cache_pattern": "safetrade_quantus_trades_*.csv.gz",
-        "hot_file": os.path.join(HOT_VPS_DIR, "safetrade_quantus_trades_hot.csv"),
-        "parquet_file": os.path.join(PROCESSED_DIR, "safetrade_quantus_trades.parquet"),
-        "hierarchical_file": os.path.join(PROCESSED_DIR, "quantus", "safetrade_trades.parquet"),
-        "dedup_key": "id",
-    },
-    {
-        "key": "bigone_quantus_depth",
-        "coin": "quantus",
-        "cache_pattern": "bigone_quantus_depth_*.csv.gz",
-        "hot_file": os.path.join(HOT_VPS_DIR, "bigone_quantus_depth_hot.csv"),
-        "parquet_file": os.path.join(PROCESSED_DIR, "bigone_quantus_depth.parquet"),
-        "hierarchical_file": os.path.join(PROCESSED_DIR, "quantus", "bigone_depth.parquet"),
-        "dedup_key": "timestamp",
-    },
-    {
-        "key": "bigone_quantus_trades",
-        "coin": "quantus",
-        "cache_pattern": "bigone_quantus_trades_*.csv.gz",
-        "hot_file": os.path.join(HOT_VPS_DIR, "bigone_quantus_trades_hot.csv"),
-        "parquet_file": os.path.join(PROCESSED_DIR, "bigone_quantus_trades.parquet"),
-        "hierarchical_file": os.path.join(PROCESSED_DIR, "quantus", "bigone_trades.parquet"),
-        "dedup_key": "id",
-    },
-    {
-        "key": "rhea_quantus_price",
-        "coin": "quantus",
-        "cache_pattern": "rhea_quantus_price_*.csv.gz",
-        "hot_file": os.path.join(HOT_VPS_DIR, "rhea_quantus_price_hot.csv"),
-        "parquet_file": os.path.join(PROCESSED_DIR, "rhea_quantus_price.parquet"),
-        "hierarchical_file": os.path.join(PROCESSED_DIR, "quantus", "rhea_price.parquet"),
-        "dedup_key": "timestamp",
-    },
-    {
-        "key": "quantus_onchain",
-        "coin": "quantus",
-        "cache_pattern": "quantus_onchain_*.csv.gz",
-        "hot_file": os.path.join(HOT_VPS_DIR, "quantus_onchain_hot.csv"),
-        "parquet_file": os.path.join(PROCESSED_DIR, "quantus_onchain.parquet"),
-        "hierarchical_file": os.path.join(PROCESSED_DIR, "quantus", "onchain.parquet"),
         "dedup_key": "timestamp",
     },
     # Binance Macro Dataset
@@ -446,6 +360,8 @@ def sync_gdrive():
 
     for f in files_to_download:
         fname = f['name']
+        if 'quantus' in fname.lower():
+            continue
         local_path = os.path.join(CACHE_GDRIVE_DIR, fname)
         remote_size = int(f.get('size', 0))
 

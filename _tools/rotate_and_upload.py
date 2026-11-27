@@ -39,7 +39,7 @@ SERVICE_ACCOUNT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 # Порог свободного места для аварийной ротации (в гигабайтах)
 MIN_FREE_DISK_GB = 2.5
 
-# Список файлов для ротации на VPS
+# Список файлов для ротации на VPS (только целевой актив PRL + макро BTC/NEAR; Quantus исключён)
 FILES_TO_ROTATE = [
     {
         "prefix": "safetrade_depth",
@@ -48,14 +48,6 @@ FILES_TO_ROTATE = [
     {
         "prefix": "safetrade_trades",
         "path": "/opt/crypto_bot/data/realtime/prlusdt/trades.csv",
-    },
-    {
-        "prefix": "safetrade_quantus_depth",
-        "path": "/opt/crypto_bot/data/realtime/quantususdt/depth.csv",
-    },
-    {
-        "prefix": "safetrade_quantus_trades",
-        "path": "/opt/crypto_bot/data/realtime/quantususdt/trades.csv",
     },
     {
         "prefix": "bigone_depth",
@@ -82,28 +74,12 @@ FILES_TO_ROTATE = [
         "path": "/opt/crypto_bot/data/realtime/prlusdt_ourbit/trades_ourbit.csv",
     },
     {
-        "prefix": "bigone_quantus_depth",
-        "path": "/opt/crypto_bot/data/realtime/quantus_bigone/depth_bigone.csv",
-    },
-    {
-        "prefix": "bigone_quantus_trades",
-        "path": "/opt/crypto_bot/data/realtime/quantus_bigone/trades_bigone.csv",
-    },
-    {
-        "prefix": "rhea_quantus_price",
-        "path": "/opt/crypto_bot/data/realtime/quantus_rhea/price_rhea.csv",
-    },
-    {
         "prefix": "binance_macro",
         "path": "/opt/crypto_bot/data/realtime/macro_binance/binance_macro.csv",
     },
     {
         "prefix": "prl_onchain",
         "path": "/opt/crypto_bot/data/realtime/onchain/prl_onchain.csv",
-    },
-    {
-        "prefix": "quantus_onchain",
-        "path": "/opt/crypto_bot/data/realtime/onchain/quantus_onchain.csv",
     },
     {
         "prefix": "exchange_rules_history",
@@ -395,7 +371,6 @@ def rotate_all(force=False, check_disk=False):
                     "bigone-collector",
                     "gate-collector",
                     "ourbit-collector",
-                    "rhea-collector",
                     "binance-collector",
                     "onchain-collector",
                 ],

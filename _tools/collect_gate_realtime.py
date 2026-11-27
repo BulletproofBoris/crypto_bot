@@ -50,7 +50,7 @@ PAIRS = [
 ]
 
 DEPTH_LEVELS = 50
-ORDERBOOK_FETCH_LIMIT = 200
+ORDERBOOK_FETCH_LIMIT = 500
 TRADES_FETCH_LIMIT = 100
 POLL_INTERVAL = 1.0  # секунды
 LOG_FILE = os.path.join(REALTIME_ROOT, "collection_gate.log")
@@ -75,6 +75,10 @@ DEPTH_TAIL_COLS = [
     "deep_bid_vol", "deep_ask_vol",
     "max_bid_wall_price", "max_bid_wall_qty",
     "max_ask_wall_price", "max_ask_wall_qty",
+    "cum_bid_05pct", "cum_bid_1pct", "cum_bid_2pct", "cum_bid_3pct", "cum_bid_4pct", "cum_bid_6pct", "cum_bid_10pct",
+    "cum_ask_05pct", "cum_ask_1pct", "cum_ask_2pct", "cum_ask_3pct", "cum_ask_5pct",
+    "work_bid_wall_price", "work_bid_wall_qty",
+    "work_ask_wall_price", "work_ask_wall_qty",
 ]
 
 
@@ -206,6 +210,16 @@ async def fetch_pair(session: requests.AsyncSession, pair_info: dict) -> None:
                 deep_ask_vol = sum(float(a[1] or 0) for a in asks[DEPTH_LEVELS:] if len(a) >= 2)
                 max_bid_wall = max(bids, key=lambda b: float(b[1] or 0) if len(b) >= 2 else 0.0)
                 max_ask_wall = max(asks, key=lambda a: float(a[1] or 0) if len(a) >= 2 else 0.0)
+                b_pq = [(float(b[0]), float(b[1] or 0), b[0], b[1]) for b in bids if len(b) >= 2 and b[0]]
+                a_pq = [(float(a[0]), float(a[1] or 0), a[0], a[1]) for a in asks if len(a) >= 2 and a[0]]
+                b1_p = b_pq[0][0] if b_pq else 0.0
+                a1_p = a_pq[0][0] if a_pq else 0.0
+                cum_b = [sum(q for p, q, _, _ in b_pq if p >= b1_p * (1.0 - thr)) for thr in (0.005, 0.01, 0.02, 0.03, 0.04, 0.06, 0.10)]
+                cum_a = [sum(q for p, q, _, _ in a_pq if p <= a1_p * (1.0 + thr)) for thr in (0.005, 0.01, 0.02, 0.03, 0.05)]
+                wb_cands = [x for x in b_pq if b1_p * 0.935 <= x[0] <= b1_p * 0.997] or b_pq
+                wa_cands = [x for x in a_pq if a1_p * 1.003 <= x[0] <= a1_p * 1.065] or a_pq
+                wb_max = max(wb_cands, key=lambda x: x[1]) if wb_cands else (0.0, 0.0, "", "")
+                wa_max = max(wa_cands, key=lambda x: x[1]) if wa_cands else (0.0, 0.0, "", "")
                 row.extend([
                     f"{deep_bid_vol:.4f}",
                     f"{deep_ask_vol:.4f}",
@@ -213,6 +227,12 @@ async def fetch_pair(session: requests.AsyncSession, pair_info: dict) -> None:
                     max_bid_wall[1] if len(max_bid_wall) >= 2 else "",
                     max_ask_wall[0] if len(max_ask_wall) >= 2 else "",
                     max_ask_wall[1] if len(max_ask_wall) >= 2 else "",
+                    *[f"{v:.4f}" for v in cum_b],
+                    *[f"{v:.4f}" for v in cum_a],
+                    wb_max[2],
+                    wb_max[3],
+                    wa_max[2],
+                    wa_max[3],
                 ])
 
                 with open(depth_file, "a", newline="", encoding="utf-8") as f:

@@ -39,19 +39,9 @@ TARGETS = [
         "name": "SafeTrade PRL"
     },
     {
-        "service": "safetrade-collector",
-        "file": "/opt/crypto_bot/data/realtime/quantususdt/depth.csv",
-        "name": "SafeTrade Quantus"
-    },
-    {
         "service": "bigone-collector",
         "file": "/opt/crypto_bot/data/realtime/prlusdt_bigone/depth_bigone.csv",
         "name": "BigONE PRL"
-    },
-    {
-        "service": "bigone-collector",
-        "file": "/opt/crypto_bot/data/realtime/quantus_bigone/depth_bigone.csv",
-        "name": "BigONE Quantus"
     },
     {
         "service": "gate-collector",
@@ -64,11 +54,6 @@ TARGETS = [
         "name": "Ourbit PEARL"
     },
     {
-        "service": "rhea-collector",
-        "file": "/opt/crypto_bot/data/realtime/quantus_rhea/price_rhea.csv",
-        "name": "Rhea Finance Quantus"
-    },
-    {
         "service": "binance-collector",
         "file": "/opt/crypto_bot/data/realtime/macro_binance/binance_macro.csv",
         "name": "Binance Macro"
@@ -79,12 +64,6 @@ TARGETS = [
         "name": "Pearl On-chain",
         "max_stale": 180
     },
-    {
-        "service": "onchain-collector",
-        "file": "/opt/crypto_bot/data/realtime/onchain/quantus_onchain.csv",
-        "name": "Quantus On-chain",
-        "max_stale": 180
-    }
 ]
 
 def load_state():

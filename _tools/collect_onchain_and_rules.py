@@ -119,10 +119,10 @@ def init_csv_files():
             ])
 
 def fetch_safetrade_rules():
-    """Получает торговые правила SafeTrade для pearlusdt (prlusdt), quantususdt."""
+    """Получает торговые правила SafeTrade для pearlusdt (prlusdt)."""
     logger.info("Запрос торговых правил SafeTrade...")
     markets_data = []
-    target_ids = {"pearlusdt": "PRL", "prlusdt": "PRL", "quantususdt": "QUANTUS"}
+    target_ids = {"pearlusdt": "PRL", "prlusdt": "PRL"}
     rules = {}
     
     for proxies in [None, {"http": SAFETRADE_PROXY, "https": SAFETRADE_PROXY}]:
@@ -175,7 +175,7 @@ def fetch_bigone_rules():
         r_pairs = requests.get("https://big.one/api/v3/asset_pairs", timeout=10)
         pairs_data = r_pairs.json().get("data", []) if r_pairs.status_code == 200 else []
 
-        target_pairs = {"PEARL-USDT": "PRL", "PRL-USDT": "PRL", "QTC-USDT": "QUANTUS"}
+        target_pairs = {"PEARL-USDT": "PRL", "PRL-USDT": "PRL"}
         for p in pairs_data:
             name = p.get("name")
             if name in target_pairs:
@@ -193,7 +193,7 @@ def fetch_bigone_rules():
 
         for a in assets_data:
             sym = a.get("symbol")
-            pair_keys = ["PEARL-USDT", "PRL-USDT"] if sym in ("PEARL", "PRL") else (["QTC-USDT"] if sym == "QTC" else [])
+            pair_keys = ["PEARL-USDT", "PRL-USDT"] if sym in ("PEARL", "PRL") else []
             for pair_key in pair_keys:
                 if pair_key in rules:
                     gateways = a.get("binding_gateways", [])
@@ -476,9 +476,8 @@ def main_loop():
 
     while True:
         try:
-            # 1. Ончейн-опрос (каждые 30 секунд)
+            # 1. Ончейн-опрос Pearl (каждые 30 секунд; Quantus исключён из пула)
             collect_prl_onchain()
-            collect_quantus_onchain()
 
             # 2. Обновление правил бирж (каждый 1 час = 3600 сек)
             now = time.time()

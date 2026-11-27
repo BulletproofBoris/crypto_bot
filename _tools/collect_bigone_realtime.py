@@ -27,10 +27,6 @@ PAIRS = [
     {
         "symbol": "PEARL-USDT",
         "dir": "/opt/crypto_bot/data/realtime/prlusdt_bigone"
-    },
-    {
-        "symbol": "QTC-USDT",
-        "dir": "/opt/crypto_bot/data/realtime/quantus_bigone"
     }
 ]
 
@@ -57,7 +53,11 @@ last_trade_ids = {p["symbol"]: None for p in PAIRS}
 DEPTH_TAIL_COLS = [
     "deep_bid_vol", "deep_ask_vol",
     "max_bid_wall_price", "max_bid_wall_qty",
-    "max_ask_wall_price", "max_ask_wall_qty"
+    "max_ask_wall_price", "max_ask_wall_qty",
+    "cum_bid_05pct", "cum_bid_1pct", "cum_bid_2pct", "cum_bid_3pct", "cum_bid_4pct", "cum_bid_6pct", "cum_bid_10pct",
+    "cum_ask_05pct", "cum_ask_1pct", "cum_ask_2pct", "cum_ask_3pct", "cum_ask_5pct",
+    "work_bid_wall_price", "work_bid_wall_qty",
+    "work_ask_wall_price", "work_ask_wall_qty",
 ]
 
 def build_depth_headers():
@@ -169,13 +169,29 @@ async def fetch_pair(session, pair_info):
                 deep_ask_vol = sum(float(a.get('quantity', 0) or 0) for a in asks[DEPTH_LEVELS:])
                 max_bid_wall = max(bids, key=lambda b: float(b.get('quantity', 0) or 0))
                 max_ask_wall = max(asks, key=lambda a: float(a.get('quantity', 0) or 0))
+                b_pq = [(float(b['price']), float(b.get('quantity', 0) or 0), str(b['price']), str(b.get('quantity', ''))) for b in bids if b.get('price')]
+                a_pq = [(float(a['price']), float(a.get('quantity', 0) or 0), str(a['price']), str(a.get('quantity', ''))) for a in asks if a.get('price')]
+                b1_p = b_pq[0][0] if b_pq else 0.0
+                a1_p = a_pq[0][0] if a_pq else 0.0
+                cum_b = [sum(q for p, q, _, _ in b_pq if p >= b1_p * (1.0 - thr)) for thr in (0.005, 0.01, 0.02, 0.03, 0.04, 0.06, 0.10)]
+                cum_a = [sum(q for p, q, _, _ in a_pq if p <= a1_p * (1.0 + thr)) for thr in (0.005, 0.01, 0.02, 0.03, 0.05)]
+                wb_cands = [x for x in b_pq if b1_p * 0.935 <= x[0] <= b1_p * 0.997] or b_pq
+                wa_cands = [x for x in a_pq if a1_p * 1.003 <= x[0] <= a1_p * 1.065] or a_pq
+                wb_max = max(wb_cands, key=lambda x: x[1]) if wb_cands else (0.0, 0.0, "", "")
+                wa_max = max(wa_cands, key=lambda x: x[1]) if wa_cands else (0.0, 0.0, "", "")
                 row.extend([
                     f"{deep_bid_vol:.4f}",
                     f"{deep_ask_vol:.4f}",
                     max_bid_wall.get('price', ''),
                     max_bid_wall.get('quantity', ''),
                     max_ask_wall.get('price', ''),
-                    max_ask_wall.get('quantity', '')
+                    max_ask_wall.get('quantity', ''),
+                    *[f"{v:.4f}" for v in cum_b],
+                    *[f"{v:.4f}" for v in cum_a],
+                    wb_max[2],
+                    wb_max[3],
+                    wa_max[2],
+                    wa_max[3],
                 ])
 
                 with open(depth_file, "a", newline="") as f:
