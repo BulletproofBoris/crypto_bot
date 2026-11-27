@@ -387,7 +387,21 @@ def rotate_all(force=False, check_disk=False):
         logger.info("🔄 Перезапуск служб сборщиков после ротации для обновления дескрипторов и снимков стакана...")
         try:
             import subprocess
-            subprocess.run(["systemctl", "restart", "safetrade-collector", "bigone-collector", "rhea-collector", "binance-collector", "onchain-collector"], check=True, timeout=30)
+            subprocess.run(
+                [
+                    "systemctl",
+                    "restart",
+                    "safetrade-collector",
+                    "bigone-collector",
+                    "gate-collector",
+                    "ourbit-collector",
+                    "rhea-collector",
+                    "binance-collector",
+                    "onchain-collector",
+                ],
+                check=True,
+                timeout=35,
+            )
             logger.info("✅ Службы сборщиков успешно перезапущены.")
         except Exception as e:
             logger.error(f"⚠️ Ошибка при перезапуске служб сборщиков: {e}")

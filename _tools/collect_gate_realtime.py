@@ -186,11 +186,9 @@ async def fetch_pair(session: requests.AsyncSession, pair_info: dict) -> None:
             asks = depth_data.get("asks") or []
 
             if bids and asks:
-                upd_ms = depth_data.get("update") or depth_data.get("current")
-                if upd_ms:
-                    ts = datetime.fromtimestamp(float(upd_ms) / 1000.0, tz=timezone.utc).isoformat()
-                else:
-                    ts = datetime.now(timezone.utc).isoformat()
+                # Фиксируем монотонное UTC-время приёма кадра (как в SafeTrade/BigONE),
+                # так как depth_data["update"] на Gate не двигается в паузах стакана и скачет между нодами API.
+                ts = datetime.now(timezone.utc).isoformat()
 
                 row = [ts]
                 for i in range(DEPTH_LEVELS):

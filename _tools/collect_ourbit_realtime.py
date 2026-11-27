@@ -209,11 +209,8 @@ async def fetch_pair(session: requests.AsyncSession, pair_info: dict) -> None:
             asks = depth_data.get("asks") or []
 
             if bids and asks:
-                ts_ms = depth_data.get("timestamp")
-                if ts_ms:
-                    ts = datetime.fromtimestamp(float(ts_ms) / 1000.0, tz=timezone.utc).isoformat()
-                else:
-                    ts = datetime.now(timezone.utc).isoformat()
+                # Фиксируем монотонное UTC-время приёма кадра (исключает микро-откаты timestamp между нодами Ourbit API)
+                ts = datetime.now(timezone.utc).isoformat()
 
                 row = [ts]
                 for i in range(DEPTH_LEVELS):

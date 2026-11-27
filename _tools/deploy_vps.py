@@ -59,6 +59,7 @@ CODE_FILES = (
     "_tools/watchdog_collectors.py",
     "_tools/train_rl_execution.py",
     "_tools/rotate_and_upload.py",
+    "_tools/trim_telemetry_inplace.py",
     "_tools/collect_onchain_and_rules.py",
     "_tools/vps_kpd_audit.py",
 )
@@ -184,9 +185,29 @@ def main():
             )
             print(f"⏸️ [VPS STAGE ONLY — SERVICE STOPPED]: {out_r.read().decode('utf-8', errors='ignore').strip()}")
         else:
+            collector_map = {
+                "_tools/collect_gate_realtime.py": "gate-collector.service",
+                "_tools/collect_ourbit_realtime.py": "ourbit-collector.service",
+                "_tools/collect_onchain_and_rules.py": "onchain-collector.service",
+            }
+            non_trader_only = {
+                "_tools/collect_gate_realtime.py",
+                "_tools/collect_ourbit_realtime.py",
+                "_tools/collect_onchain_and_rules.py",
+                "_tools/watchdog_collectors.py",
+                "_tools/rotate_and_upload.py",
+                "_tools/trim_telemetry_inplace.py",
+                "_tools/vps_kpd_audit.py",
+            }
+            for cf, svc in collector_map.items():
+                if cf in changed_code:
+                    _, out_c, _ = ssh.exec_command(f"systemctl restart {svc} && sleep 1 && systemctl is-active {svc}")
+                    print(f"🔄 [VPS COLLECTOR RESTART {svc}]: {out_c.read().decode('utf-8', errors='ignore').strip()}")
+
+            changed_trader_code = [f for f in changed_code if f not in non_trader_only]
             _, out_act, _ = ssh.exec_command("systemctl is-active live-rl-prl-l9.service")
             is_act = out_act.read().decode("utf-8", errors="ignore").strip() == "active"
-            if changed_code or changed_aux or not is_act:
+            if changed_trader_code or changed_aux or not is_act:
                 _, out_r, _ = ssh.exec_command(
                     "systemctl restart live-rl-prl-l9.service && sleep 6 && systemctl is-active live-rl-prl-l9.service"
                 )
