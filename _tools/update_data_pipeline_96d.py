@@ -84,7 +84,8 @@ def main() -> None:
     o25_cmd = [PY, "_tools/train_order25_impact_and_regret.py"] + (["--eval-only"] if args.eval_only else [])
     _run_step("10/11 Сборка слоя 88D Order-2.5 (DEC + RAW)", o25_cmd, env)
 
-    _run_step("11/11 Финальная сборка Signal Stack v7 (96D DEC + RAW)", [PY, "_tools/build_hybrid_market_obs_96d.py"], env)
+    _run_step("11/12 Финальная сборка Signal Stack v7 (96D DEC + RAW)", [PY, "_tools/build_hybrid_market_obs_96d.py"], env)
+    _run_step("12/12 Сборка Signal Stack v8 (112D Lead-Lag + Macro + Deep L50/L500 Profile)", [PY, "_tools/build_hybrid_market_obs_112d.py"], env)
 
     if not args.keep_intermediate:
         cdir = BASE_DIR / "data" / "cache"

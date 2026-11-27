@@ -365,8 +365,10 @@ def sync_gdrive():
         local_path = os.path.join(CACHE_GDRIVE_DIR, fname)
         remote_size = int(f.get('size', 0))
 
-        # Проверяем кэш: если файл уже есть и совпадает по размеру, пропускаем
+        # Проверяем кэш: если файл уже есть и совпадает по размеру (или помечен как отреставрированный 1Hz), пропускаем
         if os.path.exists(local_path):
+            if os.path.exists(local_path + ".repaired_1hz"):
+                continue
             local_size = os.path.getsize(local_path)
             if local_size == remote_size:
                 continue
@@ -633,15 +635,30 @@ def build_dataset_for_config(cfg, include_vps=True):
 
         logger.info(f"📦 Потоковое слияние Parquet {key}: +{len(new_df):,} новых строк после {max_old_ts}...")
         new_df = sanitize_dataset(new_df, key, PROCESSED_DIR)
-        for col in old_schema.names:
+        extra_cols = [c for c in new_df.columns if c not in old_schema.names]
+        if extra_cols:
+            ext_fields = list(old_schema)
+            for ec in extra_cols:
+                new_df[ec] = pd.to_numeric(new_df[ec], errors="coerce").astype("float64")
+                ext_fields.append(pa.field(ec, pa.float64()))
+            target_schema = pa.schema(ext_fields)
+        else:
+            target_schema = old_schema
+        for col in target_schema.names:
             if col not in new_df.columns:
                 new_df[col] = np.nan
-        new_df = new_df[list(old_schema.names)]
-        new_tab = pa.Table.from_pandas(new_df, schema=old_schema, preserve_index=False)
+        new_df = new_df[list(target_schema.names)]
+        new_tab = pa.Table.from_pandas(new_df, schema=target_schema, preserve_index=False)
         tmp_pq = parquet_path + ".tmp"
-        with pq.ParquetWriter(tmp_pq, old_schema, compression='snappy') as writer:
+        with pq.ParquetWriter(tmp_pq, target_schema, compression='snappy') as writer:
             for rg_i in range(pf_old.num_row_groups):
-                writer.write_table(pf_old.read_row_group(rg_i))
+                rg_tbl = pf_old.read_row_group(rg_i)
+                if extra_cols:
+                    n_r = rg_tbl.num_rows
+                    null_arr = pa.array(np.full(n_r, np.nan, dtype=np.float64), type=pa.float64())
+                    for ec in extra_cols:
+                        rg_tbl = rg_tbl.append_column(ec, null_arr)
+                writer.write_table(rg_tbl)
             writer.write_table(new_tab)
         t_max_new = new_df['timestamp'].max() if 'timestamp' in new_df.columns else None
         n_added = len(new_df)

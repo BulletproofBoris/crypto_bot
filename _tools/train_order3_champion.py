@@ -433,6 +433,9 @@ class MultimodalMoEPolicyOrder3:
                 if old_mkt_d < 96 and MKT_DIM_ORDER3 >= 96 and old_mkt_d >= 94:
                     # L80 Net2Net нулевой старт 2h Exhaustion/Capitulation [94..95] (0.00e+00 паритет на старте!):
                     w1_mkt[94:96] = 0.0
+                if old_mkt_d < 112 and MKT_DIM_ORDER3 >= 112 and old_mkt_d >= 96:
+                    # L93 Net2Net нулевой старт Signal Stack v8 [96..111] (0.00e+00 паритет на старте!):
+                    w1_mkt[96:112] = 0.0
             else:
                 w1_ag = ck["w1"][370:, :].float().clone()
             w1_full = torch.cat([w1_mkt, w1_ag], dim=0)
@@ -445,7 +448,10 @@ class MultimodalMoEPolicyOrder3:
             old_rin, old_rh = wg1_old.shape
             ch_r = min(old_rh, ROUTER_H_DIM_ORDER3)
             bg1_new[:, :ch_r] = bg1_old[:, :ch_r]
-            if old_rin == 370 and ROUTER_IN_DIM_ORDER3 == 386:
+            if old_rin == 386 and ROUTER_IN_DIM_ORDER3 == 402:
+                wg1_new[:378, :ch_r] = wg1_old[:378, :ch_r]
+                wg1_new[394:402, :ch_r] = wg1_old[378:386, :ch_r]
+            elif old_rin == 370 and ROUTER_IN_DIM_ORDER3 == 386:
                 wg1_new[:320, :ch_r] = wg1_old[:320, :ch_r]
                 wg1_new[336:386, :ch_r] = wg1_old[320:370, :ch_r]
             elif old_rin == 368 and ROUTER_IN_DIM_ORDER3 == 386:
@@ -542,6 +548,10 @@ class MultimodalMoEPolicyOrder3:
                 # L80 Function-preserving Net2Net старт для [56] recycle_anchor_z и [57] deep_hyst_z (-12.0 -> 0.00e+00 паритет до разморозки):
                 w2m_new[:, :, 56:58] = 0.0
                 b2m_new[:, :, 56:58] = -12.0
+            if old_exp_d <= 58 and EXPERT_OUT_DIM_ORDER3 >= 60:
+                # L93 Function-preserving Net2Net старт для [58] wall_anchor_z и [59] agile_pod_z (-12.0 -> 0.00e+00 паритет до разморозки):
+                w2m_new[:, :, 58:60] = 0.0
+                b2m_new[:, :, 58:60] = -12.0
 
             w2m_flat = w2m_new.reshape(256, MOE_OUT_DIM_ORDER3)
             b2m_flat = b2m_new.reshape(1, MOE_OUT_DIM_ORDER3)
@@ -573,7 +583,15 @@ class MultimodalMoEPolicyOrder3:
             if "w_moe_up" in ck and ck["w_moe_up"].shape == (256, MOE_MLP_UP_DIM_ORDER3):
                 wmup_new = ck["w_moe_up"].float()
                 bmup_new = ck["b_moe_up"].float().view(1, MOE_MLP_UP_DIM_ORDER3)
-                wmdn_new = ck["w_moe_dn"].float().view(K_MODES_ORDER3, MOE_MLP_H_ORDER3, EXPERT_OUT_DIM_ORDER3)
+                wmdn_raw = ck["w_moe_dn"].float()
+                if wmdn_raw.numel() == K_MODES_ORDER3 * MOE_MLP_H_ORDER3 * EXPERT_OUT_DIM_ORDER3:
+                    wmdn_new = wmdn_raw.view(K_MODES_ORDER3, MOE_MLP_H_ORDER3, EXPERT_OUT_DIM_ORDER3)
+                else:
+                    old_dn_ed = wmdn_raw.shape[-1]
+                    wmdn_old = wmdn_raw.view(K_MODES_ORDER3, MOE_MLP_H_ORDER3, old_dn_ed)
+                    wmdn_new = torch.zeros((K_MODES_ORDER3, MOE_MLP_H_ORDER3, EXPERT_OUT_DIM_ORDER3), dtype=torch.float32)
+                    c_dn = min(old_dn_ed, EXPERT_OUT_DIM_ORDER3)
+                    wmdn_new[:, :, :c_dn] = wmdn_old[:, :, :c_dn]
             else:
                 # Живой ортогональный базис в 1-м слое + нулевой выходной слой w_moe_dn -> 0.00e+00 паритет на Gen 0 и мгновенный градиент с Gen 1!
                 wmup_new = torch.randn((256, MOE_MLP_UP_DIM_ORDER3), generator=gen) * 0.055

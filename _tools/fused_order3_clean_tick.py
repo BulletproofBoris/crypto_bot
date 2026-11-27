@@ -18,18 +18,18 @@ os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
 import torch
 import torch.nn.functional as F
 
-MKT_DIM_ORDER3 = 96
+MKT_DIM_ORDER3 = 112
 AG_DIM_ORDER3 = 110
-TOTAL_DIM_ORDER3 = 206
+TOTAL_DIM_ORDER3 = 222
 
 MEM_DIM_ORDER3 = 64
 K_MODES_ORDER3 = 8
-EXPERT_OUT_DIM_ORDER3 = 58
-MOE_OUT_DIM_ORDER3 = K_MODES_ORDER3 * EXPERT_OUT_DIM_ORDER3  # 464
+EXPERT_OUT_DIM_ORDER3 = 60
+MOE_OUT_DIM_ORDER3 = K_MODES_ORDER3 * EXPERT_OUT_DIM_ORDER3  # 480
 MOE_MLP_H_ORDER3 = 48
 MOE_MLP_UP_DIM_ORDER3 = K_MODES_ORDER3 * (2 * MOE_MLP_H_ORDER3)  # 8 * 96 = 768
-ROUTER_EXTRA_DIM_ORDER3 = 42
-ROUTER_IN_DIM_ORDER3 = 256 + 8 + 8 + MEM_DIM_ORDER3 + ROUTER_EXTRA_DIM_ORDER3 + K_MODES_ORDER3  # 386
+ROUTER_EXTRA_DIM_ORDER3 = 58
+ROUTER_IN_DIM_ORDER3 = 256 + 8 + 8 + MEM_DIM_ORDER3 + ROUTER_EXTRA_DIM_ORDER3 + K_MODES_ORDER3  # 402
 ROUTER_H_DIM_ORDER3 = 128
 ROUTER_RES_H_ORDER3 = 64
 ROUTER_OUT_DIM_ORDER3 = 2 * K_MODES_ORDER3  # 16: 8 mode logits + 8 liquid update gates!
@@ -113,6 +113,11 @@ def _scale_mkt_44d(z_mkt: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
         # Signal Stack v7 (L80 2-Hour Exhaustion/Capitulation & Tape CVD):
         zm[..., 94] = zm[..., 94] * 2.5
         zm[..., 95] = zm[..., 95] * 2.0
+    if zm.shape[-1] >= 112:
+        # Signal Stack v8 (L93 Cross-Venue Lead-Lag Gate/Ourbit, Macro BTC/NEAR & Deep L50/L500 Protective Walls):
+        zm[..., 96:110] = zm[..., 96:110] * 1.8
+        zm[..., 110] = (zm[..., 110] - 0.50) * 2.0
+        zm[..., 111] = (zm[..., 111] - 0.35) * 2.5
     return zm.to(dt)
 
 
@@ -405,6 +410,7 @@ def _order3_clean_tick_step(
             mkt_w[:, 72:76], mkt_w[:, 79:82], mkt_w[:, 83:84],
             mkt_w[:, 84:88],
             mkt_w[:, 88:96],
+            mkt_w[:, 96:112],
         ],
         dim=-1,
     ).to(dt)
@@ -460,6 +466,8 @@ def _order3_clean_tick_step(
             bid_blend[:, 55:56],    # [55] micro_sniper_z (L79 изолированный микро-снайпер широкого спреда на слоте #00!)
             bid_blend[:, 56:57],    # [56] recycle_anchor_z (L80 якорь рециклинга: потолок откупа ниже last_sell_px!)
             bid_blend[:, 57:58],    # [57] deep_hyst_z (L80 эндогенный гистерезис перестановки глубоких заявок!)
+            bid_blend[:, 58:59],    # [58] wall_anchor_z (L93 привязка цены к защитной стене стакана L50/L500 + 1 tick!)
+            bid_blend[:, 59:60],    # [59] agile_pod_z (L93 изолированный 20% суб-транш Agile Pod, охраняющий 80% Core Vault!)
         ],
         dim=-1,
     )
@@ -471,11 +479,12 @@ def _order3_clean_tick_step(
     mode_ent_step = -(g_mode * torch.log(torch.clamp(g_mode, min=1e-6))).sum(dim=-1)
     sum_mode_ent = sum_mode_ent + mode_ent_step
 
-    # 1C. 100% Эндогенная экспозиция [0..1] + L79 Wide-Spread Micro-Sniper [55] (до 6.5% на слоте #00 при спреде >35..80 bp):
+    # 1C. 100% Эндогенная экспозиция [0..1] + L93 Двухтраншевый Изолятор [59] (0.00e+00 при b2=-12):
     rel_sp_now = (a1 - b1) / torch.clamp(b1, min=tick_size)
     wide_sp_gate = torch.clamp((rel_sp_now - 0.0035) / 0.0045, 0.0, 1.0)
     eff_micro_s = torch.sigmoid(strat_raw[:, 55]) * wide_sp_gate
-    exp_bid_frac = torch.maximum(torch.sigmoid(strat_raw[:, 0]), 0.065 * eff_micro_s)
+    pod_cap_mult = 1.0 - 0.80 * torch.sigmoid(strat_raw[:, 59])
+    exp_bid_frac = torch.maximum(torch.sigmoid(strat_raw[:, 0]) * pod_cap_mult, 0.065 * eff_micro_s)
     renorm_blend = torch.sigmoid(strat_raw[:, 47:48])
 
     tau_b = 0.08 + 2.42 * torch.sigmoid(strat_raw[:, 34:35])
@@ -589,6 +598,14 @@ def _order3_clean_tick_step(
     rec_disc = 0.0040 + 0.0160 * torch.sigmoid(strat_raw[:, 56] - 1.0)
     rec_cap_px = (last_sell_px * (1.0 - rec_disc)).unsqueeze(1)
     raw_t_bid = (1.0 - rec_w) * raw_t_bid + rec_w * torch.minimum(raw_t_bid, rec_cap_px)
+    # L93 Wall-Anchored Offset [58] (притяжение передних слотов на +1 тик перед защитной плитой L50/L500, 0.00e+00 при b2=-12):
+    w_dist_raw = torch.clamp(mkt_w[:, 110].float() * 0.5 + 0.50, 0.003, 1.50)
+    w_str_raw = mkt_w[:, 111].float() * 0.4 + 0.35
+    has_prot_wall = (w_dist_raw < 0.98) & (w_str_raw > 0.18)
+    wall_front_px = (b1 * (1.0 - 0.06 * w_dist_raw) + tick_size).unsqueeze(1)
+    ech_w_sq = torch.pow(1.0 - echelon_k01, 2.0).unsqueeze(0)
+    w_wall_k = (torch.sigmoid(strat_raw[:, 58]) * has_prot_wall.float()).unsqueeze(1) * ech_w_sq
+    raw_t_bid = (1.0 - w_wall_k) * raw_t_bid + w_wall_k * wall_front_px
     max_maker_bid = torch.clamp(a1 - tick_size, min=tick_size).unsqueeze(1)
     t_bid_px = torch.clamp(torch.round(torch.minimum(raw_t_bid, max_maker_bid) / tick_size) * tick_size, min=tick_size)
 
@@ -624,7 +641,7 @@ def _order3_clean_tick_step(
     tot_bud_eff = torch.maximum(budget, cash + pos_qty * b1)
     target_bid_pool_usd = torch.clamp(tot_bud_eff * 0.996 * exp_bid_frac - pos_qty * b1, min=0.0)
     q_target_b = (target_bid_pool_usd.unsqueeze(1) * pi_bid) / (t_bid_px * (1.0 + maker_fee))
-    q_target_b = torch.where(q_target_b >= 2.0, q_target_b, torch.zeros_like(q_target_b))
+    q_target_b = torch.where((q_target_b >= 2.0) & ((q_target_b * t_bid_px) >= 12.0), q_target_b, torch.zeros_like(q_target_b))
 
     q_target_a = torch.where(hp_now_mask, pos_qty.unsqueeze(1) * pi_ask, torch.zeros_like(pi_ask))
     q_target_a = torch.where(q_target_a >= 2.0, q_target_a, torch.zeros_like(q_target_a))
@@ -807,7 +824,7 @@ def _order3_clean_tick_step(
     avail_b_usd = torch.minimum(free_cash_for_b, rem_exp_for_b)
 
     empty_b_now = (bid_qty <= 1e-6) & ((~clear_b) if true_latency else torch.ones_like(clear_b))
-    cand_plc_b = empty_b_now & g_plc_b & (pi_bid > 1e-4) & ((avail_b_usd.unsqueeze(1) / (t_bid_px * (1.0 + maker_fee))) >= 2.0)
+    cand_plc_b = empty_b_now & g_plc_b & (pi_bid > 1e-4) & (avail_b_usd.unsqueeze(1) >= 12.0) & ((avail_b_usd.unsqueeze(1) / (t_bid_px * (1.0 + maker_fee))) >= 2.0)
     ord_b_idx = torch.argsort(torch.where(cand_plc_b, pi_bid, torch.full_like(pi_bid, -1.0)), dim=1, descending=True)
     inv_b_idx = torch.argsort(ord_b_idx, dim=1)
     cand_b_sorted = torch.gather(cand_plc_b.float(), 1, ord_b_idx)
@@ -820,7 +837,7 @@ def _order3_clean_tick_step(
     raw_share_b = torch.where(want_place_b, torch.minimum(pi_bid, full_share_b), torch.zeros_like(pi_bid))
     share_sel_b = renorm_blend * full_share_b + (1.0 - renorm_blend) * raw_share_b
     plc_b_qty = torch.floor(((avail_b_usd.unsqueeze(1) * share_sel_b * 0.999) / (t_bid_px * (1.0 + maker_fee))) * 10000.0) / 10000.0
-    valid_b = want_place_b & (plc_b_qty >= 2.0)
+    valid_b = want_place_b & (plc_b_qty >= 2.0) & ((plc_b_qty * t_bid_px) >= 12.0)
     plc_b_qty = torch.where(valid_b, plc_b_qty, torch.zeros_like(plc_b_qty))
     n_plc_b_step = valid_b.long().sum(dim=1)
     api_tokens = torch.clamp(api_tokens - valid_b.float().sum(dim=1), min=0.0)
@@ -1537,6 +1554,8 @@ def evaluate_order3_basket(
                 b2m_pad[:, :, 55] = -12.0
             if old_exp_d <= 56 and EXPERT_OUT_DIM_ORDER3 >= 58:
                 b2m_pad[:, :, 56:58] = -12.0
+            if old_exp_d <= 58 and EXPERT_OUT_DIM_ORDER3 >= 60:
+                b2m_pad[:, :, 58:60] = -12.0
             w2m_t = w2m_pad.reshape(256, MOE_OUT_DIM_ORDER3)
             b2m_t = b2m_pad.reshape(1, MOE_OUT_DIM_ORDER3)
         w2m_l.append(w2m_t.to(dtype=dt))
@@ -1544,7 +1563,16 @@ def evaluate_order3_basket(
         if 'w_moe_up' in st and st['w_moe_up'].shape == (256, MOE_MLP_UP_DIM_ORDER3):
             wmup_l.append(st['w_moe_up'].to(device=device, dtype=dt))
             bmup_l.append(st['b_moe_up'].to(device=device, dtype=dt).view(1, MOE_MLP_UP_DIM_ORDER3))
-            wmdn_l.append(st['w_moe_dn'].to(device=device, dtype=dt).view(K_MODES_ORDER3, MOE_MLP_H_ORDER3, EXPERT_OUT_DIM_ORDER3))
+            wmdn_raw = st['w_moe_dn'].to(device=device, dtype=torch.float32)
+            if wmdn_raw.numel() == K_MODES_ORDER3 * MOE_MLP_H_ORDER3 * EXPERT_OUT_DIM_ORDER3:
+                wmdn_pad = wmdn_raw.view(K_MODES_ORDER3, MOE_MLP_H_ORDER3, EXPERT_OUT_DIM_ORDER3)
+            else:
+                old_dn_ed = wmdn_raw.shape[-1]
+                wmdn_old = wmdn_raw.view(K_MODES_ORDER3, MOE_MLP_H_ORDER3, old_dn_ed)
+                wmdn_pad = torch.zeros((K_MODES_ORDER3, MOE_MLP_H_ORDER3, EXPERT_OUT_DIM_ORDER3), dtype=torch.float32, device=device)
+                c_dn = min(old_dn_ed, EXPERT_OUT_DIM_ORDER3)
+                wmdn_pad[:, :, :c_dn] = wmdn_old[:, :, :c_dn]
+            wmdn_l.append(wmdn_pad.to(dtype=dt))
         else:
             wmup_l.append(torch.zeros((256, MOE_MLP_UP_DIM_ORDER3), dtype=dt, device=device))
             bmup_l.append(torch.zeros((1, MOE_MLP_UP_DIM_ORDER3), dtype=dt, device=device))
@@ -1560,7 +1588,11 @@ def evaluate_order3_basket(
             bg1_pad = torch.zeros((1, ROUTER_H_DIM_ORDER3), dtype=torch.float32, device=device)
             ch_r = min(old_rh, ROUTER_H_DIM_ORDER3)
             bg1_pad[:, :ch_r] = bg1_t[:, :ch_r]
-            if old_rin == 370 and ROUTER_IN_DIM_ORDER3 == 386:
+            if old_rin == 386 and ROUTER_IN_DIM_ORDER3 == 402:
+                # 42D extra (idx 336..378) -> 58D extra (idx 336..394), modes (idx 378..386) -> (idx 394..402)
+                wg1_pad[:378, :ch_r] = wg1_t[:378, :ch_r]
+                wg1_pad[394:402, :ch_r] = wg1_t[378:386, :ch_r]
+            elif old_rin == 370 and ROUTER_IN_DIM_ORDER3 == 386:
                 # 48D mem (idx 272..320) -> 64D mem (idx 272..336), extra+modes (idx 320..370) -> (idx 336..386)
                 wg1_pad[:320, :ch_r] = wg1_t[:320, :ch_r]
                 wg1_pad[336:386, :ch_r] = wg1_t[320:370, :ch_r]
@@ -1806,6 +1838,7 @@ def evaluate_order3_basket(
             zw_last[:, 72:76], zw_last[:, 79:82], zw_last[:, 83:84],
             zw_last[:, 84:88],
             zw_last[:, 88:96],
+            zw_last[:, 96:112],
         ],
         dim=-1,
     ).to(dt).unsqueeze(0).expand(C, W, ROUTER_EXTRA_DIM_ORDER3)

@@ -136,9 +136,13 @@ class Order3LiveInferenceEngine:
             bg1_adap = torch.zeros((1, ROUTER_H_DIM_ORDER3), dtype=torch.float32)
             ch_r = min(old_rh, ROUTER_H_DIM_ORDER3)
             bg1_adap[:, :ch_r] = bg1_raw[:, :ch_r]
-            if old_rin == 370 and ROUTER_IN_DIM_ORDER3 == 386:
+            if old_rin == 386 and ROUTER_IN_DIM_ORDER3 == 402:
+                wg1_adap[:378, :ch_r] = wg1_raw[:378, :ch_r]
+                wg1_adap[394:402, :ch_r] = wg1_raw[378:386, :ch_r]
+            elif old_rin == 370 and ROUTER_IN_DIM_ORDER3 >= 386:
                 wg1_adap[:320, :ch_r] = wg1_raw[:320, :ch_r]
-                wg1_adap[336:386, :ch_r] = wg1_raw[320:370, :ch_r]
+                wg1_adap[336:378, :ch_r] = wg1_raw[320:362, :ch_r]
+                wg1_adap[ROUTER_IN_DIM_ORDER3 - 8 : ROUTER_IN_DIM_ORDER3, :ch_r] = wg1_raw[362:370, :ch_r]
             elif old_rin == 368 and ROUTER_IN_DIM_ORDER3 == 386:
                 wg1_adap[:320, :ch_r] = wg1_raw[:320, :ch_r]
                 wg1_adap[336:376, :ch_r] = wg1_raw[320:360, :ch_r]
@@ -212,6 +216,8 @@ class Order3LiveInferenceEngine:
                 b2m_pad[:, :, 55] = -12.0
             if old_ed <= 56 and EXPERT_OUT_DIM_ORDER3 >= 58:
                 b2m_pad[:, :, 56:58] = -12.0
+            if old_ed <= 58 and EXPERT_OUT_DIM_ORDER3 >= 60:
+                b2m_pad[:, :, 58:60] = -12.0
             w2m_raw = w2m_pad.reshape(256, self.moe_out_dim)
             b2m_raw = b2m_pad.reshape(1, self.moe_out_dim)
         self.w2_moe = w2m_raw.to(device=self.device)
@@ -219,7 +225,13 @@ class Order3LiveInferenceEngine:
         if "w_moe_up" in ck and ck["w_moe_up"].shape == (256, MOE_MLP_UP_DIM_ORDER3):
             self.w_moe_up = ck["w_moe_up"].to(device=self.device, dtype=torch.float32)
             self.b_moe_up = ck["b_moe_up"].view(1, MOE_MLP_UP_DIM_ORDER3).to(device=self.device, dtype=torch.float32)
-            self.w_moe_dn = ck["w_moe_dn"].view(self.k_modes, MOE_MLP_H_ORDER3, EXPERT_OUT_DIM_ORDER3).to(device=self.device, dtype=torch.float32)
+            wmdn_ck = ck["w_moe_dn"].to(dtype=torch.float32)
+            if wmdn_ck.shape[-1] != EXPERT_OUT_DIM_ORDER3:
+                wmdn_pad = torch.zeros((self.k_modes, MOE_MLP_H_ORDER3, EXPERT_OUT_DIM_ORDER3), dtype=torch.float32)
+                c_dn = min(wmdn_ck.shape[-1], EXPERT_OUT_DIM_ORDER3)
+                wmdn_pad[:, :, :c_dn] = wmdn_ck.view(self.k_modes, MOE_MLP_H_ORDER3, -1)[:, :, :c_dn]
+                wmdn_ck = wmdn_pad
+            self.w_moe_dn = wmdn_ck.view(self.k_modes, MOE_MLP_H_ORDER3, EXPERT_OUT_DIM_ORDER3).to(device=self.device, dtype=torch.float32)
         else:
             self.w_moe_up = torch.zeros((256, MOE_MLP_UP_DIM_ORDER3), dtype=torch.float32, device=self.device)
             self.b_moe_up = torch.zeros((1, MOE_MLP_UP_DIM_ORDER3), dtype=torch.float32, device=self.device)
@@ -367,6 +379,7 @@ class Order3LiveInferenceEngine:
                 zm[:, 72:76], zm[:, 79:82], zm[:, 83:84],
                 zm[:, 84:88],
                 zm[:, 88:96],
+                zm[:, 96:112],
             ],
             dim=-1,
         )
@@ -382,13 +395,13 @@ class Order3LiveInferenceEngine:
         self.gate_state = (1.0 - beta_gate) * self.gate_state + beta_gate * raw_logits
         g_mode = torch.softmax(self.gate_state, dim=-1)
 
-        # K Нелинейных экспертов (Linear 58D + Residual SwiGLU 256 -> 96 [48 gated] -> 58D)
+        # K Нелинейных экспертов (Linear 60D + Residual SwiGLU 256 -> 96 [48 gated] -> 60D)
         moe_lin = (h2_ctx @ self.w2_moe + self.b2_moe).float().view(1, self.k_modes, EXPERT_OUT_DIM_ORDER3)
         moe_up = (h2_ctx @ self.w_moe_up + self.b_moe_up).view(1, self.k_modes, 2 * MOE_MLP_H_ORDER3)
         moe_act = F.silu(moe_up[:, :, :MOE_MLP_H_ORDER3]) * (2.0 * torch.sigmoid(moe_up[:, :, MOE_MLP_H_ORDER3:]))
         moe_mlp = torch.matmul(moe_act.permute(1, 0, 2), self.w_moe_dn).permute(1, 0, 2).float()
         moe_all = moe_lin + moe_mlp
-        strat_inst = (g_mode.unsqueeze(-1) * moe_all).sum(dim=1)  # [1, 58]
+        strat_inst = (g_mode.unsqueeze(-1) * moe_all).sum(dim=1)  # [1, 60]
         alpha_bid = torch.sigmoid(strat_inst[:, 50:51])
         alpha_ask = torch.sigmoid(strat_inst[:, 51:52])
         bid_blend = (1.0 - alpha_bid) * self.strat_state + alpha_bid * strat_inst
@@ -401,18 +414,19 @@ class Order3LiveInferenceEngine:
                 ask_blend[:, 45:47], bid_blend[:, 47:48], strat_inst[:, 48:49],
                 ask_blend[:, 49:50], strat_inst[:, 50:52],
                 ask_blend[:, 52:53], bid_blend[:, 53:54],
-                ask_blend[:, 54:55], bid_blend[:, 55:58],
+                ask_blend[:, 54:55], bid_blend[:, 55:60],
             ],
             dim=-1,
         )
         self.strat_state = strat_merged
-        strat_raw = strat_merged.squeeze(0)  # [56]
+        strat_raw = strat_merged.squeeze(0)  # [60]
 
-        # 1C. 100% Эндогенная экспозиция [0..1] + L79 Wide-Spread Micro-Sniper [55]:
+        # 1C. 100% Эндогенная экспозиция [0..1] + L93 Двухтраншевый Изолятор [59] (1-в-1 с fused_order3_clean_tick.py):
         rel_sp_now = (a1 - b1) / max(tick_sz, float(b1))
         wide_sp_gate = min(1.0, max(0.0, (rel_sp_now - 0.0035) / 0.0045))
         eff_micro_s = float(torch.sigmoid(strat_raw[55]).item()) * wide_sp_gate
-        exp_bid_frac = max(float(torch.sigmoid(strat_raw[0]).item()), 0.065 * eff_micro_s)
+        pod_cap_mult = 1.0 - 0.80 * float(torch.sigmoid(strat_raw[59]).item())
+        exp_bid_frac = max(float(torch.sigmoid(strat_raw[0]).item()) * pod_cap_mult, 0.065 * eff_micro_s)
         renorm_blend = float(torch.sigmoid(strat_raw[47]).item())
 
         tau_b_t = 0.08 + 2.42 * torch.sigmoid(strat_raw[34:35])
@@ -452,6 +466,13 @@ class Order3LiveInferenceEngine:
             rec_disc = 0.0040 + 0.0160 * float(torch.sigmoid(strat_raw[56] - 1.0).item())
             rec_cap_px = float(last_sell_px) * (1.0 - rec_disc)
             raw_t_bid = (1.0 - rec_w_k) * raw_t_bid + rec_w_k * torch.clamp(raw_t_bid, max=rec_cap_px)
+        # L93 Wall-Anchored Offset [58] (1-в-1 с fused_order3_clean_tick.py):
+        w_dist_raw = min(1.50, max(0.003, float(zm[0, 110].item()) * 0.5 + 0.50))
+        w_str_raw = float(zm[0, 111].item()) * 0.4 + 0.35
+        if w_dist_raw < 0.98 and w_str_raw > 0.18:
+            wall_front_px = b1 * (1.0 - 0.06 * w_dist_raw) + tick_sz
+            w_wall_k = float(torch.sigmoid(strat_raw[58]).item()) * torch.pow(1.0 - self.echelon_k01, 2.0)
+            raw_t_bid = (1.0 - w_wall_k) * raw_t_bid + w_wall_k * wall_front_px
         max_maker_bid = max(tick_sz, a1 - tick_sz)
         t_bid_px = torch.clamp(torch.round(torch.clamp(raw_t_bid, max=max_maker_bid) / tick_sz) * tick_sz, min=tick_sz)
 
@@ -485,7 +506,7 @@ class Order3LiveInferenceEngine:
         tot_bud_eff = max(budget, cash + pos_qty * b1)
         target_bid_pool_usd = max(0.0, tot_bud_eff * 0.996 * exp_bid_frac - pos_qty * b1)
         q_target_b = (target_bid_pool_usd * pi_b_t) / (t_bid_px * (1.0 + maker_fee))
-        q_target_b = torch.where(q_target_b >= 2.0, torch.floor(q_target_b * 10000.0) / 10000.0, torch.zeros_like(q_target_b))
+        q_target_b = torch.where((q_target_b >= 2.0) & ((q_target_b * t_bid_px) >= 12.0), torch.floor(q_target_b * 10000.0) / 10000.0, torch.zeros_like(q_target_b))
         q_target_a = torch.where(torch.full_like(pi_a_t, pos_qty >= 2.0, dtype=torch.bool), torch.floor((pos_qty * pi_a_t) * 10000.0) / 10000.0, torch.zeros_like(pi_a_t))
         q_target_a = torch.where(q_target_a >= 2.0, q_target_a, torch.zeros_like(q_target_a))
 
@@ -1189,6 +1210,160 @@ def build_live_hybrid_market_obs_40d(trader, b1: float, a1: float) -> np.ndarray
             z[94] = float(math.tanh((st_mid / max(m_120m, 1e-4) - 1.0) * 8.0))
             z[95] = float(np.clip((b120 - s120) / (b120 + s120 + 1000.0), -1.0, 1.0))
 
+    if MKT_DIM_ORDER3 >= 112:
+        now_v8 = time.time()
+        rt_dir = BASE_DIR / "data" / "realtime"
+
+        def _tail_csv_last(fp: Path, n_bytes: int = 8192) -> list[str]:
+            if not fp.exists():
+                return []
+            try:
+                sz = fp.stat().st_size
+                with open(fp, "rb") as rf:
+                    if sz > n_bytes:
+                        rf.seek(sz - n_bytes)
+                        lines = rf.read().decode("utf-8", errors="ignore").splitlines()[1:]
+                    else:
+                        lines = rf.read().decode("utf-8", errors="ignore").splitlines()
+                return [x for x in lines if x and not x.startswith("timestamp") and not x.startswith("id,")]
+            except Exception:
+                return []
+
+        def _parse_ts_any(s_raw: str) -> float:
+            try:
+                v = float(s_raw)
+                return v / 1000.0 if v > 1e12 else v
+            except Exception:
+                from datetime import datetime
+                try:
+                    return datetime.fromisoformat(s_raw.replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    return 0.0
+
+        # 1) Gate.io & Ourbit depth + rolling 15s mid + 5m trades CVD
+        gt_hist = _LIVE_WF_CACHE.setdefault("gt_mid_hist_60s", [])
+        ob_hist = _LIVE_WF_CACHE.setdefault("ob_mid_hist_60s", [])
+        bm_hist = _LIVE_WF_CACHE.setdefault("bm_mid_hist_960s", [])
+
+        gt_lines = _tail_csv_last(rt_dir / "prlusdt_gate" / "depth_gate.csv", 6144)
+        gt_mid_v, gt_imb5_v, gt_ok = 0.0, 0.0, False
+        if gt_lines:
+            ps = gt_lines[-1].split(",")
+            if len(ps) >= 121:
+                t_gt = _parse_ts_any(ps[0])
+                if (now_v8 - t_gt) <= 30.0:
+                    try:
+                        gb1, ga1 = float(ps[1]), float(ps[101])
+                        if gb1 > 0 and ga1 > 0:
+                            gt_mid_v = 0.5 * (gb1 + ga1)
+                            gbq5 = sum(float(ps[2 * i] or 0.0) for i in range(1, 6))
+                            gaq5 = sum(float(ps[100 + 2 * i] or 0.0) for i in range(1, 6))
+                            gt_imb5_v = float(np.clip((gbq5 - gaq5) / (gbq5 + gaq5 + 50.0), -1.0, 1.0))
+                            gt_ok = True
+                            gt_hist.append((now_v8, gt_mid_v))
+                    except Exception:
+                        pass
+        gt_hist[:] = [x for x in gt_hist if (now_v8 - x[0]) <= 65.0]
+        if gt_ok and gt_hist:
+            gt_p15 = next((x[1] for x in reversed(gt_hist) if (now_v8 - x[0]) >= 14.5), gt_hist[0][1])
+            z[96] = float(math.tanh((gt_mid_v / max(gt_p15, 1e-4) - 1.0) * 40.0))
+            z[97] = gt_imb5_v
+            z[58] = float(math.tanh(((gt_mid_v - st_mid) / st_mid) * 50.0))
+
+        ob_lines = _tail_csv_last(rt_dir / "prlusdt_ourbit" / "depth_ourbit.csv", 6144)
+        ob_mid_v, ob_ok = 0.0, False
+        if ob_lines:
+            ps = ob_lines[-1].split(",")
+            if len(ps) >= 103:
+                t_ob = _parse_ts_any(ps[0])
+                if (now_v8 - t_ob) <= 30.0:
+                    try:
+                        ob1, oa1 = float(ps[1]), float(ps[101])
+                        if ob1 > 0 and oa1 > 0:
+                            ob_mid_v = 0.5 * (ob1 + oa1)
+                            ob_ok = True
+                            ob_hist.append((now_v8, ob_mid_v))
+                    except Exception:
+                        pass
+        ob_hist[:] = [x for x in ob_hist if (now_v8 - x[0]) <= 65.0]
+        if ob_ok and ob_hist:
+            ob_p15 = next((x[1] for x in reversed(ob_hist) if (now_v8 - x[0]) >= 14.5), ob_hist[0][1])
+            z[100] = float(math.tanh((ob_mid_v / max(ob_p15, 1e-4) - 1.0) * 40.0))
+
+        def _live_trades_cvd(fp_tr: Path) -> tuple[float, float]:
+            tr_lns = _tail_csv_last(fp_tr, 24576)
+            b60, s60, b300, s300 = 0.0, 0.0, 0.0, 0.0
+            for ln in tr_lns:
+                ps = ln.split(",")
+                if len(ps) >= 5:
+                    ts_t = _parse_ts_any(ps[1])
+                    age_t = now_v8 - ts_t
+                    if 0.0 <= age_t <= 300.5:
+                        try:
+                            q_t = max(0.0, float(ps[3]))
+                        except Exception:
+                            continue
+                        is_b = ps[4].strip().lower() in ("buy", "bid", "b")
+                        if is_b:
+                            b300 += q_t
+                            if age_t <= 60.5:
+                                b60 += q_t
+                        else:
+                            s300 += q_t
+                            if age_t <= 60.5:
+                                s60 += q_t
+            return float(np.clip((b60 - s60) / (b60 + s60 + 200.0), -1.0, 1.0)), float(np.clip((b300 - s300) / (b300 + s300 + 800.0), -1.0, 1.0))
+
+        z[98], z[99] = _live_trades_cvd(rt_dir / "prlusdt_gate" / "trades_gate.csv")
+        z[101], z[102] = _live_trades_cvd(rt_dir / "prlusdt_ourbit" / "trades_ourbit.csv")
+
+        lead_m = 0.5 * (gt_mid_v + ob_mid_v) if (gt_ok and ob_ok) else (gt_mid_v if gt_ok else (ob_mid_v if ob_ok else st_mid))
+        z[103] = float(math.tanh(((lead_m - st_mid) / st_mid) * 35.0))
+
+        # 2) Binance Macro (BTC + NEAR)
+        bm_lns = _tail_csv_last(rt_dir / "macro_binance" / "binance_macro.csv", 4096)
+        if bm_lns:
+            ps = bm_lns[-1].split(",")
+            if len(ps) >= 8:
+                t_bm = _parse_ts_any(ps[0])
+                if (now_v8 - t_bm) <= 30.0:
+                    try:
+                        btc_v, near_v = float(ps[3]), float(ps[7])
+                        if btc_v > 1.0 and near_v > 1e-3:
+                            bm_hist.append((now_v8, btc_v, near_v))
+                            bm_hist[:] = [x for x in bm_hist if (now_v8 - x[0]) <= 920.0]
+                            btc_60 = next((x[1] for x in reversed(bm_hist) if (now_v8 - x[0]) >= 59.5), bm_hist[0][1])
+                            btc_900 = next((x[1] for x in reversed(bm_hist) if (now_v8 - x[0]) >= 899.5), bm_hist[0][1])
+                            nr_60 = next((x[2] for x in reversed(bm_hist) if (now_v8 - x[0]) >= 59.5), bm_hist[0][2])
+                            nr_900 = next((x[2] for x in reversed(bm_hist) if (now_v8 - x[0]) >= 899.5), bm_hist[0][2])
+                            z[104] = float(math.tanh((btc_v / max(btc_60, 1.0) - 1.0) * 120.0))
+                            z[105] = float(math.tanh((btc_v / max(btc_900, 1.0) - 1.0) * 50.0))
+                            z[106] = float(math.tanh((near_v / max(nr_60, 1e-3) - 1.0) * 80.0))
+                            z[107] = float(math.tanh((near_v / max(nr_900, 1e-3) - 1.0) * 35.0))
+                    except Exception:
+                        pass
+
+        # 3) SafeTrade L50/L500 Deep Profile & Work-Zone Protective Wall (223-col CSV)
+        st_lns = _tail_csv_last(rt_dir / "prlusdt" / "depth.csv", 6144)
+        z[110] = 1.0
+        if st_lns:
+            ps = st_lns[-1].split(",")
+            if len(ps) >= 223:
+                try:
+                    cb2_v = float(ps[209] or 0.0)
+                    cb6_v = float(ps[212] or 0.0)
+                    ca2_v = float(ps[216] or 0.0)
+                    ca5_v = float(ps[218] or 0.0)
+                    ww_px_v = float(ps[219] or 0.0)
+                    ww_qt_v = float(ps[220] or 0.0)
+                    z[108] = float(np.clip((cb2_v - ca2_v) / (cb2_v + ca2_v + 500.0), -1.0, 1.0))
+                    z[109] = float(np.clip((cb6_v - ca5_v) / (cb6_v + ca5_v + 1000.0), -1.0, 1.0))
+                    if 1e-4 < ww_px_v < b1 and ww_qt_v > 1.0:
+                        z[110] = float(np.clip((b1 - ww_px_v) / (b1 * 0.06), 0.0, 1.5))
+                        z[111] = float(math.tanh(math.log1p(ww_px_v * ww_qt_v / 1000.0) / 4.0))
+                except Exception:
+                    pass
+
     return z
 
 
@@ -1258,7 +1433,7 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
                     zm_w[:, 0:1], zm_w[:, 40:44], zm_w[:, 44:45], zm_w[:, 48:49],
                     zm_w[:, 29:34], zm_w[:, 36:37], zm_w[:, 39:40], zm_w[:, 55:56], zm_w[:, 12:13],
                     zm_w[:, 60:66], zm_w[:, 72:76], zm_w[:, 79:82], zm_w[:, 83:84],
-                    zm_w[:, 84:88], zm_w[:, 88:96],
+                    zm_w[:, 84:88], zm_w[:, 88:96], zm_w[:, 96:112],
                 ],
                 dim=-1,
             )
@@ -1689,7 +1864,7 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
 
     cand_b_slots = [
         s for s in sorted(range(12), key=lambda i: float(plan["pi_bid"][i]), reverse=True)
-        if trader.bid_slots[s].get("id") is None and bool(plan["g_plc_b"][s]) and float(plan["pi_bid"][s]) > 1e-4 and (avail_b_usd / max(1e-6, float(plan["t_bid_px"][s]) * 1.0025)) >= min_amt
+        if trader.bid_slots[s].get("id") is None and bool(plan["g_plc_b"][s]) and float(plan["pi_bid"][s]) > 1e-4 and avail_b_usd >= 12.0 and (avail_b_usd / max(1e-6, float(plan["t_bid_px"][s]) * 1.0025)) >= min_amt
     ]
     sel_b = []
     for s in cand_b_slots:
@@ -1712,7 +1887,7 @@ def execute_live_24slot_order3(trader, b1: float, a1: float) -> None:
         share_s = renorm_b * full_sh_b + (1.0 - renorm_b) * raw_sh_b
         alloc_s_usd = min(avail_b_usd * share_s * 0.998, rem_batch_usd)
         q_s = math.floor((alloc_s_usd / max(1e-6, px_s * 1.0025)) * 10000.0) / 10000.0
-        if q_s >= min_amt and px_s > 0:
+        if q_s >= min_amt and px_s > 0 and (q_s * px_s) >= 12.0:
             b_tasks.append((s, q_s, px_s))
             rem_batch_usd = max(0.0, rem_batch_usd - q_s * px_s * 1.0025)
         else:

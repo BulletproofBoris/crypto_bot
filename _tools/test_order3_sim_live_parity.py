@@ -34,14 +34,14 @@ from _tools.fused_order3_clean_tick import (
     _scale_mkt_44d,
 )
 
-MKT_PATH = BASE_DIR / "data/cache/rl_hybrid_market_obs_96d.npz"
+MKT_PATH = BASE_DIR / "data/cache/rl_hybrid_market_obs_112d.npz"
 LOB_PATH = BASE_DIR / "data/cache/rl_guard_lob_cache_600h.npz"
 CHAMP_PATH = BASE_DIR / "models/prl/release_champion_v1.pt"
 
 
 def main():
     print("=" * 80)
-    print("🧪 ORDER-3 TRUE BITWISE SIM / LIVE PARITY & LATENCY VERIFICATION (SIGNAL STACK V7 96D / 58D)")
+    print("🧪 ORDER-3.5 TRUE BITWISE SIM / LIVE PARITY & LATENCY VERIFICATION (SIGNAL STACK V8 112D / 60D)")
     print("=" * 80)
 
     ck_path = Path(sys.argv[1]) if len(sys.argv) > 1 else CHAMP_PATH
@@ -49,7 +49,7 @@ def main():
     engine = Order3LiveInferenceEngine(checkpoint_path=ck_path, device="cpu")
     print(f"  ✅ Order3LiveInferenceEngine (CPU) инициализирован: {ck_path.name}")
 
-    mkt_raw = np.load(MKT_PATH, mmap_mode="r")["market_obs_96d"]
+    mkt_raw = np.load(MKT_PATH, mmap_mode="r")["market_obs_112d"]
     lob_raw = np.load(LOB_PATH, mmap_mode="r")
     assert mkt_raw.shape[1] == MKT_DIM_ORDER3, f"Expected {MKT_DIM_ORDER3}D market matrix, got {mkt_raw.shape}"
     col_stds = np.std(np.asarray(mkt_raw[3016277::100], dtype=np.float32), axis=0)
@@ -128,7 +128,7 @@ def main():
                     zm[:, 0:1], zm[:, 40:44], zm[:, 44:45], zm[:, 48:49],
                     zm[:, 29:34], zm[:, 36:37], zm[:, 39:40], zm[:, 55:56], zm[:, 12:13],
                     zm[:, 60:66], zm[:, 72:76], zm[:, 79:82], zm[:, 83:84],
-                    zm[:, 84:88], zm[:, 88:96],
+                    zm[:, 84:88], zm[:, 88:96], zm[:, 96:112],
                 ],
                 dim=-1,
             )
@@ -154,7 +154,7 @@ def main():
                 [
                     bb[:, 0:13], ak[:, 13:25], si[:, 25:26], bb[:, 26:35], ak[:, 35:36], si[:, 36:37],
                     bb[:, 37:41], ak[:, 41:44], bb[:, 44:45], ak[:, 45:47], bb[:, 47:48], si[:, 48:49],
-                    ak[:, 49:50], si[:, 50:52], ak[:, 52:53], bb[:, 53:54], ak[:, 54:55], bb[:, 55:58],
+                    ak[:, 49:50], si[:, 50:52], ak[:, 52:53], bb[:, 53:54], ak[:, 54:55], bb[:, 55:60],
                 ],
                 dim=-1,
             )
@@ -182,6 +182,12 @@ def main():
             rec_w_k = rec_w_s * (1.0 - ech0_m * eff_mic_s)
             rec_disc = 0.0040 + 0.0160 * float(torch.sigmoid(sr[56] - 1.0).item())
             raw_t_bid = (1.0 - rec_w_k) * raw_t_bid + rec_w_k * torch.clamp(raw_t_bid, max=test_ls_px * (1.0 - rec_disc))
+            w_dist_raw = min(1.50, max(0.003, float(zm[0, 110].item()) * 0.5 + 0.50))
+            w_str_raw = float(zm[0, 111].item()) * 0.4 + 0.35
+            if w_dist_raw < 0.98 and w_str_raw > 0.18:
+                wall_front_px = b1 * (1.0 - 0.06 * w_dist_raw) + 0.0001
+                w_wall_k = float(torch.sigmoid(sr[58]).item()) * torch.pow(1.0 - echelon_k01, 2.0)
+                raw_t_bid = (1.0 - w_wall_k) * raw_t_bid + w_wall_k * wall_front_px
             ref_t_bid = torch.clamp(torch.round(torch.clamp(raw_t_bid, max=max(0.0001, a1 - 0.0001)) / 0.0001) * 0.0001, min=0.0001).numpy()
 
             min_bp_test, low_tq_test = b1 * 0.994, 45.0

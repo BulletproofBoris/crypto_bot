@@ -5147,6 +5147,45 @@ class LiveTriadRLTrader:
                     for s in self.bid_slots:
                         if s.get("id") is not None and float(s.get("px", 0.0)) >= (a1 - 0.1 * exec_t):
                             crossed_oids.append(("b", s["slot"], s["id"]))
+                    # L93 200ms Cross-Venue Fast-Cancel Reflex (снятие ближних бидов при внезапном обвале на Gate/Ourbit без поломки 1Hz mem_h):
+                    try:
+                        rt_g = BASE_DIR / "data" / "realtime"
+                        now_mono = time.monotonic()
+                        for v_key, v_path in (("gt", rt_g / "prlusdt_gate" / "depth_gate.csv"), ("ob", rt_g / "prlusdt_ourbit" / "depth_ourbit.csv")):
+                            if not v_path.exists():
+                                continue
+                            st_v = v_path.stat()
+                            prev_ns = getattr(self, f"_subsec_{v_key}_ns", 0)
+                            if st_v.st_mtime_ns == prev_ns or (time.time() - st_v.st_mtime) > 4.0:
+                                continue
+                            setattr(self, f"_subsec_{v_key}_ns", st_v.st_mtime_ns)
+                            with v_path.open("rb") as vf:
+                                vf.seek(max(0, st_v.st_size - 4096))
+                                lines_v = vf.read().splitlines()
+                            if len(lines_v) >= 2:
+                                cols_v = lines_v[-1].decode("utf-8", errors="ignore").split(",")
+                                if len(cols_v) >= 5:
+                                    vb1, va1 = float(cols_v[1] or 0.0), float(cols_v[3] or 0.0)
+                                    if vb1 > 0.0 and va1 > 0.0 and va1 >= vb1:
+                                        vmid = 0.5 * (vb1 + va1)
+                                        hist_attr = f"_subsec_{v_key}_ring"
+                                        ring_v = getattr(self, hist_attr, None)
+                                        if ring_v is None:
+                                            ring_v = []
+                                            setattr(self, hist_attr, ring_v)
+                                        ring_v.append((now_mono, vmid))
+                                        ring_v[:] = [(ts_r, m_r) for ts_r, m_r in ring_v if (now_mono - ts_r) <= 3.5]
+                                        peak_3s = max(m_r for _, m_r in ring_v)
+                                        drop_3s = (vmid - peak_3s) / max(peak_3s, 1e-8)
+                                        if drop_3s <= -0.012:
+                                            already_c = {x[2] for x in crossed_oids}
+                                            for s in self.bid_slots:
+                                                oid_s = s.get("id")
+                                                px_s = float(s.get("px", 0.0))
+                                                if oid_s is not None and oid_s not in already_c and (px_s >= b1 * 0.992 or px_s > va1 * 1.003):
+                                                    crossed_oids.append(("b", s["slot"], oid_s))
+                    except Exception:
+                        pass
                 if has_a_slots:
                     low_a_px = min(float(s.get("px", 1e9)) for s in self.ask_slots if s.get("id") is not None)
                     if a1 > low_a_px + tol or ((abs(low_a_px - a1) <= tol) and ((prev_a1_q - a1_q) >= 2.0)):
@@ -5566,7 +5605,11 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
             trader.maybe_hot_reload_champion()
 
         if getattr(trader, "order3_mode", False):
+            gate_depth_f = BASE_DIR / "data" / "realtime" / "prlusdt_gate" / "depth_gate.csv"
+            ourbit_depth_f = BASE_DIR / "data" / "realtime" / "prlusdt_ourbit" / "depth_ourbit.csv"
             last_depth_ns = local_depth.stat().st_mtime_ns if local_depth.exists() else 0
+            last_gt_ns = gate_depth_f.stat().st_mtime_ns if gate_depth_f.exists() else 0
+            last_ob_ns = ourbit_depth_f.stat().st_mtime_ns if ourbit_depth_f.exists() else 0
             last_rest_ts = float(shared_depth["ts"])
             while True:
                 rem_sec = 1.0 - (time.perf_counter() - t0)
@@ -5575,9 +5618,13 @@ def run_live_or_shadow_loop(coin: str = "prl", mode: str = "shadow", steps: int 
                 time.sleep(min(0.04, rem_sec - 0.005))
                 if has_open_orders or trader.pos_qty >= 2.005:
                     cur_ns = local_depth.stat().st_mtime_ns if local_depth.exists() else 0
+                    cur_gt_ns = gate_depth_f.stat().st_mtime_ns if gate_depth_f.exists() else 0
+                    cur_ob_ns = ourbit_depth_f.stat().st_mtime_ns if ourbit_depth_f.exists() else 0
                     cur_rest_ts = float(shared_depth["ts"])
-                    if cur_ns != last_depth_ns or cur_rest_ts != last_rest_ts:
+                    if cur_ns != last_depth_ns or cur_rest_ts != last_rest_ts or cur_gt_ns != last_gt_ns or cur_ob_ns != last_ob_ns:
                         last_depth_ns = cur_ns
+                        last_gt_ns = cur_gt_ns
+                        last_ob_ns = cur_ob_ns
                         last_rest_ts = cur_rest_ts
                         trader.subsecond_guardian_step(streamer, shared_depth["data"])
         else:
