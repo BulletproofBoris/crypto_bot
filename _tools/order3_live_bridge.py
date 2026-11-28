@@ -37,8 +37,12 @@ from _tools.fused_order3_clean_tick import (
     ROUTER_OUT_DIM_ORDER3,
     REG_IN_DIM_ORDER3,
     REG_H_DIM_ORDER3,
+    MAX_RES_BANDS_ORDER3,
+    RES_PHI_DIM_ORDER3,
     TOKEN_REFILL_PER_SEC_ORDER3,
     TOKEN_BUCKET_CAP_ORDER3,
+    _apply_resonant_bank_3d,
+    _extract_resonant_phi_16d,
     _fanned_slot_softmax,
     _normalize_agent_z110_per_block,
     _scale_mkt_44d,
@@ -277,6 +281,23 @@ class Order3LiveInferenceEngine:
         self.b_reg2_b = ck["b_reg2_b"].view(1, 2).to(device=self.device, dtype=torch.float32)
         self.b_reg2_a = ck["b_reg2_a"].view(1, 2).to(device=self.device, dtype=torch.float32)
 
+        # L95: Узкополосный банк резонаторов High-Q Resonant Equalizer (по умолчанию res_amp=0 -> 0.00e+00 паритет с H_0!)
+        if "res_amp" in ck and ck["res_amp"].numel() == MAX_RES_BANDS_ORDER3:
+            self.res_amp = ck["res_amp"].to(dtype=torch.float32, device=self.device).view(1, 1, MAX_RES_BANDS_ORDER3)
+            self.res_center = ck["res_center"].to(dtype=torch.float32, device=self.device).view(1, MAX_RES_BANDS_ORDER3, RES_PHI_DIM_ORDER3)
+            self.res_q = ck["res_q"].to(dtype=torch.float32, device=self.device).view(1, MAX_RES_BANDS_ORDER3, RES_PHI_DIM_ORDER3)
+            self.res_du = ck["res_du"].to(dtype=torch.float32, device=self.device).view(1, MAX_RES_BANDS_ORDER3, EXPERT_OUT_DIM_ORDER3)
+            if "res_p" in ck and ck["res_p"].numel() == MAX_RES_BANDS_ORDER3:
+                self.res_p = ck["res_p"].to(dtype=torch.float32, device=self.device).view(1, 1, MAX_RES_BANDS_ORDER3)
+            else:
+                self.res_p = torch.zeros((1, 1, MAX_RES_BANDS_ORDER3), dtype=torch.float32, device=self.device)
+        else:
+            self.res_amp = torch.zeros((1, 1, MAX_RES_BANDS_ORDER3), dtype=torch.float32, device=self.device)
+            self.res_center = torch.zeros((1, MAX_RES_BANDS_ORDER3, RES_PHI_DIM_ORDER3), dtype=torch.float32, device=self.device)
+            self.res_q = torch.ones((1, MAX_RES_BANDS_ORDER3, RES_PHI_DIM_ORDER3), dtype=torch.float32, device=self.device)
+            self.res_du = torch.zeros((1, MAX_RES_BANDS_ORDER3, EXPERT_OUT_DIM_ORDER3), dtype=torch.float32, device=self.device)
+            self.res_p = torch.zeros((1, 1, MAX_RES_BANDS_ORDER3), dtype=torch.float32, device=self.device)
+
         # Внутреннее состояние (48D память + Liquid-вентили роутера и плана!)
         self.mem_h = torch.zeros((1, MEM_DIM_ORDER3), dtype=torch.float32, device=self.device)
         self.gate_state = torch.zeros((1, self.k_modes), dtype=torch.float32, device=self.device)
@@ -402,6 +423,10 @@ class Order3LiveInferenceEngine:
         moe_mlp = torch.matmul(moe_act.permute(1, 0, 2), self.w_moe_dn).permute(1, 0, 2).float()
         moe_all = moe_lin + moe_mlp
         strat_inst = (g_mode.unsqueeze(-1) * moe_all).sum(dim=1)  # [1, 60]
+        phi_16 = _extract_resonant_phi_16d(self.mem_h.unsqueeze(0), zm.unsqueeze(0), acct_8d[:, 1:2])  # [1, 1, 16]
+        strat_inst = strat_inst + _apply_resonant_bank_3d(
+            phi_16, self.res_amp, self.res_center, self.res_q, self.res_du, strat_inst[:, 0:1].unsqueeze(0), self.res_p
+        ).squeeze(0)
         alpha_bid = torch.sigmoid(strat_inst[:, 50:51])
         alpha_ask = torch.sigmoid(strat_inst[:, 51:52])
         bid_blend = (1.0 - alpha_bid) * self.strat_state + alpha_bid * strat_inst
@@ -414,7 +439,7 @@ class Order3LiveInferenceEngine:
                 ask_blend[:, 45:47], bid_blend[:, 47:48], strat_inst[:, 48:49],
                 ask_blend[:, 49:50], strat_inst[:, 50:52],
                 ask_blend[:, 52:53], bid_blend[:, 53:54],
-                ask_blend[:, 54:55], bid_blend[:, 55:60],
+                ask_blend[:, 54:55], bid_blend[:, 55:59], strat_inst[:, 59:60],
             ],
             dim=-1,
         )

@@ -35,8 +35,77 @@ ROUTER_RES_H_ORDER3 = 64
 ROUTER_OUT_DIM_ORDER3 = 2 * K_MODES_ORDER3  # 16: 8 mode logits + 8 liquid update gates!
 REG_IN_DIM_ORDER3 = 28 + K_MODES_ORDER3     # 36D per-slot features
 REG_H_DIM_ORDER3 = 64
+MAX_RES_BANDS_ORDER3 = 32
+RES_PHI_DIM_ORDER3 = 16
 TOKEN_REFILL_PER_SEC_ORDER3 = 1.2
 TOKEN_BUCKET_CAP_ORDER3 = 8.0
+
+
+def _extract_resonant_phi_16d(mem_next_f: torch.Tensor, zm_f: torch.Tensor, inv_ratio_f: torch.Tensor) -> torch.Tensor:
+    """
+    L95: Строго каузальный стационарный 16D спектрально-фазовый базис phi(s) для узкополосных High-Q резонаторов
+    (100% побитовый паритет GPU симулятора и CPU order3_live_bridge.py):
+      [0..7]  : 8 октавных частотных полос 64D SSM-памяти (~1s, 4s, 15s, 60s, 3m, 15m, 1h, 4h) * 3.0;
+      [8]     : rel_spread z (zm[0]);
+      [9]     : направленная альфа Order-1 60s+600s 0.5*(zm[36] + zm[73]);
+      [10]    : фаза макро-волны Wave Radar 30m (zm[62]);
+      [11]    : межбиржевой консенсус опережения Gate+Ourbit (zm[103]);
+      [12]    : поток агрессоров поводырей 60s CVD 0.5*(zm[98] + zm[101]);
+      [13]    : среднесрочная структура доходности 30m (zm[88]);
+      [14]    : аварийный краш-щит Order-2 max(zm[31], zm[81]);
+      [15]    : текущая доля инвентаря в портфеле inv_ratio [0..1.5].
+    """
+    mf = mem_next_f.float()
+    zf = zm_f.float()
+    ir = inv_ratio_f.float()
+    phi_oct = mf.reshape(*mf.shape[:-1], 8, 8).mean(dim=-1) * 3.0
+    phi_mkt = torch.stack(
+        [
+            zf[..., 0],
+            0.5 * (zf[..., 36] + zf[..., 73]),
+            zf[..., 62],
+            zf[..., 103],
+            0.5 * (zf[..., 98] + zf[..., 101]),
+            zf[..., 88],
+            torch.maximum(torch.maximum(zf[..., 31], zf[..., 81]), torch.maximum(zf[..., 79], zf[..., 86])),
+            ir,
+        ],
+        dim=-1,
+    )
+    return torch.cat([phi_oct, phi_mkt], dim=-1)
+
+
+def _apply_resonant_bank_3d(
+    phi_g: torch.Tensor,
+    res_amp_g: torch.Tensor,
+    res_center_g: torch.Tensor,
+    res_q_g: torch.Tensor,
+    res_du_g: torch.Tensor,
+    h0_exp0_g: torch.Tensor,
+    res_p_g: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Узкополосный аддитивный банк подпространственных резонаторов Гаусса / Баттерворта в нуль-пространстве H_0:
+      null_gate(s) = sigmoid(-2.0 * (H_0_exp0(s) + 4.0)),
+      d2_k(s)      = 0.5 * sum_d (q_{k,d} * (phi_d(s) - c_{k,d}))^2,   q_{k,d} >= 0.0 (0.0 = ось прозрачна!),
+      env_k(s)     = exp(-d2_k) при p_k <= 0.05, иначе 1 / (1 + d2_k^{p_k}) (плоская вершина Баттерворта!),
+      delta_u(s)   = sum_k null_gate(s) * A_k * env_k(s) * du_k.
+    """
+    null_gate = torch.sigmoid(-2.0 * (h0_exp0_g.float() + 4.0))              # [G, M, 1]
+    diff = phi_g.float().unsqueeze(-2) - res_center_g.float().unsqueeze(1)  # [G, M, 32, 16]
+    q_eff = torch.clamp(res_q_g.float(), min=0.0, max=12.0).unsqueeze(1)    # [G, 1, 32, 16]
+    d2 = torch.clamp(0.5 * torch.sum((diff * q_eff) * (diff * q_eff), dim=-1), min=0.0, max=40.0)  # [G, M, 32]
+    env_gauss = torch.exp(-d2)
+    if res_p_g is not None:
+        pf = res_p_g.float()
+        p_pos = torch.clamp(pf, min=0.5, max=6.0)
+        env_butt = 1.0 / (1.0 + torch.pow(d2 + 1e-8, p_pos))
+        env = torch.where(pf > 0.05, env_butt, env_gauss)
+    else:
+        env = env_gauss
+    amp_eff = torch.clamp(res_amp_g.float(), min=0.0, max=1.50)             # [G, 1, 32]
+    gamma = (null_gate * amp_eff) * env                                     # [G, M, 32]
+    return torch.bmm(gamma, res_du_g.float())                               # [G, M, 60]
 
 
 def _fanned_slot_softmax(
@@ -199,6 +268,11 @@ def _order3_clean_tick_step(
     w_reg2_g: torch.Tensor,
     b_reg2_b_g: torch.Tensor,
     b_reg2_a_g: torch.Tensor,
+    res_amp_g: torch.Tensor,
+    res_center_g: torch.Tensor,
+    res_q_g: torch.Tensor,
+    res_du_g: torch.Tensor,
+    res_p_g: torch.Tensor,
     echelon_k01: torch.Tensor,
     budget: torch.Tensor,
     mem_h: torch.Tensor,
@@ -436,7 +510,13 @@ def _order3_clean_tick_step(
     moe_up_act = F.silu(moe_up_raw[:, :, :, :MOE_MLP_H_ORDER3]) * (2.0 * torch.sigmoid(moe_up_raw[:, :, :, MOE_MLP_H_ORDER3:]))
     moe_mlp_g = torch.matmul(moe_up_act.permute(0, 2, 1, 3), w_moe_dn_g).permute(0, 2, 1, 3).float()
     moe_all_g = moe_lin_g + moe_mlp_g
-    strat_inst_g = (g_mode_g.unsqueeze(-1) * moe_all_g).sum(dim=2)  # [G, M, 58]
+    strat_inst_g = (g_mode_g.unsqueeze(-1) * moe_all_g).sum(dim=2)  # [G, M, 60]
+    # L95: Аддитивный узкополосный эквалайзер High-Q Resonant Bank в ортогональном нуль-пространстве H_0:
+    mkt_gm = mkt_w0.unsqueeze(0).unsqueeze(2).expand(G, W, B, MKT_DIM_ORDER3).reshape(G, M, MKT_DIM_ORDER3)
+    phi_16_g = _extract_resonant_phi_16d(mem_next_g, mkt_gm, acct_g[:, :, 1])
+    strat_inst_g = strat_inst_g + _apply_resonant_bank_3d(
+        phi_16_g, res_amp_g, res_center_g, res_q_g, res_du_g, strat_inst_g[:, :, 0:1], res_p_g
+    )
     strat_inst = strat_inst_g.view(G, W, B, EXPERT_OUT_DIM_ORDER3).permute(1, 0, 2, 3).reshape(N, EXPERT_OUT_DIM_ORDER3)
 
     # Адаптивный нелинейный демпфер плана котирования (разрывает петлю PLACE -> free_cash -> CANCEL, оставляя Taker мгновенным!):
@@ -467,7 +547,7 @@ def _order3_clean_tick_step(
             bid_blend[:, 56:57],    # [56] recycle_anchor_z (L80 якорь рециклинга: потолок откупа ниже last_sell_px!)
             bid_blend[:, 57:58],    # [57] deep_hyst_z (L80 эндогенный гистерезис перестановки глубоких заявок!)
             bid_blend[:, 58:59],    # [58] wall_anchor_z (L93 привязка цены к защитной стене стакана L50/L500 + 1 tick!)
-            bid_blend[:, 59:60],    # [59] agile_pod_z (L93 изолированный 20% суб-транш Agile Pod, охраняющий 80% Core Vault!)
+            strat_inst[:, 59:60],   # [59] agile_pod_z (мгновенный изолятор 20% Agile Pod без инерции в каскадах H_0!)
         ],
         dim=-1,
     )
@@ -1316,6 +1396,11 @@ def _get_or_build_order3_cudagraph(
         "wreg2_c": torch.zeros((C, REG_H_DIM_ORDER3, 2), dtype=dt, device=device),
         "breg2b_c": torch.zeros((C, 1, 2), dtype=torch.float32, device=device),
         "breg2a_c": torch.zeros((C, 1, 2), dtype=torch.float32, device=device),
+        "res_amp_c": torch.zeros((C, 1, MAX_RES_BANDS_ORDER3), dtype=torch.float32, device=device),
+        "res_center_c": torch.zeros((C, MAX_RES_BANDS_ORDER3, RES_PHI_DIM_ORDER3), dtype=torch.float32, device=device),
+        "res_q_c": torch.ones((C, MAX_RES_BANDS_ORDER3, RES_PHI_DIM_ORDER3), dtype=torch.float32, device=device),
+        "res_du_c": torch.zeros((C, MAX_RES_BANDS_ORDER3, EXPERT_OUT_DIM_ORDER3), dtype=torch.float32, device=device),
+        "res_p_c": torch.zeros((C, 1, MAX_RES_BANDS_ORDER3), dtype=torch.float32, device=device),
         "echelon_k01": torch.linspace(0.0, 1.0, S, dtype=torch.float32, device=device),
         "budget": torch.full((N,), 1000.0, dtype=torch.float32, device=device),
         "mem_h": torch.zeros((N, MEM_DIM_ORDER3), dtype=dt, device=device),
@@ -1403,6 +1488,7 @@ def _get_or_build_order3_cudagraph(
             buf["wreg1_c"], buf["breg1b_c"], buf["breg1a_c"],
             buf["wreg_res1_c"], buf["breg_res_c"], buf["wreg_res2_c"],
             buf["wreg2_c"], buf["breg2b_c"], buf["breg2a_c"],
+            buf["res_amp_c"], buf["res_center_c"], buf["res_q_c"], buf["res_du_c"], buf["res_p_c"],
             buf["echelon_k01"], buf["budget"],
             *(buf[k] for k in state_keys),
             tick_sz, maker_fee, taker_fee, true_latency, False,
@@ -1515,6 +1601,7 @@ def evaluate_order3_basket(
     wg1_l, bg1_l, wgres1_l, bgres_l, wgres2_l, wg2_l, bg2_l = [], [], [], [], [], [], []
     wrec_l, brec_l, wmem2h_l = [], [], []
     wreg1_l, breg1b_l, breg1a_l, wregr1_l, bregr_l, wregr2_l, wreg2_l, breg2b_l, breg2a_l = [], [], [], [], [], [], [], [], []
+    res_amp_l, res_center_l, res_q_l, res_du_l, res_p_l = [], [], [], [], []
     for st in cand_states:
         w1_t = st['w1'].to(device=device, dtype=torch.float32)
         if w1_t.shape[0] != TOTAL_DIM_ORDER3:
@@ -1704,6 +1791,21 @@ def evaluate_order3_basket(
         wreg2_l.append(wreg2_t.to(dtype=dt))
         breg2b_l.append(st['b_reg2_b'].to(device=device, dtype=torch.float32).view(1, 2))
         breg2a_l.append(st['b_reg2_a'].to(device=device, dtype=torch.float32).view(1, 2))
+        if 'res_amp' in st and st['res_amp'].numel() == MAX_RES_BANDS_ORDER3:
+            res_amp_l.append(st['res_amp'].to(device=device, dtype=torch.float32).view(1, MAX_RES_BANDS_ORDER3))
+            res_center_l.append(st['res_center'].to(device=device, dtype=torch.float32).view(MAX_RES_BANDS_ORDER3, RES_PHI_DIM_ORDER3))
+            res_q_l.append(st['res_q'].to(device=device, dtype=torch.float32).view(MAX_RES_BANDS_ORDER3, RES_PHI_DIM_ORDER3))
+            res_du_l.append(st['res_du'].to(device=device, dtype=torch.float32).view(MAX_RES_BANDS_ORDER3, EXPERT_OUT_DIM_ORDER3))
+            if 'res_p' in st and st['res_p'].numel() == MAX_RES_BANDS_ORDER3:
+                res_p_l.append(st['res_p'].to(device=device, dtype=torch.float32).view(1, MAX_RES_BANDS_ORDER3))
+            else:
+                res_p_l.append(torch.zeros((1, MAX_RES_BANDS_ORDER3), dtype=torch.float32, device=device))
+        else:
+            res_amp_l.append(torch.zeros((1, MAX_RES_BANDS_ORDER3), dtype=torch.float32, device=device))
+            res_center_l.append(torch.zeros((MAX_RES_BANDS_ORDER3, RES_PHI_DIM_ORDER3), dtype=torch.float32, device=device))
+            res_q_l.append(torch.ones((MAX_RES_BANDS_ORDER3, RES_PHI_DIM_ORDER3), dtype=torch.float32, device=device))
+            res_du_l.append(torch.zeros((MAX_RES_BANDS_ORDER3, EXPERT_OUT_DIM_ORDER3), dtype=torch.float32, device=device))
+            res_p_l.append(torch.zeros((1, MAX_RES_BANDS_ORDER3), dtype=torch.float32, device=device))
 
     w1_c = torch.stack(w1_l, dim=0).contiguous()
     w1_mkt_c = w1_c[:, :MKT_DIM_ORDER3, :].contiguous()
@@ -1736,6 +1838,11 @@ def evaluate_order3_basket(
     wreg2_c = torch.stack(wreg2_l, dim=0).contiguous()
     breg2b_c = torch.stack(breg2b_l, dim=0).contiguous()
     breg2a_c = torch.stack(breg2a_l, dim=0).contiguous()
+    res_amp_c = torch.stack(res_amp_l, dim=0).contiguous()
+    res_center_c = torch.stack(res_center_l, dim=0).contiguous()
+    res_q_c = torch.stack(res_q_l, dim=0).contiguous()
+    res_du_c = torch.stack(res_du_l, dim=0).contiguous()
+    res_p_c = torch.stack(res_p_l, dim=0).contiguous()
 
     w_starts = torch.tensor([ws for _, ws, _, _ in val_windows], dtype=torch.long, device=device)
     total_max_t = len(mkt_39d_all) - 1
@@ -1857,6 +1964,12 @@ def evaluate_order3_basket(
     moe_mlp_w = torch.matmul(moe_act_w.permute(0, 2, 1, 3), wmdn_c).permute(0, 2, 1, 3).float()
     moe_w = moe_lin_w + moe_mlp_w
     st_w = (gm_w.unsqueeze(-1) * moe_w).sum(dim=2)
+    phi_w = _extract_resonant_phi_16d(
+        mem_cw,
+        zw_last.unsqueeze(0).expand(C, W, MKT_DIM_ORDER3),
+        torch.zeros((C, W), dtype=torch.float32, device=device),
+    )
+    st_w = st_w + _apply_resonant_bank_3d(phi_w, res_amp_c, res_center_c, res_q_c, res_du_c, st_w[:, :, 0:1], res_p_c)
 
     mem_h = mem_cw.permute(1, 0, 2).unsqueeze(2).expand(W, C, B_bud, MEM_DIM_ORDER3).reshape(N, MEM_DIM_ORDER3).contiguous()
     gate_state = go_w.permute(1, 0, 2).unsqueeze(2).expand(W, C, B_bud, K_MODES_ORDER3).reshape(N, K_MODES_ORDER3).contiguous()
@@ -1963,6 +2076,8 @@ def evaluate_order3_basket(
         cb["wreg1_c"].copy_(wreg1_c); cb["breg1b_c"].copy_(breg1b_c); cb["breg1a_c"].copy_(breg1a_c)
         cb["wreg_res1_c"].copy_(wreg_res1_c); cb["breg_res_c"].copy_(breg_res_c); cb["wreg_res2_c"].copy_(wreg_res2_c)
         cb["wreg2_c"].copy_(wreg2_c); cb["breg2b_c"].copy_(breg2b_c); cb["breg2a_c"].copy_(breg2a_c)
+        cb["res_amp_c"].copy_(res_amp_c); cb["res_center_c"].copy_(res_center_c)
+        cb["res_q_c"].copy_(res_q_c); cb["res_du_c"].copy_(res_du_c); cb["res_p_c"].copy_(res_p_c)
         cb["budget"].copy_(budget)
 
         init_states = [
@@ -2059,6 +2174,7 @@ def evaluate_order3_basket(
                     wg1_c, bg1_c, wgres1_c, bgres_c, wgres2_c, wg2_c, bg2_c,
                     wrec_c, brec_c, wmem2h_c,
                     wreg1_c, breg1b_c, breg1a_c, wreg_res1_c, breg_res_c, wreg_res2_c, wreg2_c, breg2b_c, breg2a_c,
+                    res_amp_c, res_center_c, res_q_c, res_du_c, res_p_c,
                     echelon_k01, budget,
                     mem_h, gate_state, strat_state, cash, pos_qty, pos_cost_usd, avg_entry,
                     min_buy_px, low_tranche_qty, mid_buy_px, mid_tranche_qty, entry_s,

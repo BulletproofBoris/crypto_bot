@@ -668,6 +668,10 @@ class MultimodalMoEPolicyOrder3:
             }
 
         state = _normalize_weights_order3(state, self.dtype)
+        if "res_amp" in ck:
+            for rk in ("res_amp", "res_center", "res_q", "res_du", "res_p"):
+                if rk in ck:
+                    state[rk] = ck[rk].float().to(device=self.device)
         cpu_st = {k: v.detach().cpu().clone() for k, v in state.items()}
         return cpu_st
 
